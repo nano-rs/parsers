@@ -1,0 +1,77 @@
+name: ad_identity
+display_name: Active Directory Identity
+version: "1.0.0"
+description: >-
+  Normalizes pushed Active Directory identity records (nano_enrich, kind=identity,
+  source=ad) into the user_registry enrichment table. The mapping is the
+  repo-sourced replacement for the previously hard-coded Vector transform
+  (NAN-1148/NAN-1149) — updating AD→user_registry field mapping no longer
+  requires an application ship.
+
+# NAN-1149: enrichment-parser flavor. This file lives under
+# enrichments/<enrich_kind>/<enrich_source>/parser.yaml, but enrich_kind /
+# enrich_source / target_table are also set explicitly here because the parser
+# sync reads them straight from the YAML (it does not infer them from the path).
+kind: enrichment
+enrich_kind: identity
+enrich_source: ad
+target_table: user_registry
+
+# The remap body emitted as [transforms.enrichment_normalize_identity] in the
+# generated _enrichment.toml. Maps a pushed nano_enrich/kind=identity record to
+# the user_registry columns. Invariants (NAN-1114 / NAN-1123): the enrichment
+# sink must never block the shared upstream, `version` is always a non-zero
+# integer-ms clock, and `last_synced_at` is its formatted-string form.
+normalize_vrl: |
+  # Map a pushed nano_enrich/kind=identity record to the user_registry columns.
+  now_ms = to_unix_timestamp(now(), unit: "milliseconds")
+
+  external_id = to_string(.external_id) ?? ""
+  if external_id == "" {
+      log("nano_enrich identity record missing external_id; dead-lettering", level: "warn")
+      abort
+  }
+
+  # version + last_synced_at on ONE clock (ms epoch). Sender may supply version;
+  # otherwise stamp now. last_synced_at is the formatted-string form of version.
+  version = to_int(.version) ?? 0
+  if version <= 0 { version = now_ms }
+  last_synced_at = format_timestamp!(from_unix_timestamp!(version, unit: "milliseconds"), "%Y-%m-%d %H:%M:%S%.3f")
+
+  # account_status enum guard (defense-in-depth; full validation in NAN-1133).
+  account_status = downcase(to_string(.account_status) ?? "active")
+  if !includes(["active", "disabled", "deleted", "anonymized"], account_status) {
+      account_status = "active"
+  }
+
+  groups = .groups
+  if !is_array(groups) { groups = [] }
+
+  . = {
+      "provider_id": to_string(.provider_id) ?? "",
+      "external_id": external_id,
+      "username": to_string(.username) ?? "",
+      "upn": to_string(.upn) ?? "",
+      "email": to_string(.email) ?? "",
+      "display_name": to_string(.display_name) ?? "",
+      "first_name": to_string(.first_name) ?? "",
+      "last_name": to_string(.last_name) ?? "",
+      "department": to_string(.department) ?? "",
+      "title": to_string(.title) ?? "",
+      "manager_upn": to_string(.manager_upn) ?? "",
+      "manager_display_name": to_string(.manager_display_name) ?? "",
+      "company": to_string(.company) ?? "",
+      "office_location": to_string(.office_location) ?? "",
+      "city": to_string(.city) ?? "",
+      "country": to_string(.country) ?? "",
+      "groups": groups,
+      "account_enabled": to_int(.account_enabled) ?? 1,
+      "account_status": account_status,
+      "mfa_enabled": to_int(.mfa_enabled) ?? 0,
+      "phone": to_string(.phone) ?? "",
+      "employee_id": to_string(.employee_id) ?? "",
+      "employee_type": to_string(.employee_type) ?? "employee",
+      "sync_hash": to_string(.sync_hash) ?? "",
+      "last_synced_at": last_synced_at,
+      "version": version
+  }
