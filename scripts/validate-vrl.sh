@@ -10,8 +10,13 @@ FAIL=0
 WARN=0
 PASS=0
 
-# Minimal test event — just enough structure for VRL to compile against
+# Minimal test events — just enough structure for VRL to compile + run against.
+#   log:        a wrapped raw log line (the common `parser_vrl` shape)
+#   enrichment: a pushed nano_enrich record (the `normalize_vrl` shape, NAN-1149)
+# The enrichment event carries a non-empty external_id so identity-style
+# normalizers don't `abort` on the missing-key guard during the run check.
 TEST_EVENT='{"message": "{\"timestamp\":\"2025-01-01T00:00:00Z\",\"severity\":\"INFO\"}"}'
+ENRICH_TEST_EVENT='{"external_id":"S-1-5-21-100-500","username":"jdoe","upn":"jdoe@corp.example","email":"jdoe@corp.example","display_name":"Jane Doe","version":1717000000000,"account_status":"active","groups":["domain admins"]}'
 
 while IFS= read -r parser_file; do
     [ -z "$parser_file" ] && continue
@@ -22,13 +27,32 @@ while IFS= read -r parser_file; do
     echo "Validating: $parser_name ($parser_file)"
     echo "─────────────────────────────────────────"
 
-    # Extract the VRL program from parser_vrl field
-    vrl_program=$(yq '.parser_vrl' "$parser_file")
+    # NAN-1149: an enrichment parser (kind: enrichment, or any file carrying a
+    # normalize_vrl) keeps its VRL in `normalize_vrl` and is fed a pushed-record
+    # test event instead of a wrapped log line.
+    kind=$(yq '.kind // "parser"' "$parser_file")
+    normalize_vrl=$(yq '.normalize_vrl' "$parser_file")
+    is_enrichment=0
+    if [ "$kind" = "enrichment" ] || { [ -n "$normalize_vrl" ] && [ "$normalize_vrl" != "null" ]; }; then
+        is_enrichment=1
+    fi
 
-    if [ -z "$vrl_program" ] || [ "$vrl_program" = "null" ]; then
-        echo "  ERROR: No parser_vrl field found"
-        FAIL=$((FAIL + 1))
-        continue
+    if [ "$is_enrichment" -eq 1 ]; then
+        vrl_program="$normalize_vrl"
+        event_json="$ENRICH_TEST_EVENT"
+        if [ -z "$vrl_program" ] || [ "$vrl_program" = "null" ]; then
+            echo "  ERROR: enrichment parser has no normalize_vrl field"
+            FAIL=$((FAIL + 1))
+            continue
+        fi
+    else
+        vrl_program=$(yq '.parser_vrl' "$parser_file")
+        event_json="$TEST_EVENT"
+        if [ -z "$vrl_program" ] || [ "$vrl_program" = "null" ]; then
+            echo "  ERROR: No parser_vrl field found"
+            FAIL=$((FAIL + 1))
+            continue
+        fi
     fi
 
     # Write VRL to temp file (vector vrl reads from file)
@@ -37,7 +61,7 @@ while IFS= read -r parser_file; do
 
     # Write test event to temp file
     event_file=$(mktemp /tmp/event_XXXXXX.json)
-    echo "$TEST_EVENT" > "$event_file"
+    echo "$event_json" > "$event_file"
 
     # Run Vector VRL validation
     # --print-object outputs the transformed event
