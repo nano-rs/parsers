@@ -1,0 +1,92 @@
+name: okta_identity
+display_name: Okta Identity
+version: "1.0.0"
+description: >-
+  Normalizes pushed Okta identity records (nano_enrich, kind=identity,
+  source=okta) into the user_registry enrichment table. Okta nests most user
+  attributes under .profile; status/timestamps are top-level. This file is the
+  repo-sourced mapping (NAN-1148/NAN-1149/NAN-1151) — updating the
+  Okta→user_registry field mapping no longer requires an application ship.
+
+# NAN-1149: enrichment-parser flavor. This file lives under
+# enrichments/<enrich_kind>/<enrich_source>/parser.yaml, but enrich_kind /
+# enrich_source / target_table are also set explicitly here because the parser
+# sync reads them straight from the YAML (it does not infer them from the path).
+kind: enrichment
+enrich_kind: identity
+enrich_source: okta
+target_table: user_registry
+
+# The remap body emitted as [transforms.enrichment_normalize_identity] in the
+# generated _enrichment.toml. Maps a pushed nano_enrich/kind=identity Okta
+# record to the user_registry columns. Invariants (NAN-1114 / NAN-1123): the
+# enrichment sink must never block the shared upstream, `version` is always a
+# non-zero integer-ms clock, and `last_synced_at` is its formatted-string form.
+normalize_vrl: |
+  # Map a pushed nano_enrich/kind=identity Okta record to the user_registry
+  # columns. Okta nests user attributes under .profile; status is top-level.
+  now_ms = to_unix_timestamp(now(), unit: "milliseconds")
+
+  external_id = to_string(.id) ?? ""
+  if external_id == "" {
+      log("nano_enrich okta identity record missing id; dead-lettering", level: "warn")
+      abort
+  }
+
+  # Per-record sync hash over the full raw payload.
+  sync_hash = sha2(encode_json(.), variant: "SHA-256")
+
+  # version + last_synced_at on ONE clock (ms epoch). Sender may supply version;
+  # otherwise stamp now. last_synced_at is the formatted-string form of version.
+  version = to_int(.version) ?? 0
+  if version <= 0 { version = now_ms }
+  last_synced_at = format_timestamp!(from_unix_timestamp!(version, unit: "milliseconds"), "%Y-%m-%d %H:%M:%S%.3f")
+
+  # upn is .profile.login; username is the local part before "@".
+  upn = to_string(.profile.login) ?? ""
+  username = upn
+  parts = split(upn, "@")
+  if length(parts) > 1 { username = parts[0] }
+
+  # display_name: prefer .profile.displayName; else "first last" trimmed.
+  dn = to_string(.profile.displayName) ?? ""
+  if dn == "" {
+      fn = to_string(.profile.firstName) ?? ""
+      ln = to_string(.profile.lastName) ?? ""
+      dn = strip_whitespace(fn + " " + ln)
+  }
+
+  # account_enabled: Okta status == "ACTIVE" -> 1, else 0. Absent/non-string
+  # status defaults to enabled (1).
+  status = to_string(.status) ?? ""
+  account_enabled = if status == "" { 1 } else if status == "ACTIVE" { 1 } else { 0 }
+  account_status = if account_enabled == 0 { "disabled" } else { "active" }
+
+  . = {
+      "provider_id": to_string(.provider_id) ?? "",
+      "external_id": external_id,
+      "username": username,
+      "upn": upn,
+      "email": to_string(.profile.email) ?? "",
+      "display_name": dn,
+      "first_name": to_string(.profile.firstName) ?? "",
+      "last_name": to_string(.profile.lastName) ?? "",
+      "department": to_string(.profile.department) ?? "",
+      "title": to_string(.profile.title) ?? "",
+      "manager_upn": to_string(.profile.manager) ?? "",
+      "manager_display_name": "",
+      "company": to_string(.profile.organization) ?? "",
+      "office_location": "",
+      "city": to_string(.profile.city) ?? "",
+      "country": to_string(.profile.countryCode) ?? "",
+      "groups": [],
+      "account_enabled": account_enabled,
+      "account_status": account_status,
+      "mfa_enabled": 0,
+      "phone": to_string(.profile.mobilePhone) ?? "",
+      "employee_id": to_string(.profile.employeeNumber) ?? "",
+      "employee_type": to_string(.profile.userType) ?? "employee",
+      "sync_hash": sync_hash,
+      "last_synced_at": last_synced_at,
+      "version": version
+  }
