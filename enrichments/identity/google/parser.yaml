@@ -1,0 +1,133 @@
+name: google_identity
+display_name: Google Workspace Identity
+version: "1.0.0"
+description: >-
+  Normalizes pushed Google Workspace Admin SDK Directory user records
+  (nano_enrich, kind=identity, source=google) into the user_registry enrichment
+  table. The mapping is the repo-sourced replacement for the previously
+  hard-coded Vector/Rust transform (NAN-1148/NAN-1151) — updating
+  Google→user_registry field mapping no longer requires an application ship.
+
+# NAN-1151: enrichment-parser flavor. This file lives under
+# enrichments/<enrich_kind>/<enrich_source>/parser.yaml, but enrich_kind /
+# enrich_source / target_table are also set explicitly here because the parser
+# sync reads them straight from the YAML (it does not infer them from the path).
+kind: enrichment
+enrich_kind: identity
+enrich_source: google
+target_table: user_registry
+
+# The remap body emitted as [transforms.enrichment_normalize_identity] in the
+# generated _enrichment.toml. Maps a raw Google Admin SDK Directory user object
+# (nested name/organizations/phones/relations/externalIds) to the user_registry
+# columns. Invariants (NAN-1114 / NAN-1123): the enrichment sink must never block
+# the shared upstream, `version` is always a non-zero integer-ms clock, and
+# `last_synced_at` is its formatted-string form. Nested arrays are guarded so an
+# absent organizations/phones/relations/externalIds never aborts the record.
+normalize_vrl: |
+  # Map a raw Google Admin SDK Directory user object to the user_registry columns.
+  now_ms = to_unix_timestamp(now(), unit: "milliseconds")
+
+  external_id = to_string(.id) ?? ""
+  if external_id == "" {
+      log("nano_enrich google identity record missing id; dead-lettering", level: "warn")
+      abort
+  }
+
+  # version + last_synced_at on ONE clock (ms epoch). Sender may supply version;
+  # otherwise stamp now. last_synced_at is the formatted-string form of version.
+  version = to_int(.version) ?? 0
+  if version <= 0 { version = now_ms }
+  last_synced_at = format_timestamp!(from_unix_timestamp!(version, unit: "milliseconds"), "%Y-%m-%d %H:%M:%S%.3f")
+
+  # username = local part of primaryEmail before "@".
+  primary_email = to_string(.primaryEmail) ?? ""
+  username = primary_email
+  email_parts = split(primary_email, "@")
+  if length(email_parts) > 1 {
+      username = email_parts[0]
+  }
+
+  # organizations[] -> department / title / company (Google "name" is company).
+  org0 = {}
+  if is_array(.organizations) && length(array!(.organizations)) > 0 {
+      org0 = array!(.organizations)[0]
+      if !is_object(org0) { org0 = {} }
+  }
+  department = to_string(org0.department) ?? ""
+  title = to_string(org0.title) ?? ""
+  company = to_string(org0.name) ?? ""
+
+  # phones[] -> first value.
+  ph0 = {}
+  if is_array(.phones) && length(array!(.phones)) > 0 {
+      ph0 = array!(.phones)[0]
+      if !is_object(ph0) { ph0 = {} }
+  }
+  phone = to_string(ph0.value) ?? ""
+
+  # relations[] -> .value of the first element with type == "manager".
+  manager_upn = ""
+  rels = .relations
+  if is_array(rels) {
+      for_each(array!(rels)) -> |_i, r| {
+          if (to_string(r.type) ?? "") == "manager" && manager_upn == "" {
+              manager_upn = to_string(r.value) ?? ""
+          }
+      }
+  }
+
+  # externalIds[] -> .value of the first element with type == "organization".
+  employee_id = ""
+  ext_ids = .externalIds
+  if is_array(ext_ids) {
+      for_each(array!(ext_ids)) -> |_i, e| {
+          if (to_string(e.type) ?? "") == "organization" && employee_id == "" {
+              employee_id = to_string(e.value) ?? ""
+          }
+      }
+  }
+
+  # mfa: Google 2-Step Verification enrollment.
+  mfa_enabled = if (to_bool(.isEnrolledIn2Sv) ?? false) { 1 } else { 0 }
+
+  # account state: enabled when NOT suspended AND NOT archived.
+  suspended = to_bool(.suspended) ?? false
+  archived = to_bool(.archived) ?? false
+  account_enabled = if suspended || archived { 0 } else { 1 }
+
+  # account_status: Google distinguishes suspended/archived; user_registry enum
+  # only allows active/disabled/deleted/anonymized, so suspended -> disabled.
+  account_status = if suspended { "suspended" } else if archived { "disabled" } else { "active" }
+  if !includes(["active", "disabled", "deleted", "anonymized"], account_status) {
+      account_status = "disabled"
+  }
+
+  . = {
+      "provider_id": to_string(.provider_id) ?? "",
+      "external_id": external_id,
+      "username": username,
+      "upn": primary_email,
+      "email": primary_email,
+      "display_name": to_string(.name.fullName) ?? "",
+      "first_name": to_string(.name.givenName) ?? "",
+      "last_name": to_string(.name.familyName) ?? "",
+      "department": department,
+      "title": title,
+      "manager_upn": manager_upn,
+      "manager_display_name": "",
+      "company": company,
+      "office_location": "",
+      "city": "",
+      "country": "",
+      "groups": [],
+      "account_enabled": account_enabled,
+      "account_status": account_status,
+      "mfa_enabled": mfa_enabled,
+      "phone": phone,
+      "employee_id": employee_id,
+      "employee_type": "employee",
+      "sync_hash": sha2(encode_json(.), variant: "SHA-256"),
+      "last_synced_at": last_synced_at,
+      "version": version
+  }
