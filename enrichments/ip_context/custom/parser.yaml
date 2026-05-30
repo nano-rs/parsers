@@ -1,0 +1,56 @@
+name: custom_ip_context
+display_name: Custom IP Context Feed
+version: "1.0.0"
+description: >-
+  Normalizes a pushed IP-context record (nano_enrich, kind=ip_context,
+  source=custom) into the ip_enrichments table — the feed-agnostic push lane
+  for any CIDR-keyed context feed (Spur, GreyNoise, a CMDB-by-IP export, etc.,
+  NAN-1137). The canonical shape below carries the ip_enrichments columns
+  directly; per-feed parsers follow the same envelope with feed-specific field
+  extraction (and their own enrich_source). IPinfo Lite stays native (bulk
+  MMDB) and does NOT use this lane.
+
+kind: enrichment
+enrich_kind: ip_context
+enrich_source: custom
+target_table: ip_enrichments
+
+# Coexists with other IP feeds in ip_enrichments and argMax-merges per network
+# via ip_enrichment_dict (IP_TRIE, HAVING deleted=0) — the dict DDL is untouched.
+normalize_vrl: |
+  # network is the IP_TRIE key — it MUST be a valid CIDR. Dead-letter on a
+  # missing/malformed one rather than default to 0.0.0.0/0 (which would shadow
+  # every lookup). NAN-1137.
+  network = to_string(.network) ?? ""
+  if !match(network, r'^[0-9a-fA-F:.]+/[0-9]+$') {
+      log("nano_enrich ip_context record missing/invalid network CIDR; dead-lettering", level: "warn")
+      abort
+  }
+
+  # source_id is the feed discriminator (coexists per network). Prefer the
+  # explicit field, else the routing `source`, else a safe default.
+  source_id = to_string(.source_id) ?? ""
+  if source_id == "" { source_id = to_string(.source) ?? "custom" }
+
+  # updated_at is BOTH the ReplacingMergeTree version AND the dict argMax key:
+  # stamp it on one clock as a formatted DateTime64(3) string, NEVER far-future
+  # (a 9999 value would permanently win and bury real updates). NAN-1137.
+  updated_at = format_timestamp!(now(), "%Y-%m-%d %H:%M:%S%.3f")
+
+  # deleted: 0/1 tombstone (a CIDR a newer feed dropped). Coerce to {0,1}.
+  deleted = to_int(.deleted) ?? 0
+  if deleted != 1 { deleted = 0 }
+
+  . = {
+      "network": network,
+      "source_id": source_id,
+      "country": to_string(.country) ?? "",
+      "country_code": to_string(.country_code) ?? "",
+      "continent": to_string(.continent) ?? "",
+      "continent_code": to_string(.continent_code) ?? "",
+      "asn": to_string(.asn) ?? "",
+      "as_name": to_string(.as_name) ?? "",
+      "as_domain": to_string(.as_domain) ?? "",
+      "updated_at": updated_at,
+      "deleted": deleted
+  }
