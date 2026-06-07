@@ -137,21 +137,24 @@ parser_vrl: |
                   "uid": caller_uid,
                   "type": string(ui.type) ?? ""
               }
-          },
-          "is_mfa": mfa
+          }
       }
 
-      src_ip = string(p.sourceIPAddress) ?? ""
-      if src_ip != "" { ocsf.src_endpoint = { "ip": downcase(src_ip) } }
+      # src_endpoint is REQUIRED on API Activity 6003 — always emit it.
+      ocsf.src_endpoint = { "ip": downcase(string(p.sourceIPAddress) ?? "") }
 
       ua = string(p.userAgent) ?? ""
       if ua != "" { ocsf.http_request = { "user_agent": ua } }
 
       if length(resources) > 0 { ocsf.resources = resources }
 
+      # is_mfa is NOT an API Activity attribute (it's auth-specific) -> unmapped.
+      unmapped = { "mfa_authenticated": mfa }
       if error_code != "" {
-          ocsf.unmapped = { "error_code": error_code, "error_message": string(p.errorMessage) ?? null }
+          unmapped.error_code = error_code
+          unmapped.error_message = string(p.errorMessage) ?? null
       }
+      ocsf.unmapped = unmapped
 
       . = ocsf
   }

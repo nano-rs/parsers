@@ -88,22 +88,30 @@ parser_vrl: |
           if hmerr == null { sha = downcase(string(hm.h) ?? "") }
       }
 
-      # actor.process assembled once; reused by the process-family classes.
-      actor_process = {
+      # The Image-based (acting/subject) process, assembled once. For 1007
+      # process-family events this is the OCSF top-level `process` (the SUBJECT);
+      # for the network/file/dns classes it is the initiator (actor.process).
+      subject_process = {
           "name": actor_proc_name,
           "cmd_line": string(ed.CommandLine) ?? "",
           "pid": to_int(ed.ProcessId) ?? 0,
           "uid": string(ed.ProcessGuid) ?? "",
           "file": { "path": img }
       }
-      if sha != "" { actor_process.file = { "path": img, "hashes": [{ "algorithm_id": 3, "value": sha }] } }
-      if pimg != "" || (string(ed.ParentCommandLine) ?? "") != "" {
-          actor_process.parent_process = {
-              "name": parent_proc_name,
-              "cmd_line": string(ed.ParentCommandLine) ?? "",
-              "pid": to_int(ed.ParentProcessId) ?? 0
-          }
+      if sha != "" { subject_process.file = { "path": img, "hashes": [{ "algorithm_id": 3, "value": sha }] } }
+
+      # The PARENT process (initiator), present on Process Create (EID 1).
+      parent_process = {
+          "name": parent_proc_name,
+          "cmd_line": string(ed.ParentCommandLine) ?? "",
+          "pid": to_int(ed.ParentProcessId) ?? 0
       }
+      has_parent = pimg != "" || (string(ed.ParentCommandLine) ?? "") != ""
+
+      # actor.process for the non-1007 classes (network/file/dns): the initiator
+      # is the Image-based process, with its parent nested.
+      actor_process = subject_process
+      if has_parent { actor_process.parent_process = parent_process }
 
       # ---- defaults; overridden per class below ----
       class_uid = 1007
@@ -120,7 +128,16 @@ parser_vrl: |
           class_uid = 1007; class_name = "Process Activity"; category_uid = 1; category_name = "System Activity"
           if eid == 1 { activity_id = 1; activity_name = "Launch" }
           if eid == 5 { activity_id = 2; activity_name = "Terminate" }
-          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          # OCSF 1007: top-level `process` (REQUIRED) = the SUBJECT process.
+          ocsf.process = subject_process
+          # EID 1 (Create) carries a parent/initiator -> actor.process. The other
+          # process-family events (Terminate / Image Load / Registry) have no
+          # separate initiator, so actor is the user only.
+          if eid == 1 {
+              ocsf.actor = { "process": parent_process, "user": { "name": actor_user } }
+          } else {
+              ocsf.actor = { "user": { "name": actor_user } }
+          }
           ocsf.device = { "hostname": computer }
           if eid == 7 {
               ocsf.unmapped = { "sysmon_event_id": eid, "image_loaded": string(ed.ImageLoaded) ?? null, "signed": ed.Signed, "signature_status": string(ed.SignatureStatus) ?? null }
@@ -152,12 +169,11 @@ parser_vrl: |
           class_uid = 4001; class_name = "Network Activity"; category_uid = 4; category_name = "Network Activity"
           activity_id = 1; activity_name = "Open"
           proto = downcase(string(ed.Protocol) ?? "")
-          proto_num = -1
-          if proto == "tcp" { proto_num = 6 }
-          if proto == "udp" { proto_num = 17 }
           ocsf.src_endpoint = { "ip": downcase(string(ed.SourceIp) ?? ""), "port": to_int(ed.SourcePort) ?? 0, "hostname": downcase(string(ed.SourceHostname) ?? "") }
           ocsf.dst_endpoint = { "ip": downcase(string(ed.DestinationIp) ?? ""), "port": to_int(ed.DestinationPort) ?? 0, "hostname": downcase(string(ed.DestinationHostname) ?? "") }
-          ocsf.connection_info = { "protocol_num": proto_num }
+          # protocol_num is an IANA number; only emit it when known (no -1 sentinel).
+          if proto == "tcp" { ocsf.connection_info = { "protocol_num": 6 } }
+          if proto == "udp" { ocsf.connection_info = { "protocol_num": 17 } }
           ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
           ocsf.device = { "hostname": computer }
       } else if eid == 11 || eid == 23 {
