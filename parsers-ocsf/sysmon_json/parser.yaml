@@ -7,7 +7,7 @@ description: >
     1  Process Create   -> Process Activity 1007 (Launch)
     5  Process Terminate -> Process Activity 1007 (Terminate)
     10 Process Access    -> Process Activity 1007 (Open)
-    7  Image Loaded      -> Process Activity 1007 (Other; module info in unmapped)
+    7  Image Loaded      -> Module Activity 1005 (Load; module = the loaded image)
     12 Registry Key Set  -> Process Activity 1007 (Other; registry info in unmapped)
     13 Registry Val Set  -> Process Activity 1007 (Other; registry info in unmapped)
     3  Network Connect   -> Network Activity 4001 (Open)
@@ -123,7 +123,7 @@ parser_vrl: |
 
       ocsf = {}
 
-      if eid == 1 || eid == 5 || eid == 7 || eid == 12 || eid == 13 {
+      if eid == 1 || eid == 5 || eid == 12 || eid == 13 {
           # process-family -> Process Activity 1007
           class_uid = 1007; class_name = "Process Activity"; category_uid = 1; category_name = "System Activity"
           if eid == 1 { activity_id = 1; activity_name = "Launch" }
@@ -131,20 +131,32 @@ parser_vrl: |
           # OCSF 1007: top-level `process` (REQUIRED) = the SUBJECT process.
           ocsf.process = subject_process
           # EID 1 (Create) carries a parent/initiator -> actor.process. The other
-          # process-family events (Terminate / Image Load / Registry) have no
-          # separate initiator, so actor is the user only.
+          # process-family events (Terminate / Registry) have no separate
+          # initiator, so actor is the user only.
           if eid == 1 {
               ocsf.actor = { "process": parent_process, "user": { "name": actor_user } }
           } else {
               ocsf.actor = { "user": { "name": actor_user } }
           }
           ocsf.device = { "hostname": computer }
-          if eid == 7 {
-              ocsf.unmapped = { "sysmon_event_id": eid, "image_loaded": string(ed.ImageLoaded) ?? null, "signed": ed.Signed, "signature_status": string(ed.SignatureStatus) ?? null }
-          }
           if eid == 12 || eid == 13 {
               ocsf.unmapped = { "sysmon_event_id": eid, "registry_event": string(ed.EventType) ?? null, "target_object": string(ed.TargetObject) ?? null, "details": string(ed.Details) ?? null }
           }
+      } else if eid == 7 {
+          # Image Loaded -> Module Activity 1005 (Load). OCSF models this as a
+          # module load: the loading process is the ACTOR (actor.process), the
+          # loaded image is the `module` (its own subject), NOT Process Activity.
+          class_uid = 1005; class_name = "Module Activity"; category_uid = 1; category_name = "System Activity"
+          activity_id = 1; activity_name = "Load"
+          loaded = string(ed.ImageLoaded) ?? ""
+          mod_name = ""
+          mnm, mnmerr = parse_regex(loaded, r'(?P<b>[^\\/]+)$')
+          if mnmerr == null { mod_name = string(mnm.b) ?? "" }
+          ocsf.actor = { "process": subject_process, "user": { "name": actor_user } }
+          ocsf.module = { "file": { "path": loaded, "name": mod_name } }
+          ocsf.device = { "hostname": computer }
+          # signature/signed have no promoted home -> standard `unmapped`.
+          ocsf.unmapped = { "sysmon_event_id": eid, "signed": ed.Signed, "signature": string(ed.Signature) ?? null, "signature_status": string(ed.SignatureStatus) ?? null }
       } else if eid == 10 {
           # Process Access -> Process Activity 1007 (Open). Source = actor, Target = process.
           class_uid = 1007; class_name = "Process Activity"; category_uid = 1; category_name = "System Activity"
