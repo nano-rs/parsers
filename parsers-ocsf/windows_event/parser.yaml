@@ -1,0 +1,190 @@
+name: windows_event_ocsf
+display_name: Windows Event Log (OCSF)
+version: "1.0.0"
+description: >
+  Parses Windows Security Event Log records (JSON; top-level event_id +
+  event_data) into complete OCSF 1.8.0 records, routed by EventID:
+    4624 Successful Logon       -> Authentication 3002 (Logon, Success)
+    4625 Failed Logon           -> Authentication 3002 (Logon, Failure)
+    4634 Logoff                 -> Authentication 3002 (Logoff)
+    4672 Special Privileges     -> Authentication 3002 (Other)
+    4688 Process Creation       -> Process Activity 1007 (Launch)
+  Emits the whole OCSF object on the root so it lands in ocsf_logs.event and the
+  promoted columns materialize. Mirrors the UDM windows_event parser but targets
+  OCSF instead of `.udm.*`.
+match_values:
+  - windows_event
+  - winlogbeat
+  - windows
+  - win_event
+  - winevent
+category: endpoint
+vendor: "Microsoft"
+product: "Windows"
+parser_vrl: |
+  # Windows Security Event Log JSON -> OCSF 1.8.0. Emits the COMPLETE record on root.
+  raw_log = string!(.message)
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      . = {
+          "class_uid": 3002,
+          "category_uid": 3,
+          "activity_id": 99,
+          "type_uid": 300299,
+          "severity_id": 1,
+          "status_id": 0,
+          "time": 0,
+          "message": raw_log,
+          "metadata": {
+              "version": "1.8.0",
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "product": { "name": "Windows", "vendor_name": "Microsoft" }
+          }
+      }
+  } else {
+      p = object!(parsed)
+      ed = object(p.event_data) ?? {}
+      eid = to_int(p.event_id) ?? 0
+
+      computer = downcase(string(p.computer) ?? string(p.host) ?? "")
+
+      # human-readable Windows message if present, else the raw JSON
+      msg = string(p.message) ?? ""
+      if msg == "" { msg = raw_log }
+
+      # ---- event time (top-level ISO8601) -> epoch ms ----
+      time_ms = 0
+      ts_str = string(p.timestamp) ?? ""
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      ocsf = {}
+
+      if eid == 4688 {
+          # Process Creation -> Process Activity 1007 (Launch)
+          npn = string(ed.NewProcessName) ?? ""
+          proc_name = ""
+          nm, nmerr = parse_regex(npn, r'(?P<b>[^\\/]+)$')
+          if nmerr == null { proc_name = string(nm.b) ?? "" }
+          ppn = string(ed.ParentProcessName) ?? ""
+          parent_name = ""
+          pm, pmerr = parse_regex(ppn, r'(?P<b>[^\\/]+)$')
+          if pmerr == null { parent_name = string(pm.b) ?? "" }
+
+          ocsf.class_uid = 1007
+          ocsf.class_name = "Process Activity"
+          ocsf.category_uid = 1
+          ocsf.category_name = "System Activity"
+          ocsf.activity_id = 1
+          ocsf.activity_name = "Launch"
+          ocsf.actor = {
+              "process": {
+                  "name": proc_name,
+                  "cmd_line": string(ed.CommandLine) ?? "",
+                  "pid": parse_int(string(ed.NewProcessId) ?? "0") ?? 0,
+                  "file": { "path": npn },
+                  "parent_process": { "name": parent_name, "file": { "path": ppn } }
+              },
+              "user": { "name": downcase(string(ed.SubjectUserName) ?? "") }
+          }
+          ocsf.user = {
+              "name": downcase(string(ed.SubjectUserName) ?? ""),
+              "domain": downcase(string(ed.SubjectDomainName) ?? ""),
+              "uid": string(ed.SubjectUserSid) ?? ""
+          }
+          ocsf.device = { "hostname": computer }
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+          ocsf.severity_id = 1
+          ocsf.severity = "Informational"
+      } else {
+          # Authentication family -> 3002
+          ocsf.class_uid = 3002
+          ocsf.class_name = "Authentication"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+
+          activity_id = 99
+          activity_name = "Other"
+          status_id = 1
+          status_str = "Success"
+          severity_id = 1
+          severity = "Informational"
+          if eid == 4624 { activity_id = 1; activity_name = "Logon" }
+          if eid == 4625 { activity_id = 1; activity_name = "Logon"; status_id = 2; status_str = "Failure"; severity_id = 2; severity = "Low" }
+          if eid == 4634 { activity_id = 2; activity_name = "Logoff" }
+
+          # subject for 4672 lives in Subject*; logon events in Target*
+          uname = string(ed.TargetUserName) ?? ""
+          udom = string(ed.TargetDomainName) ?? ""
+          usid = string(ed.TargetUserSid) ?? ""
+          if eid == 4672 {
+              uname = string(ed.SubjectUserName) ?? ""
+              udom = string(ed.SubjectDomainName) ?? ""
+              usid = string(ed.SubjectUserSid) ?? ""
+          }
+
+          # auth package -> auth_protocol(_id)
+          pkg = string(ed.AuthenticationPackageName) ?? ""
+          pkg_l = downcase(pkg)
+          auth_protocol_id = 0
+          if pkg_l == "ntlm" { auth_protocol_id = 1 }
+          if pkg_l == "kerberos" { auth_protocol_id = 2 }
+          if pkg != "" && auth_protocol_id == 0 { auth_protocol_id = 99 }
+
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          ocsf.status_id = status_id
+          ocsf.status = status_str
+          ocsf.severity_id = severity_id
+          ocsf.severity = severity
+          ocsf.user = { "name": downcase(uname), "domain": downcase(udom), "uid": usid }
+          ocsf.is_mfa = false
+
+          logon_id = string(ed.TargetLogonId) ?? string(ed.SubjectLogonId) ?? ""
+          if logon_id != "" { ocsf.session = { "uid": logon_id } }
+          if auth_protocol_id != 0 {
+              ocsf.auth_protocol_id = auth_protocol_id
+              ocsf.auth_protocol = pkg
+          }
+
+          # source endpoint (network logons carry IpAddress/IpPort/Workstation)
+          ip = string(ed.IpAddress) ?? ""
+          ws = string(ed.WorkstationName) ?? ""
+          if ip != "" || ws != "" {
+              ocsf.src_endpoint = {
+                  "ip": downcase(ip),
+                  "port": to_int(ed.IpPort) ?? 0,
+                  "hostname": downcase(ws)
+              }
+          }
+          ocsf.device = { "hostname": computer }
+
+          unmapped = { "windows_event_id": eid, "logon_type": string(ed.LogonType) ?? null }
+          if eid == 4625 {
+              unmapped.failure_reason = string(ed.FailureReason) ?? null
+              unmapped.status = string(ed.Status) ?? null
+              unmapped.sub_status = string(ed.SubStatus) ?? null
+          }
+          if eid == 4672 { unmapped.privilege_list = string(ed.PrivilegeList) ?? null }
+          ocsf.unmapped = unmapped
+      }
+
+      # ---- common envelope ----
+      ocsf.type_uid = to_int(ocsf.class_uid) * 100 + to_int(ocsf.activity_id)
+      ocsf.time = time_ms
+      ocsf.message = msg
+      ocsf.metadata = {
+          "version": "1.8.0",
+          "uid": string(p.record_id) ?? uuid_v4(),
+          "log_name": string(p.channel) ?? "Security",
+          "log_provider": string(p.provider_name) ?? "Microsoft-Windows-Security-Auditing",
+          "product": { "name": "Windows", "vendor_name": "Microsoft" }
+      }
+
+      . = ocsf
+  }

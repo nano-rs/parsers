@@ -1,0 +1,216 @@
+name: sysmon_json_ocsf
+display_name: Microsoft Sysmon (JSON, OCSF)
+version: "1.0.0"
+description: >
+  Parses Windows Sysmon events in JSON form (top-level event_id + event_data)
+  into complete OCSF 1.8.0 records, routed by Sysmon EventID:
+    1  Process Create   -> Process Activity 1007 (Launch)
+    5  Process Terminate -> Process Activity 1007 (Terminate)
+    10 Process Access    -> Process Activity 1007 (Open)
+    7  Image Loaded      -> Process Activity 1007 (Other; module info in unmapped)
+    12 Registry Key Set  -> Process Activity 1007 (Other; registry info in unmapped)
+    13 Registry Val Set  -> Process Activity 1007 (Other; registry info in unmapped)
+    3  Network Connect   -> Network Activity 4001 (Open)
+    11 File Create       -> File System Activity 1001 (Create)
+    23 File Delete       -> File System Activity 1001 (Delete)
+    22 DNS Query         -> DNS Activity 4003 (Query)
+  Emits the whole OCSF object on the root so it lands in ocsf_logs.event and the
+  promoted columns materialize. Mirrors the UDM sysmon_json parser but targets
+  OCSF instead of `.udm.*`.
+match_values:
+  - sysmon
+  - windows_sysmon
+  - sysmon_json
+category: endpoint
+vendor: "Microsoft"
+product: "Sysmon"
+parser_vrl: |
+  # Sysmon JSON -> OCSF 1.8.0. Emits the COMPLETE OCSF record on the root.
+  raw_log = string!(.message)
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      . = {
+          "class_uid": 1007,
+          "category_uid": 1,
+          "activity_id": 99,
+          "type_uid": 100799,
+          "severity_id": 1,
+          "status_id": 0,
+          "time": 0,
+          "message": raw_log,
+          "metadata": {
+              "version": "1.8.0",
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "product": { "name": "Sysmon", "vendor_name": "Microsoft" }
+          }
+      }
+  } else {
+      p = object!(parsed)
+      ed = object(p.event_data) ?? {}
+      eid = to_int(p.event_id) ?? 0
+
+      computer = downcase(string(p.computer) ?? string(p.host) ?? "")
+
+      # ---- event time (top-level ISO8601) -> epoch ms ----
+      time_ms = 0
+      ts_str = string(p.timestamp) ?? ""
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- shared helpers (inlined) ------------------------------------
+      # actor user "DOMAIN\\user" -> name (strip domain)
+      actor_user = ""
+      au_raw = string(ed.User) ?? ""
+      if au_raw != "" {
+          aup = split(au_raw, "\\")
+          actor_user = if length(aup) >= 2 { string(aup[1]) ?? "" } else { string(aup[0]) ?? "" }
+      }
+      # actor process basename from Image path (VRL has no dynamic array index,
+      # so take the trailing path segment via regex)
+      img = string(ed.Image) ?? ""
+      actor_proc_name = ""
+      anm, anmerr = parse_regex(img, r'(?P<b>[^\\/]+)$')
+      if anmerr == null { actor_proc_name = string(anm.b) ?? "" }
+      # parent basename
+      pimg = string(ed.ParentImage) ?? ""
+      parent_proc_name = ""
+      pnm, pnmerr = parse_regex(pimg, r'(?P<b>[^\\/]+)$')
+      if pnmerr == null { parent_proc_name = string(pnm.b) ?? "" }
+      # SHA-256 out of the "SHA256=..,MD5=.." Hashes string
+      sha = ""
+      hs = string(ed.Hashes) ?? ""
+      if hs != "" {
+          hm, hmerr = parse_regex(hs, r'SHA256=(?P<h>[0-9A-Fa-f]+)')
+          if hmerr == null { sha = downcase(string(hm.h) ?? "") }
+      }
+
+      # actor.process assembled once; reused by the process-family classes.
+      actor_process = {
+          "name": actor_proc_name,
+          "cmd_line": string(ed.CommandLine) ?? "",
+          "pid": to_int(ed.ProcessId) ?? 0,
+          "uid": string(ed.ProcessGuid) ?? "",
+          "file": { "path": img }
+      }
+      if sha != "" { actor_process.file = { "path": img, "hashes": [{ "algorithm_id": 3, "value": sha }] } }
+      if pimg != "" || (string(ed.ParentCommandLine) ?? "") != "" {
+          actor_process.parent_process = {
+              "name": parent_proc_name,
+              "cmd_line": string(ed.ParentCommandLine) ?? "",
+              "pid": to_int(ed.ParentProcessId) ?? 0
+          }
+      }
+
+      # ---- defaults; overridden per class below ----
+      class_uid = 1007
+      class_name = "Process Activity"
+      category_uid = 1
+      category_name = "System Activity"
+      activity_id = 99
+      activity_name = "Other"
+
+      ocsf = {}
+
+      if eid == 1 || eid == 5 || eid == 7 || eid == 12 || eid == 13 {
+          # process-family -> Process Activity 1007
+          class_uid = 1007; class_name = "Process Activity"; category_uid = 1; category_name = "System Activity"
+          if eid == 1 { activity_id = 1; activity_name = "Launch" }
+          if eid == 5 { activity_id = 2; activity_name = "Terminate" }
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          ocsf.device = { "hostname": computer }
+          if eid == 7 {
+              ocsf.unmapped = { "sysmon_event_id": eid, "image_loaded": string(ed.ImageLoaded) ?? null, "signed": ed.Signed, "signature_status": string(ed.SignatureStatus) ?? null }
+          }
+          if eid == 12 || eid == 13 {
+              ocsf.unmapped = { "sysmon_event_id": eid, "registry_event": string(ed.EventType) ?? null, "target_object": string(ed.TargetObject) ?? null, "details": string(ed.Details) ?? null }
+          }
+      } else if eid == 10 {
+          # Process Access -> Process Activity 1007 (Open). Source = actor, Target = process.
+          class_uid = 1007; class_name = "Process Activity"; category_uid = 1; category_name = "System Activity"
+          activity_id = 3; activity_name = "Open"
+          simg = string(ed.SourceImage) ?? ""
+          src_proc_name = ""
+          snm, snmerr = parse_regex(simg, r'(?P<b>[^\\/]+)$')
+          if snmerr == null { src_proc_name = string(snm.b) ?? "" }
+          timg = string(ed.TargetImage) ?? ""
+          tgt_proc_name = ""
+          tnm, tnmerr = parse_regex(timg, r'(?P<b>[^\\/]+)$')
+          if tnmerr == null { tgt_proc_name = string(tnm.b) ?? "" }
+          ocsf.actor = {
+              "process": { "name": src_proc_name, "uid": string(ed.SourceProcessGUID) ?? "", "pid": to_int(ed.SourceProcessId) ?? 0, "file": { "path": simg } },
+              "user": { "name": actor_user }
+          }
+          ocsf.process = { "name": tgt_proc_name, "uid": string(ed.TargetProcessGUID) ?? "", "pid": to_int(ed.TargetProcessId) ?? 0, "file": { "path": timg } }
+          ocsf.device = { "hostname": computer }
+          ocsf.unmapped = { "sysmon_event_id": eid, "granted_access": string(ed.GrantedAccess) ?? null }
+      } else if eid == 3 {
+          # Network Connection -> Network Activity 4001 (Open)
+          class_uid = 4001; class_name = "Network Activity"; category_uid = 4; category_name = "Network Activity"
+          activity_id = 1; activity_name = "Open"
+          proto = downcase(string(ed.Protocol) ?? "")
+          proto_num = -1
+          if proto == "tcp" { proto_num = 6 }
+          if proto == "udp" { proto_num = 17 }
+          ocsf.src_endpoint = { "ip": downcase(string(ed.SourceIp) ?? ""), "port": to_int(ed.SourcePort) ?? 0, "hostname": downcase(string(ed.SourceHostname) ?? "") }
+          ocsf.dst_endpoint = { "ip": downcase(string(ed.DestinationIp) ?? ""), "port": to_int(ed.DestinationPort) ?? 0, "hostname": downcase(string(ed.DestinationHostname) ?? "") }
+          ocsf.connection_info = { "protocol_num": proto_num }
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          ocsf.device = { "hostname": computer }
+      } else if eid == 11 || eid == 23 {
+          # File Create / Delete -> File System Activity 1001
+          class_uid = 1001; class_name = "File System Activity"; category_uid = 1; category_name = "System Activity"
+          if eid == 11 { activity_id = 1; activity_name = "Create" }
+          if eid == 23 { activity_id = 4; activity_name = "Delete" }
+          tf = string(ed.TargetFilename) ?? ""
+          file_name = ""
+          fnm, fnmerr = parse_regex(tf, r'(?P<b>[^\\/]+)$')
+          if fnmerr == null { file_name = string(fnm.b) ?? "" }
+          file_obj = { "name": file_name, "path": tf, "type_id": 1 }
+          if sha != "" { file_obj.hashes = [{ "algorithm_id": 3, "value": sha }] }
+          ocsf.file = file_obj
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          ocsf.device = { "hostname": computer }
+      } else if eid == 22 {
+          # DNS Query -> DNS Activity 4003 (Query)
+          class_uid = 4003; class_name = "DNS Activity"; category_uid = 4; category_name = "Network Activity"
+          activity_id = 1; activity_name = "Query"
+          ocsf.query = { "hostname": downcase(string(ed.QueryName) ?? "") }
+          qr = string(ed.QueryResults) ?? ""
+          if qr != "" { ocsf.answers = [{ "rdata": qr }] }
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          ocsf.device = { "hostname": computer }
+      } else {
+          # unknown EventID -> Process Activity / Other, carry context
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          ocsf.device = { "hostname": computer }
+          ocsf.unmapped = { "sysmon_event_id": eid }
+      }
+
+      # ---- common envelope ----
+      ocsf.class_uid = class_uid
+      ocsf.class_name = class_name
+      ocsf.category_uid = category_uid
+      ocsf.category_name = category_name
+      ocsf.activity_id = activity_id
+      ocsf.activity_name = activity_name
+      ocsf.type_uid = class_uid * 100 + activity_id
+      ocsf.severity_id = 1
+      ocsf.severity = "Informational"
+      ocsf.status_id = 1
+      ocsf.status = "Success"
+      ocsf.time = time_ms
+      ocsf.message = raw_log
+      ocsf.metadata = {
+          "version": "1.8.0",
+          "uid": string(p.record_id) ?? uuid_v4(),
+          "log_name": string(p.channel) ?? "Microsoft-Windows-Sysmon/Operational",
+          "log_provider": string(p.provider_name) ?? "Microsoft-Windows-Sysmon",
+          "product": { "name": "Sysmon", "vendor_name": "Microsoft" }
+      }
+
+      . = ocsf
+  }

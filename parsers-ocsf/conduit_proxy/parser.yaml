@@ -1,0 +1,187 @@
+name: conduit_proxy_ocsf
+display_name: Conduit MITM Proxy (OCSF)
+version: "1.0.0"
+description: >
+  Parses Conduit MITM proxy access logs into a complete OCSF 1.8.0
+  "HTTP Activity" (class_uid 4002) record. The whole OCSF object is emitted on
+  the root so it lands in the ocsf_logs `event` column and the promoted columns
+  materialize. Mirrors the UDM conduit_proxy parser
+  (../parsers/parsers/conduit_proxy/parser.yaml) but targets OCSF instead of
+  `.udm.*`. Proxy-specific signals that have no OCSF home (threat scoring, DLP
+  category/action, cache status) are preserved under the standard OCSF
+  `unmapped` object so nothing is lost.
+match_values:
+  - conduit
+  - conduit_proxy
+  - conduit-proxy
+category: network
+vendor: "Conduit"
+product: "Conduit Proxy"
+parser_vrl: |
+  # Conduit proxy JSON access log -> OCSF 1.8.0 HTTP Activity (class_uid 4002).
+  # Emits the COMPLETE OCSF record on the root.
+
+  raw_log = string!(.message)
+  parsed, err = parse_json(raw_log)
+
+  if err == null && is_object(parsed) {
+      p = object!(parsed)
+
+      # ---- method -> activity_id (OCSF HTTP Activity enum, 1.8.0) ----
+      method = upcase(string(p.method) ?? "")
+      activity_id = 99
+      activity_name = "Other"
+      if method == "CONNECT" { activity_id = 1; activity_name = "Connect" }
+      if method == "DELETE"  { activity_id = 2; activity_name = "Delete" }
+      if method == "GET"     { activity_id = 3; activity_name = "Get" }
+      if method == "HEAD"    { activity_id = 4; activity_name = "Head" }
+      if method == "OPTIONS" { activity_id = 5; activity_name = "Options" }
+      if method == "POST"    { activity_id = 6; activity_name = "Post" }
+      if method == "PUT"     { activity_id = 7; activity_name = "Put" }
+      if method == "TRACE"   { activity_id = 8; activity_name = "Trace" }
+      if method == "PATCH"   { activity_id = 9; activity_name = "Patch" }
+
+      # ---- status_code -> status_id (2xx/3xx Success, else Failure) ----
+      code = to_int(p.status_code) ?? 0
+      status_id = 2
+      status_str = "Failure"
+      if code >= 200 && code < 400 { status_id = 1; status_str = "Success" }
+
+      # ---- severity: elevate when the proxy blocked the request ----
+      severity_id = 1
+      severity = "Informational"
+      blocked = if is_boolean(p.threat_blocked) { bool(p.threat_blocked) ?? false } else { false }
+      if blocked {
+          severity_id = 4
+          severity = "High"
+      }
+
+      # ---- time: ISO8601 (nanoseconds) -> epoch milliseconds ----
+      time_ms = 0
+      ts_str = string(p.timestamp) ?? ""
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- upstream_addr "ip:port" -> dst_endpoint ip/port ----
+      dst_endpoint = {}
+      host = string(p.host) ?? ""
+      if host != "" { dst_endpoint.hostname = downcase(host) }
+      upstream = string(p.upstream_addr) ?? ""
+      if upstream != "" {
+          ua = split(upstream, ":")
+          if length(ua) >= 1 { dst_endpoint.ip = downcase(string(ua[0]) ?? "") }
+          if length(ua) >= 2 { dst_endpoint.port = to_int(ua[1]) ?? 0 }
+      }
+      if !exists(dst_endpoint.port) {
+          dport = to_int(p.port) ?? 0
+          if dport != 0 { dst_endpoint.port = dport }
+      }
+
+      class_uid = 4002
+
+      req_path = string(p.path) ?? ""
+      full_url = string(p.full_url) ?? ""
+
+      http_request = {
+          "http_method": method,
+          "url": {
+              "path": req_path,
+              "url_string": full_url,
+              "hostname": downcase(host)
+          }
+      }
+
+      http_response = {
+          "code": code,
+          "length": to_int(p.response_bytes) ?? 0,
+          "status": status_str
+      }
+
+      # Proxy-specific signals with no native OCSF home -> standard `unmapped`.
+      unmapped = {
+          "category": string(p.category) ?? null,
+          "action": string(p.action) ?? null,
+          "cache_status": string(p.cache_status) ?? null,
+          "content_type": string(p.content_type) ?? null,
+          "tls_intercepted": p.tls_intercepted,
+          "threat_score": p.threat_score,
+          "threat_tier": string(p.threat_tier) ?? null,
+          "threat_blocked": p.threat_blocked,
+          "threat_signals": p.threat_signals,
+          "rule_id": p.rule_id,
+          "duration_ms": p.duration_ms
+      }
+
+      . = {
+          "class_uid": class_uid,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "metadata": {
+              "version": "1.8.0",
+              "uid": string(p.id) ?? uuid_v4(),
+              "log_name": "conduit-proxy",
+              "product": {
+                  "name": "Conduit Proxy",
+                  "vendor_name": "Conduit"
+              }
+          },
+          "src_endpoint": {
+              "ip": downcase(string(p.client_ip) ?? "")
+          },
+          "dst_endpoint": dst_endpoint,
+          "url": {
+              "hostname": downcase(host),
+              "url_string": full_url
+          },
+          "http_request": http_request,
+          "http_response": http_response,
+          # OCSF: bytes_in = source(client)->destination, bytes_out = destination->source.
+          "traffic": {
+              "bytes_in": to_int(p.request_bytes) ?? 0,
+              "bytes_out": to_int(p.response_bytes) ?? 0
+          },
+          "unmapped": unmapped
+      }
+
+      # authenticated proxy user -> actor.user.name (+ top-level user.name),
+      # omit when absent/null.
+      auth_user = string(p.username) ?? ""
+      if auth_user != "" {
+          .actor = { "user": { "name": downcase(auth_user) } }
+          .user = { "name": downcase(auth_user) }
+      }
+  } else {
+      # Non-access (internal/error) lines or parse failure: land a minimal,
+      # debuggable record rather than dropping the row.
+      . = {
+          "class_uid": 4002,
+          "category_uid": 4,
+          "activity_id": 99,
+          "type_uid": 400299,
+          "severity_id": 1,
+          "status_id": 0,
+          "time": 0,
+          "message": raw_log,
+          "metadata": {
+              "version": "1.8.0",
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "product": {
+                  "name": "Conduit Proxy",
+                  "vendor_name": "Conduit"
+              }
+          }
+      }
+  }
