@@ -7,7 +7,7 @@ description: >
     4624 Successful Logon       -> Authentication 3002 (Logon, Success)
     4625 Failed Logon           -> Authentication 3002 (Logon, Failure)
     4634 Logoff                 -> Authentication 3002 (Logoff)
-    4672 Special Privileges     -> Authentication 3002 (Other)
+    4672 Special Privileges     -> Authorize Session 3003 (Assign Privileges)
     4688 Process Creation       -> Process Activity 1007 (Launch)
   Emits the whole OCSF object on the root so it lands in ocsf_logs.event and the
   promoted columns materialize. Mirrors the UDM windows_event parser but targets
@@ -87,10 +87,10 @@ parser_vrl: |
               "name": proc_name,
               "cmd_line": string(ed.CommandLine) ?? "",
               "pid": parse_int(string(ed.NewProcessId) ?? "0") ?? 0,
-              "file": { "path": npn }
+              "file": { "name": proc_name, "path": npn, "type_id": 1 }
           }
           ocsf.actor = {
-              "process": { "name": parent_name, "file": { "path": ppn } },
+              "process": { "name": parent_name, "file": { "name": parent_name, "path": ppn, "type_id": 1 } },
               "user": { "name": downcase(string(ed.SubjectUserName) ?? "") }
           }
           ocsf.user = {
@@ -103,6 +103,28 @@ parser_vrl: |
           ocsf.status = "Success"
           ocsf.severity_id = 1
           ocsf.severity = "Informational"
+      } else if eid == 4672 {
+          # Special Privileges Assigned -> Authorize Session 3003 (IAM),
+          # activity 1 (Assign Privileges). Required: user + at_least_one of
+          # (privileges, groups, iam_roles); we populate privileges from PrivilegeList.
+          ocsf.class_uid = 3003
+          ocsf.class_name = "Authorize Session"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = 1
+          ocsf.activity_name = "Assign Privileges"
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+          ocsf.severity_id = 1
+          ocsf.severity = "Informational"
+          ocsf.user = { "name": downcase(string(ed.SubjectUserName) ?? ""), "domain": downcase(string(ed.SubjectDomainName) ?? ""), "uid": string(ed.SubjectUserSid) ?? "" }
+          priv_raw = strip_whitespace(string(ed.PrivilegeList) ?? "")
+          privileges = []
+          if priv_raw != "" { privileges = split(priv_raw, r'\s+') }
+          ocsf.privileges = privileges
+          ocsf.device = { "hostname": computer }
+          ocsf.session = { "uid": string(ed.SubjectLogonId) ?? "" }
+          ocsf.unmapped = { "windows_event_id": eid }
       } else {
           # Authentication family -> 3002
           ocsf.class_uid = 3002
@@ -120,15 +142,10 @@ parser_vrl: |
           if eid == 4625 { activity_id = 1; activity_name = "Logon"; status_id = 2; status_str = "Failure"; severity_id = 2; severity = "Low" }
           if eid == 4634 { activity_id = 2; activity_name = "Logoff" }
 
-          # subject for 4672 lives in Subject*; logon events in Target*
+          # logon events carry the principal in Target*
           uname = string(ed.TargetUserName) ?? ""
           udom = string(ed.TargetDomainName) ?? ""
           usid = string(ed.TargetUserSid) ?? ""
-          if eid == 4672 {
-              uname = string(ed.SubjectUserName) ?? ""
-              udom = string(ed.SubjectDomainName) ?? ""
-              usid = string(ed.SubjectUserSid) ?? ""
-          }
 
           # auth package -> auth_protocol(_id)
           pkg = string(ed.AuthenticationPackageName) ?? ""
@@ -175,7 +192,6 @@ parser_vrl: |
               unmapped.status = string(ed.Status) ?? null
               unmapped.sub_status = string(ed.SubStatus) ?? null
           }
-          if eid == 4672 { unmapped.privilege_list = string(ed.PrivilegeList) ?? null }
           ocsf.unmapped = unmapped
       }
 

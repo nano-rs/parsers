@@ -9,7 +9,7 @@ description: >
     10 Process Access    -> Process Activity 1007 (Open)
     7  Image Loaded      -> Module Activity 1005 (Load; module = the loaded image)
     12 Registry Key      -> Registry Key Activity 201001 (Win ext; Create/Delete)
-    13 Registry Value    -> Registry Value Activity 201002 (Win ext; Set)
+    13 Registry Value    -> Registry Value Activity 201002 (Win ext; Set); reg_value carries name+path+data
     3  Network Connect   -> Network Activity 4001 (Open)
     11 File Create       -> File System Activity 1001 (Create)
     23 File Delete       -> File System Activity 1001 (Delete)
@@ -96,9 +96,9 @@ parser_vrl: |
           "cmd_line": string(ed.CommandLine) ?? "",
           "pid": to_int(ed.ProcessId) ?? 0,
           "uid": string(ed.ProcessGuid) ?? "",
-          "file": { "path": img }
+          "file": { "name": actor_proc_name, "path": img, "type_id": 1 }
       }
-      if sha != "" { subject_process.file = { "path": img, "hashes": [{ "algorithm_id": 3, "value": sha }] } }
+      if sha != "" { subject_process.file = { "name": actor_proc_name, "path": img, "type_id": 1, "hashes": [{ "algorithm_id": 3, "value": sha }] } }
 
       # The PARENT process (initiator), present on Process Create (EID 1).
       parent_process = {
@@ -155,7 +155,16 @@ parser_vrl: |
           class_uid = 201002; class_name = "Registry Value Activity"; category_uid = 1; category_name = "System Activity"
           activity_id = 2; activity_name = "Set"
           ocsf.actor = { "process": subject_process, "user": { "name": actor_user } }
-          ocsf.reg_value = { "path": string(ed.TargetObject) ?? "", "data": string(ed.Details) ?? "" }
+          # Sysmon TargetObject is the full key\value; split on the LAST backslash:
+          # tail -> reg_value.name (required), head -> reg_value.path (required).
+          tgt = string(ed.TargetObject) ?? ""
+          rv_name = ""
+          rvm, rvmerr = parse_regex(tgt, r'(?P<n>[^\\]+)$')
+          if rvmerr == null { rv_name = string(rvm.n) ?? "" }
+          rv_path = tgt
+          rpm, rpmerr = parse_regex(tgt, r'^(?P<p>.*)\\[^\\]+$')
+          if rpmerr == null { rv_path = string(rpm.p) ?? "" }
+          ocsf.reg_value = { "name": rv_name, "path": rv_path, "data": string(ed.Details) ?? "" }
           ocsf.device = { "hostname": computer }
       } else if eid == 7 {
           # Image Loaded -> Module Activity 1005 (Load). OCSF models this as a
@@ -168,7 +177,7 @@ parser_vrl: |
           mnm, mnmerr = parse_regex(loaded, r'(?P<b>[^\\/]+)$')
           if mnmerr == null { mod_name = string(mnm.b) ?? "" }
           ocsf.actor = { "process": subject_process, "user": { "name": actor_user } }
-          ocsf.module = { "file": { "path": loaded, "name": mod_name } }
+          ocsf.module = { "file": { "path": loaded, "name": mod_name, "type_id": 1 } }
           ocsf.device = { "hostname": computer }
           # signature/signed have no promoted home -> standard `unmapped`.
           ocsf.unmapped = { "sysmon_event_id": eid, "signed": ed.Signed, "signature": string(ed.Signature) ?? null, "signature_status": string(ed.SignatureStatus) ?? null }
@@ -185,10 +194,10 @@ parser_vrl: |
           tnm, tnmerr = parse_regex(timg, r'(?P<b>[^\\/]+)$')
           if tnmerr == null { tgt_proc_name = string(tnm.b) ?? "" }
           ocsf.actor = {
-              "process": { "name": src_proc_name, "uid": string(ed.SourceProcessGUID) ?? "", "pid": to_int(ed.SourceProcessId) ?? 0, "file": { "path": simg } },
+              "process": { "name": src_proc_name, "uid": string(ed.SourceProcessGUID) ?? "", "pid": to_int(ed.SourceProcessId) ?? 0, "file": { "name": src_proc_name, "path": simg, "type_id": 1 } },
               "user": { "name": actor_user }
           }
-          ocsf.process = { "name": tgt_proc_name, "uid": string(ed.TargetProcessGUID) ?? "", "pid": to_int(ed.TargetProcessId) ?? 0, "file": { "path": timg } }
+          ocsf.process = { "name": tgt_proc_name, "uid": string(ed.TargetProcessGUID) ?? "", "pid": to_int(ed.TargetProcessId) ?? 0, "file": { "name": tgt_proc_name, "path": timg, "type_id": 1 } }
           ocsf.device = { "hostname": computer }
           ocsf.unmapped = { "sysmon_event_id": eid, "granted_access": string(ed.GrantedAccess) ?? null }
       } else if eid == 3 {
