@@ -81,14 +81,16 @@ parser_vrl: |
           ocsf.category_name = "System Activity"
           ocsf.activity_id = 1
           ocsf.activity_name = "Launch"
+          # OCSF 1007: top-level `process` (REQUIRED) = the SUBJECT (the new
+          # process); `actor.process` = the PARENT/initiator.
+          ocsf.process = {
+              "name": proc_name,
+              "cmd_line": string(ed.CommandLine) ?? "",
+              "pid": parse_int(string(ed.NewProcessId) ?? "0") ?? 0,
+              "file": { "path": npn }
+          }
           ocsf.actor = {
-              "process": {
-                  "name": proc_name,
-                  "cmd_line": string(ed.CommandLine) ?? "",
-                  "pid": parse_int(string(ed.NewProcessId) ?? "0") ?? 0,
-                  "file": { "path": npn },
-                  "parent_process": { "name": parent_name, "file": { "path": ppn } }
-              },
+              "process": { "name": parent_name, "file": { "path": ppn } },
               "user": { "name": downcase(string(ed.SubjectUserName) ?? "") }
           }
           ocsf.user = {
@@ -162,6 +164,9 @@ parser_vrl: |
                   "hostname": downcase(ws)
               }
           }
+          # Authentication 3002 requires at_least_one(service, dst_endpoint):
+          # the logon TARGET is the reporting machine.
+          ocsf.dst_endpoint = { "hostname": computer }
           ocsf.device = { "hostname": computer }
 
           unmapped = { "windows_event_id": eid, "logon_type": string(ed.LogonType) ?? null }
