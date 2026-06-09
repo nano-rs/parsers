@@ -55,6 +55,34 @@ while IFS= read -r parser_file; do
         fi
     fi
 
+    # NAN-1329: nano's app-side parser validator does a *raw* character count of
+    # (), {} and [] across the whole VRL — strings, regex literals and comments
+    # included — and refuses to deploy on any imbalance, before the VRL ever
+    # reaches the compiler. `vector vrl` below is more lenient: it correctly
+    # ignores a bracket inside a regex char class like `[^(]` / `[^)]`. So a
+    # parser can compile cleanly here yet fail to deploy on a real tenant. Mirror
+    # the app's raw count so that gap is caught at PR time, not on the user's box.
+    read -r op cp ob cb os cs <<EOF
+$(printf '%s' "$vrl_program" | awk '
+        { for (i = 1; i <= length($0); i++) { c = substr($0, i, 1)
+            if (c == "(") op++; else if (c == ")") cp++
+            else if (c == "{") ob++; else if (c == "}") cb++
+            else if (c == "[") os++; else if (c == "]") cs++ } }
+        END { printf "%d %d %d %d %d %d", op, cp, ob, cb, os, cs }')
+EOF
+    imbalance=""
+    [ "$op" != "$cp" ] && imbalance="${imbalance}    parentheses: $op opening, $cp closing\n"
+    [ "$ob" != "$cb" ] && imbalance="${imbalance}    braces: $ob opening, $cb closing\n"
+    [ "$os" != "$cs" ] && imbalance="${imbalance}    square brackets: $os opening, $cs closing\n"
+    if [ -n "$imbalance" ]; then
+        echo "  FAIL: unbalanced brackets — nano's parser validator rejects this on deploy"
+        printf "%b" "$imbalance"
+        echo "    A bracket inside a regex char class (e.g. [^(] or [^)]) trips the raw count."
+        echo "    Rewrite it without the literal bracket — e.g. '.+?' up to the delimiter."
+        FAIL=$((FAIL + 1))
+        continue
+    fi
+
     # Write VRL to temp file (vector vrl reads from file)
     vrl_file=$(mktemp /tmp/vrl_XXXXXX.vrl)
     echo "$vrl_program" > "$vrl_file"
