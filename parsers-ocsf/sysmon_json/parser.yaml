@@ -256,9 +256,15 @@ parser_vrl: |
       ocsf.status = "Success"
       ocsf.time = time_ms
       ocsf.message = raw_log
+      # NAN-1403: record_id arrives as an integer and string() errors on
+      # integers, so string(p.record_id) ?? uuid_v4() randomized every uid.
+      # to_string coerces int → decimal string, string → itself, null/absent
+      # → "" — the guard routes "" to the genuinely-absent uuid_v4 fallback.
+      record_uid = to_string(p.record_id) ?? ""
+      if record_uid == "" { record_uid = uuid_v4() }
       ocsf.metadata = {
           "version": "1.8.0",
-          "uid": string(p.record_id) ?? uuid_v4(),
+          "uid": record_uid,
           "log_name": string(p.channel) ?? "Microsoft-Windows-Sysmon/Operational",
           "log_provider": string(p.provider_name) ?? "Microsoft-Windows-Sysmon",
           "product": { "name": "Sysmon", "vendor_name": "Microsoft" }
