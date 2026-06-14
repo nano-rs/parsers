@@ -1,0 +1,544 @@
+name: limacharlie
+display_name: LimaCharlie EDR
+version: "1.0.0"
+description: "Parses LimaCharlie sensor telemetry: process, network, DNS, file, module, registry, auth, code identity, detection, and sensor-lifecycle events"
+match_values:
+  - limacharlie
+  - lima_charlie
+  - lc_sensor
+  - lc_edr
+category: endpoint
+vendor: "LimaCharlie"
+product: "LimaCharlie EDR"
+parser_vrl: |
+  # LimaCharlie EDR sensor telemetry parser.
+  # Envelope:
+  #   .routing  — event_type, event_time (ms epoch), hostname, oid/sid/iid sensor IDs,
+  #               ext_ip / int_ip, parent/this atom chain (causality)
+  #   .event    — payload, SCREAMING_SNAKE_CASE keys; shape varies by event_type
+  .udm = {}
+  .ext = {}
+  .metadata = {}
+
+  raw_log = string!(.message)
+  parsed, parse_err = parse_json(raw_log)
+
+  if parse_err != null {
+      .metadata.parse_error = to_string(parse_err)
+      .udm.timestamp = now()
+      .udm.action = "unknown"
+      .metadata.parser = "limacharlie"
+      .message = raw_log
+  } else {
+      routing = if exists(parsed.routing) && is_object(parsed.routing) { object!(parsed.routing) } else { {} }
+      ev      = if exists(parsed.event)   && is_object(parsed.event)   { object!(parsed.event)   } else { {} }
+
+      # ── Timestamp ──
+      # routing.event_time is unix epoch milliseconds
+      if exists(routing.event_time) {
+          ts_ms = to_int(routing.event_time) ?? 0
+          if ts_ms > 0 {
+              ts_secs = to_int(floor(ts_ms / 1000))
+              ts, ts_err = from_unix_timestamp(ts_secs)
+              if ts_err == null {
+                  .udm.timestamp = ts
+              }
+          }
+      }
+      if !exists(.udm.timestamp) {
+          .udm.timestamp = now()
+      }
+
+      # ── Common envelope → UDM/ext ──
+      if exists(routing.hostname) {
+          hn = string!(routing.hostname)
+          if hn != "" {
+              .udm.src_host  = hn
+              .udm.dest_host = hn
+          }
+      }
+      # int_ip is the host's local IP; ext_ip is the public/NATed egress IP
+      if exists(routing.int_ip) {
+          ip = string!(routing.int_ip)
+          if ip != "" { .udm.src_ip = ip }
+      }
+      if exists(routing.ext_ip) {
+          ip = string!(routing.ext_ip)
+          if ip != "" { .ext.lc_ext_ip = ip }
+      }
+      if exists(routing.event_id)   { .ext.lc_event_id   = string!(routing.event_id) }
+      if exists(routing.oid)        { .ext.lc_oid        = string!(routing.oid) }
+      if exists(routing.sid)        { .ext.lc_sensor_id  = string!(routing.sid) }
+      if exists(routing.iid)        { .ext.lc_install_id = string!(routing.iid) }
+      if exists(routing.did)        {
+          did = string!(routing.did)
+          if did != "" { .ext.lc_device_id = did }
+      }
+      if exists(routing.parent)     { .ext.lc_atom_parent = string!(routing.parent) }
+      if exists(routing.this)       { .ext.lc_atom_this   = string!(routing.this) }
+      if exists(routing.arch)       { .ext.lc_arch        = to_int(routing.arch) ?? null }
+      if exists(routing.plat)       { .ext.lc_platform    = to_int(routing.plat) ?? null }
+      if exists(routing.moduleid)   { .ext.lc_module_id   = to_int(routing.moduleid) ?? null }
+      if exists(routing.latency)    { .ext.lc_latency_ms  = to_int(routing.latency) ?? null }
+      if exists(routing.tags) && is_array(routing.tags) {
+          tags = array!(routing.tags)
+          if length(tags) > 0 { .ext.lc_tags = tags }
+      }
+
+      event_type = if exists(routing.event_type) { string!(routing.event_type) } else { "UNKNOWN" }
+      .ext.lc_event_type = event_type
+
+      # ─────────────────────────────────────────────────────────────────────
+      # PROCESS EVENTS — NEW_PROCESS, EXISTING_PROCESS, TERMINATE_PROCESS
+      # FILE_PATH = process executable, HASH = process hash
+      # ─────────────────────────────────────────────────────────────────────
+      if event_type == "NEW_PROCESS" || event_type == "EXISTING_PROCESS" {
+          .udm.action = if event_type == "NEW_PROCESS" { "process_create" } else { "process_observed" }
+
+          if exists(ev.COMMAND_LINE)      { .udm.command_line  = string!(ev.COMMAND_LINE) }
+          if exists(ev.FILE_PATH) {
+              fp = string!(ev.FILE_PATH)
+              if fp != "" {
+                  .udm.process_path = fp
+                  fname_match = parse_regex(fp, r'(?P<basename>[^\\/]+)$') ?? {}
+                  if exists(fname_match.basename) {
+                      .udm.process_name = string!(fname_match.basename)
+                  }
+              }
+          }
+          if exists(ev.HASH)              { .udm.process_hash    = string!(ev.HASH) }
+          if exists(ev.PROCESS_ID)        { .udm.process_id      = to_int(ev.PROCESS_ID) ?? null }
+          if exists(ev.PARENT_PROCESS_ID) { .udm.parent_process_id = to_int(ev.PARENT_PROCESS_ID) ?? null }
+          if exists(ev.USER_NAME)         { .udm.user            = string!(ev.USER_NAME) }
+          if exists(ev.USER_ID)           { .ext.user_id         = to_int(ev.USER_ID) ?? null }
+          if exists(ev.MEMORY_USAGE)      { .ext.memory_usage    = to_int(ev.MEMORY_USAGE) ?? null }
+          if exists(ev.THREADS)           { .ext.thread_count    = to_int(ev.THREADS) ?? null }
+
+          # Nested PARENT block (rich parent process info on Linux/macOS sensors)
+          if exists(ev.PARENT) && is_object(ev.PARENT) {
+              parent = object!(ev.PARENT)
+              if exists(parent.COMMAND_LINE)      { .udm.parent_command_line = string!(parent.COMMAND_LINE) }
+              if exists(parent.FILE_PATH) {
+                  pfp = string!(parent.FILE_PATH)
+                  if pfp != "" {
+                      .udm.parent_process_path = pfp
+                      pname_match = parse_regex(pfp, r'(?P<basename>[^\\/]+)$') ?? {}
+                      if exists(pname_match.basename) {
+                          .udm.parent_process_name = string!(pname_match.basename)
+                      }
+                  }
+              }
+              if exists(parent.HASH)         { .ext.parent_process_hash = string!(parent.HASH) }
+              if exists(parent.USER_NAME)    { .ext.parent_user         = string!(parent.USER_NAME) }
+              if exists(parent.USER_ID)      { .ext.parent_user_id      = to_int(parent.USER_ID) ?? null }
+              if exists(parent.MEMORY_USAGE) { .ext.parent_memory_usage = to_int(parent.MEMORY_USAGE) ?? null }
+              if exists(parent.THREADS)      { .ext.parent_thread_count = to_int(parent.THREADS) ?? null }
+              if exists(parent.TIMESTAMP) {
+                  pts_ms = to_int(parent.TIMESTAMP) ?? 0
+                  if pts_ms > 0 {
+                      pts_secs = to_int(floor(pts_ms / 1000))
+                      pts, pts_err = from_unix_timestamp(pts_secs)
+                      if pts_err == null {
+                          .ext.parent_process_creation_time = pts
+                      }
+                  }
+              }
+              if exists(parent.PARENT_ATOM)  { .ext.lc_parent_atom_parent = string!(parent.PARENT_ATOM) }
+              if exists(parent.THIS_ATOM)    { .ext.lc_parent_atom_this   = string!(parent.THIS_ATOM) }
+          }
+
+      } else if event_type == "TERMINATE_PROCESS" {
+          .udm.action = "process_terminate"
+          if exists(ev.PROCESS_ID)        { .udm.process_id        = to_int(ev.PROCESS_ID) ?? null }
+          if exists(ev.PARENT_PROCESS_ID) { .udm.parent_process_id = to_int(ev.PARENT_PROCESS_ID) ?? null }
+
+      # ─────────────────────────────────────────────────────────────────────
+      # NETWORK EVENTS
+      # ─────────────────────────────────────────────────────────────────────
+      } else if event_type == "NEW_TCP4_CONNECTION" || event_type == "NEW_TCP6_CONNECTION" {
+          .udm.action = "network_connection"
+          .udm.protocol = "tcp"
+          if event_type == "NEW_TCP6_CONNECTION" { .ext.ip_version = 6 } else { .ext.ip_version = 4 }
+          if exists(ev.SOURCE) && is_object(ev.SOURCE) {
+              src = object!(ev.SOURCE)
+              if exists(src.IP)   { .udm.src_ip   = string!(src.IP) }
+              if exists(src.PORT) { .udm.src_port = to_int(src.PORT) ?? null }
+          }
+          if exists(ev.DESTINATION) && is_object(ev.DESTINATION) {
+              dst = object!(ev.DESTINATION)
+              if exists(dst.IP)   { .udm.dest_ip   = string!(dst.IP) }
+              if exists(dst.PORT) { .udm.dest_port = to_int(dst.PORT) ?? null }
+          }
+          if exists(ev.PROCESS_ID) { .udm.process_id = to_int(ev.PROCESS_ID) ?? null }
+          if exists(ev.FILE_PATH) {
+              fp = string!(ev.FILE_PATH)
+              if fp != "" {
+                  .udm.process_path = fp
+                  fname_match = parse_regex(fp, r'(?P<basename>[^\\/]+)$') ?? {}
+                  if exists(fname_match.basename) { .udm.process_name = string!(fname_match.basename) }
+              }
+          }
+          if exists(ev.HASH)      { .udm.process_hash = string!(ev.HASH) }
+          if exists(ev.USER_NAME) { .udm.user         = string!(ev.USER_NAME) }
+
+      } else if event_type == "NEW_UDP4_CONNECTION" || event_type == "NEW_UDP6_CONNECTION" {
+          .udm.action = "network_connection"
+          .udm.protocol = "udp"
+          if event_type == "NEW_UDP6_CONNECTION" { .ext.ip_version = 6 } else { .ext.ip_version = 4 }
+          if exists(ev.SOURCE) && is_object(ev.SOURCE) {
+              src = object!(ev.SOURCE)
+              if exists(src.IP)   { .udm.src_ip   = string!(src.IP) }
+              if exists(src.PORT) { .udm.src_port = to_int(src.PORT) ?? null }
+          }
+          if exists(ev.DESTINATION) && is_object(ev.DESTINATION) {
+              dst = object!(ev.DESTINATION)
+              if exists(dst.IP)   { .udm.dest_ip   = string!(dst.IP) }
+              if exists(dst.PORT) { .udm.dest_port = to_int(dst.PORT) ?? null }
+          }
+          if exists(ev.PROCESS_ID) { .udm.process_id = to_int(ev.PROCESS_ID) ?? null }
+          if exists(ev.FILE_PATH) {
+              fp = string!(ev.FILE_PATH)
+              if fp != "" {
+                  .udm.process_path = fp
+                  fname_match = parse_regex(fp, r'(?P<basename>[^\\/]+)$') ?? {}
+                  if exists(fname_match.basename) { .udm.process_name = string!(fname_match.basename) }
+              }
+          }
+          if exists(ev.HASH)      { .udm.process_hash = string!(ev.HASH) }
+          if exists(ev.USER_NAME) { .udm.user         = string!(ev.USER_NAME) }
+
+      } else if event_type == "NETWORK_CONNECTIONS" || event_type == "NETWORK_SUMMARY" {
+          .udm.action = "network_summary"
+          if exists(ev.NETWORK_ACTIVITY) && is_array(ev.NETWORK_ACTIVITY) {
+              .ext.network_activity = array!(ev.NETWORK_ACTIVITY)
+          }
+          if exists(ev.PROCESS_ID) { .udm.process_id = to_int(ev.PROCESS_ID) ?? null }
+          if exists(ev.FILE_PATH) {
+              fp = string!(ev.FILE_PATH)
+              if fp != "" { .udm.process_path = fp }
+          }
+
+      # ─────────────────────────────────────────────────────────────────────
+      # DNS
+      # ─────────────────────────────────────────────────────────────────────
+      } else if event_type == "DNS_REQUEST" {
+          .udm.action = "dns_query"
+          if exists(ev.DOMAIN_NAME) {
+              dn = string!(ev.DOMAIN_NAME)
+              if dn != "" {
+                  .udm.dns_query  = dn
+                  .udm.url_domain = dn
+              }
+          }
+          if exists(ev.IP_ADDRESS) {
+              ip = string!(ev.IP_ADDRESS)
+              if ip != "" { .udm.dest_ip = ip }
+          }
+          if exists(ev.DNS_TYPE)   { .ext.dns_type     = string!(ev.DNS_TYPE) }
+          if exists(ev.TYPE)       { .ext.dns_type_raw = to_int(ev.TYPE) ?? null }
+          if exists(ev.PROCESS_ID) { .udm.process_id   = to_int(ev.PROCESS_ID) ?? null }
+          if exists(ev.FILE_PATH) {
+              fp = string!(ev.FILE_PATH)
+              if fp != "" {
+                  .udm.process_path = fp
+                  fname_match = parse_regex(fp, r'(?P<basename>[^\\/]+)$') ?? {}
+                  if exists(fname_match.basename) { .udm.process_name = string!(fname_match.basename) }
+              }
+          }
+          if exists(ev.HASH)      { .udm.process_hash = string!(ev.HASH) }
+          if exists(ev.USER_NAME) { .udm.user         = string!(ev.USER_NAME) }
+
+      # ─────────────────────────────────────────────────────────────────────
+      # MODULE LOAD/UNLOAD — FILE_PATH is the loaded library
+      # ─────────────────────────────────────────────────────────────────────
+      } else if event_type == "MODULE_LOAD" || event_type == "MODULE_UNLOAD" {
+          .udm.action = if event_type == "MODULE_LOAD" { "module_load" } else { "module_unload" }
+          if exists(ev.FILE_PATH) {
+              mp = string!(ev.FILE_PATH)
+              if mp != "" {
+                  .ext.module_path = mp
+                  mname_match = parse_regex(mp, r'(?P<basename>[^\\/]+)$') ?? {}
+                  if exists(mname_match.basename) { .ext.module_name = string!(mname_match.basename) }
+              }
+          }
+          if exists(ev.HASH)        { .ext.module_hash = string!(ev.HASH) }
+          if exists(ev.MEMORY_SIZE) { .ext.module_size = to_int(ev.MEMORY_SIZE) ?? null }
+          if exists(ev.BASE_ADDRESS){ .ext.module_base = string!(ev.BASE_ADDRESS) }
+          if exists(ev.PROCESS_ID)  { .udm.process_id  = to_int(ev.PROCESS_ID) ?? null }
+          if exists(ev.USER_NAME)   { .udm.user        = string!(ev.USER_NAME) }
+
+      # ─────────────────────────────────────────────────────────────────────
+      # FILE EVENTS — FILE_PATH is the file artifact
+      # ─────────────────────────────────────────────────────────────────────
+      } else if event_type == "FILE_CREATE" || event_type == "FILE_DELETE" ||
+                event_type == "FILE_MODIFIED" || event_type == "FILE_GET" ||
+                event_type == "FILE_READ"     || event_type == "NEW_DOCUMENT" {
+          if event_type == "FILE_CREATE" {
+              .udm.action = "file_create"
+              .udm.file_action = "created"
+          } else if event_type == "FILE_DELETE" {
+              .udm.action = "file_delete"
+              .udm.file_action = "deleted"
+          } else if event_type == "FILE_MODIFIED" {
+              .udm.action = "file_modify"
+              .udm.file_action = "modified"
+          } else if event_type == "FILE_GET" || event_type == "FILE_READ" {
+              .udm.action = "file_read"
+              .udm.file_action = "read"
+          } else {
+              .udm.action = "new_document"
+              .udm.file_action = "observed"
+          }
+          if exists(ev.FILE_PATH) {
+              fpath = string!(ev.FILE_PATH)
+              if fpath != "" {
+                  .udm.file_path = fpath
+                  fname_match = parse_regex(fpath, r'(?P<basename>[^\\/]+)$') ?? {}
+                  if exists(fname_match.basename) {
+                      .udm.file_name = string!(fname_match.basename)
+                  }
+              }
+          }
+          if exists(ev.HASH)       { .udm.file_hash    = string!(ev.HASH) }
+          if exists(ev.FILE_SIZE)  { .udm.file_size    = to_int(ev.FILE_SIZE) ?? null }
+          if exists(ev.PROCESS_ID) { .udm.process_id   = to_int(ev.PROCESS_ID) ?? null }
+          if exists(ev.USER_NAME)  { .udm.user         = string!(ev.USER_NAME) }
+          if exists(ev.USER_ID)    { .ext.user_id      = to_int(ev.USER_ID) ?? null }
+
+      # ─────────────────────────────────────────────────────────────────────
+      # REGISTRY (Windows)
+      # ─────────────────────────────────────────────────────────────────────
+      } else if event_type == "REGISTRY_WRITE"  || event_type == "REGISTRY_DELETE" ||
+                event_type == "REGISTRY_READ"   || event_type == "REGISTRY_CREATE" {
+          if event_type == "REGISTRY_WRITE" {
+              .udm.action = "registry_write"
+          } else if event_type == "REGISTRY_DELETE" {
+              .udm.action = "registry_delete"
+          } else if event_type == "REGISTRY_READ" {
+              .udm.action = "registry_read"
+          } else {
+              .udm.action = "registry_create"
+          }
+          if exists(ev.PATH)         { .ext.registry_path  = string!(ev.PATH) }
+          if exists(ev.REGISTRY_PATH){ .ext.registry_path  = string!(ev.REGISTRY_PATH) }
+          if exists(ev.VALUE_NAME)   { .ext.registry_value_name = string!(ev.VALUE_NAME) }
+          if exists(ev.VALUE)        { .ext.registry_value = string!(ev.VALUE) }
+          if exists(ev.NEW_VALUE)    { .ext.registry_new_value = string!(ev.NEW_VALUE) }
+          if exists(ev.OLD_VALUE)    { .ext.registry_old_value = string!(ev.OLD_VALUE) }
+          if exists(ev.PROCESS_ID)   { .udm.process_id     = to_int(ev.PROCESS_ID) ?? null }
+          if exists(ev.USER_NAME)    { .udm.user           = string!(ev.USER_NAME) }
+
+      # ─────────────────────────────────────────────────────────────────────
+      # AUTH / USERS
+      # ─────────────────────────────────────────────────────────────────────
+      } else if event_type == "USER_OBSERVED" {
+          .udm.action = "user_observed"
+          if exists(ev.USER_NAME)  { .udm.user    = string!(ev.USER_NAME) }
+          if exists(ev.USER_ID)    { .ext.user_id = to_int(ev.USER_ID) ?? null }
+          if exists(ev.SESSION_ID) { .udm.session_id = to_int(ev.SESSION_ID) ?? null }
+          if exists(ev.DOMAIN)     { .udm.user_domain = string!(ev.DOMAIN) }
+
+      } else if event_type == "NEW_LOGON" {
+          .udm.action = "login"
+          .udm.status = "success"
+          if exists(ev.USER_NAME)   { .udm.user        = string!(ev.USER_NAME) }
+          if exists(ev.USER_ID)     { .ext.user_id     = to_int(ev.USER_ID) ?? null }
+          if exists(ev.SESSION_ID)  { .udm.session_id  = to_int(ev.SESSION_ID) ?? null }
+          if exists(ev.LOGON_TYPE)  { .udm.auth_type   = string!(ev.LOGON_TYPE) }
+          if exists(ev.SOURCE_IP) {
+              ip = string!(ev.SOURCE_IP)
+              if ip != "" { .udm.src_ip = ip }
+          }
+          if exists(ev.DOMAIN)      { .udm.user_domain = string!(ev.DOMAIN) }
+
+      } else if event_type == "BAD_LOGON" || event_type == "FAILED_LOGON" {
+          .udm.action = "login"
+          .udm.status = "failure"
+          .udm.auth_result = "failure"
+          if exists(ev.USER_NAME)   { .udm.user        = string!(ev.USER_NAME) }
+          if exists(ev.USER_ID)     { .ext.user_id     = to_int(ev.USER_ID) ?? null }
+          if exists(ev.LOGON_TYPE)  { .udm.auth_type   = string!(ev.LOGON_TYPE) }
+          if exists(ev.SOURCE_IP) {
+              ip = string!(ev.SOURCE_IP)
+              if ip != "" { .udm.src_ip = ip }
+          }
+          if exists(ev.ERROR)       { .ext.logon_error = string!(ev.ERROR) }
+
+      # ─────────────────────────────────────────────────────────────────────
+      # CODE IDENTITY (binary signature info)
+      # ─────────────────────────────────────────────────────────────────────
+      } else if event_type == "CODE_IDENTITY" {
+          .udm.action = "code_identity"
+          if exists(ev.FILE_PATH) {
+              fp = string!(ev.FILE_PATH)
+              if fp != "" {
+                  .udm.file_path = fp
+                  fname_match = parse_regex(fp, r'(?P<basename>[^\\/]+)$') ?? {}
+                  if exists(fname_match.basename) { .udm.file_name = string!(fname_match.basename) }
+              }
+          }
+          if exists(ev.HASH)              { .udm.file_hash         = string!(ev.HASH) }
+          if exists(ev.SIGNATURE_STATUS)  { .ext.signature_status  = string!(ev.SIGNATURE_STATUS) }
+          if exists(ev.SIGNATURE_VALID)   { .ext.signature_valid   = ev.SIGNATURE_VALID }
+          if exists(ev.SIGNERS) && is_array(ev.SIGNERS) {
+              signers = array!(ev.SIGNERS)
+              if length(signers) > 0 { .ext.signers = signers }
+          }
+          if exists(ev.FILE_SIZE)         { .udm.file_size         = to_int(ev.FILE_SIZE) ?? null }
+
+      # ─────────────────────────────────────────────────────────────────────
+      # PROCESS ACCESS / INJECTION
+      # ─────────────────────────────────────────────────────────────────────
+      } else if event_type == "SENSITIVE_PROCESS_ACCESS" {
+          .udm.action = "process_access"
+          if exists(ev.SOURCE) && is_object(ev.SOURCE) {
+              s = object!(ev.SOURCE)
+              if exists(s.PROCESS_ID) { .udm.process_id   = to_int(s.PROCESS_ID) ?? null }
+              if exists(s.FILE_PATH)  { .udm.process_path = string!(s.FILE_PATH) }
+              if exists(s.USER_NAME)  { .udm.user         = string!(s.USER_NAME) }
+          }
+          if exists(ev.TARGET) && is_object(ev.TARGET) {
+              t = object!(ev.TARGET)
+              if exists(t.PROCESS_ID) { .ext.target_process_id   = to_int(t.PROCESS_ID) ?? null }
+              if exists(t.FILE_PATH)  { .ext.target_process_path = string!(t.FILE_PATH) }
+              if exists(t.USER_NAME)  { .ext.target_user         = string!(t.USER_NAME) }
+          }
+          if exists(ev.ACCESS_MASK)  { .ext.access_mask  = ev.ACCESS_MASK }
+
+      } else if event_type == "OPEN_HANDLES" {
+          .udm.action = "open_handles"
+          if exists(ev.PROCESS_ID) { .udm.process_id = to_int(ev.PROCESS_ID) ?? null }
+          if exists(ev.HANDLES) && is_array(ev.HANDLES) {
+              handles = array!(ev.HANDLES)
+              .ext.handle_count = length(handles)
+              .ext.handles      = handles
+          }
+
+      } else if event_type == "NEW_REMOTE_THREAD" {
+          .udm.action = "remote_thread_create"
+          if exists(ev.SOURCE) && is_object(ev.SOURCE) {
+              s = object!(ev.SOURCE)
+              if exists(s.PROCESS_ID) { .udm.process_id   = to_int(s.PROCESS_ID) ?? null }
+              if exists(s.FILE_PATH)  { .udm.process_path = string!(s.FILE_PATH) }
+          }
+          if exists(ev.TARGET) && is_object(ev.TARGET) {
+              t = object!(ev.TARGET)
+              if exists(t.PROCESS_ID) { .ext.target_process_id   = to_int(t.PROCESS_ID) ?? null }
+              if exists(t.FILE_PATH)  { .ext.target_process_path = string!(t.FILE_PATH) }
+          }
+          if exists(ev.START_ADDRESS) { .ext.thread_start_address = string!(ev.START_ADDRESS) }
+
+      } else if event_type == "NEW_NAMED_PIPE" {
+          .udm.action = "named_pipe_create"
+          if exists(ev.NAME)       { .ext.pipe_name  = string!(ev.NAME) }
+          if exists(ev.PROCESS_ID) { .udm.process_id = to_int(ev.PROCESS_ID) ?? null }
+          if exists(ev.FILE_PATH) {
+              fp = string!(ev.FILE_PATH)
+              if fp != "" { .udm.process_path = fp }
+          }
+          if exists(ev.USER_NAME)  { .udm.user       = string!(ev.USER_NAME) }
+
+      # ─────────────────────────────────────────────────────────────────────
+      # DETECTIONS (LC's own rule engine + YARA)
+      # ─────────────────────────────────────────────────────────────────────
+      } else if event_type == "DETECTION" {
+          .udm.action = "detection"
+          if exists(ev.cat)     { .ext.detection_category = string!(ev.cat) }
+          if exists(ev.source)  { .ext.detection_source   = string!(ev.source) }
+          if exists(ev.author)  { .ext.detection_author   = string!(ev.author) }
+          if exists(ev.detect)  { .ext.detection_payload  = ev.detect }
+          if exists(ev.detect_id) { .ext.detection_id     = string!(ev.detect_id) }
+          if exists(ev.summary) { .ext.detection_summary  = string!(ev.summary) }
+
+      } else if event_type == "YARA_DETECTION" {
+          .udm.action = "yara_detection"
+          if exists(ev.RULE_NAME) { .ext.yara_rule = string!(ev.RULE_NAME) }
+          if exists(ev.RULE_NS)   { .ext.yara_rule_namespace = string!(ev.RULE_NS) }
+          if exists(ev.PROCESS_ID){ .udm.process_id = to_int(ev.PROCESS_ID) ?? null }
+          if exists(ev.FILE_PATH) {
+              fp = string!(ev.FILE_PATH)
+              if fp != "" {
+                  .udm.file_path = fp
+                  fname_match = parse_regex(fp, r'(?P<basename>[^\\/]+)$') ?? {}
+                  if exists(fname_match.basename) { .udm.file_name = string!(fname_match.basename) }
+              }
+          }
+          if exists(ev.HASH) { .udm.file_hash = string!(ev.HASH) }
+
+      # ─────────────────────────────────────────────────────────────────────
+      # SERVICE CHANGE (Windows)
+      # ─────────────────────────────────────────────────────────────────────
+      } else if event_type == "SERVICE_CHANGE" {
+          .udm.action = "service_change"
+          if exists(ev.SVC_NAME)        { .ext.service_name      = string!(ev.SVC_NAME) }
+          if exists(ev.SVC_DISPLAY_NAME){ .ext.service_display   = string!(ev.SVC_DISPLAY_NAME) }
+          if exists(ev.SVC_BINARY)      { .ext.service_binary    = string!(ev.SVC_BINARY) }
+          if exists(ev.SVC_START_TYPE)  { .ext.service_start_type = string!(ev.SVC_START_TYPE) }
+          if exists(ev.SVC_STATE)       { .ext.service_state     = string!(ev.SVC_STATE) }
+
+      # ─────────────────────────────────────────────────────────────────────
+      # SENSOR LIFECYCLE
+      # ─────────────────────────────────────────────────────────────────────
+      } else if event_type == "CONNECTED" {
+          .udm.action = "sensor_connect"
+      } else if event_type == "DISCONNECTED" {
+          .udm.action = "sensor_disconnect"
+      } else if event_type == "STARTING_UP" {
+          .udm.action = "sensor_starting"
+      } else if event_type == "SENSOR_HOSTNAME" {
+          .udm.action = "sensor_hostname"
+          if exists(ev.HOSTNAME) {
+              hn = string!(ev.HOSTNAME)
+              if hn != "" {
+                  .udm.src_host  = hn
+                  .udm.dest_host = hn
+              }
+          }
+
+      # ─────────────────────────────────────────────────────────────────────
+      # CLOUD / LOG INPUTS (LC adapters: cloud audit, generic log ingest)
+      # ─────────────────────────────────────────────────────────────────────
+      } else if event_type == "LOG" {
+          .udm.action = "log"
+          if exists(ev.FILE_PATH)      { .ext.log_source_path = string!(ev.FILE_PATH) }
+          if exists(ev.RAW)            { .ext.log_raw         = string!(ev.RAW) }
+
+      } else if event_type == "CLOUD_API_RECEIVED" || event_type == "CLOUD_NOTIFICATION" {
+          .udm.action = downcase(event_type)
+          if exists(ev.SERVICE)  { .ext.cloud_service = string!(ev.SERVICE) }
+          if exists(ev.REGION)   { .ext.cloud_region  = string!(ev.REGION) }
+          if exists(ev.PAYLOAD)  { .ext.cloud_payload = ev.PAYLOAD }
+
+      # ─────────────────────────────────────────────────────────────────────
+      # OUTBOUND / INCIDENT REPORTS
+      # ─────────────────────────────────────────────────────────────────────
+      } else if event_type == "OUTBOUND_DATA_REPORT" {
+          .udm.action = "outbound_data"
+          if exists(ev.DATA) { .ext.outbound_data = ev.DATA }
+
+      } else if event_type == "INCIDENT_REPORT" {
+          .udm.action = "incident_report"
+          if exists(ev.SUMMARY) { .ext.incident_summary = string!(ev.SUMMARY) }
+          if exists(ev.SEVERITY){ .ext.incident_severity = ev.SEVERITY }
+
+      # ─────────────────────────────────────────────────────────────────────
+      # FALLBACK — unknown LC event_type
+      # ─────────────────────────────────────────────────────────────────────
+      } else {
+          .udm.action = downcase(event_type)
+          # Best-effort common-field extraction so unknowns aren't blank
+          if exists(ev.PROCESS_ID) { .udm.process_id   = to_int(ev.PROCESS_ID) ?? null }
+          if exists(ev.PARENT_PROCESS_ID) { .udm.parent_process_id = to_int(ev.PARENT_PROCESS_ID) ?? null }
+          if exists(ev.FILE_PATH) {
+              fp = string!(ev.FILE_PATH)
+              if fp != "" { .udm.process_path = fp }
+          }
+          if exists(ev.HASH)      { .udm.process_hash = string!(ev.HASH) }
+          if exists(ev.USER_NAME) { .udm.user         = string!(ev.USER_NAME) }
+          if exists(ev.COMMAND_LINE) { .udm.command_line = string!(ev.COMMAND_LINE) }
+          .ext.lc_event_raw = ev
+      }
+
+      .metadata.parser = "limacharlie"
+      .message = raw_log
+  }

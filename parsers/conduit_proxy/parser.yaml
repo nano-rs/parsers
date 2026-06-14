@@ -30,7 +30,7 @@ parser_vrl: |
           target = string(parsed.target) ?? ""
 
           .udm.event_type = if level == "error" { "proxy_error" } else if level == "warn" { "proxy_warning" } else { "proxy_info" }
-          .udm.category = "web_proxy"
+          .udm.tags = ["web", "proxy"]
           .udm.vendor = "Conduit"
           .udm.product = "Conduit Proxy"
           .ext.log_level = level
@@ -107,7 +107,7 @@ parser_vrl: |
       # ---------------------------------------------------------------
       action_raw = string(parsed.action) ?? "unknown"
       .udm.event_type = action_raw
-      .udm.category = "web_proxy"
+      .udm.tags = ["web", "proxy"]
 
       # Blocked requests get elevated severity
       threat_blocked = bool(parsed.threat_blocked) ?? false
@@ -178,7 +178,9 @@ parser_vrl: |
       .ext.content_type = string(parsed.content_type) ?? null
       .ext.cache_status = string(parsed.cache_status) ?? null
       .ext.rule_id = string(parsed.rule_id) ?? null
-      .ext.category = string(parsed.category) ?? null
+      # NAN-1464: web content/filtering category -> CIM `category` (Web.category);
+      # event-class lives in `tags` (["web","proxy"]).
+      .udm.category = string(parsed.category) ?? null
       # upstream_addr already extracted to udm.dest_ip above
 
       # ---------------------------------------------------------------

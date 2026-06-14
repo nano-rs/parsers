@@ -68,7 +68,7 @@ parser_vrl: |
               if starts_with(raw_ip, "[") {
                   bracket_parts = split(raw_ip, "]")
                   if length(bracket_parts) > 0 {
-                      ip_part = replace(to_string(get!(bracket_parts, [0])) ?? "", "[", "")
+                      ip_part = replace(replace(to_string(get!(bracket_parts, [0])) ?? "", "[", ""), "]", "")
                       if ip_part != "" {
                           .udm.src_ip = ip_part
                       }
@@ -149,7 +149,7 @@ parser_vrl: |
 
           if is_message_trace {
               # --- Exchange MessageTrace (mail flow) ---
-              .udm.category = "email"
+              .udm.tags = ["email"]
 
               if exists(parsed.SenderAddress) {
                   .udm.sender = string!(parsed.SenderAddress)
@@ -221,7 +221,7 @@ parser_vrl: |
 
           } else {
               # --- Exchange mailbox events ---
-              .udm.category = "email"
+              .udm.tags = ["email"]
 
               if exists(parsed.MailboxOwnerUPN) {
                   .udm.dest_user = string!(parsed.MailboxOwnerUPN)
@@ -262,7 +262,7 @@ parser_vrl: |
 
       } else if workload == "SharePoint" || workload == "OneDrive" {
           # --- SharePoint / OneDrive ---
-          .udm.category = "file"
+          .udm.tags = ["endpoint", "filesystem"]
 
           if exists(parsed.SourceFileName) {
               .udm.file_name = string!(parsed.SourceFileName)
@@ -306,7 +306,7 @@ parser_vrl: |
 
       } else if workload == "AzureActiveDirectory" {
           # --- Azure AD / Entra ---
-          .udm.category = "identity"
+          .udm.tags = ["authentication"]
 
           # Actor -> src_user
           if exists(parsed.Actor) && is_array(parsed.Actor) {
@@ -358,7 +358,7 @@ parser_vrl: |
 
       } else if workload == "MicrosoftTeams" {
           # --- Teams ---
-          .udm.category = "collaboration"
+          .udm.tags = ["collaboration"]
 
           if exists(parsed.ChatName) {
               .ext.chat_name = string!(parsed.ChatName)
@@ -390,7 +390,7 @@ parser_vrl: |
 
       } else if operation == "DLPRuleMatch" || exists(parsed.IncidentId) || exists(parsed.PolicyDetails) {
           # --- DLP ---
-          .udm.category = "dlp"
+          .udm.tags = ["dlp"]
 
           if exists(parsed.IncidentId) {
               .ext.incident_id = string!(parsed.IncidentId)
@@ -460,7 +460,7 @@ parser_vrl: |
           if workload != "" {
               .udm.category = downcase(workload)
           } else {
-              .udm.category = "other"
+              .udm.tags = []
           }
 
           # Capture any additional common fields
