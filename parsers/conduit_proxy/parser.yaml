@@ -1,6 +1,6 @@
 name: conduit_proxy
 display_name: Conduit MITM Proxy
-version: "1.0.0"
+version: "1.1.0"
 description: "Parses Conduit MITM proxy logs. Captures HTTP/HTTPS requests with TLS interception status, threat scoring, DLP matches, and upstream connection details."
 match_values:
   - conduit
@@ -129,17 +129,25 @@ parser_vrl: |
       .ext.threat_score = to_string(threat_score)
       .ext.threat_tier = string(parsed.threat_tier) ?? null
 
-      # Surface threat signals as comma-separated string
-      if exists(parsed.threat_signals) && is_array(parsed.threat_signals) {
-          signals = array!(parsed.threat_signals)
-          signal_parts = []
-          for_each(signals) -> |_i, signal| {
-              name = string(signal.name) ?? "unknown"
-              signal_parts = push(signal_parts, name)
+      # threat_signals: reshape the array of {name, score, tier} into a
+      # name-keyed map so each detector is a queryable JSON subcolumn
+      # (ext.threat_signals.dga_entropy.score > 0.5) and flattens to leaf rows
+      # in the record view instead of a flat name string. Mirrors the OCSF
+      # conduit parser (NAN-1459/NAN-1460). Raw array preserved in `message`.
+      threat_signals = {}
+      raw_signals = array(parsed.threat_signals) ?? []
+      for_each(raw_signals) -> |_i, sig| {
+          s = object(sig) ?? {}
+          sig_name = string(s.name) ?? ""
+          if sig_name != "" {
+              threat_signals = set(threat_signals, [sig_name], {
+                  "score": s.score,
+                  "tier": s.tier
+              }) ?? threat_signals
           }
-          if length(signal_parts) > 0 {
-              .ext.threat_signals = join!(signal_parts, ", ")
-          }
+      }
+      if length(threat_signals) > 0 {
+          .ext.threat_signals = threat_signals
       }
 
       # Set severity based on threat score
