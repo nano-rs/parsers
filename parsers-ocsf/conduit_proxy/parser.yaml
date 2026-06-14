@@ -1,6 +1,6 @@
 name: conduit_proxy_ocsf
 display_name: Conduit MITM Proxy (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 description: >
   Parses Conduit MITM proxy access logs into a complete OCSF 1.8.0
   "HTTP Activity" (class_uid 4002) record. The whole OCSF object is emitted on
@@ -120,10 +120,18 @@ parser_vrl: |
           }
       }
 
-      # Proxy-specific signals with no native OCSF home -> standard `unmapped`.
+      # Proxy-specific signals with no PROMOTED OCSF column -> standard
+      # `unmapped` (the OCSF extended-fields spill). NAN-1443 lean storage keeps
+      # only promoted columns + this object + raw `message`, so anything not
+      # promoted must land here to stay a queryable field rather than
+      # message-only. `scheme`/`auth_method` were previously dropped to
+      # message-only (NAN-1462); `url.scheme` is not a promoted column, so
+      # `scheme` belongs here, not at a non-promoted spec path.
       unmapped = {
           "category": string(p.category) ?? null,
           "action": string(p.action) ?? null,
+          "scheme": string(p.scheme) ?? null,
+          "auth_method": string(p.auth_method) ?? null,
           "cache_status": string(p.cache_status) ?? null,
           "content_type": string(p.content_type) ?? null,
           "tls_intercepted": p.tls_intercepted,
