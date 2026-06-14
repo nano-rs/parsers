@@ -1,6 +1,6 @@
 name: conduit_proxy_ocsf
 display_name: Conduit MITM Proxy (OCSF)
-version: "1.0.0"
+version: "1.1.0"
 description: >
   Parses Conduit MITM proxy access logs into a complete OCSF 1.8.0
   "HTTP Activity" (class_uid 4002) record. The whole OCSF object is emitted on
@@ -99,6 +99,27 @@ parser_vrl: |
           "status": status_str
       }
 
+      # threat_signals arrives as an array of {name, score, tier} objects, which
+      # is awkward to query (positional indices) and renders as a JSON blob in
+      # the record view. Reshape it into a name-keyed map so each detector is a
+      # first-class queryable JSON subcolumn under `unmapped`
+      # (e.g. unmapped.threat_signals.dga_entropy.score > 0.5) and flattens to
+      # leaf rows in the inspector. Detection rules ride the same nPL->SQL path,
+      # so signals are usable in rules directly. The raw array is preserved in
+      # the OCSF `message` (raw log), so nothing is lost.
+      threat_signals = {}
+      raw_signals = array(p.threat_signals) ?? []
+      for_each(raw_signals) -> |_i, sig| {
+          s = object(sig) ?? {}
+          sig_name = string(s.name) ?? ""
+          if sig_name != "" {
+              threat_signals = set(threat_signals, [sig_name], {
+                  "score": s.score,
+                  "tier": s.tier
+              }) ?? threat_signals
+          }
+      }
+
       # Proxy-specific signals with no native OCSF home -> standard `unmapped`.
       unmapped = {
           "category": string(p.category) ?? null,
@@ -109,7 +130,7 @@ parser_vrl: |
           "threat_score": p.threat_score,
           "threat_tier": string(p.threat_tier) ?? null,
           "threat_blocked": p.threat_blocked,
-          "threat_signals": p.threat_signals,
+          "threat_signals": threat_signals,
           "rule_id": p.rule_id,
           "duration_ms": p.duration_ms
       }
