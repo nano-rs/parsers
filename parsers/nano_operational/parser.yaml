@@ -1,0 +1,66 @@
+name: nano_operational
+display_name: nano Operational Logs
+version: "1.0.0"
+description: "Parses nano platform operational/tracing logs (Rust tracing JSON from nanosiem-api, nanosiem-jobs, nanosiem-search). Maps level->severity, message, service.name->service_name, and HTTP access fields; preserves all structured fields in ext."
+match_values:
+  - nano_operational
+category: application
+vendor: "nano"
+product: "nanosiem"
+parser_vrl: |
+  .udm = {}
+  .ext = {}
+  .metadata = {}
+  .udm.timestamp = format_timestamp!(now(), format: "%Y-%m-%d %H:%M:%S")
+
+  raw_log = string!(.message)
+  parsed, err = parse_json(raw_log)
+
+  if err == null {
+      # Preserve every structured field for full fidelity (schema varies per event type)
+      .ext = object(parsed) ?? {}
+
+      # Event time: RFC3339 w/ nanoseconds + offset, e.g. 2026-06-16T12:26:34.147107243+00:00
+      if exists(parsed.timestamp) {
+          ts, ts_err = parse_timestamp(string!(parsed.timestamp), "%+")
+          if ts_err == null {
+              .udm.timestamp = format_timestamp!(ts, format: "%Y-%m-%d %H:%M:%S")
+          }
+      }
+
+      # Rust tracing level -> UDM severity (no dedicated level column)
+      if exists(parsed.level) { .udm.severity = string!(parsed.level) }
+
+      # Human-readable log line
+      if exists(parsed.message) { .udm.message = string!(parsed.message) }
+
+      # Emitting service (dotted JSON key)
+      svc = string(parsed."service.name") ?? ""
+      if svc != "" { .udm.service_name = svc }
+
+      .udm.vendor_product = "nano/nanosiem"
+
+      # HTTP access-log fields (present only on request/response trace events)
+      if exists(parsed.method) { .udm.http_method = string!(parsed.method) }
+      if exists(parsed.uri) { .udm.uri_path = string!(parsed.uri) }
+      if exists(parsed.status) {
+          sc, sc_err = to_int(parsed.status)
+          if sc_err == null { .udm.http_status_code = sc }
+      }
+      if exists(parsed.url) { .udm.url = string!(parsed.url) }
+
+      # Latency string preferred; else numeric duration_ms (duration is a String column)
+      if exists(parsed.latency) {
+          .udm.duration = string!(parsed.latency)
+      } else if exists(parsed.duration_ms) {
+          dur, dur_err = to_string(parsed.duration_ms)
+          if dur_err == null { .udm.duration = dur }
+      }
+
+      .udm.event_type = if exists(parsed.method) || exists(parsed.uri) { "http_request" } else { "application_log" }
+  } else {
+      .metadata.parse_error = to_string(err)
+      .udm.event_type = "unparsed"
+  }
+
+  .message = raw_log
