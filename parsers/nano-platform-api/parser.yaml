@@ -1,0 +1,80 @@
+name: nano-platform-api
+display_name: nano Platform API
+version: "1.0.0"
+description: "Parses nano platform API logs (pino/Node.js JSON). Maps numeric pino levels to severity, epoch-ms time to timestamp, HTTP access fields, and authenticated-request identity (userEmail->user, userId->user_id). Strips IPv4-mapped-IPv6 prefix on client IP; preserves all structured fields in ext."
+match_values:
+  - nano-platform-api
+category: application
+vendor: "nano"
+product: "platform-api"
+parser_vrl: |
+  .udm = {}
+  .ext = {}
+  .metadata = {}
+  .udm.timestamp = format_timestamp!(now(), format: "%Y-%m-%d %H:%M:%S")
+
+  raw_log = string!(.message)
+  parsed, err = parse_json(raw_log)
+
+  if err == null {
+      # Preserve every structured field for full fidelity (schema varies per event type)
+      .ext = object(parsed) ?? {}
+
+      # Event time: pino `time` is epoch milliseconds; `ts` (rare) may be RFC3339
+      if exists(parsed.time) {
+          t_ms, t_err = to_int(parsed.time)
+          if t_err == null {
+              tv, tv_err = from_unix_timestamp(t_ms, "milliseconds")
+              if tv_err == null { .udm.timestamp = format_timestamp!(tv, format: "%Y-%m-%d %H:%M:%S") }
+          }
+      } else if exists(parsed.ts) {
+          pt, pt_err = parse_timestamp(string!(parsed.ts), "%+")
+          if pt_err == null { .udm.timestamp = format_timestamp!(pt, format: "%Y-%m-%d %H:%M:%S") }
+      }
+
+      # pino numeric level -> UDM severity string
+      if exists(parsed.level) {
+          lvl, lvl_err = to_int(parsed.level)
+          .udm.severity = if lvl_err != null { "info" } else if lvl >= 60 { "fatal" } else if lvl >= 50 { "error" } else if lvl >= 40 { "warn" } else if lvl >= 30 { "info" } else if lvl >= 20 { "debug" } else { "trace" }
+      }
+
+      # Human-readable log line
+      if exists(parsed.msg) { .udm.message = string!(parsed.msg) }
+
+      # Emitting pod -> host
+      if exists(parsed.replica) { .udm.src_host = string!(parsed.replica) }
+
+      .udm.vendor_product = "nano/platform-api"
+
+      # Authenticated-request identity (stable identifiers only; raw extras stay in ext)
+      if exists(parsed.userEmail) { .udm.user = string!(parsed.userEmail) }
+      if exists(parsed.userId) { .udm.user_id = string!(parsed.userId) }
+
+      # HTTP access-log fields
+      if exists(parsed.method) { .udm.http_method = string!(parsed.method) }
+      if exists(parsed.path) { .udm.uri_path = string!(parsed.path) }
+      if exists(parsed.status) {
+          sc, sc_err = to_int(parsed.status)
+          if sc_err == null { .udm.http_status_code = sc }
+      }
+      if exists(parsed.ua) { .udm.http_user_agent = string!(parsed.ua) }
+
+      # ms latency -> duration (String column)
+      if exists(parsed.ms) {
+          dur, dur_err = to_string(parsed.ms)
+          if dur_err == null { .udm.duration = dur }
+      }
+
+      # Client IP: strip IPv4-mapped-IPv6 prefix so analysts get the clean v4
+      if exists(parsed.ip) {
+          ip_clean = replace(string!(parsed.ip), r'^::ffff:', "")
+          if is_ipv4(ip_clean) || is_ipv6(ip_clean) { .udm.src_ip = ip_clean }
+      }
+
+      .udm.event_type = if exists(parsed.method) || exists(parsed.path) { "http_request" } else { "application_log" }
+  } else {
+      .metadata.parse_error = to_string(err)
+      .udm.event_type = "unparsed"
+  }
+
+  .message = raw_log
