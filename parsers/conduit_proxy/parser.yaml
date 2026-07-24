@@ -1,6 +1,6 @@
 name: conduit_proxy
 display_name: Conduit MITM Proxy
-version: "1.1.0"
+version: "1.1.1"
 description: "Parses Conduit MITM proxy logs. Captures HTTP/HTTPS requests with TLS interception status, threat scoring, DLP matches, and upstream connection details."
 match_values:
   - conduit
@@ -90,8 +90,18 @@ parser_vrl: |
           }
       }
 
-      # User if authenticated
-      .udm.user = string(parsed.username) ?? null
+      # User if authenticated. Keep UDM identity normalization consistent with
+      # the Windows parsers: DOMAIN\user becomes user_domain + leaf user.
+      user_raw = string(parsed.username) ?? ""
+      if user_raw != "" {
+          user_parts = split(user_raw, "\\")
+          if length(user_parts) == 2 {
+              .udm.user_domain = user_parts[0]
+              .udm.user = user_parts[1]
+          } else {
+              .udm.user = user_raw
+          }
+      }
       .ext.auth_method = string(parsed.auth_method) ?? null
 
       # Timestamp
