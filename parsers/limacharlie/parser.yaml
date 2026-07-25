@@ -1,6 +1,6 @@
 name: limacharlie
 display_name: LimaCharlie EDR
-version: "1.0.0"
+version: "1.0.1"
 description: "Parses LimaCharlie sensor telemetry: process, network, DNS, file, module, registry, auth, code identity, detection, and sensor-lifecycle events"
 match_values:
   - limacharlie
@@ -226,16 +226,54 @@ parser_vrl: |
           if exists(ev.DOMAIN_NAME) {
               dn = string!(ev.DOMAIN_NAME)
               if dn != "" {
-                  .udm.dns_query  = dn
+                  .udm.query      = dn
                   .udm.url_domain = dn
               }
           }
-          if exists(ev.IP_ADDRESS) {
-              ip = string!(ev.IP_ADDRESS)
-              if ip != "" { .udm.dest_ip = ip }
+          # Current LimaCharlie streams may return all answers in
+          # IP_ADDRESSES; older learned schemas expose one IP_ADDRESS.
+          if exists(ev.IP_ADDRESSES) && is_array(ev.IP_ADDRESSES) {
+              raw_addresses = array!(ev.IP_ADDRESSES)
+              dns_addresses = []
+              for_each(raw_addresses) -> |_idx, address| {
+                  address_string = to_string(address) ?? ""
+                  if address_string != "" {
+                      dns_addresses = push(dns_addresses, address_string)
+                  }
+              }
+              if length(dns_addresses) > 0 {
+                  first_address = get!(dns_addresses, [0])
+                  .udm.dest_ip = string!(first_address)
+                  .udm.answer = string!(first_address)
+                  .udm.dns_answers = join!(dns_addresses, ", ")
+                  .ext.dns_addresses = dns_addresses
+              }
+          } else if exists(ev.IP_ADDRESS) {
+              ip = to_string(ev.IP_ADDRESS) ?? ""
+              if ip != "" {
+                  .udm.dest_ip = ip
+                  .udm.answer = ip
+                  .udm.dns_answers = ip
+                  .ext.dns_addresses = [ip]
+              }
           }
-          if exists(ev.DNS_TYPE)   { .ext.dns_type     = string!(ev.DNS_TYPE) }
-          if exists(ev.TYPE)       { .ext.dns_type_raw = to_int(ev.TYPE) ?? null }
+          # DNS_TYPE is an integer in LimaCharlie's learned DNS_REQUEST schema.
+          # Keep the numeric value for fidelity and map common RR codes to the
+          # names analysts use in DNS hunts.
+          if exists(ev.DNS_TYPE) {
+              dns_type_raw = to_int(ev.DNS_TYPE) ?? null
+              dns_type_string = to_string(ev.DNS_TYPE) ?? ""
+              .ext.dns_type_raw = dns_type_raw
+              .udm.query_type = if dns_type_raw == 1 { "A" } else if dns_type_raw == 2 { "NS" } else if dns_type_raw == 5 { "CNAME" } else if dns_type_raw == 6 { "SOA" } else if dns_type_raw == 12 { "PTR" } else if dns_type_raw == 15 { "MX" } else if dns_type_raw == 16 { "TXT" } else if dns_type_raw == 28 { "AAAA" } else if dns_type_raw == 33 { "SRV" } else if dns_type_raw == 65 { "HTTPS" } else if dns_type_raw == 255 { "ANY" } else { dns_type_string }
+              .udm.record_type = .udm.query_type
+              .ext.dns_type = .udm.query_type
+          } else if exists(ev.TYPE) {
+              dns_type_string = to_string(ev.TYPE) ?? ""
+              .udm.query_type = dns_type_string
+              .udm.record_type = dns_type_string
+              .ext.dns_type = dns_type_string
+              .ext.dns_type_raw = to_int(ev.TYPE) ?? null
+          }
           if exists(ev.PROCESS_ID) { .udm.process_id   = to_int(ev.PROCESS_ID) ?? null }
           if exists(ev.FILE_PATH) {
               fp = string!(ev.FILE_PATH)
