@@ -1,0 +1,191 @@
+name: google_workspace
+display_name: Google Workspace Audit
+version: "1.0.0"
+description: >
+  Parses Google Workspace audit activities from the Admin SDK Reports API —
+  login, admin console, OAuth token grant and Drive events — as delivered by the
+  nano Google Workspace collector. Distinct from gcp_audit, which parses Google
+  Cloud audit logs: a different product with a different schema.
+match_values:
+  - gws_login
+  - gws_admin
+  - gws_token
+  - gws_drive
+  - google_workspace
+category: cloud
+vendor: "Google"
+product: "Google Workspace"
+parser_vrl: |
+  # Google Workspace Reports API activities.
+  #
+  # One activity carries an `events[]` array — a single record can describe
+  # several things that happened together. This parser maps the FIRST event to
+  # the UDM fields and keeps the whole array in ext, rather than fanning one
+  # activity into several nano events: fanning out would multiply the row count
+  # against the actual audit record count and break any "how many admin actions"
+  # question.
+  #
+  # `events[].parameters[]` is a name/value list whose value lands in one of
+  # several typed keys (value / intValue / boolValue / multiValue). It is
+  # flattened to a plain object so nPL can reach `ext.params.login_type`
+  # instead of walking an array.
+  #
+  # Docs: https://developers.google.com/workspace/admin/reports/v1/reference/activities/list
+
+  .udm = {}
+  .ext = {}
+  if !is_object(.metadata) { .metadata = {} }
+
+  .udm.timestamp = now()
+  .udm.vendor = "Google"
+  .udm.product = "Google Workspace"
+  .udm.vendor_product = "Google Workspace"
+
+  raw_log = to_string(.message) ?? ""
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      if err != null {
+          .metadata.parse_error = to_string(err)
+      } else {
+          .metadata.parse_error = "not a JSON object"
+      }
+      .udm.tags = ["saas", "google"]
+  } else {
+      evt = object!(parsed)
+      id = object(evt.id) ?? {}
+
+      # --- Timestamp ---------------------------------------------------
+      # `id.time` is RFC 3339 in practice; the reference has also described it
+      # as epoch seconds, so both are accepted rather than silently defaulting
+      # to ingest time.
+      if exists(id.time) {
+          time_raw = to_string(id.time) ?? ""
+          ts, ts_err = parse_timestamp(time_raw, "%+")
+          if ts_err == null {
+              .udm.timestamp = format_timestamp!(ts, format: "%Y-%m-%d %H:%M:%S")
+          } else {
+              epoch = to_int(time_raw) ?? null
+              if epoch != null {
+                  ts2, ts2_err = from_unix_timestamp(int!(epoch))
+                  if ts2_err == null {
+                      .udm.timestamp = format_timestamp!(ts2, format: "%Y-%m-%d %H:%M:%S")
+                  }
+              }
+          }
+      }
+
+      # --- Application / event class -------------------------------------
+      app = ""
+      if exists(id.applicationName) { app = downcase(to_string(id.applicationName) ?? "") }
+      .ext.application = app
+
+      # Stable identity for a record. Google documents (time, uniqueQualifier,
+      # applicationName, customerId) as the composite key — worth keeping since
+      # the collector is at-least-once and re-delivers around the watermark.
+      if exists(id.uniqueQualifier) {
+          .ext.unique_qualifier = to_string(id.uniqueQualifier) ?? ""
+      }
+      if exists(id.customerId) { .ext.customer_id = to_string(id.customerId) ?? "" }
+
+      # --- Actor ---------------------------------------------------------
+      actor = object(evt.actor) ?? {}
+      if exists(actor.email) { .udm.user = string!(actor.email) }
+      if exists(actor.profileId) { .ext.actor_profile_id = to_string(actor.profileId) ?? "" }
+      if exists(actor.callerType) { .ext.actor_caller_type = to_string(actor.callerType) ?? "" }
+      # An OAuth application acting on a user's behalf. The single most useful
+      # signal in the token stream: it names the third-party app.
+      actor_app = object(actor.applicationInfo) ?? {}
+      if exists(actor_app.applicationName) {
+          .ext.oauth_application = to_string(actor_app.applicationName) ?? ""
+      }
+      if exists(actor_app.oauthClientId) {
+          .ext.oauth_client_id = to_string(actor_app.oauthClientId) ?? ""
+      }
+      if exists(actor_app.impersonation) {
+          .ext.oauth_impersonation = to_string(actor_app.impersonation) ?? ""
+      }
+
+      # --- Source --------------------------------------------------------
+      if exists(evt.ipAddress) { .udm.src_ip = string!(evt.ipAddress) }
+      if exists(evt.ownerDomain) { .ext.owner_domain = string!(evt.ownerDomain) }
+
+      net = object(evt.networkInfo) ?? {}
+      if exists(net.regionCode) { .ext.src_country = to_string(net.regionCode) ?? "" }
+      if exists(net.subdivisionCode) { .ext.src_region = to_string(net.subdivisionCode) ?? "" }
+
+      # --- Events --------------------------------------------------------
+      events_arr = array(evt.events) ?? []
+      .ext.event_count = length(events_arr)
+
+      if length(events_arr) > 0 {
+          first = object(events_arr[0]) ?? {}
+
+          if exists(first.name) {
+              name = to_string(first.name) ?? ""
+              .udm.event_type = name
+              .udm.signature = name
+          }
+          if exists(first.type) { .ext.event_category = to_string(first.type) ?? "" }
+
+          # Flatten parameters into a plain object. Google spreads the value
+          # across typed keys and only one is populated per parameter.
+          params = {}
+          for_each(array(first.parameters) ?? []) -> |_i, p| {
+              po = object(p) ?? {}
+              pname = to_string(po.name) ?? ""
+              if pname != "" {
+                  if exists(po.value) {
+                      params = set!(params, [pname], to_string(po.value) ?? "")
+                  } else if exists(po.intValue) {
+                      params = set!(params, [pname], to_int(po.intValue) ?? 0)
+                  } else if exists(po.boolValue) {
+                      params = set!(params, [pname], to_bool(po.boolValue) ?? false)
+                  } else if exists(po.multiValue) {
+                      params = set!(params, [pname], array(po.multiValue) ?? [])
+                  }
+              }
+          }
+          .ext.params = params
+
+          status = object(first.status) ?? {}
+          if exists(status.statusCode) { .ext.status_code = to_string(status.statusCode) ?? "" }
+      }
+
+      # --- Auth outcome ----------------------------------------------------
+      # Login events carry the verdict in the event NAME rather than a status
+      # field: login_success / login_failure / logout. Derived here so
+      # cross-source auth hunts work without knowing Google's vocabulary.
+      if app == "login" {
+          name = to_string(.udm.event_type)
+          if name == "login_success" {
+              .udm.auth_result = "success"
+              .udm.result = "success"
+          } else if name == "login_failure" {
+              .udm.auth_result = "failure"
+              .udm.result = "failure"
+          }
+          # `login_type` distinguishes password / saml / google_password /
+          # exchange, which is what tells a reviewer whether SSO was bypassed.
+          login_type = to_string(.ext.params.login_type)
+          if login_type != "" { .udm.auth_type = login_type }
+      }
+
+      # --- Tags ------------------------------------------------------------
+      tags = ["saas", "google"]
+      if app == "login" {
+          tags = push(tags, "authentication")
+      } else if app == "admin" {
+          tags = push(tags, "audit")
+          tags = push(tags, "change")
+      } else if app == "token" {
+          tags = push(tags, "authentication")
+          tags = push(tags, "oauth")
+      } else if app == "drive" {
+          tags = push(tags, "file")
+      }
+      .udm.tags = tags
+  }
+
+  .metadata.parser = "google_workspace"
+  .message = raw_log
