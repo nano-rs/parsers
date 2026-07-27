@@ -1,0 +1,129 @@
+name: slack_access
+display_name: Slack Access Logs
+version: "1.0.0"
+description: >
+  Parses Slack workspace sign-in records from the team.accessLogs Web API
+  method, as delivered by the nano Slack collector. Distinct from slack_audit,
+  which parses the Enterprise Grid Audit Logs API — a different endpoint with a
+  different schema and a different plan requirement.
+match_values:
+  - slack_access_log
+  - slack_access
+# Deliberately does NOT claim `slack`: parsers/slack_audit already does, and the
+# two schemas share no fields.
+category: cloud
+vendor: "Salesforce"
+product: "Slack"
+parser_vrl: |
+  # Slack team.accessLogs sign-in records.
+  #
+  # These are NOT discrete sign-in events. Each record aggregates one
+  # (user, IP, user-agent) combination, carrying `date_first`, `date_last` and
+  # a `count` of sign-ins in that window — so the same logical record arrives
+  # repeatedly with a rising count while the session stays active.
+  #
+  # `date_last` is used as the event timestamp: it is when the activity this
+  # copy describes actually happened, so successive copies land in time order
+  # and the newest copy of a record sorts last.
+  #
+  # Docs: https://docs.slack.dev/reference/methods/team.accessLogs/
+
+  .udm = {}
+  .ext = {}
+  if !is_object(.metadata) { .metadata = {} }
+
+  .udm.timestamp = now()
+  .udm.vendor = "Salesforce"
+  .udm.product = "Slack"
+  .udm.vendor_product = "Slack"
+
+  raw_log = to_string(.message) ?? ""
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      if err != null {
+          .metadata.parse_error = to_string(err)
+      } else {
+          .metadata.parse_error = "not a JSON object"
+      }
+      .udm.tags = ["saas", "slack"]
+  } else {
+      evt = object!(parsed)
+
+      .udm.event_type = "login"
+      .udm.tags = ["authentication", "saas", "slack"]
+
+      # --- Timestamp ---------------------------------------------------
+      # date_last: the most recent sign-in this record covers. Falls back to
+      # date_first for a record seen exactly once.
+      ts_epoch = null
+      if exists(evt.date_last) {
+          ts_epoch = to_int(evt.date_last) ?? null
+      }
+      if ts_epoch == null && exists(evt.date_first) {
+          ts_epoch = to_int(evt.date_first) ?? null
+      }
+      if ts_epoch != null {
+          ts, ts_err = from_unix_timestamp(int!(ts_epoch))
+          if ts_err == null {
+              .udm.timestamp = format_timestamp!(ts, format: "%Y-%m-%d %H:%M:%S")
+          }
+      }
+
+      # First sign-in in this record's window, kept so the span is recoverable.
+      if exists(evt.date_first) {
+          first_epoch = to_int(evt.date_first) ?? null
+          if first_epoch != null {
+              first_ts, first_err = from_unix_timestamp(int!(first_epoch))
+              if first_err == null {
+                  .ext.first_seen = format_timestamp!(first_ts, format: "%Y-%m-%d %H:%M:%S")
+              }
+          }
+      }
+
+      # --- Identity ----------------------------------------------------
+      if exists(evt.username) { .udm.user = string!(evt.username) }
+      if exists(evt.user_id) { .ext.slack_user_id = string!(evt.user_id) }
+
+      # --- Source ------------------------------------------------------
+      if exists(evt.ip) { .udm.src_ip = string!(evt.ip) }
+      if exists(evt.isp) { .ext.isp = string!(evt.isp) }
+      if exists(evt.country) { .ext.src_country = string!(evt.country) }
+      if exists(evt.region) { .ext.src_region = string!(evt.region) }
+
+      # --- Device ------------------------------------------------------
+      if exists(evt.user_agent) {
+          ua = string!(evt.user_agent)
+          .udm.http_user_agent = ua
+          # Slack sends desktop/mobile client strings as well as browsers, and
+          # the client ones are not standard UA syntax — parse opportunistically
+          # and keep the raw string regardless.
+          ua_parsed = parse_user_agent(ua)
+          # parse_user_agent returns "" (and "Other") for fields it cannot
+          # identify, which a Slack desktop/mobile client string routinely
+          # triggers. Writing those through would fill ext with blanks that
+          # look like real values in a facet list.
+          browser = to_string(ua_parsed.browser.family)
+          if browser != "" && browser != "Other" { .ext.browser = browser }
+          os_family = to_string(ua_parsed.os.family)
+          if os_family != "" && os_family != "Other" { .ext.os = os_family }
+          device = to_string(ua_parsed.device.family)
+          if device != "" && device != "Other" { .ext.device = device }
+      }
+
+      # --- Aggregation ---------------------------------------------------
+      # How many sign-ins this record covers. NOT a count of events in nano —
+      # one record is one event here, however many sign-ins it represents.
+      # A hunt for "noisy" sessions should read this rather than counting rows.
+      if exists(evt.count) { .ext.access_count = to_int(evt.count) ?? null }
+
+      # team.accessLogs records successful sign-ins only — the response carries
+      # no failure signal at all. Stated explicitly so a detection author does
+      # not read the absence of failures as "no failed logins occurred"; failed
+      # attempts need the Enterprise Grid audit log, a different source.
+      .udm.auth_result = "success"
+      .udm.result = "success"
+  }
+
+  .metadata.parser = "slack_access"
+  .message = raw_log
