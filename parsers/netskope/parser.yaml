@@ -1,16 +1,42 @@
 name: netskope
 display_name: Netskope
-version: "1.0.0"
-description: "Parses Netskope CASB/SSE logs including application activity, alerts, DLP, and network events"
+version: "2.0.0"
+description: >
+  Parses Netskope CASB/SSE logs — application activity, alerts, DLP, audit,
+  network, page, connection, incident, infrastructure and endpoint records.
+  Covers the REST API v2 Data Export shapes delivered by the nano Netskope
+  collector as well as anything forwarded verbatim by Cloud Exchange or a
+  bucket export.
 match_values:
   - netskope
   - netskope_events
+  # Per-stream source types emitted by the nano Netskope collector. Each stream
+  # gets its own source_type so an operator can enable page/connection (very
+  # high volume) independently, and so retention or routing can differ per
+  # class — but they share one parser because the field set is shared.
+  - netskope_alert
+  - netskope_application
+  - netskope_network
+  - netskope_audit
+  - netskope_page
+  - netskope_connection
+  - netskope_incident
+  - netskope_infrastructure
+  - netskope_endpoint
 category: security
 vendor: "Netskope"
 product: "SSE"
 parser_vrl: |
   # Netskope SSE Parser
-  # Parses application events, alerts, DLP, and network events
+  #
+  # Field names follow https://github.com/netskopeoss/Data-Schema.
+  #
+  # v2.0.0 (NAN-2189): added the per-stream collector source types, switched
+  # class detection to `record_type` (what Data Export actually sends) with
+  # `type` kept as a fallback, and corrected several mappings — see the inline
+  # notes at each one. `.udm.event_type` now carries the event CLASS rather
+  # than the activity verb; the verb moved to `.ext.activity`, which is where
+  # every other proxy parser keeps it.
 
   # Initialize required structures
   .udm = {}
@@ -29,10 +55,44 @@ parser_vrl: |
   # Parse JSON
   parsed, err = parse_json(raw_log)
 
-  if err == null {
-      event_type = to_string(parsed.type) ?? "unknown"
+  if err == null && is_object(parsed) {
+      # --- Event class ---------------------------------------------------
+      # Data Export labels records with `record_type`; older/reshaped feeds use
+      # `type`. Sniff field presence last so a shipper that strips both still
+      # classifies rather than falling into "unknown".
+      event_type = ""
+      if exists(parsed.record_type) {
+          event_type = downcase(to_string(parsed.record_type) ?? "")
+      } else if exists(parsed.type) {
+          event_type = downcase(to_string(parsed.type) ?? "")
+      }
+
+      if event_type == "" {
+          if exists(parsed.alert_type) || exists(parsed.alert_name) {
+              event_type = "alert"
+          } else if exists(parsed.audit_log_event) {
+              event_type = "audit"
+          } else if exists(parsed.activity) || exists(parsed.app) {
+              event_type = "application"
+          } else {
+              event_type = "unknown"
+          }
+      }
+
+      # Netskope sets `alert = "yes"` on any record it escalated, including
+      # application and page events. Those must triage as alerts even though
+      # their record_type is not "alert".
+      is_alert = event_type == "alert"
+      if exists(parsed.alert) {
+          if downcase(to_string(parsed.alert) ?? "") == "yes" { is_alert = true }
+      }
+
+      .udm.event_type = event_type
+      .udm.record_type = event_type
 
       # --- Timestamp (common, epoch seconds) ---
+      # `timestamp` is when the activity happened; Netskope's insertion time is
+      # deliberately not used so events land on the log's own clock.
       if exists(parsed.timestamp) {
           ts_sec = to_int(parsed.timestamp) ?? 0
           if ts_sec > 0 {
@@ -52,6 +112,10 @@ parser_vrl: |
       # Source IP
       if exists(parsed.srcip) {
           .udm.src_ip = string!(parsed.srcip)
+      } else if exists(parsed.userip) {
+          # With no egress address recorded, the client's own address is the
+          # only source there is — better than leaving src_ip empty.
+          .udm.src_ip = string!(parsed.userip)
       }
 
       # Destination IP
@@ -64,27 +128,94 @@ parser_vrl: |
           .ext.user_ip = string!(parsed.userip)
       }
 
+      # Hosts and ports
+      if exists(parsed.hostname) {
+          .udm.src_host = downcase(string!(parsed.hostname))
+      }
+      if exists(parsed.dsthost) {
+          .udm.dest_host = downcase(string!(parsed.dsthost))
+      }
+      if exists(parsed.srcport) {
+          .udm.src_port = to_int(parsed.srcport) ?? null
+      }
+      if exists(parsed.dstport) {
+          .udm.dest_port = to_int(parsed.dstport) ?? null
+      }
+      if exists(parsed.protocol) {
+          .udm.protocol = downcase(string!(parsed.protocol))
+      }
+
+      # Session
+      if exists(parsed.app_session_id) {
+          .udm.session_id = to_string(parsed.app_session_id) ?? ""
+      }
+
       # URL / domain
       if exists(parsed.url) {
           .udm.url = string!(parsed.url)
       }
       if exists(parsed.domain) {
-          .udm.url_domain = string!(parsed.domain)
+          .udm.url_domain = downcase(string!(parsed.domain))
+      } else if exists(parsed.url) {
+          # Netskope often sends a bare host or host/path with no scheme, which
+          # parse_url rejects — fall back to the leading authority so
+          # url_domain populates either way.
+          url_str = string!(parsed.url)
+          parsed_url, url_err = parse_url(url_str)
+          if url_err == null {
+              .udm.url_domain = downcase(to_string(parsed_url.host))
+          } else {
+              stripped = replace(url_str, r'^[a-zA-Z][a-zA-Z0-9+.-]*://', "")
+              host_part = split(stripped, "/")[0]
+              host_only = split(to_string(host_part), ":")[0]
+              if to_string(host_only) != "" {
+                  .udm.url_domain = downcase(to_string(host_only))
+              }
+          }
+      }
+
+      # HTTP context (present on page and transaction-shaped records)
+      if exists(parsed.useragent) {
+          .udm.http_user_agent = string!(parsed.useragent)
+      }
+      if exists(parsed.http_status_code) {
+          .udm.http_status_code = to_int(parsed.http_status_code) ?? null
+      }
+      if exists(parsed.referer) {
+          .udm.http_referrer = string!(parsed.referer)
       }
 
       # Application
       if exists(parsed.app) {
           .ext.app = string!(parsed.app)
       }
+      if exists(parsed.appcategory) {
+          .udm.category = string!(parsed.appcategory)
+      }
 
-      # Activity -> action
+      # Activity — the verb ("Browse", "Upload", "Login Successful").
+      # v1 put this in `.udm.event_type`, which meant every Netskope event
+      # reported a different "type" and none of them matched the event's class.
       if exists(parsed.activity) {
-          .udm.event_type = string!(parsed.activity)
+          .ext.activity = string!(parsed.activity)
       }
 
       # Action -> result
       if exists(parsed.action) {
-          .udm.result = string!(parsed.action)
+          action_str = downcase(string!(parsed.action))
+          .ext.netskope_action = action_str
+          # Collapse Netskope's verbs (block / allow / useralert / bypass /
+          # quarantine …) onto the allowed-denied axis the other proxy parsers
+          # use, so cross-source hunts work. The exact verb stays in ext.
+          if action_str == "block" || action_str == "quarantine" || action_str == "deny" {
+              .udm.result = "denied"
+              .udm.status = "blocked"
+          } else if action_str == "allow" || action_str == "bypass" {
+              .udm.result = "allowed"
+              .udm.status = "allowed"
+          } else {
+              .udm.result = action_str
+          }
       }
 
       # Severity
@@ -94,29 +225,60 @@ parser_vrl: |
 
       # Object -> file_name
       if exists(parsed.object) {
-          .udm.file_name = string!(parsed.object)
+          .ext.object = string!(parsed.object)
       }
       if exists(parsed.object_type) {
           .ext.object_type = string!(parsed.object_type)
       }
+      # `object` is whatever the activity acted on — a file, a folder, a CRM
+      # record. Only promote it to file_name when Netskope says it is a file,
+      # so file-centric hunts don't match Salesforce record ids.
+      if exists(parsed.object) {
+          obj_type = ""
+          if exists(parsed.object_type) { obj_type = downcase(string!(parsed.object_type)) }
+          if obj_type == "file" || obj_type == "" {
+              .udm.file_name = string!(parsed.object)
+          }
+      }
 
       # File details
-      if exists(parsed.file_size) {
-          .udm.file_size = to_string(parsed.file_size) ?? ""
+      if exists(parsed.file_path) {
+          .udm.file_path = string!(parsed.file_path)
       }
+      if exists(parsed.file_size) {
+          # v1 stored this as a string, which made size comparisons in nPL
+          # impossible. Every other parser uses to_int here.
+          .udm.file_size = to_int(parsed.file_size) ?? null
+      }
+      # Hashes are lowercased at ingest; emit them lowercased so the raw-column
+      # bloom filters prune on the same form analysts paste in.
       if exists(parsed.sha256) {
-          .udm.file_hash = string!(parsed.sha256)
+          .udm.file_hash = downcase(string!(parsed.sha256))
+          .ext.sha256 = downcase(string!(parsed.sha256))
+      } else if exists(parsed.md5) {
+          .udm.file_hash = downcase(string!(parsed.md5))
       }
       if exists(parsed.md5) {
-          .ext.md5 = string!(parsed.md5)
+          .ext.md5 = downcase(string!(parsed.md5))
       }
       if exists(parsed.file_type) {
           .ext.file_type = string!(parsed.file_type)
       }
 
-      # Bytes
+      # Bytes.
+      # Netskope names these from the client's point of view, while UDM's
+      # bytes_in/out are from the monitored host's — so client_bytes (sent by
+      # the client) is bytes_out. v1 mapped the `numbytes` TOTAL to bytes_out
+      # as a string, which both double-counted inbound traffic and blocked
+      # numeric comparison.
+      if exists(parsed.client_bytes) {
+          .udm.bytes_out = to_int(parsed.client_bytes) ?? null
+      }
+      if exists(parsed.server_bytes) {
+          .udm.bytes_in = to_int(parsed.server_bytes) ?? null
+      }
       if exists(parsed.numbytes) {
-          .udm.bytes_out = to_string(parsed.numbytes) ?? ""
+          .ext.total_bytes = to_int(parsed.numbytes) ?? null
       }
 
       # Policy / rule
@@ -128,24 +290,42 @@ parser_vrl: |
       if exists(parsed.device) {
           .ext.device = string!(parsed.device)
       }
+      if exists(parsed.device_classification) {
+          .ext.device_classification = string!(parsed.device_classification)
+      }
       if exists(parsed.os) {
           .ext.os = string!(parsed.os)
       }
+      if exists(parsed.os_version) {
+          .ext.os_version = string!(parsed.os_version)
+      }
       if exists(parsed.browser) {
           .ext.browser = string!(parsed.browser)
+      }
+      if exists(parsed.browser_version) {
+          .ext.browser_version = string!(parsed.browser_version)
       }
 
       # Access method / traffic type
       if exists(parsed.access_method) {
           .ext.access_method = string!(parsed.access_method)
+          # Access method ("Client", "Secure Forwarder", "Reverse Proxy", API)
+          # is how the session reached Netskope — the closest thing these
+          # records carry to an auth/transport type.
+          .udm.auth_type = string!(parsed.access_method)
       }
       if exists(parsed.traffic_type) {
           .ext.traffic_type = string!(parsed.traffic_type)
       }
 
-      # Cloud confidence level
+      # Cloud confidence level / index — Netskope's own rating of the app.
+      # Kept in ext: `risk_score` is owned by the risk engine, and an app
+      # reputation score is not the same quantity as an entity risk score.
       if exists(parsed.ccl) {
           .ext.ccl = string!(parsed.ccl)
+      }
+      if exists(parsed.cci) {
+          .ext.cci = to_int(parsed.cci) ?? null
       }
 
       # Country
@@ -155,10 +335,33 @@ parser_vrl: |
       if exists(parsed.dst_country) {
           .ext.dst_country = string!(parsed.dst_country)
       }
+      if exists(parsed.src_location) {
+          .ext.src_location = string!(parsed.src_location)
+      }
+      if exists(parsed.dst_location) {
+          .ext.dst_location = string!(parsed.dst_location)
+      }
 
       # Organization unit
       if exists(parsed.organization_unit) {
           .ext.org_unit = string!(parsed.organization_unit)
+      }
+      if exists(parsed.user_group) {
+          # Netskope sends this as a string on some records and an array of
+          # group names on others; to_string on an array yields "".
+          if is_string(parsed.user_group) {
+              .ext.user_group = string!(parsed.user_group)
+          } else {
+              .ext.user_group = encode_json(parsed.user_group)
+          }
+      }
+
+      # Instance (which tenant of the SaaS app, e.g. which Google Workspace)
+      if exists(parsed.instance_name) {
+          .ext.instance_name = string!(parsed.instance_name)
+      }
+      if exists(parsed.instance_id) {
+          .ext.instance_id = to_string(parsed.instance_id) ?? ""
       }
 
       # From/To user
@@ -175,71 +378,152 @@ parser_vrl: |
           }
       }
 
-      # Connection / request / transaction IDs
+      # Connection / request / transaction IDs. Kept so an analyst can pivot
+      # back into the Netskope console, and so re-deliveries (the collector is
+      # at-least-once by design) are recognisable as duplicates.
       if exists(parsed.connection_id) {
           .ext.connection_id = to_string(parsed.connection_id) ?? ""
       }
       if exists(parsed.request_id) {
-          .ext.request_id = string!(parsed.request_id)
+          .ext.request_id = to_string(parsed.request_id) ?? ""
       }
       if exists(parsed.transaction_id) {
-          .ext.transaction_id = string!(parsed.transaction_id)
+          .ext.transaction_id = to_string(parsed.transaction_id) ?? ""
+      }
+      if exists(parsed._id) {
+          .ext.netskope_id = to_string(parsed._id) ?? ""
+      }
+      if exists(parsed.count) {
+          .ext.event_count = to_int(parsed.count) ?? null
       }
 
-      # --- Type-specific handling ---
-      if event_type == "alert" {
-          .udm.tags = ["alert"]
-
+      # --- Alert handling ------------------------------------------------
+      # Driven by `is_alert`, not by record_type, so an application or page
+      # event that Netskope escalated carries its alert fields too.
+      if is_alert {
           if exists(parsed.alert_name) {
               .ext.alert_name = string!(parsed.alert_name)
+              .udm.signature = string!(parsed.alert_name)
           }
           if exists(parsed.alert_type) {
               .ext.alert_type = string!(parsed.alert_type)
+          }
+          if exists(parsed.alert_id) {
+              .ext.alert_id = to_string(parsed.alert_id) ?? ""
           }
           if exists(parsed.risk_level) {
               .ext.risk_level = string!(parsed.risk_level)
           }
 
-      } else if event_type == "page" || event_type == "application" {
-          .udm.tags = ["application", "cloud"]
-
-          # DLP fields
-          if exists(parsed.dlp_profile) {
-              .ext.dlp_profile = string!(parsed.dlp_profile)
+          # Threat protection
+          if exists(parsed.malware_name) {
+              .ext.malware_name = string!(parsed.malware_name)
+              if !exists(.udm.signature) {
+                  .udm.signature = string!(parsed.malware_name)
+              }
           }
-          if exists(parsed.dlp_rule) {
-              .ext.dlp_rule = string!(parsed.dlp_rule)
+          if exists(parsed.malware_type) {
+              .ext.malware_type = string!(parsed.malware_type)
           }
-          if exists(parsed.dlp_incident_id) {
-              .ext.dlp_incident_id = string!(parsed.dlp_incident_id)
+          if exists(parsed.malware_id) {
+              .ext.malware_id = to_string(parsed.malware_id) ?? ""
           }
-          if exists(parsed.alert_type) {
-              .ext.alert_type = string!(parsed.alert_type)
+          if exists(parsed.detection_engine) {
+              .ext.detection_engine = string!(parsed.detection_engine)
           }
-
-          # Category from data
-          if exists(parsed.category) {
-              .ext.app_category = string!(parsed.category)
-          }
-
-          # Page / site
-          if exists(parsed.page) {
-              .ext.page_url = string!(parsed.page)
-          }
-          if exists(parsed.site) {
-              .ext.site = string!(parsed.site)
-          }
-
-      } else if event_type == "audit" {
-          .udm.tags = ["change", "audit"]
-      } else if event_type == "network" {
-          .udm.tags = ["network", "communicate"]
-      } else {
-          .udm.tags = ["application", "cloud"]
       }
 
+      # --- DLP -----------------------------------------------------------
+      # DLP fields ride on application, page and incident records as well as
+      # alerts, so they are read unconditionally rather than inside a class
+      # branch (v1 only read them for page/application).
+      if exists(parsed.dlp_profile) {
+          .ext.dlp_profile = string!(parsed.dlp_profile)
+      }
+      if exists(parsed.dlp_rule) {
+          .ext.dlp_rule = string!(parsed.dlp_rule)
+          if !exists(.udm.rule_name) {
+              .udm.rule_name = string!(parsed.dlp_rule)
+          }
+      }
+      if exists(parsed.dlp_rule_severity) {
+          .ext.dlp_rule_severity = string!(parsed.dlp_rule_severity)
+      }
+      if exists(parsed.dlp_incident_id) {
+          .ext.dlp_incident_id = to_string(parsed.dlp_incident_id) ?? ""
+      }
+      if exists(parsed.dlp_file) {
+          .ext.dlp_file = string!(parsed.dlp_file)
+      }
+
+      # --- Page / site ---------------------------------------------------
+      if exists(parsed.page) {
+          .ext.page_url = string!(parsed.page)
+      }
+      if exists(parsed.site) {
+          .ext.site = string!(parsed.site)
+      }
+      if exists(parsed.category) {
+          .ext.app_category = string!(parsed.category)
+          if !exists(.udm.category) {
+              .udm.category = string!(parsed.category)
+          }
+      }
+
+      # --- Audit ---------------------------------------------------------
+      if event_type == "audit" {
+          if exists(parsed.audit_log_event) {
+              .ext.audit_log_event = string!(parsed.audit_log_event)
+              if !exists(.udm.signature) {
+                  .udm.signature = string!(parsed.audit_log_event)
+              }
+          }
+          if exists(parsed.supporting_data) {
+              # `supporting_data` is an object ({data_type, data_values[]}), and
+              # to_string on an object yields an empty string — so v1's mapping
+              # silently dropped the only field that says WHAT an audit event
+              # acted on. Encode it instead.
+              if is_string(parsed.supporting_data) {
+                  .ext.supporting_data = string!(parsed.supporting_data)
+              } else {
+                  .ext.supporting_data = encode_json(parsed.supporting_data)
+              }
+          }
+          if exists(parsed.audit_type) {
+              .ext.audit_type = string!(parsed.audit_type)
+          }
+      }
+
+      # --- Tags ----------------------------------------------------------
+      tags = ["casb", "netskope"]
+      if is_alert { tags = push(tags, "alert") }
+      if event_type == "audit" {
+          tags = push(tags, "change")
+          tags = push(tags, "audit")
+      } else if event_type == "network" || event_type == "connection" {
+          tags = push(tags, "network")
+          tags = push(tags, "communicate")
+      } else if event_type == "page" {
+          tags = push(tags, "web")
+      } else if event_type == "application" || event_type == "unknown" {
+          # Only genuine app activity gets the application/cloud tags. An alert
+          # or incident record picking them up would make "tag=application"
+          # hunts return findings alongside the activity that caused them.
+          tags = push(tags, "application")
+          tags = push(tags, "cloud")
+      }
+      .udm.tags = tags
+
   } else {
-      .metadata.parse_error = to_string(err)
+      if err != null {
+          .metadata.parse_error = to_string(err)
+      } else {
+          # Valid JSON that isn't an object — a bare array or scalar. Distinct
+          # from a parse failure, and worth saying so rather than reporting a
+          # null error.
+          .metadata.parse_error = "not a JSON object"
+      }
+      .udm.tags = ["casb", "netskope"]
   }
 
   # Set parser name
