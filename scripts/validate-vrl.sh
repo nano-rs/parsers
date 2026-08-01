@@ -78,7 +78,12 @@ EOF
         echo "  FAIL: unbalanced brackets — nano's parser validator rejects this on deploy"
         printf "%b" "$imbalance"
         echo "    A bracket inside a regex char class (e.g. [^(] or [^)]) trips the raw count."
-        echo "    Rewrite it without the literal bracket — e.g. '.+?' up to the delimiter."
+        echo "    Escape it as hex so no literal bracket appears in the source:"
+        echo "      [^\\]]  ->  [^\\x5D]      [^}]  ->  [^\\x7D]"
+        echo "      [^)]   ->  [^\\x29]      [^(]  ->  [^\\x28]"
+        echo "    Do NOT substitute '.+?' — it looks equivalent but is not: '.' excludes"
+        echo "    newlines in Rust regex while a negated class matches them, so a capture"
+        echo "    that can span a line silently stops matching. The hex form is exact."
         FAIL=$((FAIL + 1))
         continue
     fi
