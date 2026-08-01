@@ -6,6 +6,12 @@ on:
     paths:
       - "parsers/**"
       - "enrichments/**"
+      # The validator's own rules are the change most likely to invalidate
+      # parsers repo-wide, so a PR touching only the script or this workflow
+      # must still run the whole-repo pass. Without these two entries such a
+      # PR triggers no validation at all.
+      - "scripts/**"
+      - ".github/workflows/validate-parsers.yml"
 
 permissions:
   contents: write
@@ -48,6 +54,26 @@ jobs:
       - name: Validate VRL syntax
         if: steps.changed.outputs.has_changes == 'true'
         run: bash scripts/validate-vrl.sh /tmp/changed_parsers.txt
+
+      # Validating only the changed parsers let three parsers reach main in a
+      # state nano refuses to deploy (aws_s3_access, juniper_srx, linux_auditd —
+      # all unbalanced bracket counts). Nothing ever re-checked them, and this
+      # workflow auto-merges on a green run, so they merged unattended. The
+      # whole-repo pass is cheap (one `vector vrl` per parser) and is what keeps
+      # main deployable rather than merely keeping each PR self-consistent.
+      - name: Validate every parser in the repo
+        run: |
+          find parsers enrichments -name parser.yaml | sort > /tmp/all_parsers.txt
+          count=$(wc -l < /tmp/all_parsers.txt)
+          echo "Validating $count parsers"
+          # A glob that silently matches nothing would let this step pass while
+          # covering nothing — the same false sense of coverage that let three
+          # broken parsers sit on main. Fail loudly instead.
+          if [ "$count" -lt 50 ]; then
+            echo "Expected at least 50 parsers, found $count — parser discovery is broken."
+            exit 1
+          fi
+          bash scripts/validate-vrl.sh /tmp/all_parsers.txt
 
   auto-merge:
     name: Auto-Merge
