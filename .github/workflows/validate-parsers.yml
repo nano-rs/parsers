@@ -5,6 +5,10 @@ on:
     branches: [main]
     paths:
       - "parsers/**"
+      # parsers-ocsf/ was covered by neither the path filter nor the discovery
+      # glob, so its parsers had never been validated by CI at all — a PR
+      # touching only them triggered no run.
+      - "parsers-ocsf/**"
       - "enrichments/**"
       # The validator's own rules are the change most likely to invalidate
       # parsers repo-wide, so a PR touching only the script or this workflow
@@ -63,7 +67,7 @@ jobs:
       # main deployable rather than merely keeping each PR self-consistent.
       - name: Validate every parser in the repo
         run: |
-          find parsers enrichments -name parser.yaml | sort > /tmp/all_parsers.txt
+          find parsers parsers-ocsf enrichments -name parser.yaml | sort > /tmp/all_parsers.txt
           count=$(wc -l < /tmp/all_parsers.txt)
           echo "Validating $count parsers"
           # A glob that silently matches nothing would let this step pass while
