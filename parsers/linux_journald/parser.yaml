@@ -1,0 +1,303 @@
+name: linux_journald
+display_name: systemd-journald
+version: "1.0.0"
+description: "Parses systemd-journald structured JSON entries: priority, facility, unit, originating process, transport, plus sshd and sudo auth sub-parsing"
+match_values:
+  - linux_journald
+  - journald
+  - systemd_journal
+category: endpoint
+vendor: "systemd"
+product: "journald"
+parser_vrl: |
+  # systemd-journald Parser
+  #
+  # FORMAT REFERENCES — all field names and semantics below are taken from the
+  # official systemd documentation, not from observed traffic:
+  #
+  #   systemd.journal-fields.7 — canonical list of journal field names
+  #     https://man7.org/linux/man-pages/man7/systemd.journal-fields.7.html
+  #   journalctl.1 — the `-o json` export format consumed here
+  #     https://man7.org/linux/man-pages/man1/journalctl.1.html
+  #
+  # Input: one JSON object per journal entry, as emitted by `journalctl -o json`,
+  # systemd-journal-upload, Vector's `journald` source, or Fluent Bit's systemd
+  # input. Documented field meanings, quoting systemd.journal-fields.7:
+  #
+  #   MESSAGE               "The human-readable message string for this entry."
+  #   PRIORITY              "A priority value between 0 and 7 formatted as a
+  #                          decimal string" — 0 emerg through 7 debug.
+  #   SYSLOG_FACILITY       syslog compatibility field, "the facility
+  #                          formatted as decimal string".
+  #   SYSLOG_IDENTIFIER     syslog compatibility field, the "identifier
+  #                          string i.e. tag".
+  #   SYSLOG_PID            syslog compatibility field, "the client PID".
+  #   _PID _UID _GID        "of the process the journal entry originates from"
+  #   _COMM _EXE _CMDLINE   originating process name, executable path, cmdline
+  #   _HOSTNAME             "The hostname of the originating host."
+  #   _SYSTEMD_UNIT         "The systemd unit name ... the journal entry
+  #                          originates from."
+  #   _BOOT_ID              "The kernel boot ID for the boot the message was
+  #                          generated in."
+  #   _MACHINE_ID           "The machine ID of the originating host."
+  #   _TRANSPORT            "How the entry was received by the journal
+  #                          service" — audit, driver, syslog, journal,
+  #                          stdout or kernel.
+  #   _AUDIT_SESSION        audit session of the originating process
+  #   _AUDIT_LOGINUID       "The login UID of the process the journal entry
+  #                          originates from."
+  #   __REALTIME_TIMESTAMP  "The wallclock time CLOCK_REALTIME at the point in
+  #                          time the entry was received" — microseconds.
+  #
+  # Underscore-prefixed names are trusted journal fields, added by journald
+  # itself and not forgeable by the sending process. Names without an
+  # underscore come from the client and are treated as untrusted input.
+
+  .udm = {}
+  .ext = {}
+  if !is_object(.metadata) { .metadata = {} }
+
+  # ------------------------------------------------------------------
+  # Accept either a pre-decoded object or a JSON string in .message
+  # ------------------------------------------------------------------
+  entry = {}
+  decoded = false
+
+  if is_object(.message) {
+      entry = object!(.message)
+      decoded = true
+  } else {
+      raw_log = to_string(.message) ?? ""
+      parsed, parse_err = parse_json(raw_log)
+      if parse_err == null && is_object(parsed) {
+          entry = object!(parsed)
+          decoded = true
+      } else {
+          .ext.raw_message = raw_log
+          .ext.parse_error = "not a journald JSON entry"
+      }
+  }
+
+  if decoded {
+      .udm.vendor_product = "systemd-journald"
+
+      # --------------------------------------------------------------
+      # Message text
+      # --------------------------------------------------------------
+      if exists(entry.MESSAGE) {
+          .ext.message_body = to_string(entry.MESSAGE) ?? null
+      }
+
+      # --------------------------------------------------------------
+      # PRIORITY: 0 emerg .. 7 debug per systemd.journal-fields.7
+      # --------------------------------------------------------------
+      priority_num = -1
+      if exists(entry.PRIORITY) {
+          priority_num = to_int(entry.PRIORITY) ?? -1
+      }
+
+      if priority_num >= 0 && priority_num <= 7 {
+          .ext.priority = priority_num
+
+          severity_names = ["emergency", "alert", "critical", "error", "warning", "notice", "informational", "debug"]
+          sev_name = get(severity_names, [priority_num]) ?? null
+          if sev_name != null {
+              .ext.syslog_severity = to_string(sev_name) ?? null
+          }
+
+          if priority_num <= 2 {
+              .udm.severity = "critical"
+          } else if priority_num == 3 {
+              .udm.severity = "high"
+          } else if priority_num == 4 {
+              .udm.severity = "medium"
+          } else {
+              .udm.severity = "low"
+          }
+      }
+
+      # --------------------------------------------------------------
+      # SYSLOG_FACILITY — decimal string, mapped per RFC 5424 table 1
+      # --------------------------------------------------------------
+      if exists(entry.SYSLOG_FACILITY) {
+          facility_num = to_int(entry.SYSLOG_FACILITY) ?? -1
+          if facility_num >= 0 {
+              .ext.facility_num = facility_num
+              facility_names = ["kern", "user", "mail", "daemon", "auth", "syslog", "lpr", "news",
+                                "uucp", "cron", "authpriv", "ftp", "ntp", "audit", "alert", "clock",
+                                "local0", "local1", "local2", "local3", "local4", "local5", "local6", "local7"]
+              fac_name = get(facility_names, [facility_num]) ?? null
+              if fac_name != null {
+                  .ext.facility = to_string(fac_name) ?? null
+              } else {
+                  .ext.facility = to_string(facility_num)
+              }
+          }
+      }
+
+      # --------------------------------------------------------------
+      # Originating host and process
+      # --------------------------------------------------------------
+      if exists(entry._HOSTNAME) { .udm.src_host = to_string(entry._HOSTNAME) ?? null }
+
+      # SYSLOG_IDENTIFIER is the syslog tag; _COMM is journald's trusted
+      # process name. Prefer the tag for display, fall back to _COMM.
+      identifier = ""
+      if exists(entry.SYSLOG_IDENTIFIER) {
+          identifier = to_string(entry.SYSLOG_IDENTIFIER) ?? ""
+      } else if exists(entry._COMM) {
+          identifier = to_string(entry._COMM) ?? ""
+      }
+      if identifier != "" {
+          .udm.process_name = identifier
+          .ext.app_name = identifier
+      }
+
+      if exists(entry._COMM) { .ext.comm = to_string(entry._COMM) ?? null }
+      if exists(entry._EXE) { .udm.process_path = to_string(entry._EXE) ?? null }
+      if exists(entry._CMDLINE) { .udm.command_line = to_string(entry._CMDLINE) ?? null }
+
+      # _PID is journald-trusted; SYSLOG_PID is client-reported.
+      if exists(entry._PID) {
+          .udm.process_id = to_string(entry._PID) ?? null
+      } else if exists(entry.SYSLOG_PID) {
+          .udm.process_id = to_string(entry.SYSLOG_PID) ?? null
+      }
+
+      if exists(entry._UID) { .udm.user_id = to_string(entry._UID) ?? null }
+      if exists(entry._GID) { .ext.gid = to_string(entry._GID) ?? null }
+
+      # --------------------------------------------------------------
+      # systemd and host identity
+      # --------------------------------------------------------------
+      if exists(entry._SYSTEMD_UNIT) { .ext.systemd_unit = to_string(entry._SYSTEMD_UNIT) ?? null }
+      if exists(entry._SYSTEMD_SLICE) { .ext.systemd_slice = to_string(entry._SYSTEMD_SLICE) ?? null }
+      if exists(entry._SYSTEMD_CGROUP) { .ext.systemd_cgroup = to_string(entry._SYSTEMD_CGROUP) ?? null }
+      if exists(entry._BOOT_ID) { .ext.boot_id = to_string(entry._BOOT_ID) ?? null }
+      if exists(entry._MACHINE_ID) { .ext.machine_id = to_string(entry._MACHINE_ID) ?? null }
+      if exists(entry._TRANSPORT) { .ext.transport = to_string(entry._TRANSPORT) ?? null }
+      if exists(entry._AUDIT_SESSION) { .ext.audit_session = to_string(entry._AUDIT_SESSION) ?? null }
+      if exists(entry._AUDIT_LOGINUID) { .ext.audit_loginuid = to_string(entry._AUDIT_LOGINUID) ?? null }
+      if exists(entry.CODE_FILE) { .ext.code_file = to_string(entry.CODE_FILE) ?? null }
+      if exists(entry.CODE_LINE) { .ext.code_line = to_string(entry.CODE_LINE) ?? null }
+      if exists(entry.CODE_FUNC) { .ext.code_func = to_string(entry.CODE_FUNC) ?? null }
+      if exists(entry.MESSAGE_ID) { .ext.message_id = to_string(entry.MESSAGE_ID) ?? null }
+
+      # --------------------------------------------------------------
+      # __REALTIME_TIMESTAMP — CLOCK_REALTIME in microseconds
+      # --------------------------------------------------------------
+      if exists(entry.__REALTIME_TIMESTAMP) {
+          realtime_us = to_int(entry.__REALTIME_TIMESTAMP) ?? 0
+          if realtime_us > 0 {
+              ts = from_unix_timestamp(realtime_us * 1000, unit: "nanoseconds") ?? null
+              if ts != null {
+                  .udm.timestamp = ts
+              }
+          }
+      }
+
+      # --------------------------------------------------------------
+      # Auth sub-parsing for well-known identifiers.
+      #
+      # OpenSSH and sudo write these strings to the journal via syslog; the
+      # formats are the upstream OpenSSH auth log lines and the sudo log
+      # format documented in sudoers.5. Only the stable, widely documented
+      # lines are matched here.
+      #   https://man7.org/linux/man-pages/man5/sudoers.5.html
+      # --------------------------------------------------------------
+      message_text = to_string(.ext.message_body)
+      identifier_lower = downcase(identifier)
+
+      if identifier_lower == "sshd" && message_text != "" {
+          ssh_accept, ssh_a_err = parse_regex(message_text, r'^Accepted\s+(?P<method>\S+)\s+for\s+(?P<user>\S+)\s+from\s+(?P<ip>\S+)\s+port\s+(?P<port>\d+)')
+          if ssh_a_err == null {
+              .udm.user = string!(ssh_accept.user)
+              .udm.src_ip = string!(ssh_accept.ip)
+              .udm.src_port = to_int(string!(ssh_accept.port)) ?? null
+              .udm.authentication_method = string!(ssh_accept.method)
+              .udm.auth_type = "ssh"
+              .udm.auth_result = "success"
+              .udm.event_type = "login"
+          } else {
+              ssh_fail, ssh_f_err = parse_regex(message_text, r'^Failed\s+(?P<method>\S+)\s+for\s+(?:invalid user\s+)?(?P<user>\S+)\s+from\s+(?P<ip>\S+)\s+port\s+(?P<port>\d+)')
+              if ssh_f_err == null {
+                  .udm.user = string!(ssh_fail.user)
+                  .udm.src_ip = string!(ssh_fail.ip)
+                  .udm.src_port = to_int(string!(ssh_fail.port)) ?? null
+                  .udm.authentication_method = string!(ssh_fail.method)
+                  .udm.auth_type = "ssh"
+                  .udm.auth_result = "failure"
+                  .udm.event_type = "login_failed"
+              } else {
+                  ssh_disc, ssh_d_err = parse_regex(message_text, r'^(?:Disconnected from|Connection closed by)\s+(?:authenticating user\s+(?P<user>\S+)\s+)?(?P<ip>[0-9a-fA-F:.]+)\s+port\s+(?P<port>\d+)')
+                  if ssh_d_err == null {
+                      .udm.src_ip = string!(ssh_disc.ip)
+                      .udm.src_port = to_int(string!(ssh_disc.port)) ?? null
+                      .udm.auth_type = "ssh"
+                      .udm.event_type = "logout"
+                      disc_user = string!(ssh_disc.user)
+                      if disc_user != "" { .udm.user = disc_user }
+                  }
+              }
+          }
+
+      } else if identifier_lower == "sudo" && message_text != "" {
+          # sudoers.5 log line: user : TTY=x ; PWD=y ; USER=target ; COMMAND=cmd
+          sudo_match, sudo_err = parse_regex(message_text, r'(?P<user>\S+)\s*:\s+TTY=(?P<tty>\S+)\s*;\s*PWD=(?P<pwd>\S+)\s*;\s*USER=(?P<target_user>\S+)\s*;\s*COMMAND=(?P<command>.*)')
+          if sudo_err == null {
+              .udm.user = string!(sudo_match.user)
+              .udm.dest_user = string!(sudo_match.target_user)
+              .udm.command_line = string!(sudo_match.command)
+              .ext.tty = string!(sudo_match.tty)
+              .ext.working_directory = string!(sudo_match.pwd)
+              .udm.auth_type = "sudo"
+              .udm.event_type = "sudo"
+
+              command_full = string!(sudo_match.command)
+              command_parts = split(command_full, " ")
+              command_path = get(command_parts, [0]) ?? null
+              if command_path != null {
+                  path_segments = split(to_string(command_path) ?? "", "/")
+                  command_name = get(path_segments, [-1]) ?? null
+                  if command_name != null {
+                      .udm.process_name = to_string(command_name) ?? null
+                  }
+              }
+          } else {
+              # Authentication failure line, also documented in sudoers.5
+              sudo_fail, sudo_f_err = parse_regex(message_text, r'(?P<user>\S+)\s*:\s+(?P<reason>authentication failure|user NOT in sudoers|command not allowed)')
+              if sudo_f_err == null {
+                  .udm.user = string!(sudo_fail.user)
+                  .udm.auth_type = "sudo"
+                  .udm.auth_result = "failure"
+                  .udm.event_type = "sudo_failed"
+                  .ext.failure_reason = string!(sudo_fail.reason)
+              }
+          }
+
+      } else if identifier_lower == "kernel" && message_text != "" {
+          # netfilter LOG target prefix, iptables-extensions.8
+          netfilter_kv, netfilter_err = parse_regex(message_text, r'\bSRC=(?P<src>\S+)\s+DST=(?P<dst>\S+)')
+          if netfilter_err == null {
+              .udm.src_ip = string!(netfilter_kv.src)
+              .udm.dest_ip = string!(netfilter_kv.dst)
+              .udm.event_type = "firewall"
+
+              port_match, port_err = parse_regex(message_text, r'\bSPT=(?P<spt>\d+)\s+DPT=(?P<dpt>\d+)')
+              if port_err == null {
+                  .udm.src_port = to_int(string!(port_match.spt)) ?? null
+                  .udm.dest_port = to_int(string!(port_match.dpt)) ?? null
+              }
+
+              proto_match, proto_err = parse_regex(message_text, r'\bPROTO=(?P<proto>\S+)')
+              if proto_err == null {
+                  .udm.protocol = string!(proto_match.proto)
+              }
+          }
+      }
+  }
+
+  # Fall back to ingest time when the entry carried no usable timestamp
+  if !exists(.udm.timestamp) || .udm.timestamp == null {
+      .udm.timestamp = now()
+  }

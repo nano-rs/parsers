@@ -26,8 +26,15 @@ parser_vrl: |
       pri_val = to_int(string!(pri_match.pri)) ?? 0
       rest = string!(pri_match.rest)
 
-      # Decode facility and severity from PRI
-      facility_num = pri_val / 8
+      # Decode facility and severity from PRI.
+      #
+      # VRL division always yields a float, so `pri_val / 8` gives 3.75 for
+      # PRI 30 rather than 3. Left unfloored, the severity subtraction below
+      # collapses to zero and EVERY event is labelled critical, while the
+      # facility name lookup misses and falls back to the string "3.75".
+      # Floor to an int first — RFC 5424 section 6.2.1 defines facility as the
+      # integer quotient of PRI over 8 and severity as the remainder.
+      facility_num = to_int(floor(pri_val / 8))
       severity_num = pri_val - (facility_num * 8)
 
       # Map facility number to name
@@ -146,8 +153,12 @@ parser_vrl: |
               .udm.process_name = app_name
               .ext.app_name = app_name
 
-              # PID (optional)
-              pid_val = string!(rfc3164_match.pid)
+              # PID (optional). A named group that does not participate in the
+              # match yields null, not "", so `string!` aborts the whole
+              # program and the event is dropped as a parse failure. Any
+              # RFC 3164 line without a "[pid]" bracket — which is a great
+              # many of them — hits this. Coalesce instead of asserting.
+              pid_val = to_string(rfc3164_match.pid)
               if pid_val != "" {
                   .udm.process_id = pid_val
               }
