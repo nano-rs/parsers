@@ -1,0 +1,337 @@
+name: routeros
+display_name: MikroTik RouterOS
+version: "1.0.0"
+description: "Parses MikroTik RouterOS remote syslog: DNS queries and answers, user login/logout/failure, firewall connection tracking, and DHCP lease events"
+match_values:
+  - routeros
+  - mikrotik
+category: network
+vendor: "MikroTik"
+product: "RouterOS"
+parser_vrl: |
+  # MikroTik RouterOS Parser
+  #
+  # FORMAT REFERENCES — every message shape below is taken from vendor
+  # documentation or independent public parser projects, not from observed
+  # customer traffic:
+  #
+  #   MikroTik RouterOS Log documentation — remote logging transport, topic
+  #   system, and the remote-log-format / syslog-time-format settings
+  #     https://help.mikrotik.com/docs/spaces/ROS/pages/328094/Log
+  #   MikroTik RouterOS DNS documentation — the dns topic
+  #     https://help.mikrotik.com/docs/spaces/ROS/pages/37748767/DNS
+  #   coolacid/logstash-grok — independent MikroTik grok patterns covering
+  #   DNS query and answer, firewall with and without NAT, DHCP, login
+  #     https://github.com/coolacid/logstash-grok/blob/master/patterns/mikrotik
+  #   publi0/mikrotik-dns — documents the DNS query line format
+  #     https://github.com/publi0/mikrotik-dns
+  #
+  # ENVELOPE — RouterOS forwards to a remote collector using BSD syslog,
+  # RFC 3164, per the Log documentation. That documentation also states that
+  # enabling BSD syslog format adds the RFC 3164 date and severity headers but
+  # REMOVES the topic prefix from the message body. Two device settings change
+  # the wire format independently:
+  #
+  #   remote-log-format   syslog  -> RFC 3164 envelope, topics stripped
+  #                       default -> topics present as a comma-separated prefix
+  #   syslog-time-format  bsd-syslog -> "Mon DD HH:MM:SS"
+  #                       iso8601    -> "YYYY-MM-DDTHH:MM:SS"
+  #
+  # A parser that assumes only one branch of that matrix works on one device
+  # and silently falls through to generic on the next. The envelope handling
+  # below therefore treats PRI, timestamp, hostname and topic prefix as all
+  # independently optional, and the message-family patterns are unanchored so
+  # they match regardless of which envelope elements are present.
+  #
+  # NOT PARSED, deliberately: the SSH transport detail lines RouterOS emits
+  # under the ssh topic — "auth req:", "kex algo:", "channel #N", "enc algo".
+  # No public format reference exists for those strings, so they are left in
+  # the raw message rather than guessed at. Web proxy lines are likewise left
+  # alone pending a citable format.
+
+  .udm = {}
+  .ext = {}
+  if !is_object(.metadata) { .metadata = {} }
+
+  raw_log = string!(.message)
+  body = raw_log
+
+  .udm.vendor_product = "MikroTik RouterOS"
+
+  # ------------------------------------------------------------------
+  # Optional PRI header, RFC 3164 section 4.1.1
+  # ------------------------------------------------------------------
+  pri_match, pri_err = parse_regex(raw_log, r'^<(?P<pri>\d{1,3})>(?P<rest>.*)')
+  if pri_err == null {
+      pri_val = to_int(string!(pri_match.pri)) ?? 0
+      body = string!(pri_match.rest)
+
+      # VRL division always yields a float, so `pri_val / 8` gives e.g. 3.75
+      # for PRI 30. Left unfloored, the severity subtraction below collapses to
+      # zero and every event is labelled emergency/critical. Floor to an int
+      # first — RFC 5424 section 6.2.1 defines facility as the integer quotient
+      # and severity as the remainder.
+      facility_num = to_int(floor(pri_val / 8))
+      severity_num = pri_val - (facility_num * 8)
+      .ext.facility_num = facility_num
+      .ext.severity_num = severity_num
+
+      facility_names = ["kern", "user", "mail", "daemon", "auth", "syslog", "lpr", "news",
+                        "uucp", "cron", "authpriv", "ftp", "ntp", "audit", "alert", "clock",
+                        "local0", "local1", "local2", "local3", "local4", "local5", "local6", "local7"]
+      fac_name = get(facility_names, [facility_num]) ?? null
+      if fac_name != null { .ext.facility = to_string(fac_name) ?? null }
+
+      severity_names = ["emergency", "alert", "critical", "error", "warning", "notice", "informational", "debug"]
+      sev_name = get(severity_names, [severity_num]) ?? null
+      if sev_name != null { .ext.syslog_severity = to_string(sev_name) ?? null }
+
+      if severity_num <= 2 {
+          .udm.severity = "critical"
+      } else if severity_num == 3 {
+          .udm.severity = "high"
+      } else if severity_num == 4 {
+          .udm.severity = "medium"
+      } else {
+          .udm.severity = "low"
+      }
+  }
+
+  # ------------------------------------------------------------------
+  # Optional leading timestamp — bsd-syslog or iso8601 per syslog-time-format
+  # ------------------------------------------------------------------
+  iso_match, iso_err = parse_regex(body, r'^(?P<ts>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s+(?P<rest>.*)')
+  if iso_err == null {
+      parsed_ts = parse_timestamp(string!(iso_match.ts), "%+") ?? null
+      if parsed_ts != null { .udm.timestamp = parsed_ts }
+      body = string!(iso_match.rest)
+  } else {
+      bsd_match, bsd_err = parse_regex(body, r'^(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(?P<rest>.*)')
+      if bsd_err == null {
+          parsed_ts = parse_timestamp(string!(bsd_match.ts), "%b %d %H:%M:%S") ?? null
+          if parsed_ts != null { .udm.timestamp = parsed_ts }
+          body = string!(bsd_match.rest)
+      }
+  }
+
+  # ------------------------------------------------------------------
+  # Optional hostname, then optional comma-separated topic prefix.
+  #
+  # Topics are lowercase words per the Log documentation topic list; a
+  # hostname is consumed only when what follows still looks like a topic
+  # list or a known message family, so a bare message body is not mistaken
+  # for a hostname.
+  # ------------------------------------------------------------------
+  host_match, host_err = parse_regex(body, r'^(?P<host>[A-Za-z0-9][A-Za-z0-9._-]*)\s+(?P<rest>(?:[a-z][a-z0-9-]*,[a-z0-9,-]+\s+|query from |local query: |done query: |user\s|login failure|dhcp\S*\s).*)')
+  if host_err == null {
+      .udm.src_host = string!(host_match.host)
+      body = string!(host_match.rest)
+  }
+
+  topic_match, topic_err = parse_regex(body, r'^(?P<topics>[a-z][a-z0-9-]*(?:,[a-z0-9-]+)+)\s+(?P<rest>.*)')
+  if topic_err == null {
+      topics_str = string!(topic_match.topics)
+      .ext.topics = topics_str
+      body = string!(topic_match.rest)
+
+      # The topic list carries the RouterOS severity word when present.
+      if contains(topics_str, "critical") {
+          .udm.severity = "critical"
+      } else if contains(topics_str, "error") {
+          .udm.severity = "high"
+      } else if contains(topics_str, "warning") {
+          .udm.severity = "medium"
+      }
+  }
+
+  .ext.message_body = body
+
+  # ------------------------------------------------------------------
+  # DNS — query, local query, and answer.
+  #
+  # Query line format per publi0/mikrotik-dns:
+  #   query from 192.168.1.100: #12345 google.com. A
+  # Answer line per coolacid MIKROTIKDNSANSWER:
+  #   done query: #12345 <name or resolver status text>
+  # ------------------------------------------------------------------
+  matched = false
+
+  dns_query, dns_q_err = parse_regex(body, r'query from (?P<src_ip>[^:\s]+):\s+#(?P<qid>\d+)\s+(?P<qname>\S+?)\.?\s+(?P<qtype>[A-Z]+)\b')
+  if dns_q_err == null {
+      .udm.src_ip = string!(dns_query.src_ip)
+      .udm.query = string!(dns_query.qname)
+      .udm.url_domain = string!(dns_query.qname)
+      .udm.query_type = string!(dns_query.qtype)
+      .udm.record_type = string!(dns_query.qtype)
+      .ext.dns_query_id = string!(dns_query.qid)
+      .udm.event_type = "dns_query"
+      .udm.action = "query"
+      matched = true
+  }
+
+  if !matched {
+      dns_local, dns_l_err = parse_regex(body, r'local query:\s+#(?P<qid>\d+)\s+(?P<qname>\S+?)\.?\s+(?P<qtype>[A-Z]+)\b')
+      if dns_l_err == null {
+          .udm.query = string!(dns_local.qname)
+          .udm.url_domain = string!(dns_local.qname)
+          .udm.query_type = string!(dns_local.qtype)
+          .udm.record_type = string!(dns_local.qtype)
+          .ext.dns_query_id = string!(dns_local.qid)
+          .ext.dns_query_origin = "local"
+          .udm.event_type = "dns_query"
+          .udm.action = "query"
+          matched = true
+      }
+  }
+
+  if !matched {
+      dns_nxdomain, nx_err = parse_regex(body, r'done query:\s+#(?P<qid>\d+)\s+dns name does not exist')
+      if nx_err == null {
+          .ext.dns_query_id = string!(dns_nxdomain.qid)
+          .udm.status = "NXDOMAIN"
+          .udm.result = "failure"
+          .udm.event_type = "dns_response"
+          matched = true
+      }
+  }
+
+  if !matched {
+      dns_nodata, nd_err = parse_regex(body, r'done query:\s+#(?P<qid>\d+)\s+dns name exists, but no appropriate record')
+      if nd_err == null {
+          .ext.dns_query_id = string!(dns_nodata.qid)
+          .udm.status = "NODATA"
+          .udm.result = "failure"
+          .udm.event_type = "dns_response"
+          matched = true
+      }
+  }
+
+  if !matched {
+      dns_answer, dns_a_err = parse_regex(body, r'done query:\s+#(?P<qid>\d+)\s+(?P<qname>\S+?)\.?\s+(?P<answer>[0-9]{1,3}(?:\.[0-9]{1,3}){3}|[0-9a-fA-F:]{3,})\s*$')
+      if dns_a_err == null {
+          .udm.query = string!(dns_answer.qname)
+          .udm.url_domain = string!(dns_answer.qname)
+          .udm.answer = string!(dns_answer.answer)
+          .udm.dns_answers = [string!(dns_answer.answer)]
+          .ext.dns_query_id = string!(dns_answer.qid)
+          .udm.status = "NOERROR"
+          .udm.result = "success"
+          .udm.event_type = "dns_response"
+          matched = true
+      }
+  }
+
+  # ------------------------------------------------------------------
+  # Login and logout, per coolacid MIKROTIKLOGINOUT and MIKROTIKLOGINFAIL:
+  #   user admin logged in from 192.168.1.5 via winbox
+  #   user admin logged out from 192.168.1.5 via ssh
+  #   login failure for user admin from 192.168.1.5 via ssh
+  # ------------------------------------------------------------------
+  if !matched {
+      login_match, login_err = parse_regex(body, r'user\s+(?P<user>\S+)\s+logged\s+(?P<direction>in|out)\s+from\s+(?P<src_ip>\S+)(?:\s+via\s+(?P<via>\S+))?')
+      if login_err == null {
+          .udm.user = string!(login_match.user)
+          .udm.src_ip = string!(login_match.src_ip)
+          .udm.auth_result = "success"
+          direction = string!(login_match.direction)
+          if direction == "in" {
+              .udm.event_type = "login"
+              .udm.action = "login"
+          } else {
+              .udm.event_type = "logout"
+              .udm.action = "logout"
+          }
+          via = string!(login_match.via)
+          if via != "" {
+              .udm.auth_type = via
+              .udm.authentication_method = via
+          }
+          matched = true
+      }
+  }
+
+  if !matched {
+      loginfail_match, loginfail_err = parse_regex(body, r'login failure for user\s+(?P<user>\S+)\s+from\s+(?P<src_ip>\S+)(?:\s+via\s+(?P<via>\S+))?')
+      if loginfail_err == null {
+          .udm.user = string!(loginfail_match.user)
+          .udm.src_ip = string!(loginfail_match.src_ip)
+          .udm.auth_result = "failure"
+          .udm.result = "failure"
+          .udm.event_type = "login_failed"
+          .udm.action = "login"
+          via = string!(loginfail_match.via)
+          if via != "" {
+              .udm.auth_type = via
+              .udm.authentication_method = via
+          }
+          matched = true
+      }
+  }
+
+  # ------------------------------------------------------------------
+  # Firewall connection tracking, per coolacid MIKROTIKFIREWALL patterns:
+  #   forward: in:ether1 out:ether2, src-mac aa:bb:cc:dd:ee:ff,
+  #   proto TCP, 192.168.1.10:52134->93.184.216.34:443, len 60
+  # ------------------------------------------------------------------
+  if !matched {
+      flow_match, flow_err = parse_regex(body, r'(?P<src_ip>[0-9]{1,3}(?:\.[0-9]{1,3}){3}):(?P<src_port>\d+)->(?P<dest_ip>[0-9]{1,3}(?:\.[0-9]{1,3}){3}):(?P<dest_port>\d+)')
+      if flow_err == null {
+          .udm.src_ip = string!(flow_match.src_ip)
+          .udm.dest_ip = string!(flow_match.dest_ip)
+          .udm.src_port = to_int(string!(flow_match.src_port)) ?? null
+          .udm.dest_port = to_int(string!(flow_match.dest_port)) ?? null
+          .udm.event_type = "firewall"
+          matched = true
+
+          chain_match, chain_err = parse_regex(body, r'(?P<chain>input|output|forward|prerouting|postrouting):')
+          if chain_err == null { .ext.chain = string!(chain_match.chain) }
+
+          iface_match, iface_err = parse_regex(body, r'in:(?P<in_if>\S*)\s+out:(?P<out_if>\S*?),')
+          if iface_err == null {
+              in_if = string!(iface_match.in_if)
+              out_if = string!(iface_match.out_if)
+              if in_if != "" { .ext.interface_in = in_if }
+              if out_if != "" { .ext.interface_out = out_if }
+          }
+
+          mac_match, mac_err = parse_regex(body, r'src-mac\s+(?P<src_mac>[0-9a-fA-F:]{11,17})')
+          if mac_err == null { .udm.src_mac = string!(mac_match.src_mac) }
+
+          proto_match, proto_err = parse_regex(body, r'proto\s+(?P<proto>[A-Za-z0-9-]+)')
+          if proto_err == null { .udm.protocol = string!(proto_match.proto) }
+
+          len_match, len_err = parse_regex(body, r'\blen\s+(?P<len>\d+)')
+          if len_err == null { .udm.bytes_in = to_int(string!(len_match.len)) ?? null }
+      }
+  }
+
+  # ------------------------------------------------------------------
+  # DHCP leases, per coolacid MIKROTIKDHCP:
+  #   dhcp1 assigned 192.168.1.100 to AA:BB:CC:DD:EE:FF
+  #   dhcp1 deassigned 192.168.1.100 from AA:BB:CC:DD:EE:FF
+  # ------------------------------------------------------------------
+  if !matched {
+      dhcp_match, dhcp_err = parse_regex(body, r'(?P<server>\S+)\s+(?P<action>assigned|deassigned)\s+(?P<ip>[0-9]{1,3}(?:\.[0-9]{1,3}){3})\s+(?:to|from)\s+(?P<mac>[0-9a-fA-F:]{11,17})')
+      if dhcp_err == null {
+          .ext.dhcp_server = string!(dhcp_match.server)
+          .udm.src_ip = string!(dhcp_match.ip)
+          .udm.src_mac = string!(dhcp_match.mac)
+          dhcp_action = string!(dhcp_match.action)
+          .udm.action = dhcp_action
+          if dhcp_action == "assigned" {
+              .udm.event_type = "dhcp_assign"
+          } else {
+              .udm.event_type = "dhcp_release"
+          }
+          matched = true
+      }
+  }
+
+  if !matched {
+      .ext.unparsed = true
+  }
+
+  # Fall back to ingest time when no timestamp was present in the envelope
+  if !exists(.udm.timestamp) || .udm.timestamp == null {
+      .udm.timestamp = now()
+  }

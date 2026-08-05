@@ -19,6 +19,7 @@ A collection of VRL parsers for nano log source ingestion.
 | [Windows Event Log (XML)](parsers/windows_event_xml) | `windows_event` | Microsoft | Native XML | 30+ EventIDs parsed from raw Windows Event XML |
 | [Windows Event Log (Text)](parsers/windows_event_text) | `windows_event` | Microsoft | Rendered text | Splunk UF / wevtutil format with section-aware body parsing |
 | [Linux auditd](parsers/linux_auditd) | `linux_auditd` | Linux | key=value | SYSCALL, EXECVE, PATH, USER_AUTH, USER_LOGIN, AVC (SELinux), NETFILTER |
+| [systemd-journald](parsers/linux_journald) | `linux_journald` | systemd | JSON (journalctl -o json) | Priority, facility, unit, originating process, transport; sshd, sudo and netfilter sub-parsing |
 | [LimaCharlie EDR](parsers/limacharlie) | `limacharlie` | LimaCharlie | JSON | Sensor telemetry: process, network, DNS, file, module, registry, auth, detections |
 
 ### Network & Firewall
@@ -32,6 +33,7 @@ A collection of VRL parsers for nano log source ingestion.
 | [Sophos Firewall](parsers/sophos) | `sophos` | Sophos | key=value syslog | Firewall, content filtering, AV, ATP, IDP, anti-spam, WAF |
 | [Juniper SRX](parsers/juniper_srx) | `juniper_srx` | Juniper | RFC 5424 structured data | RT_FLOW sessions, RT_IDP attacks, RT_UTM events |
 | [Cisco Meraki](parsers/meraki) | `meraki` | Cisco | Syslog | MX firewall flows, IDS alerts, URL filtering, wireless, VPN |
+| [MikroTik RouterOS](parsers/routeros) | `routeros` | MikroTik | RFC 3164 syslog | DNS queries/answers, user login/logout/failure, firewall flows, DHCP leases |
 | [SonicWall](parsers/sonicwall) | `sonicwall` | SonicWall | key=value syslog | Connections, IPS detection, content filtering, user auth |
 | [Zscaler ZIA](parsers/zscaler_zia) | `zscaler_zia` | Zscaler | JSON envelope | Web, firewall, DNS, tunnel, DLP, audit log types |
 | [Broadcom ProxySG](parsers/broadcom_proxy) | `broadcom_proxy` | Broadcom | ELFF space-delimited | Web proxy access logs with URL reconstruction |
