@@ -301,3 +301,47 @@ parser_vrl: |
   if !exists(.udm.timestamp) || .udm.timestamp == null {
       .udm.timestamp = now()
   }
+
+# Runtime samples (NAN-2327). Field names per systemd.journal-fields(7);
+# input shape is one JSON object per entry as emitted by journalctl -o json.
+samples:
+  - raw: '{"__REALTIME_TIMESTAMP":"1785931200000000","PRIORITY":"6","SYSLOG_FACILITY":"4","SYSLOG_IDENTIFIER":"sshd","MESSAGE":"Accepted publickey for alice from 203.0.113.5 port 54321 ssh2","_PID":"1234","_HOSTNAME":"web01","_SYSTEMD_UNIT":"ssh.service","_TRANSPORT":"syslog"}'
+    expect:
+      udm.event_type: login
+      udm.user: alice
+      udm.src_ip: 203.0.113.5
+      udm.auth_result: success
+      udm.src_host: web01
+      udm.severity: low
+      ext.facility: auth
+      ext.systemd_unit: ssh.service
+  - raw: '{"PRIORITY":"3","SYSLOG_IDENTIFIER":"sshd","MESSAGE":"Failed password for invalid user bob from 198.51.100.9 port 2222 ssh2","_HOSTNAME":"web01"}'
+    expect:
+      udm.event_type: login_failed
+      udm.user: bob
+      udm.auth_result: failure
+      udm.severity: high
+  - raw: '{"PRIORITY":"5","SYSLOG_IDENTIFIER":"sudo","MESSAGE":"alice : TTY=pts/0 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/apt update","_HOSTNAME":"web01"}'
+    expect:
+      udm.event_type: sudo
+      udm.user: alice
+      udm.dest_user: root
+      udm.process_name: apt
+  - raw: '{"PRIORITY":"4","SYSLOG_IDENTIFIER":"kernel","_TRANSPORT":"kernel","MESSAGE":"[UFW BLOCK] IN=eth0 OUT= SRC=192.0.2.5 DST=10.10.0.3 PROTO=TCP SPT=44321 DPT=22","_HOSTNAME":"fw01"}'
+    expect:
+      udm.event_type: firewall
+      udm.src_ip: 192.0.2.5
+      udm.dest_ip: 10.10.0.3
+      udm.protocol: TCP
+      udm.severity: medium
+  # A plain unit message carries no auth semantics — it must still parse the
+  # envelope cleanly rather than abort.
+  - raw: '{"PRIORITY":"6","SYSLOG_IDENTIFIER":"systemd","_TRANSPORT":"journal","MESSAGE":"Started Daily apt download activities.","_HOSTNAME":"web01","_SYSTEMD_UNIT":"apt-daily.service"}'
+    expect:
+      udm.src_host: web01
+      ext.systemd_unit: apt-daily.service
+      udm.severity: low
+  # Non-JSON input must degrade gracefully, not abort.
+  - raw: 'this is not a journald entry'
+    expect:
+      ext.parse_error: not a journald JSON entry

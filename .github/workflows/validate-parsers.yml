@@ -3,6 +3,12 @@ name: Validate & Auto-Merge Parsers
 on:
   pull_request:
     branches: [main]
+    # `ready_for_review` is not in the default type set (opened, synchronize,
+    # reopened). Without it, undrafting a PR re-runs nothing, so the Auto-Merge
+    # job keeps whatever result it got while the PR was still a draft — a red X
+    # that never clears and never merges. Every draft PR then needs a manual
+    # merge despite a green validation run.
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "parsers/**"
       # parsers-ocsf/ was covered by neither the path filter nor the discovery
@@ -83,7 +89,12 @@ jobs:
     name: Auto-Merge
     needs: validate-vrl
     runs-on: ubuntu-latest
-    if: success()
+    # Skip on drafts rather than attempting the merge and failing with
+    # "Pull Request is still a draft". That error is expected on every draft
+    # PR, but it surfaces as a failed check, which is indistinguishable at a
+    # glance from a real problem. Combined with the ready_for_review trigger
+    # above, a draft now shows no auto-merge result until it is marked ready.
+    if: success() && github.event.pull_request.draft == false
     steps:
       - name: Enable auto-merge
         uses: actions/github-script@v7
