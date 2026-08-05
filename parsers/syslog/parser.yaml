@@ -258,3 +258,45 @@ parser_vrl: |
       .ext.raw_message = raw_log
       .ext.parse_error = "no syslog PRI header found"
   }
+
+# Runtime samples (NAN-2327). These are regression tests for FRO-677, where
+# two defects each dropped 100% of events while CI reported success.
+samples:
+  # PRI decode must floor the facility quotient before using it as an array
+  # index. `pri_val / 8` returns a float in VRL (3.75 for PRI 30), which threw
+  # "path segment must be either string or integer, not float" and aborted.
+  - raw: '<30>Aug  5 12:00:00 host1 testd: daemon informational probe'
+    expect:
+      udm.severity: low
+      ext.facility: daemon
+      udm.src_host: host1
+  - raw: '<11>Aug  5 12:00:00 host1 testd: user error probe'
+    expect:
+      udm.severity: high
+      ext.facility: user
+  - raw: '<0>Aug  5 12:00:00 host1 kernel: emergency probe'
+    expect:
+      udm.severity: critical
+      ext.facility: kern
+  - raw: '<191>Aug  5 12:00:00 host1 testd: local7 debug probe'
+    expect:
+      udm.severity: low
+      ext.facility: local7
+  # The "[pid]" group is optional. A non-participating named group yields null,
+  # not "", so string! on it aborted for every line without a PID bracket.
+  - raw: '<38>Aug  5 12:00:00 host1 sshd: no pid bracket on this line'
+    expect:
+      udm.process_name: sshd
+      udm.severity: low
+  - raw: '<38>Aug  5 12:00:00 host1 sshd[1234]: Accepted publickey for alice from 203.0.113.5 port 22 ssh2'
+    expect:
+      udm.process_id: '1234'
+      udm.user: alice
+      udm.auth_result: success
+      udm.event_type: login
+  # RFC 5424 branch
+  - raw: '<34>1 2026-08-05T12:00:00.000Z host1 myapp 555 ID47 - structured probe'
+    expect:
+      udm.src_host: host1
+      udm.process_name: myapp
+      ext.rfc_version: '5424'

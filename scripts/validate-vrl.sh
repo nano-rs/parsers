@@ -9,6 +9,17 @@ CHANGED_FILE="${1:?Usage: validate-vrl.sh <file-with-changed-paths>}"
 FAIL=0
 WARN=0
 PASS=0
+SAMPLED=0
+UNSAMPLED=0
+UNSAMPLED_NAMES=""
+
+# `vector vrl --print-object` emits timestamps as VRL literals (t'2026-01-01T…'),
+# which is not valid JSON. Rewrite them to plain strings so the result can be
+# fed to jq. Used to tell "ran to completion" from "aborted": a program that
+# finishes emits a JSON object, one that aborts emits "aborted" or a bare error.
+normalize_vector_output() {
+    printf '%s' "$1" | grep -v "INFO vector" | perl -pe "s/t'([^']*)'/\"\$1\"/g"
+}
 
 # Minimal test events — just enough structure for VRL to compile + run against.
 #   log:        a wrapped raw log line (the common `parser_vrl` shape)
@@ -100,7 +111,9 @@ EOF
     # --print-object outputs the transformed event
     # Exit code 0 = valid, non-zero = compilation error
     output=""
+    compiled=0
     if output=$(vector vrl --input "$event_file" --program "$vrl_file" --print-object 2>&1); then
+        compiled=1
         # Check for warnings in output
         if echo "$output" | grep -qi "warning"; then
             echo "  WARN: VRL compiled with warnings"
@@ -116,18 +129,110 @@ EOF
         FAIL=$((FAIL + 1))
     fi
 
+    # NAN-2327: everything above proves only that the program COMPILES.
+    # `vector vrl` exits 0 even when the program aborts at runtime — it prints
+    # the error and returns success — so the exit-code check above cannot see a
+    # parser that drops every event it touches. Two such defects shipped to main
+    # behind a green run (FRO-677: a float array index in the PRI decode, and
+    # string! on a non-participating optional regex group).
+    #
+    # The reliable signal is whether `--print-object` emitted a JSON object. A
+    # parser that handles a bad line writes its complaint INTO the event (e.g.
+    # .metadata.parse_error) and still emits an object; one that aborts emits
+    # "aborted" or a bare error line instead. So: parseable as JSON = ran to
+    # completion, not parseable = aborted.
+    if [ "$compiled" -eq 1 ] && [ "$is_enrichment" -eq 0 ]; then
+        if ! normalize_vector_output "$output" | jq -e . >/dev/null 2>&1; then
+            echo "  NOTE: aborts on the generic stub event (no JSON emitted)"
+            echo "        Not blocking — the stub is not a meaningful input for"
+            echo "        most parsers. Add samples: to assert real behaviour."
+        fi
+    fi
+
+    # ---------------------------------------------------------------------
+    # Sample-based runtime validation (NAN-2327)
+    #
+    # An optional `samples:` block carries representative RAW lines for this
+    # parser. Unlike the stub above these are inputs the parser is expected to
+    # handle, so aborting on one is a hard failure, and declared `expect:`
+    # fields must match. This is the check that would have caught FRO-677.
+    #
+    #   samples:
+    #     - raw: '<30>Aug  5 12:00:00 host1 testd: probe'
+    #       expect:
+    #         udm.severity: low
+    #         udm.src_host: host1
+    # ---------------------------------------------------------------------
+    sample_count=$(yq '.samples // [] | length' "$parser_file")
+    if [ "$compiled" -eq 1 ] && [ "${sample_count:-0}" -gt 0 ]; then
+        SAMPLED=$((SAMPLED + 1))
+        sample_failed=0
+        idx=0
+        while [ "$idx" -lt "$sample_count" ]; do
+            raw=$(yq ".samples[$idx].raw" "$parser_file")
+            sample_event=$(mktemp /tmp/sample_XXXXXX.json)
+            jq -nc --arg m "$raw" '{message: $m}' > "$sample_event"
+
+            s_out=$(vector vrl --input "$sample_event" --program "$vrl_file" --print-object 2>&1)
+            s_json=$(normalize_vector_output "$s_out")
+
+            if ! printf '%s' "$s_json" | jq -e . >/dev/null 2>&1; then
+                echo "  FAIL: sample[$idx] aborted at runtime — the parser would DROP this event"
+                echo "    input:  $raw"
+                echo "$s_out" | grep -v "INFO vector" | head -3 | sed 's/^/    output: /'
+                sample_failed=1
+            else
+                # Assert declared expectations, if any
+                exp_keys=$(yq -o=json ".samples[$idx].expect // {}" "$parser_file" | jq -r 'keys[]?')
+                for key in $exp_keys; do
+                    want=$(yq ".samples[$idx].expect.\"$key\"" "$parser_file")
+                    got=$(printf '%s' "$s_json" | jq -r --arg p "$key" 'getpath($p | split(".")) // "<missing>"')
+                    if [ "$got" != "$want" ]; then
+                        echo "  FAIL: sample[$idx] expected $key = '$want' but got '$got'"
+                        echo "    input: $raw"
+                        sample_failed=1
+                    fi
+                done
+            fi
+            rm -f "$sample_event"
+            idx=$((idx + 1))
+        done
+
+        if [ "$sample_failed" -eq 1 ]; then
+            FAIL=$((FAIL + 1))
+            PASS=$((PASS - 1))
+        else
+            echo "  OK: $sample_count sample(s) parsed and matched expectations"
+        fi
+    elif [ "$is_enrichment" -eq 0 ]; then
+        UNSAMPLED=$((UNSAMPLED + 1))
+        UNSAMPLED_NAMES="${UNSAMPLED_NAMES}${parser_name} "
+    fi
+
     rm -f "$vrl_file" "$event_file"
 done < "$CHANGED_FILE"
 
 echo ""
 echo "═══════════════════════════════════════"
 echo "Results: $PASS passed, $WARN warnings, $FAIL failed"
+echo "Runtime samples: $SAMPLED parser(s) exercised against real input"
 echo "═══════════════════════════════════════"
 
+# NAN-2327: a compile-only pass is a weak signal. Name the parsers that carry no
+# samples so the gap stays visible rather than reading as full coverage.
+if [ "$UNSAMPLED" -gt 0 ]; then
+    echo ""
+    echo "$UNSAMPLED parser(s) have no samples: block and were only compile-checked:"
+    echo "  $UNSAMPLED_NAMES" | fold -s -w 76 | sed 's/^/  /'
+    echo "  These are NOT verified to parse anything. Add samples: to cover them."
+fi
+
 if [ "$FAIL" -gt 0 ]; then
+    echo ""
     echo "Blocking merge — fix VRL errors above."
     exit 1
 fi
 
+echo ""
 echo "All parsers valid. Clear to merge."
 exit 0

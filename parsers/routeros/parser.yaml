@@ -335,3 +335,66 @@ parser_vrl: |
   if !exists(.udm.timestamp) || .udm.timestamp == null {
       .udm.timestamp = now()
   }
+
+# Runtime samples (NAN-2327). Cover the format matrix — remote-log-format
+# syslog vs default (topics stripped or present) and syslog-time-format
+# bsd-syslog vs iso8601 — plus one line per message family.
+samples:
+  # RFC 3164, topics stripped (remote-log-format=syslog)
+  - raw: '<30>Aug  5 12:00:00 edge-rtr query from 10.20.0.5: #1001 example.com. A'
+    expect:
+      udm.event_type: dns_query
+      udm.query: example.com
+      udm.query_type: A
+      udm.src_ip: 10.20.0.5
+      udm.severity: low
+  # Topics present (remote-log-format=default)
+  - raw: '<30>Aug  5 12:00:00 edge-rtr dns,packet query from 10.20.0.6: #1002 example.net. AAAA'
+    expect:
+      udm.event_type: dns_query
+      udm.query: example.net
+      ext.topics: dns,packet
+  # iso8601 timestamp variant
+  - raw: '<30>2026-08-05T12:00:00Z edge-rtr query from 10.20.0.7: #1003 example.org. A'
+    expect:
+      udm.event_type: dns_query
+      udm.query: example.org
+  - raw: '<30>Aug  5 12:00:00 edge-rtr done query: #1001 example.com. 192.0.2.10'
+    expect:
+      udm.event_type: dns_response
+      udm.answer: 192.0.2.10
+      udm.status: NOERROR
+  - raw: '<30>Aug  5 12:00:00 edge-rtr done query: #1004 dns name does not exist'
+    expect:
+      udm.event_type: dns_response
+      udm.status: NXDOMAIN
+  - raw: '<30>Aug  5 12:00:00 edge-rtr done query: #1005 dns name exists, but no appropriate record'
+    expect:
+      udm.status: NODATA
+  - raw: '<30>Aug  5 12:00:00 edge-rtr system,info,account user admin logged in from 203.0.113.9 via ssh'
+    expect:
+      udm.event_type: login
+      udm.user: admin
+      udm.src_ip: 203.0.113.9
+      udm.auth_type: ssh
+  - raw: '<38>Aug  5 12:00:00 edge-rtr system,error,critical login failure for user root from 198.51.100.4 via ssh'
+    expect:
+      udm.event_type: login_failed
+      udm.user: root
+      udm.auth_result: failure
+      udm.severity: critical
+  - raw: '<30>Aug  5 12:00:00 edge-rtr firewall,info forward: in:ether1 out:ether2, src-mac 00:16:3e:aa:bb:cc, proto TCP (SYN), 10.20.0.8:51000->192.0.2.20:443, len 60'
+    expect:
+      udm.event_type: firewall
+      udm.src_ip: 10.20.0.8
+      udm.dest_ip: 192.0.2.20
+      udm.protocol: TCP
+  - raw: '<30>Aug  5 12:00:00 edge-rtr dhcp,info dhcp1 assigned 10.20.0.9 to 00:16:3E:AA:BB:CC'
+    expect:
+      udm.event_type: dhcp_assign
+      udm.src_ip: 10.20.0.9
+  # SSH transport detail is deliberately unparsed — it must fall through
+  # WITHOUT aborting, leaving the raw message intact.
+  - raw: '<30>Aug  5 12:00:00 edge-rtr ssh,debug auth req: admin ssh-connection publickey'
+    expect:
+      ext.unparsed: 'true'
