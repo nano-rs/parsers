@@ -1,0 +1,644 @@
+name: fortinet_ocsf
+display_name: Fortinet FortiGate (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Fortinet FortiGate key=value syslog into OCSF 1.9.0, routed by
+  type/subtype: traffic and utm/app-ctrl -> Network Activity (4001);
+  utm/webfilter -> HTTP Activity (4002); utm/dns -> DNS Activity (4003);
+  utm/ips, utm/virus, utm/anomaly, utm/dlp and utm/emailfilter -> Detection
+  Finding (2004); event/user, event/vpn and admin login/logout -> Authentication
+  (3002). Any other subtype, and any line without recognisable FortiGate keys,
+  still emits a Network Activity record with activity_id 99 and the raw line in
+  `message`.
+match_values:
+  - fortinet
+category: network
+vendor: "Fortinet"
+product: "FortiGate"
+parser_vrl: |
+  # Fortinet FortiGate -> OCSF 1.9.0
+
+  raw_log = string!(.message)
+
+  stripped = raw_log
+  pm, pe = parse_regex(raw_log, r'^<(?P<pri>\d+)>(?P<body>.*)$')
+  if pe == null && pm != null { stripped = string!(pm.body) }
+
+  kv = parse_key_value(stripped, key_value_delimiter: "=", field_delimiter: " ") ?? {}
+
+  # ---- time: eventtime (epoch ns/us/ms/s) else date+time ----
+  time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
+  et = to_string(kv.eventtime) ?? ""
+  if et != "" {
+      ev = to_int(et) ?? 0
+      if ev > 1000000000000000 { time_ms = to_int(floor(ev / 1000000)) }
+      if ev > 1000000000000 && ev <= 1000000000000000 { time_ms = to_int(floor(ev / 1000)) }
+      if ev > 1000000000 && ev <= 1000000000000 { time_ms = ev * 1000 }
+  }
+  if et == "" {
+      d = to_string(kv.date) ?? ""
+      t = to_string(kv.time) ?? ""
+      if d != "" && t != "" {
+          ts, ts_err = parse_timestamp(d + " " + t, "%Y-%m-%d %H:%M:%S")
+          if ts_err == null { time_ms = to_int(to_unix_timestamp(ts, unit: "milliseconds")) }
+      }
+  }
+
+  log_type = downcase(to_string(kv.type) ?? "")
+  subtype = downcase(to_string(kv.subtype) ?? "")
+  fg_action = downcase(to_string(kv.action) ?? "")
+  level = downcase(to_string(kv.level) ?? "")
+  status_raw = downcase(to_string(kv.status) ?? "")
+
+  # ---- severity ----
+  severity_id = 1
+  severity = "Informational"
+  if level == "notice" || level == "low" { severity_id = 2; severity = "Low" }
+  if level == "warning" || level == "medium" { severity_id = 3; severity = "Medium" }
+  if level == "error" || level == "high" { severity_id = 4; severity = "High" }
+  if level == "critical" || level == "alert" || level == "emergency" { severity_id = 5; severity = "Critical" }
+  ips_sev = downcase(to_string(kv.severity) ?? "")
+  if ips_sev == "low" { severity_id = 2; severity = "Low" }
+  if ips_sev == "medium" { severity_id = 3; severity = "Medium" }
+  if ips_sev == "high" { severity_id = 4; severity = "High" }
+  if ips_sev == "critical" { severity_id = 5; severity = "Critical" }
+
+  # ---- endpoints ----
+  src_ip = to_string(kv.srcip) ?? ""
+  dst_ip = to_string(kv.dstip) ?? ""
+  src_port = to_int(to_string(kv.srcport) ?? "") ?? 0
+  dst_port = to_int(to_string(kv.dstport) ?? "") ?? 0
+  src_if = to_string(kv.srcintf) ?? ""
+  dst_if = to_string(kv.dstintf) ?? ""
+  src_mac = to_string(kv.srcmac) ?? ""
+  dst_mac = to_string(kv.dstmac) ?? ""
+  src_country = to_string(kv.srccountry) ?? ""
+  dst_country = to_string(kv.dstcountry) ?? ""
+  src_name = to_string(kv.srcname) ?? ""
+  dst_name = to_string(kv.dstname) ?? ""
+
+  proto_num = to_int(to_string(kv.proto) ?? "") ?? 0
+  proto = ""
+  if proto_num == 1 { proto = "icmp" }
+  if proto_num == 2 { proto = "igmp" }
+  if proto_num == 6 { proto = "tcp" }
+  if proto_num == 17 { proto = "udp" }
+  if proto_num == 47 { proto = "gre" }
+  if proto_num == 50 { proto = "esp" }
+  if proto_num == 51 { proto = "ah" }
+  if proto_num == 58 { proto = "icmpv6" }
+  if proto_num == 132 { proto = "sctp" }
+
+  direction_id = 0
+  dirv = downcase(to_string(kv.direction) ?? "")
+  if dirv == "incoming" || dirv == "inbound" { direction_id = 1 }
+  if dirv == "outgoing" || dirv == "outbound" { direction_id = 2 }
+
+  bytes_out = to_int(to_string(kv.sentbyte) ?? "") ?? 0
+  bytes_in = to_int(to_string(kv.rcvdbyte) ?? "") ?? 0
+  pkts_out = to_int(to_string(kv.sentpkt) ?? "") ?? 0
+  pkts_in = to_int(to_string(kv.rcvdpkt) ?? "") ?? 0
+  duration_s = to_int(to_string(kv.duration) ?? "") ?? 0
+
+  user_name = to_string(kv.user) ?? ""
+  if user_name == "" { user_name = to_string(kv.srcuser) ?? "" }
+  if user_name == "" { user_name = to_string(kv.unauthuser) ?? "" }
+
+  policy_id = to_string(kv.policyid) ?? ""
+  policy_name = to_string(kv.policyname) ?? ""
+  session_id = to_string(kv.sessionid) ?? ""
+  app_name = to_string(kv.app) ?? ""
+  service = to_string(kv.service) ?? ""
+  devname = to_string(kv.devname) ?? ""
+  devid = to_string(kv.devid) ?? ""
+  logid = to_string(kv.logid) ?? ""
+  logdesc = to_string(kv.logdesc) ?? ""
+  msg_txt = to_string(kv.msg) ?? ""
+  reason = to_string(kv.reason) ?? ""
+
+  # ---- action -> OCSF action / disposition ----
+  action_id = 3
+  action = "Observed"
+  disposition_id = 17
+  disposition = "Logged"
+  status_id = 1
+  status_str = "Success"
+
+  if fg_action == "accept" || fg_action == "allow" || fg_action == "permit" || fg_action == "passthrough" || fg_action == "pass" || fg_action == "start" {
+      action_id = 1
+      action = "Allowed"
+      disposition_id = 1
+      disposition = "Allowed"
+  }
+  if fg_action == "deny" || fg_action == "block" || fg_action == "blocked" {
+      action_id = 2
+      action = "Denied"
+      disposition_id = 2
+      disposition = "Blocked"
+      status_id = 2
+      status_str = "Failure"
+  }
+  if fg_action == "drop" || fg_action == "dropped" {
+      action_id = 2
+      action = "Denied"
+      disposition_id = 6
+      disposition = "Dropped"
+      status_id = 2
+      status_str = "Failure"
+  }
+  if fg_action == "reset" || fg_action == "client-rst" || fg_action == "server-rst" {
+      action_id = 2
+      action = "Denied"
+      disposition_id = 21
+      disposition = "Reset"
+  }
+  if fg_action == "quarantine" {
+      action_id = 2
+      action = "Denied"
+      disposition_id = 3
+      disposition = "Quarantined"
+  }
+  if fg_action == "monitor" || fg_action == "detected" {
+      action_id = 3
+      action = "Observed"
+      disposition_id = 15
+      disposition = "Detected"
+  }
+
+  # ---- routing ----
+  route = "network"
+  activity_id = 6
+  activity_name = "Traffic"
+
+  if log_type == "traffic" {
+      route = "network"
+      activity_id = 6
+      activity_name = "Traffic"
+      if subtype == "forward" || subtype == "local" || subtype == "sniffer" {
+          if fg_action == "start" { activity_id = 1; activity_name = "Open" }
+          if fg_action == "close" || fg_action == "timeout" { activity_id = 2; activity_name = "Close" }
+          if fg_action == "deny" || fg_action == "block" || fg_action == "drop" { activity_id = 5; activity_name = "Refuse" }
+          if fg_action == "client-rst" || fg_action == "server-rst" || fg_action == "reset" { activity_id = 3; activity_name = "Reset" }
+      }
+  } else if log_type == "utm" && subtype == "webfilter" {
+      route = "http"
+  } else if log_type == "utm" && subtype == "dns" {
+      route = "dns"
+  } else if log_type == "utm" && (subtype == "ips" || subtype == "virus" || subtype == "anomaly" || subtype == "dlp" || subtype == "emailfilter" || subtype == "email-filter") {
+      route = "finding"
+      activity_id = 1
+      activity_name = "Create"
+      if severity_id < 2 { severity_id = 2; severity = "Low" }
+  } else if log_type == "utm" && subtype == "app-ctrl" {
+      route = "network"
+      activity_id = 6
+      activity_name = "Traffic"
+  } else if log_type == "event" && (subtype == "user" || subtype == "vpn") {
+      route = "auth"
+      activity_id = 1
+      activity_name = "Logon"
+      if contains(fg_action, "logout") || contains(fg_action, "tunnel-down") || contains(fg_action, "close") { activity_id = 2; activity_name = "Logoff" }
+  } else if log_type == "event" && subtype == "system" && (fg_action == "login" || fg_action == "logout") {
+      route = "auth"
+      activity_id = 1
+      activity_name = "Logon"
+      if fg_action == "logout" { activity_id = 2; activity_name = "Logoff" }
+  } else {
+      route = "network"
+      activity_id = 99
+      activity_name = "Other"
+  }
+
+  # auth outcome
+  if route == "auth" {
+      if status_raw == "success" || status_raw == "succeeded" || fg_action == "login" || fg_action == "tunnel-up" {
+          action_id = 1
+          action = "Allowed"
+          disposition_id = 1
+          disposition = "Allowed"
+          status_id = 1
+          status_str = "Success"
+      }
+      if status_raw == "failed" || status_raw == "failure" || fg_action == "auth-failed" || fg_action == "login-failed" {
+          action_id = 2
+          action = "Denied"
+          disposition_id = 2
+          disposition = "Blocked"
+          status_id = 2
+          status_str = "Failure"
+          if severity_id < 2 { severity_id = 2; severity = "Low" }
+      }
+  }
+
+  # ---- objects ----
+  src = {}
+  if src_ip != "" { src.ip = downcase(src_ip) }
+  if src_port > 0 { src.port = src_port }
+  if src_if != "" { src.interface_name = src_if }
+  if src_mac != "" { src.mac = downcase(src_mac) }
+  if src_country != "" && src_country != "Reserved" { src.location = { "country": src_country } }
+  if src_name != "" { src.hostname = src_name }
+
+  dst = {}
+  if dst_ip != "" { dst.ip = downcase(dst_ip) }
+  if dst_port > 0 { dst.port = dst_port }
+  if dst_if != "" { dst.interface_name = dst_if }
+  if dst_mac != "" { dst.mac = downcase(dst_mac) }
+  if dst_country != "" && dst_country != "Reserved" { dst.location = { "country": dst_country } }
+  if dst_name != "" { dst.hostname = dst_name }
+  if service != "" { dst.svc_name = service }
+
+  traffic = {}
+  if bytes_in > 0 { traffic.bytes_in = bytes_in }
+  if bytes_out > 0 { traffic.bytes_out = bytes_out }
+  if pkts_in > 0 { traffic.packets_in = pkts_in }
+  if pkts_out > 0 { traffic.packets_out = pkts_out }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": uuid_v4(),
+      "log_source": "fortinet",
+      "log_provider": "FortiGate",
+      "profiles": ["host", "security_control"],
+      "product": {
+          "name": "FortiGate",
+          "vendor_name": "Fortinet",
+          "feature": { "name": "firewall" }
+      }
+  }
+  if logid != "" { metadata.event_code = logid }
+  if log_type != "" { metadata.log_name = log_type + ":" + subtype }
+
+  device = { "type_id": 9, "type": "Firewall" }
+  has_device = false
+  if devname != "" { device.hostname = devname; has_device = true }
+  if devid != "" { device.uid = devid; has_device = true }
+
+  fw_rule = {}
+  if policy_name != "" { fw_rule.name = policy_name }
+  if policy_id != "" { fw_rule.uid = policy_id }
+  if policy_name == "" && policy_id != "" { fw_rule.name = "policy " + policy_id }
+
+  unmapped = {}
+  if session_id != "" { unmapped.session_id = session_id }
+  if fg_action != "" { unmapped.fortigate_action = fg_action }
+  if logdesc != "" { unmapped.logdesc = logdesc }
+  if msg_txt != "" { unmapped.msg = msg_txt }
+  if reason != "" { unmapped.reason = reason }
+  if status_raw != "" { unmapped.fortigate_status = status_raw }
+  ti = to_string(kv.transip) ?? ""
+  if ti != "" { unmapped.nat_src_ip = ti }
+  tp = to_string(kv.transport) ?? ""
+  if tp != "" { unmapped.nat_src_port = tp }
+  tni = to_string(kv.tranip) ?? ""
+  if tni != "" { unmapped.nat_dst_ip = tni }
+  tunnel = to_string(kv.tunnelid) ?? ""
+  if tunnel != "" { unmapped.tunnel_id = tunnel }
+  tuntype = to_string(kv.tunneltype) ?? ""
+  if tuntype != "" { unmapped.tunnel_type = tuntype }
+  if length(kv) == 0 { unmapped.parse_status = "no_key_value_pairs" }
+
+  obs = []
+  if src_ip != "" { obs = push(obs, { "name": "src_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(src_ip) }) }
+  if dst_ip != "" { obs = push(obs, { "name": "dst_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(dst_ip) }) }
+  if user_name != "" { obs = push(obs, { "name": "user.name", "type": "User Name", "type_id": 4, "value": user_name }) }
+
+  # ============================================================
+  # Assemble
+  # ============================================================
+  if route == "dns" {
+      class_uid = 4003
+      qname = to_string(kv.qname) ?? ""
+      qtype = to_string(kv.qtype) ?? ""
+      qclass = to_string(kv.qclass) ?? ""
+      answer = to_string(kv.ipaddr) ?? ""
+      xid = to_int(to_string(kv.xid) ?? "") ?? 0
+      dns_activity = 2
+      dns_activity_name = "Response"
+      if answer == "" { dns_activity = 1; dns_activity_name = "Query" }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "DNS Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": dns_activity,
+          "activity_name": dns_activity_name,
+          "type_uid": class_uid * 100 + dns_activity,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": { "direction_id": direction_id, "protocol_num": proto_num }
+      }
+      if proto != "" { .connection_info.protocol_name = proto }
+      q = {}
+      if qname != "" { q.hostname = qname }
+      if qtype != "" { q.type = qtype }
+      if qclass != "" { q.class = qclass }
+      if length(q) > 0 { .query = q }
+      if answer != "" {
+          ans = { "rdata": answer }
+          if qtype != "" { ans.type = qtype }
+          .answers = [ans]
+      }
+      if xid > 0 { .transaction_id = xid }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if length(src) == 0 && length(dst) == 0 { .dst_endpoint = { "svc_name": "dns" } }
+      if has_device { .device = device }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if qname != "" { obs = push(obs, { "name": "query.hostname", "type": "Hostname", "type_id": 1, "value": qname }) }
+
+  } else if route == "http" {
+      class_uid = 4002
+      hostname = to_string(kv.hostname) ?? ""
+      url_path = to_string(kv.url) ?? ""
+      method = upcase(to_string(kv.method) ?? "")
+      catdesc = to_string(kv.catdesc) ?? ""
+      ua = to_string(kv.agent) ?? ""
+      http_activity = 99
+      http_activity_name = "Other"
+      if method == "CONNECT" { http_activity = 1;  http_activity_name = "Connect" }
+      if method == "DELETE"  { http_activity = 2;  http_activity_name = "Delete" }
+      if method == "GET"     { http_activity = 3;  http_activity_name = "Get" }
+      if method == "HEAD"    { http_activity = 4;  http_activity_name = "Head" }
+      if method == "OPTIONS" { http_activity = 5;  http_activity_name = "Options" }
+      if method == "POST"    { http_activity = 6;  http_activity_name = "Post" }
+      if method == "PUT"     { http_activity = 7;  http_activity_name = "Put" }
+      if method == "TRACE"   { http_activity = 8;  http_activity_name = "Trace" }
+      if method == "PATCH"   { http_activity = 9;  http_activity_name = "Patch" }
+      url = {}
+      if hostname != "" { url.hostname = hostname }
+      if url_path != "" { url.path = url_path }
+      if hostname != "" && url_path != "" { url.url_string = "http://" + hostname + url_path }
+      if catdesc != "" { url.categories = [catdesc] }
+      # FortiGate's webfilter `method` is the match method ("domain", "regex"),
+      # not an HTTP verb — only emit it when it really is one.
+      req = {}
+      if http_activity != 99 { req.http_method = method }
+      if ua != "" { req.user_agent = ua }
+      if length(url) > 0 { req.url = url }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": http_activity,
+          "activity_name": http_activity_name,
+          "type_uid": class_uid * 100 + http_activity,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "http_request": req,
+          "connection_info": { "direction_id": direction_id, "protocol_num": proto_num }
+      }
+      if proto != "" { .connection_info.protocol_name = proto }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if length(src) == 0 && length(dst) == 0 { .dst_endpoint = { "svc_name": "http" } }
+      if length(traffic) > 0 { .traffic = traffic }
+      if length(fw_rule) > 0 { .firewall_rule = fw_rule }
+      if has_device { .device = device }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if app_name != "" { .app_name = app_name }
+
+  } else if route == "finding" {
+      class_uid = 2004
+      sig = to_string(kv.attack) ?? ""
+      if sig == "" { sig = to_string(kv.virus) ?? "" }
+      if sig == "" { sig = to_string(kv.filtername) ?? "" }
+      if sig == "" { sig = logdesc }
+      if sig == "" { sig = "FortiGate " + subtype }
+      sig_id = to_string(kv.attackid) ?? ""
+      if sig_id == "" { sig_id = to_string(kv.virusid) ?? "" }
+      if sig_id == "" { sig_id = logid }
+      if sig_id == "" { sig_id = sig }
+      fname = to_string(kv.filename) ?? ""
+      fhash = to_string(kv.checksum) ?? ""
+      evidence = {}
+      if length(src) > 0 { evidence.src_endpoint = src }
+      if length(dst) > 0 { evidence.dst_endpoint = dst }
+      if proto_num > 0 { evidence.connection_info = { "direction_id": direction_id, "protocol_num": proto_num } }
+      if user_name != "" { evidence.user = { "name": user_name } }
+      if fname != "" {
+          fobj = { "name": fname, "type_id": 1 }
+          if fhash != "" { fobj.hashes = [{ "algorithm_id": 0, "algorithm": "Unknown", "value": fhash }] }
+          evidence.file = fobj
+      }
+      evidence.name = "FortiGate " + subtype + " detection"
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Detection Finding",
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": 1,
+          "activity_name": "Create",
+          "type_uid": class_uid * 100 + 1,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "is_alert": true,
+          "metadata": metadata,
+          "finding_info": {
+              "uid": sig_id,
+              "title": sig,
+              "types": [subtype],
+              "data_sources": ["fortinet"],
+              "analytic": { "name": sig, "uid": sig_id, "type_id": 1, "type": "Rule" }
+          },
+          "evidences": [evidence]
+      }
+      if length(fw_rule) > 0 { .firewall_rule = fw_rule }
+      if has_device { .device = device }
+      cve = to_string(kv.cve) ?? ""
+      if cve != "" { .unmapped = { "cve": cve } }
+      if fhash != "" { obs = push(obs, { "name": "file.hashes.value", "type": "Fingerprint", "type_id": 30, "value": fhash }) }
+
+  } else if route == "auth" {
+      class_uid = 3002
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Authentication",
+          "category_uid": 3,
+          "category_name": "Identity & Access Management",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "user": { "name": user_name }
+      }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 {
+          .dst_endpoint = dst
+      } else {
+          .service = { "name": "FortiGate " + subtype }
+      }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      ap = to_string(kv.authproto) ?? ""
+      if ap != "" { .auth_protocol = ap }
+      if subtype == "vpn" { .logon_type = "VPN"; .is_remote = true }
+      if reason != "" { .status_detail = reason }
+      if duration_s > 0 { .duration = duration_s }
+      if has_device { .device = device }
+
+  } else {
+      class_uid = 4001
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Network Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": { "direction_id": direction_id, "protocol_num": proto_num }
+      }
+      if proto != "" { .connection_info.protocol_name = proto }
+      if session_id != "" { .connection_info.uid = session_id }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if length(src) == 0 && length(dst) == 0 {
+          fb = {}
+          if devname != "" { fb.hostname = devname }
+          if length(fb) == 0 { fb.hostname = "unknown" }
+          .src_endpoint = fb
+      }
+      if length(traffic) > 0 { .traffic = traffic }
+      if duration_s > 0 { .duration = duration_s }
+      if length(fw_rule) > 0 { .firewall_rule = fw_rule }
+      if has_device { .device = device }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if app_name != "" { .app_name = app_name }
+      if msg_txt != "" { .status_detail = msg_txt }
+  }
+
+  if length(unmapped) > 0 {
+      if exists(.unmapped) {
+          .unmapped = merge(object!(.unmapped), unmapped)
+      } else {
+          .unmapped = unmapped
+      }
+  }
+  if length(obs) > 0 { .observables = obs }
+
+  .
+samples:
+- raw: <189>date=2024-10-30 time=09:54:00 devname="FGT-EDGE" logid="0100032002" type="event" subtype="system" level="information" vd="root" logdesc="Admin login successful" user="admin" ui="ssh(10.0.0.9)" action="login" status="success" reason="none" msg="Administrator admin logged in successfully from ssh(10.0.0.9)"
+  expect:
+    class_uid: 3002
+    activity_id: 1
+    user.name: admin
+    actor.user.name: admin
+    disposition_id: 1
+- raw: <189>date=2024-10-30 time=09:49:00 devname="FGT-EDGE" logid="1501054802" type="utm" subtype="dns" eventtype="dns-response" level="notice" vd="root" srcip=10.10.1.55 srcport=51000 dstip=8.8.8.8 dstport=53 proto=17 profile="default" xid=42513 qname="example.com" qtype="A" qtypeval=1 qclass="IN" ipaddr="93.184.216.34" action="pass" cat=52 catdesc="Information Technology"
+  expect:
+    class_uid: 4003
+    activity_id: 2
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 8.8.8.8
+    query.hostname: example.com
+    disposition_id: 1
+- raw: <189>date=2024-10-30 time=09:55:00 devname="FGT-EDGE" logid="0104043525" type="event" subtype="ha" level="critical" vd="root" logdesc="HA slave heartbeat lost" action="ha-state" msg="HA slave heartbeat is lost"
+  expect:
+    class_uid: 4001
+    activity_id: 99
+    disposition_id: 17
+- raw: '<189>date=2024-10-30 time=09:50:00 devname="FGT-EDGE" logid="0419016384" type="utm" subtype="ips" eventtype="signature" level="alert" vd="root" severity="critical" srcip=203.0.113.9 srccountry="Russian Federation" dstip=10.10.1.7 srcintf="port1" dstintf="port2" policyid=7 sessionid=84734 action="dropped" proto=6 service="SMB" srcport=44001 dstport=445 attackid=30810 profile="default" ref="http://www.fortinet.com/ids/VID30810" attack="MS.SMB.Server.Trans.Peeking.Data.Information.Disclosure" incidentserialno=1234567 msg="applications3: MS.SMB.Server" crscore=50 crlevel="critical" cve="CVE-2017-0144"'
+  expect:
+    class_uid: 2004
+    activity_id: 1
+    finding_info.uid: '30810'
+    disposition_id: 6
+- raw: a completely unrelated line with no fortigate keys
+  expect:
+    class_uid: 4001
+    activity_id: 99
+    disposition_id: 17
+- raw: <189>date=2024-10-30 time=09:46:12 devname="FGT-EDGE" devid="FG100D1234567890" eventtime=1730281572123456789 tz="+0000" logid="0000000013" type="traffic" subtype="forward" level="notice" vd="root" srcip=10.10.1.55 srcport=51422 srcintf="port2" srcintfrole="lan" dstip=93.184.216.34 dstport=443 dstintf="port1" dstintfrole="wan" sessionid=84732 proto=6 action="accept" policyid=7 policyname="allow-web" policytype="policy" service="HTTPS" trandisp="snat" transip=198.51.100.7 transport=32100 appid=40568 app="HTTPS.BROWSER" appcat="Web.Client" duration=60 sentbyte=4210 rcvdbyte=11111 sentpkt=14 rcvdpkt=10 srccountry="Reserved" dstcountry="United States"
+  expect:
+    class_uid: 4001
+    activity_id: 6
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 93.184.216.34
+    disposition_id: 1
+- raw: <189>date=2024-10-30 time=09:47:00 devname="FGT-EDGE" devid="FG100D1234567890" logid="0000000013" type="traffic" subtype="forward" level="warning" vd="root" srcip=203.0.113.44 srcport=44112 srcintf="port1" dstip=10.10.1.55 dstport=3389 dstintf="port2" sessionid=0 proto=6 action="deny" policyid=0 policyname="Implicit Deny" service="RDP" sentbyte=60 rcvdbyte=0 srccountry="Russian Federation"
+  expect:
+    class_uid: 4001
+    activity_id: 5
+    src_endpoint.ip: 203.0.113.44
+    dst_endpoint.ip: 10.10.1.55
+    disposition_id: 2
+- raw: <189>date=2024-10-30 time=09:52:00 devname="FGT-EDGE" logid="0102043008" type="event" subtype="user" level="notice" vd="root" logdesc="Authentication failed" srcip=10.10.1.55 user="jsmith" action="authentication" status="failed" reason="passwd_invalid" authproto="RADIUS(10.1.1.5)" msg="User jsmith failed authentication"
+  expect:
+    class_uid: 3002
+    activity_id: 1
+    src_endpoint.ip: 10.10.1.55
+    user.name: jsmith
+    actor.user.name: jsmith
+    disposition_id: 2
+- raw: <189>date=2024-10-30 time=09:51:00 devname="FGT-EDGE" logid="0211008192" type="utm" subtype="virus" eventtype="infected" level="warning" vd="root" msg="File is infected." action="blocked" service="HTTP" sessionid=84735 srcip=10.10.1.55 dstip=93.184.216.34 srcport=51424 dstport=80 proto=6 direction="incoming" filename="invoice.exe" checksum="a94a8fe5" quarskip="File-was-not-quarantined" virus="EICAR_TEST_FILE" dtype="Virus" ref="http://www.fortinet.com/ve?vn=EICAR" virusid=2172
+  expect:
+    class_uid: 2004
+    activity_id: 1
+    finding_info.uid: '2172'
+    disposition_id: 2
+- raw: <189>date=2024-10-30 time=09:53:00 devname="FGT-EDGE" logid="0101039424" type="event" subtype="vpn" level="notice" vd="root" logdesc="SSL VPN tunnel up" action="tunnel-up" tunneltype="ssl-tunnel" tunnelid=1234 remip=203.0.113.5 user="jsmith" group="vpn-users" dst_host="10.10.10.55" reason="N/A" msg="SSL tunnel established"
+  expect:
+    class_uid: 3002
+    activity_id: 1
+    user.name: jsmith
+    actor.user.name: jsmith
+    disposition_id: 1
+- raw: <189>date=2024-10-30 time=09:48:00 devname="FGT-EDGE" logid="0316013056" type="utm" subtype="webfilter" eventtype="ftgd_blk" level="warning" vd="root" policyid=7 srcip=10.10.1.55 srcport=51423 dstip=93.184.216.34 dstport=80 proto=6 service="HTTP" hostname="malware.example.com" profile="default" action="blocked" reqtype="direct" url="/payload.exe" sentbyte=512 rcvdbyte=0 direction="outgoing" msg="URL belongs to a denied category in policy" method="domain" cat=26 catdesc="Malicious Websites" user="jsmith"
+  expect:
+    class_uid: 4002
+    activity_id: 99
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 93.184.216.34
+    actor.user.name: jsmith
+    http_request.url.path: /payload.exe
+    disposition_id: 2

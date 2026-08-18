@@ -1,0 +1,327 @@
+name: json_generic_ocsf
+display_name: Generic JSON (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses arbitrary JSON logs into OCSF 1.9.0 by sniffing common field names.
+  A generic source has NO fixed schema, so this parser only promotes a record
+  to a specific OCSF class when the evidence is unambiguous, and otherwise
+  uses the Base Event:
+    * an HTTP method/status AND a url/uri  -> HTTP Activity    (class_uid 4002)
+    * a source and/or destination IP, no HTTP evidence
+                                           -> Network Activity (class_uid 4001)
+    * anything else                        -> Base Event       (class_uid 0)
+  The COMPLETE source object is copied into `unmapped` regardless of route, so
+  nothing is lost when a key has no canonical home — that is what OCSF's
+  `unmapped` is for. Mirrors the UDM json_generic parser
+  (../parsers/parsers/json_generic/parser.yaml).
+match_values:
+  - json_generic
+category: generic
+vendor: "nano"
+product: "JSON Parser"
+parser_vrl: |
+  # Generic JSON -> OCSF 1.9.0 (evidence-routed)
+  raw_log = string!(.message)
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
+
+  p, perr = parse_json(raw_log)
+  ok = perr == null && is_object(p)
+  e = {}
+  if ok { e = object!(p) }
+
+
+  time_ms = 0
+  ts_val = ""
+  for_each(["timestamp", "time", "@timestamp", "datetime", "date", "eventTime"]) -> |_i, k| {
+      if ts_val == "" {
+          v = to_string(get(e, [k]) ?? "") ?? ""
+          if v != "" { ts_val = v }
+      }
+  }
+  if ts_val != "" {
+      epoch = to_int(ts_val) ?? 0
+      if epoch > 1000000000 && epoch < 100000000000 {
+          time_ms = epoch * 1000
+      } else if epoch >= 100000000000 {
+          time_ms = epoch
+      } else {
+          t, terr = parse_timestamp(ts_val, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") } else {
+              t2, t2err = parse_timestamp(ts_val, "%Y-%m-%d %H:%M:%S")
+              if t2err == null { time_ms = to_unix_timestamp(t2, unit: "milliseconds") }
+          }
+      }
+  }
+
+  src_ip = ""
+  for_each(["src_ip", "source_ip", "client_ip", "clientIp", "remote_addr"]) -> |_i, k| {
+      if src_ip == "" {
+          v = to_string(get(e, [k]) ?? "") ?? ""
+          if match(v, ip_re) { src_ip = v }
+      }
+  }
+  dst_ip = ""
+  for_each(["dest_ip", "dst_ip", "destination_ip", "server_ip", "target_ip"]) -> |_i, k| {
+      if dst_ip == "" {
+          v = to_string(get(e, [k]) ?? "") ?? ""
+          if match(v, ip_re) { dst_ip = v }
+      }
+  }
+  user_name = ""
+  for_each(["user", "username", "user_name", "src_user", "account"]) -> |_i, k| {
+      if user_name == "" { user_name = to_string(get(e, [k]) ?? "") ?? "" }
+  }
+  host_name = ""
+  for_each(["host", "hostname", "dvc", "device", "computer"]) -> |_i, k| {
+      if host_name == "" { host_name = to_string(get(e, [k]) ?? "") ?? "" }
+  }
+  url_str = ""
+  for_each(["url", "uri", "request_url", "request_uri"]) -> |_i, k| {
+      if url_str == "" { url_str = to_string(get(e, [k]) ?? "") ?? "" }
+  }
+  method = ""
+  for_each(["method", "http_method", "request_method", "verb"]) -> |_i, k| {
+      if method == "" { method = upcase(to_string(get(e, [k]) ?? "") ?? "") }
+  }
+  code = 0
+  for_each(["status_code", "http_status_code", "status", "response_code"]) -> |_i, k| {
+      if code == 0 {
+          n = to_int(get(e, [k]) ?? 0) ?? 0
+          if n >= 100 && n <= 599 { code = n }
+      }
+  }
+  src_port = to_int(get(e, ["src_port"]) ?? 0) ?? 0
+  if src_port == 0 { src_port = to_int(get(e, ["source_port"]) ?? 0) ?? 0 }
+  dst_port = to_int(get(e, ["dest_port"]) ?? 0) ?? 0
+  if dst_port == 0 { dst_port = to_int(get(e, ["dst_port"]) ?? 0) ?? 0 }
+  if dst_port == 0 { dst_port = to_int(get(e, ["destination_port"]) ?? 0) ?? 0 }
+  protocol = downcase(to_string(get(e, ["protocol"]) ?? "") ?? "")
+  user_agent = to_string(get(e, ["user_agent"]) ?? "") ?? ""
+  referrer = to_string(get(e, ["referer"]) ?? "") ?? ""
+  if referrer == "" { referrer = to_string(get(e, ["referrer"]) ?? "") ?? "" }
+  pid = to_int(get(e, ["pid"]) ?? 0) ?? 0
+  if pid == 0 { pid = to_int(get(e, ["process_id"]) ?? 0) ?? 0 }
+  proc_name = to_string(get(e, ["process_name"]) ?? "") ?? ""
+  if proc_name == "" { proc_name = to_string(get(e, ["image"]) ?? "") ?? "" }
+  cmd_line = to_string(get(e, ["command_line"]) ?? "") ?? ""
+  if cmd_line == "" { cmd_line = to_string(get(e, ["cmdline"]) ?? "") ?? "" }
+  file_name = to_string(get(e, ["file_name"]) ?? "") ?? ""
+  file_path = to_string(get(e, ["file_path"]) ?? "") ?? ""
+  file_hash = downcase(to_string(get(e, ["hash"]) ?? "") ?? "")
+  if file_hash == "" { file_hash = downcase(to_string(get(e, ["sha256"]) ?? "") ?? "") }
+  msg_text = to_string(get(e, ["message"]) ?? "") ?? ""
+  if msg_text == "" { msg_text = to_string(get(e, ["msg"]) ?? "") ?? "" }
+
+  sev_raw = ""
+  for_each(["severity", "level", "log_level", "loglevel"]) -> |_i, k| {
+      if sev_raw == "" { sev_raw = downcase(to_string(get(e, [k]) ?? "") ?? "") }
+  }
+  severity_id = 1
+  severity = "Informational"
+  if contains(sev_raw, "fatal") || contains(sev_raw, "emerg") { severity_id = 6; severity = "Fatal" } else if contains(sev_raw, "crit") { severity_id = 5; severity = "Critical" } else if contains(sev_raw, "err") || contains(sev_raw, "high") { severity_id = 4; severity = "High" } else if contains(sev_raw, "warn") || contains(sev_raw, "medium") { severity_id = 3; severity = "Medium" } else if contains(sev_raw, "notice") || contains(sev_raw, "low") { severity_id = 2; severity = "Low" }
+
+  # The whole source record is preserved in `unmapped`: a generic source has
+  # no schema, so anything not positively identified above still has to land
+  # somewhere addressable rather than being dropped.
+  unmapped = e
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": uuid_v4(),
+      "profiles": ["host"],
+      "log_name": "json_generic",
+      "product": { "name": "JSON Parser", "vendor_name": "nano" }
+  }
+  if sev_raw != "" { metadata.log_level = sev_raw }
+  ecode = to_string(get(e, ["event_code"]) ?? "") ?? ""
+  if ecode != "" { metadata.event_code = ecode }
+
+  device = { "type_id": 0 }
+  if host_name != "" { device.hostname = downcase(host_name) }
+
+  actor = {}
+  if user_name != "" { actor.user = { "name": user_name } }
+  if pid != 0 {
+      proc = { "pid": pid }
+      if proc_name != "" { proc.name = proc_name }
+      if cmd_line != "" { proc.cmd_line = cmd_line }
+      actor.process = proc
+  }
+
+  has_http = (method != "" || code != 0) && url_str != ""
+  has_net = src_ip != "" || dst_ip != ""
+
+  if ok && has_http {
+      # =================== HTTP Activity (4002) ===================
+      activity_id = 99
+      activity_name = "Other"
+      if method == "CONNECT" { activity_id = 1; activity_name = "Connect" }
+      if method == "DELETE"  { activity_id = 2; activity_name = "Delete" }
+      if method == "GET"     { activity_id = 3; activity_name = "Get" }
+      if method == "HEAD"    { activity_id = 4; activity_name = "Head" }
+      if method == "OPTIONS" { activity_id = 5; activity_name = "Options" }
+      if method == "POST"    { activity_id = 6; activity_name = "Post" }
+      if method == "PUT"     { activity_id = 7; activity_name = "Put" }
+      if method == "TRACE"   { activity_id = 8; activity_name = "Trace" }
+      if method == "PATCH"   { activity_id = 9; activity_name = "Patch" }
+
+      status_id = 2
+      status_str = "Failure"
+      if code >= 200 && code < 400 { status_id = 1; status_str = "Success" }
+      if code == 0 { status_id = 0; status_str = "Unknown" }
+
+      url_obj = {}
+      pu, puerr = parse_url(url_str)
+      if puerr == null {
+          url_obj.url_string = url_str
+          up = to_string(pu.path)
+          if up != "" { url_obj.path = up }
+          uh = to_string(pu.host)
+          if uh != "" { url_obj.hostname = downcase(uh) }
+          us = to_string(pu.scheme)
+          if us != "" { url_obj.scheme = us }
+      } else {
+          # A bare path is never a url_string per the OCSF url object.
+          sp = split(url_str, "?", limit: 2)
+          url_obj.path = to_string(sp[0])
+          if length(sp) == 2 { url_obj.query_string = to_string(sp[1]) }
+      }
+      dom = to_string(get(e, ["domain"]) ?? "") ?? ""
+      if dom != "" && !exists(url_obj.hostname) { url_obj.hostname = downcase(dom) }
+      if !exists(url_obj.path) && !exists(url_obj.url_string) { url_obj.path = "/" }
+
+      http_request = { "url": url_obj }
+      if method != "" { http_request.http_method = method }
+      if user_agent != "" { http_request.user_agent = user_agent }
+      if referrer != "" { http_request.referrer = referrer }
+
+      . = {
+          "class_uid": 4002,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": 400200 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "http_request": http_request,
+          "http_response": { "code": code, "status": status_str },
+          "unmapped": unmapped
+      }
+      se = {}
+      if src_ip != "" { se.ip = src_ip }
+      if src_port != 0 { se.port = src_port }
+      if exists(se.ip) { .src_endpoint = se }
+      de = {}
+      if dst_ip != "" { de.ip = dst_ip }
+      if dst_port != 0 { de.port = dst_port }
+      if exists(url_obj.hostname) { de.hostname = url_obj.hostname }
+      if exists(de.ip) || exists(de.hostname) { .dst_endpoint = de }
+      if length(actor) > 0 { .actor = actor }
+      if exists(device.hostname) { .device = device }
+  } else if ok && has_net {
+      # =================== Network Activity (4001) ===================
+      . = {
+          "class_uid": 4001,
+          "class_name": "Network Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": 6,
+          "activity_name": "Traffic",
+          "type_uid": 400106,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": 0,
+          "status": "Unknown",
+          "time": time_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "unmapped": unmapped
+      }
+      se = {}
+      if src_ip != "" { se.ip = src_ip }
+      if src_port != 0 { se.port = src_port }
+      if host_name != "" { se.hostname = downcase(host_name) }
+      de = {}
+      if dst_ip != "" { de.ip = dst_ip }
+      if dst_port != 0 { de.port = dst_port }
+      if exists(se.ip) || exists(se.hostname) { .src_endpoint = se }
+      if exists(de.ip) { .dst_endpoint = de }
+      if !exists(.src_endpoint) && !exists(.dst_endpoint) { .src_endpoint = { "svc_name": "json_generic" } }
+      if protocol != "" { .connection_info = { "direction_id": 0, "direction": "Unknown", "protocol_name": protocol } }
+      if length(actor) > 0 { .actor = actor }
+      if exists(device.hostname) { .device = device }
+  } else {
+      # =================== Base Event (0) ===================
+      # No positive evidence of a specific class. OCSF's Base Event is the
+      # concrete class for exactly this case — it keeps time, severity,
+      # message, device, actor and the full source record (in `unmapped`)
+      # addressable without asserting a class the data does not support.
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": 0,
+          "status": "Unknown",
+          "time": time_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": metadata
+      }
+      if ok {
+          .unmapped = unmapped
+          if length(actor) > 0 { .actor = actor }
+          if exists(device.hostname) { .device = device }
+          if msg_text != "" { .status_detail = msg_text }
+      } else {
+          .metadata.log_level = "error"
+          .unmapped = { "parse_error": to_string(perr) }
+      }
+  }
+
+  .
+
+# Runtime samples (NAN-2327): one per event shape this parser routes.
+# `class_uid` is asserted because class routing is the whole point of the
+# OCSF conversion — a silent reroute is the defect most likely to survive
+# a compile-only check.
+samples:
+  - raw: '{"@timestamp":"2026-08-12T09:15:30.123Z","level":"ERROR","message":"failed to write checkpoint","service":"ingest-worker","pid":8811,"process_name":"ingestd","hostname":"worker-03","attempt":4,"queue_depth":19233}'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: '{"unterminated":'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: '{"timestamp":"2026-08-12T09:15:22Z","client_ip":"203.0.113.7","server_ip":"192.0.2.10","method":"GET","url":"https://api.example.com/v1/users?page=2","status_code":200,"user":"svc-report","user_agent":"go-http-client/2.0","referer":"https://app.example.com/","latency_ms":42,"trace":"abc123"}'
+    expect:
+      class_uid: 4002
+      activity_id: 3
+  - raw: '{"foo":"bar","n":1,"nested":{"a":[1,2,3]}}'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: '{"time":1786000522,"src_ip":"10.0.5.4","dest_ip":"198.51.100.9","src_port":49122,"dest_port":8443,"protocol":"TCP","action":"allow","severity":"low","hostname":"edge-fw-1"}'
+    expect:
+      class_uid: 4001
+      activity_id: 6
+  - raw: '{"datetime":"2026-08-12 09:15:40","uri":"/internal/health?deep=1","http_method":"POST","response_code":503,"remote_addr":"10.0.5.99","username":"probe"}'
+    expect:
+      class_uid: 4002
+      activity_id: 6

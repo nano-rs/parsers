@@ -1,0 +1,240 @@
+name: aws_alb_ocsf
+display_name: AWS ALB Access Logs (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses AWS Application Load Balancer access logs into complete OCSF 1.9.0
+  "HTTP Activity" (class_uid 4002) records. The whole OCSF object is emitted on
+  the root so it lands in ocsf_logs.event and the promoted columns materialize
+  (http_request.*, http_response.*, src_endpoint, dst_endpoint, traffic.*,
+  trace.uid, cloud.*). Mirrors the UDM aws_alb parser but targets OCSF instead
+  of `.udm.*`.
+match_values:
+  - aws_alb
+category: cloud
+vendor: "Amazon"
+product: "ALB"
+parser_vrl: |
+  # AWS ALB access log (space delimited) -> OCSF 1.9.0 HTTP Activity (4002)
+  raw_log = to_string(.message) ?? ""
+
+  m = parse_regex(raw_log, r'^(?P<type>\S+)\s+(?P<timestamp>\S+)\s+(?P<elb>\S+)\s+(?P<client_port>\S+)\s+(?P<target_port>\S+)\s+(?P<request_processing_time>\S+)\s+(?P<target_processing_time>\S+)\s+(?P<response_processing_time>\S+)\s+(?P<elb_status_code>\S+)\s+(?P<target_status_code>\S+)\s+(?P<received_bytes>\S+)\s+(?P<sent_bytes>\S+)\s+"(?P<request>[^"]*)"\s+"(?P<user_agent>[^"]*)"\s+(?P<ssl_cipher>\S+)\s+(?P<ssl_protocol>\S+)\s+(?P<target_group_arn>\S+)\s+"(?P<trace_id>[^"]*)"\s+"(?P<domain_name>[^"]*)"\s+"(?P<chosen_cert_arn>[^"]*)"\s+(?P<matched_rule_priority>\S+)\s+(?P<request_creation_time>\S+)\s+"(?P<actions_executed>[^"]*)"\s+"(?P<redirect_url>[^"]*)"\s+"(?P<error_reason>[^"]*)"') ?? {}
+
+  class_uid = 4002
+
+  if length(keys(m)) > 0 {
+      # ---- time ----
+      time_ms = 0
+      ts_str = to_string(m.timestamp)
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- request line: "METHOD URL PROTO" ----
+      request_str = to_string(m.request)
+      method = ""
+      url_raw = ""
+      http_ver = ""
+      req_parts = split(request_str, " ")
+      if length(req_parts) >= 1 { method = upcase(to_string(req_parts[0])) }
+      if length(req_parts) >= 2 { url_raw = to_string(req_parts[1]) }
+      if length(req_parts) >= 3 { http_ver = to_string(req_parts[2]) }
+
+      activity_id = 99
+      activity_name = "Other"
+      if method == "CONNECT" { activity_id = 1; activity_name = "Connect" }
+      if method == "DELETE"  { activity_id = 2; activity_name = "Delete" }
+      if method == "GET"     { activity_id = 3; activity_name = "Get" }
+      if method == "HEAD"    { activity_id = 4; activity_name = "Head" }
+      if method == "OPTIONS" { activity_id = 5; activity_name = "Options" }
+      if method == "POST"    { activity_id = 6; activity_name = "Post" }
+      if method == "PUT"     { activity_id = 7; activity_name = "Put" }
+      if method == "TRACE"   { activity_id = 8; activity_name = "Trace" }
+      if method == "PATCH"   { activity_id = 9; activity_name = "Patch" }
+
+      # ---- url object ----
+      url_obj = {}
+      if url_raw != "" && url_raw != "-" {
+          u, uerr = parse_url(url_raw)
+          if uerr == null {
+              url_obj = { "url_string": url_raw }
+              scheme = to_string(u.scheme)
+              if scheme != "" { url_obj.scheme = scheme }
+              host = to_string(u.host)
+              if host != "" { url_obj.hostname = host }
+              upath = to_string(u.path)
+              if upath != "" { url_obj.path = upath }
+              uq = to_string(u.query) ?? ""
+              if uq != "" && uq != "{}" { url_obj.query_string = uq }
+              uport = to_int(u.port)
+              if uport > 0 { url_obj.port = uport }
+          } else {
+              url_obj = { "path": url_raw }
+          }
+      }
+      dom = to_string(m.domain_name)
+      if dom != "" && dom != "-" { url_obj.hostname = dom }
+
+      # ---- http_request ----
+      http_request = {}
+      if method != "" && method != "-" { http_request.http_method = method }
+      if http_ver != "" && http_ver != "-" { http_request.version = http_ver }
+      ua = to_string(m.user_agent)
+      if ua != "" && ua != "-" { http_request.user_agent = ua }
+      if length(keys(url_obj)) > 0 { http_request.url = url_obj }
+
+      # ---- http_response ----
+      elb_status = to_string(m.elb_status_code)
+      code = to_int(elb_status) ?? 0
+      status_id = 0
+      status_str = "Unknown"
+      if code > 0 {
+          if code >= 200 && code < 400 { status_id = 1; status_str = "Success" } else { status_id = 2; status_str = "Failure" }
+      }
+      sent = to_int(to_string(m.sent_bytes)) ?? 0
+      recv = to_int(to_string(m.received_bytes)) ?? 0
+      http_response = { "length": sent }
+      if code > 0 { http_response.code = code; http_response.status = status_str }
+
+      # ---- endpoints ----
+      src_endpoint = {}
+      client_str = to_string(m.client_port)
+      if client_str != "-" {
+          cp = split(client_str, ":")
+          if length(cp) >= 2 {
+              src_endpoint.ip = downcase(to_string(cp[0]))
+              src_endpoint.port = to_int(to_string(cp[1])) ?? 0
+          }
+      }
+      dst_endpoint = {}
+      target_str = to_string(m.target_port)
+      if target_str != "-" {
+          tp = split(target_str, ":")
+          if length(tp) >= 2 {
+              dst_endpoint.ip = downcase(to_string(tp[0]))
+              dst_endpoint.port = to_int(to_string(tp[1])) ?? 0
+          }
+      }
+      if dom != "" && dom != "-" { dst_endpoint.hostname = dom }
+
+      # ---- duration: ALB reports seconds; OCSF wants milliseconds ----
+      rpt = to_float(to_string(m.request_processing_time)) ?? 0.0
+      tpt = to_float(to_string(m.target_processing_time)) ?? 0.0
+      rspt = to_float(to_string(m.response_processing_time)) ?? 0.0
+      total_s = 0.0
+      if rpt > 0.0 { total_s = total_s + rpt }
+      if tpt > 0.0 { total_s = total_s + tpt }
+      if rspt > 0.0 { total_s = total_s + rspt }
+      duration_ms = to_int(round(total_s * 1000.0))
+
+      ocsf = {
+          "class_uid": class_uid,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "duration": duration_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud", "load_balancer"],
+              "uid": uuid_v4(),
+              "log_name": "ALB Access Log",
+              "log_provider": "AWS Elastic Load Balancing",
+              "product": { "name": "AWS Application Load Balancer", "vendor_name": "Amazon" }
+          },
+          "cloud": { "provider": "AWS" },
+          "traffic": { "bytes_in": recv, "bytes_out": sent },
+          "http_response": http_response
+      }
+      if length(keys(http_request)) > 0 { ocsf.http_request = http_request }
+      if length(keys(src_endpoint)) > 0 { ocsf.src_endpoint = src_endpoint }
+      if length(keys(dst_endpoint)) > 0 { ocsf.dst_endpoint = dst_endpoint }
+
+      # ---- load_balancer profile ----
+      lb = {}
+      elb_name = to_string(m.elb)
+      if elb_name != "" && elb_name != "-" { lb.name = elb_name }
+      if code > 0 { lb.code = code }
+      err_reason = to_string(m.error_reason)
+      if err_reason != "" && err_reason != "-" { lb.error_message = err_reason }
+      if length(keys(dst_endpoint)) > 0 { lb.dst_endpoint = dst_endpoint }
+      if length(keys(lb)) > 0 { ocsf.load_balancer = lb }
+
+      # ---- TLS ----
+      tls_obj = {}
+      cipher = to_string(m.ssl_cipher)
+      if cipher != "" && cipher != "-" { tls_obj.cipher = cipher }
+      sslp = to_string(m.ssl_protocol)
+      if sslp != "" && sslp != "-" { tls_obj.version = sslp }
+      if dom != "" && dom != "-" { tls_obj.sni = dom }
+      if length(keys(tls_obj)) > 1 { ocsf.tls = tls_obj }
+
+      # ---- X-Amzn-Trace-Id -> trace profile ----
+      trace_id = to_string(m.trace_id)
+      if trace_id != "" && trace_id != "-" {
+          ocsf.trace = { "uid": trace_id }
+          ocsf.metadata.profiles = ["cloud", "load_balancer", "trace"]
+      }
+
+      # ---- everything with no canonical home ----
+      unmapped = {}
+      lb_type = to_string(m.type)
+      if lb_type != "" { unmapped.listener_type = lb_type }
+      tsc = to_string(m.target_status_code)
+      if tsc != "" && tsc != "-" { unmapped.target_status_code = tsc }
+      tga = to_string(m.target_group_arn)
+      if tga != "" && tga != "-" { unmapped.target_group_arn = tga }
+      cert = to_string(m.chosen_cert_arn)
+      if cert != "" && cert != "-" { unmapped.chosen_cert_arn = cert }
+      prio = to_string(m.matched_rule_priority)
+      if prio != "" && prio != "-" { unmapped.matched_rule_priority = prio }
+      acts = to_string(m.actions_executed)
+      if acts != "" && acts != "-" { unmapped.actions_executed = acts }
+      redir = to_string(m.redirect_url)
+      if redir != "" && redir != "-" { unmapped.redirect_url = redir }
+      rct = to_string(m.request_creation_time)
+      if rct != "" && rct != "-" { unmapped.request_creation_time = rct }
+      if rpt >= 0.0 { unmapped.request_processing_time = rpt }
+      if tpt >= 0.0 { unmapped.target_processing_time = tpt }
+      if rspt >= 0.0 { unmapped.response_processing_time = rspt }
+      if length(keys(unmapped)) > 0 { ocsf.unmapped = unmapped }
+
+      . = ocsf
+  } else {
+      # Unrecognised line: emit a minimal, still-valid record so it stays queryable.
+      . = {
+          "class_uid": class_uid,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": class_uid * 100 + 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud"],
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_name": "ALB Access Log",
+              "product": { "name": "AWS Application Load Balancer", "vendor_name": "Amazon" }
+          },
+          "cloud": { "provider": "AWS" },
+          "http_request": { "url": { "path": "/" } }
+      }
+  }

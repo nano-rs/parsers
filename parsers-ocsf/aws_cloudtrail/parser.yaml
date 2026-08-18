@@ -1,8 +1,9 @@
 name: aws_cloudtrail_ocsf
 display_name: AWS CloudTrail (OCSF)
-version: "1.0.0"
+version: "1.1.0"
+ocsf_version: "1.9.0"
 description: >
-  Parses AWS CloudTrail management events into complete OCSF 1.8.0
+  Parses AWS CloudTrail management events into complete OCSF 1.9
   "API Activity" (class_uid 6003) records. The whole OCSF object is emitted on
   the root so it lands in ocsf_logs.event and the promoted columns materialize
   (api.service.name, api.operation, cloud.*, resources[], src_endpoint, actor).
@@ -13,7 +14,7 @@ category: cloud
 vendor: "Amazon"
 product: "AWS CloudTrail"
 parser_vrl: |
-  # AWS CloudTrail JSON -> OCSF 1.8.0 API Activity (class_uid 6003).
+  # AWS CloudTrail JSON -> OCSF 1.9.0 API Activity (class_uid 6003).
   raw_log = string!(.message)
   parsed, err = parse_json(raw_log)
 
@@ -28,11 +29,16 @@ parser_vrl: |
           "time": 0,
           "message": raw_log,
           "metadata": {
-              "version": "1.8.0",
+              "version": "1.9.0",
+              "profiles": ["cloud"],
               "uid": uuid_v4(),
               "log_level": "error",
               "product": { "name": "AWS CloudTrail", "vendor_name": "Amazon" }
-          }
+          },
+          "api": { "operation": "Unknown", "service": { "name": "unknown" } },
+          "cloud": { "provider": "AWS" },
+          "actor": { "user": { "name": "unknown" } },
+          "src_endpoint": { "ip": "0.0.0.0" }
       }
   } else {
       p = object!(parsed)
@@ -111,7 +117,8 @@ parser_vrl: |
           "time": time_ms,
           "message": raw_log,
           "metadata": {
-              "version": "1.8.0",
+              "version": "1.9.0",
+              "profiles": ["cloud"],
               "uid": string(p.eventID) ?? uuid_v4(),
               "log_name": "CloudTrail",
               "log_provider": "AWS CloudTrail",
@@ -140,7 +147,15 @@ parser_vrl: |
       }
 
       # src_endpoint is REQUIRED on API Activity 6003 — always emit it.
-      ocsf.src_endpoint = { "ip": downcase(string(p.sourceIPAddress) ?? "") }
+      src_ip_raw = downcase(string(p.sourceIPAddress) ?? "")
+      if is_ipv4(src_ip_raw) || is_ipv6(src_ip_raw) {
+          ocsf.src_endpoint = { "ip": src_ip_raw }
+      } else if src_ip_raw != "" {
+          # CloudTrail also emits service principals here ("ec2.amazonaws.com").
+          ocsf.src_endpoint = { "ip": "0.0.0.0", "hostname": src_ip_raw }
+      } else {
+          ocsf.src_endpoint = { "ip": "0.0.0.0" }
+      }
 
       ua = string(p.userAgent) ?? ""
       if ua != "" { ocsf.http_request = { "user_agent": ua } }

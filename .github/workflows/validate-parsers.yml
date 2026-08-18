@@ -2,7 +2,10 @@ name: Validate & Auto-Merge Parsers
 
 on:
   pull_request:
-    branches: [main]
+    # `ocsf-1.9` is the OCSF 1.9 line; `main` keeps the OCSF 1.8 content for
+    # tenants still running OCSF on ClickHouse. Both need the same gates, and a
+    # PR that targets ocsf-1.9 would otherwise trigger nothing at all.
+    branches: [main, ocsf-1.9]
     # `ready_for_review` is not in the default type set (opened, synchronize,
     # reopened). Without it, undrafting a PR re-runs nothing, so the Auto-Merge
     # job keeps whatever result it got while the PR was still a draft — a red X
@@ -49,7 +52,8 @@ jobs:
       - name: Find changed parsers
         id: changed
         run: |
-          changed=$(git diff --name-only origin/main...HEAD -- 'parsers/*/parser.yaml' 'enrichments/**/parser.yaml')
+          base="origin/${{ github.event.pull_request.base.ref }}"
+          changed=$(git diff --name-only "$base"...HEAD -- 'parsers/*/parser.yaml' 'enrichments/**/parser.yaml')
           if [ -z "$changed" ]; then
             echo "No parser files changed"
             echo "has_changes=false" >> $GITHUB_OUTPUT
@@ -85,9 +89,42 @@ jobs:
           fi
           bash scripts/validate-vrl.sh /tmp/all_parsers.txt
 
+  validate-ocsf:
+    name: Validate OCSF
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Vector
+        run: |
+          curl -sSL https://sh.vector.dev | bash -s -- -y --prefix "$HOME/.vector"
+          echo "$HOME/.vector/bin" >> $GITHUB_PATH
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet pyyaml
+
+      # Whole-tree, same reasoning as the VRL job: validating only what a PR
+      # touched is what let broken parsers sit on main unnoticed. This job runs
+      # the static OCSF consistency rules (metadata.version vs the parser's own
+      # ocsf_version, type_uid arithmetic, no .udm.*/source_type, no deprecated
+      # class_uid) plus gate 1 against each parser's samples/ corpus.
+      #
+      # The OCSF *contract* half of gate 2 needs nano's `ocsf_event_validate`
+      # binary, which is a nano build artifact and is not vendored into this
+      # public repo. Where it is absent the script reports the schema check as
+      # SKIPPED and still enforces everything above. Set OCSF_VALIDATOR (or put
+      # the binary on PATH) on a runner that has it to turn the schema half on.
+      - name: Validate OCSF parser tree
+        run: bash scripts/validate-ocsf.sh
+
   auto-merge:
     name: Auto-Merge
-    needs: validate-vrl
+    needs: [validate-vrl, validate-ocsf]
     runs-on: ubuntu-latest
     # Skip on drafts rather than attempting the merge and failing with
     # "Pull Request is still a draft". That error is expected on every draft

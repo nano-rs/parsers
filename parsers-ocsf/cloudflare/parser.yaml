@@ -1,0 +1,348 @@
+name: cloudflare_ocsf
+display_name: Cloudflare (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Cloudflare Logpush JSON — HTTP requests, firewall events and DNS
+  queries — into OCSF 1.9.0. HTTP request and firewall-event records become
+  "HTTP Activity" (class_uid 4002); DNS records become "DNS Activity"
+  (class_uid 4003). The WAF / firewall verdict drives the security-control
+  action/disposition and `firewall_rule`, the client ASN and country ride on
+  src_endpoint (promoted columns), and RayID becomes
+  metadata.correlation_uid so an analyst can join edge and origin records.
+  Mirrors the UDM cloudflare parser (../parsers/parsers/cloudflare/parser.yaml).
+match_values:
+  - cloudflare
+category: network
+vendor: "Cloudflare"
+product: "Cloudflare"
+parser_vrl: |
+  # Cloudflare Logpush -> OCSF 1.9.0 HTTP Activity (4002) / DNS Activity (4003)
+  raw_log = string!(.message)
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
+
+  p, perr = parse_json(raw_log)
+
+  if perr == null && is_object(p) {
+      is_dns = exists(p.QueryName)
+      is_firewall = exists(p.Kind) || (exists(p.Action) && !exists(p.EdgeStartTimestamp))
+
+      # ---- common client context -------------------------------------
+      src_endpoint = {}
+      cip = string(p.ClientIP) ?? ""
+      if !is_dns {
+          if match(cip, ip_re) { src_endpoint.ip = cip }
+      } else {
+          sip = string(p.SourceIP) ?? ""
+          if match(sip, ip_re) { src_endpoint.ip = sip }
+      }
+      sport = to_int(p.ClientSrcPort) ?? 0
+      if sport != 0 { src_endpoint.port = sport }
+      asn = to_int(p.ClientASN) ?? 0
+      asn_name = string(p.ClientASNDescription) ?? ""
+      if asn != 0 || asn_name != "" {
+          a = {}
+          if asn != 0 { a.number = asn }
+          if asn_name != "" { a.name = asn_name }
+          src_endpoint.autonomous_system = a
+      }
+      ccountry = string(p.ClientCountry) ?? ""
+      if ccountry != "" && ccountry != "xx" { src_endpoint.location = { "country": upcase(ccountry) } }
+
+      metadata = {
+          "version": "1.9.0",
+          "uid": uuid_v4(),
+          "profiles": ["host", "security_control"],
+          "log_name": "cloudflare-logpush",
+          "product": { "name": "Cloudflare", "vendor_name": "Cloudflare" }
+      }
+      ray = string(p.RayID) ?? ""
+      if ray != "" { metadata.correlation_uid = ray }
+
+      unmapped = {}
+
+      if is_dns {
+          # ================= DNS Activity (4003) =================
+          time_ms = 0
+          ts_str = string(p.Timestamp) ?? ""
+          if ts_str != "" {
+              t, terr = parse_timestamp(ts_str, "%+")
+              if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+          }
+
+          qt = to_int(p.QueryType) ?? 0
+          qtype = to_string(qt)
+          if qt == 1 { qtype = "A" }
+          if qt == 2 { qtype = "NS" }
+          if qt == 5 { qtype = "CNAME" }
+          if qt == 6 { qtype = "SOA" }
+          if qt == 12 { qtype = "PTR" }
+          if qt == 15 { qtype = "MX" }
+          if qt == 16 { qtype = "TXT" }
+          if qt == 28 { qtype = "AAAA" }
+          if qt == 33 { qtype = "SRV" }
+
+          rc = to_int(p.ResponseCode) ?? 0
+          rcode_id = 99
+          rcode = to_string(rc)
+          if rc == 0 { rcode_id = 0; rcode = "NoError" }
+          if rc == 1 { rcode_id = 1; rcode = "FormError" }
+          if rc == 2 { rcode_id = 2; rcode = "ServError" }
+          if rc == 3 { rcode_id = 3; rcode = "NXDomain" }
+          if rc == 4 { rcode_id = 4; rcode = "NotImp" }
+          if rc == 5 { rcode_id = 5; rcode = "Refused" }
+
+          status_id = 1
+          status_str = "Success"
+          if rc != 0 { status_id = 2; status_str = "Failure" }
+
+          colo = string(p.ColoCode) ?? ""
+          if colo != "" { unmapped.colo_code = colo }
+          edns = string(p.EDNSSubnet) ?? ""
+          if edns != "" { unmapped.edns_subnet = edns }
+
+          . = {
+              "class_uid": 4003,
+              "class_name": "DNS Activity",
+              "category_uid": 4,
+              "category_name": "Network Activity",
+              "activity_id": 2,
+              "activity_name": "Response",
+              "type_uid": 400302,
+              "severity_id": 1,
+              "severity": "Informational",
+              "status_id": status_id,
+              "status": status_str,
+              "rcode_id": rcode_id,
+              "rcode": rcode,
+              "time": time_ms,
+              "message": raw_log,
+              "raw_data": raw_log,
+              "metadata": metadata,
+              "query": { "hostname": downcase(string(p.QueryName) ?? ""), "type": qtype }
+          }
+          if exists(src_endpoint.ip) {
+              .src_endpoint = src_endpoint
+          } else {
+              .dst_endpoint = { "svc_name": "cloudflare-dns" }
+          }
+          if length(unmapped) > 0 { .unmapped = unmapped }
+      } else {
+          # ================= HTTP Activity (4002) =================
+          time_ms = 0
+          if is_firewall {
+              ts_str = string(p.Datetime) ?? ""
+              if ts_str != "" {
+                  t, terr = parse_timestamp(ts_str, "%+")
+                  if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+              }
+          } else {
+              ns = to_int(p.EdgeStartTimestamp) ?? 0
+              if ns > 0 {
+                  time_ms = to_int(floor(ns / 1000000))
+              } else {
+                  ts_str = string(p.EdgeStartTimestamp) ?? ""
+                  if ts_str != "" {
+                      t, terr = parse_timestamp(ts_str, "%+")
+                      if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+                  }
+              }
+          }
+
+          method = upcase(string(p.ClientRequestMethod) ?? "")
+          activity_id = 99
+          activity_name = "Other"
+          if method == "CONNECT" { activity_id = 1; activity_name = "Connect" }
+          if method == "DELETE"  { activity_id = 2; activity_name = "Delete" }
+          if method == "GET"     { activity_id = 3; activity_name = "Get" }
+          if method == "HEAD"    { activity_id = 4; activity_name = "Head" }
+          if method == "OPTIONS" { activity_id = 5; activity_name = "Options" }
+          if method == "POST"    { activity_id = 6; activity_name = "Post" }
+          if method == "PUT"     { activity_id = 7; activity_name = "Put" }
+          if method == "TRACE"   { activity_id = 8; activity_name = "Trace" }
+          if method == "PATCH"   { activity_id = 9; activity_name = "Patch" }
+
+          code = to_int(p.EdgeResponseStatus) ?? 0
+          status_id = 2
+          status_str = "Failure"
+          if code >= 200 && code < 400 { status_id = 1; status_str = "Success" }
+          if code == 0 { status_id = 0; status_str = "Unknown" }
+
+          host = string(p.ClientRequestHost) ?? ""
+          scheme = downcase(string(p.ClientRequestScheme) ?? "")
+          if scheme == "" { scheme = "https" }
+          uri = string(p.ClientRequestURI) ?? ""
+          if uri == "" { uri = string(p.ClientRequestPath) ?? "" }
+          query = string(p.ClientRequestQuery) ?? ""
+
+          url_obj = {}
+          if host != "" { url_obj.hostname = downcase(host) }
+          url_obj.scheme = scheme
+          upath = uri
+          if contains(uri, "?") {
+              sp = split(uri, "?", limit: 2)
+              upath = string(sp[0]) ?? ""
+              if length(sp) == 2 { url_obj.query_string = string(sp[1]) ?? "" }
+          } else if query != "" {
+              url_obj.query_string = replace(query, "?", "")
+          }
+          if upath != "" { url_obj.path = upath } else { url_obj.path = "/" }
+          if host != "" { url_obj.url_string = scheme + "://" + host + uri }
+
+          http_request = { "url": url_obj }
+          if method != "" { http_request.http_method = method }
+          ua = string(p.ClientRequestUserAgent) ?? ""
+          if ua != "" { http_request.user_agent = ua }
+          ref = string(p.ClientRequestReferer) ?? ""
+          if ref != "" { http_request.referrer = ref }
+          proto = string(p.ClientRequestProtocol) ?? ""
+          if proto != "" { http_request.version = proto }
+          req_bytes = to_int(p.ClientRequestBytes) ?? 0
+          if req_bytes != 0 { http_request.length = req_bytes }
+
+          resp_bytes = to_int(p.EdgeResponseBytes) ?? 0
+          http_response = { "code": code, "status": status_str }
+          if resp_bytes != 0 { http_response.length = resp_bytes }
+          ct = string(p.EdgeResponseContentType) ?? ""
+          if ct != "" { http_response.content_type = ct }
+
+          # ---- verdict: firewall event Action, then WAFAction, then the
+          #      first FirewallMatchesActions entry ----
+          verdict = downcase(string(p.Action) ?? "")
+          if verdict == "" || verdict == "unknown" { verdict = downcase(string(p.WAFAction) ?? "") }
+          if verdict == "" || verdict == "unknown" {
+              fma = array(p.FirewallMatchesActions) ?? []
+              if length(fma) > 0 { verdict = downcase(to_string(fma[0]) ?? "") }
+          }
+          action_id = 0
+          action_name = "Unknown"
+          disposition_id = 0
+          disposition_name = "Unknown"
+          severity_id = 1
+          severity = "Informational"
+          is_alert = false
+          if verdict == "block" || verdict == "drop" {
+              action_id = 2; action_name = "Denied"
+              disposition_id = 2; disposition_name = "Blocked"
+              severity_id = 4; severity = "High"
+              is_alert = true
+          } else if verdict == "challenge" || verdict == "jschallenge" || verdict == "managedchallenge" {
+              action_id = 2; action_name = "Denied"
+              disposition_id = 19; disposition_name = "Challenge"
+              severity_id = 3; severity = "Medium"
+              is_alert = true
+          } else if verdict == "allow" || verdict == "skip" || verdict == "log" || verdict == "simulate" {
+              action_id = 1; action_name = "Allowed"
+              disposition_id = 1; disposition_name = "Allowed"
+          } else if verdict != "" && verdict != "unknown" {
+              action_id = 99; action_name = verdict
+          }
+
+          rule_uid = string(p.RuleID) ?? ""
+          if rule_uid == "" { rule_uid = string(p.WAFRuleID) ?? "" }
+          rule_desc = string(p.Description) ?? ""
+          if rule_desc == "" { rule_desc = string(p.WAFRuleMessage) ?? "" }
+
+          for_each(["SecurityLevel", "BotScoreSrc", "JA3Hash", "ClientSSLProtocol", "ClientSSLCipher", "CacheCacheStatus", "ZoneName", "EdgeColoCode", "ClientDeviceType", "ClientIPClass", "Source", "Kind", "WAFProfile"]) -> |_i, key| {
+              v = to_string(get(p, [key]) ?? "") ?? ""
+              if v != "" { unmapped = set!(unmapped, [downcase(key)], v) }
+          }
+          ort = to_int(p.OriginResponseTime) ?? 0
+          if ort != 0 { unmapped.origin_response_time_ns = ort }
+          fw_ids = array(p.FirewallMatchesRuleIDs) ?? []
+          if length(fw_ids) > 0 { unmapped.firewall_rule_ids = encode_json(fw_ids) }
+
+          . = {
+              "class_uid": 4002,
+              "class_name": "HTTP Activity",
+              "category_uid": 4,
+              "category_name": "Network Activity",
+              "activity_id": activity_id,
+              "activity_name": activity_name,
+              "type_uid": 400200 + activity_id,
+              "severity_id": severity_id,
+              "severity": severity,
+              "status_id": status_id,
+              "status": status_str,
+              "action_id": action_id,
+              "action": action_name,
+              "disposition_id": disposition_id,
+              "disposition": disposition_name,
+              "is_alert": is_alert,
+              "time": time_ms,
+              "message": raw_log,
+              "raw_data": raw_log,
+              "metadata": metadata,
+              "http_request": http_request,
+              "http_response": http_response,
+              "traffic": { "bytes_in": req_bytes, "bytes_out": resp_bytes }
+          }
+          if exists(src_endpoint.ip) || exists(src_endpoint.port) { .src_endpoint = src_endpoint }
+          dst_endpoint = {}
+          oip = string(p.OriginIP) ?? ""
+          if match(oip, ip_re) { dst_endpoint.ip = oip }
+          if host != "" { dst_endpoint.hostname = downcase(host) }
+          if exists(dst_endpoint.ip) || exists(dst_endpoint.hostname) { .dst_endpoint = dst_endpoint }
+          eip = string(p.EdgeServerIP) ?? ""
+          if match(eip, ip_re) { .proxy = { "ip": eip } }
+          if rule_uid != "" || rule_desc != "" {
+              fr = {}
+              if rule_uid != "" { fr.uid = rule_uid }
+              if rule_desc != "" { fr.name = rule_desc }
+              .firewall_rule = fr
+          }
+          # BotScore is Cloudflare's 1-99 likelihood that the client is human;
+          # it is a risk signal, not an entity risk score from the RBA engine.
+          bs = to_int(p.BotScore) ?? -1
+          if bs >= 0 { .risk_score = bs }
+          if length(unmapped) > 0 { .unmapped = unmapped }
+      }
+  } else {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_name": "cloudflare-logpush",
+              "product": { "name": "Cloudflare", "vendor_name": "Cloudflare" }
+          }
+      }
+  }
+
+  .
+
+# Runtime samples (NAN-2327): one per event shape this parser routes.
+# `class_uid` is asserted because class routing is the whole point of the
+# OCSF conversion — a silent reroute is the defect most likely to survive
+# a compile-only check.
+samples:
+  - raw: 'not json at all'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: '{"Timestamp":"2026-08-12T09:15:35Z","QueryName":"lookup.example.org","QueryType":28,"ResponseCode":3,"SourceIP":"10.60.4.9","ColoCode":"AMS","EDNSSubnet":"10.60.4.0/24"}'
+    expect:
+      class_uid: 4003
+      activity_id: 2
+  - raw: '{"Datetime":"2026-08-12T09:15:30Z","Action":"block","ClientIP":"198.51.100.200","ClientASN":64513,"ClientASNDescription":"BADNET","ClientCountry":"ru","ClientIPClass":"badHost","ClientRequestHost":"api.example.com","ClientRequestMethod":"POST","ClientRequestPath":"/v1/login","ClientRequestQuery":"?next=%2Fadmin","ClientRequestProtocol":"HTTP/1.1","ClientRequestScheme":"https","ClientRequestUserAgent":"python-requests/2.31","EdgeResponseStatus":403,"RuleID":"a1b2c3d4","Description":"OWASP SQLi","Source":"waf","Kind":"firewall","RayID":"8f2c1a9b4d0e9999"}'
+    expect:
+      class_uid: 4002
+      activity_id: 6
+  - raw: '{"EdgeStartTimestamp":1786000522123000000,"ClientIP":"203.0.113.88","ClientSrcPort":51422,"ClientASN":64512,"ClientASNDescription":"EXAMPLE-AS","ClientCountry":"de","ClientRequestHost":"shop.example.com","ClientRequestURI":"/checkout?step=2","ClientRequestMethod":"POST","ClientRequestProtocol":"HTTP/2","ClientRequestUserAgent":"Mozilla/5.0","ClientRequestReferer":"https://shop.example.com/cart","ClientRequestBytes":2048,"EdgeResponseStatus":200,"EdgeResponseBytes":10240,"EdgeServerIP":"198.51.100.1","OriginIP":"192.0.2.55","RayID":"8f2c1a9b4d0e1234","CacheCacheStatus":"dynamic","ZoneName":"example.com","EdgeColoCode":"FRA","BotScore":34,"BotScoreSrc":"Machine Learning","JA3Hash":"e7d705a3286e19ea42f587b344ee6865","ClientSSLProtocol":"TLSv1.3","SecurityLevel":"medium","WAFAction":"unknown","FirewallMatchesActions":[],"FirewallMatchesRuleIDs":[]}'
+    expect:
+      class_uid: 4002
+      activity_id: 6

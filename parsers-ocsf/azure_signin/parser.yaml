@@ -1,0 +1,287 @@
+name: azure_signin_ocsf
+display_name: Azure Sign-in Logs (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Microsoft Entra ID (Azure AD) sign-in logs into complete OCSF 1.9.0
+  "Authentication" (class_uid 3002) records. Handles the diagnostic-settings
+  envelope (properties{...}) and the flattened Graph shape, plus interactive,
+  non-interactive and service-principal sign-ins. Declares the cloud, host and
+  security_control profiles so cloud.*, device.* and risk_level_id are legal.
+  The whole OCSF object is emitted on the root so it lands in ocsf_logs.event
+  and the promoted columns materialize. Mirrors the UDM azure_signin parser but
+  targets OCSF instead of `.udm.*`.
+match_values:
+  - azure_signin
+category: cloud
+vendor: "Microsoft"
+product: "Entra ID"
+parser_vrl: |
+  # Entra ID sign-in log -> OCSF 1.9.0 Authentication (class_uid 3002)
+  raw_log = to_string(.message) ?? ""
+  class_uid = 3002
+
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Authentication",
+          "category_uid": 3,
+          "category_name": "Identity & Access Management",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": class_uid * 100 + 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud"],
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_name": "SignInLogs",
+              "product": { "name": "Microsoft Entra ID", "vendor_name": "Microsoft" }
+          },
+          "cloud": { "provider": "Azure" },
+          "api": { "operation": "SignIn", "service": { "name": "entra_id" } },
+          "user": { "name": "unknown" },
+          "service": { "name": "unknown" }
+      }
+  } else {
+      top = object!(parsed)
+      props = object(top.properties) ?? top
+
+      # ---- time ----
+      time_ms = 0
+      ts_str = to_string(top.time) ?? ""
+      if ts_str == "" { ts_str = to_string(props.createdDateTime) ?? "" }
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- outcome: properties.status.errorCode wins, else top-level resultType ----
+      status_obj = object(props.status) ?? {}
+      error_code = -1
+      failure_reason = ""
+      additional = ""
+      if length(keys(status_obj)) > 0 {
+          error_code = to_int(status_obj.errorCode) ?? -1
+          failure_reason = to_string(status_obj.failureReason) ?? ""
+          additional = to_string(status_obj.additionalDetails) ?? ""
+      }
+      if error_code < 0 {
+          rt = to_string(top.resultType) ?? ""
+          if rt != "" { error_code = to_int(rt) ?? -1 }
+          if failure_reason == "" { failure_reason = to_string(top.resultDescription) ?? "" }
+      }
+      status_id = 0
+      status_str = "Unknown"
+      severity_id = 1
+      severity = "Informational"
+      if error_code == 0 {
+          status_id = 1
+          status_str = "Success"
+      } else if error_code > 0 {
+          status_id = 2
+          status_str = "Failure"
+          severity_id = 2
+          severity = "Low"
+      }
+
+      # ---- subject ----
+      upn = to_string(props.userPrincipalName) ?? ""
+      display = to_string(props.userDisplayName) ?? ""
+      sp_name = to_string(props.servicePrincipalName) ?? ""
+      user = { "name": "unknown" }
+      if upn != "" {
+          user = { "name": upn, "type_id": 1, "type": "User" }
+          user.email_addr = upn
+          upn_parts = split(upn, "@")
+          if length(upn_parts) == 2 { user.domain = to_string(upn_parts[1]) }
+      } else if sp_name != "" {
+          user = { "name": sp_name, "type_id": 4, "type": "Service" }
+      } else if display != "" {
+          user = { "name": display, "type_id": 0 }
+      }
+      if display != "" { user.display_name = display }
+      uid = to_string(props.userId) ?? ""
+      if uid == "" { uid = to_string(props.servicePrincipalId) ?? "" }
+      if uid != "" { user.uid = uid }
+
+      # ---- the target application -> `service` (satisfies the 3002 constraint) ----
+      app_name = to_string(props.resourceDisplayName) ?? ""
+      if app_name == "" { app_name = to_string(props.appDisplayName) ?? "" }
+      if app_name == "" { app_name = "unknown" }
+      service = { "name": app_name }
+      res_uid = to_string(props.resourceId) ?? ""
+      if res_uid != "" { service.uid = res_uid }
+
+      # ---- source endpoint ----
+      ip = to_string(props.ipAddress) ?? ""
+      if ip == "" { ip = to_string(top.callerIpAddress) ?? "" }
+      src_endpoint = { "ip": "0.0.0.0" }
+      if ip != "" { src_endpoint = { "ip": downcase(ip) } }
+      location = object(props.location) ?? {}
+      loc = {}
+      country = to_string(location.countryOrRegion) ?? ""
+      if country != "" { loc.country = country }
+      city = to_string(location.city) ?? ""
+      if city != "" { loc.city = city }
+      state = to_string(location.state) ?? ""
+      if state != "" { loc.region = state }
+      if length(keys(loc)) > 0 { src_endpoint.location = loc }
+      asn = to_int(props.autonomousSystemNumber) ?? 0
+      if asn > 0 { src_endpoint.autonomous_system = { "number": asn } }
+
+      # ---- MFA / logon type / auth protocol ----
+      auth_req = to_string(props.authenticationRequirement) ?? ""
+      mfa_detail = object(props.mfaDetail) ?? {}
+      mfa_method = to_string(mfa_detail.authMethod) ?? ""
+      is_mfa = false
+      if auth_req == "multiFactorAuthentication" { is_mfa = true }
+      if mfa_method != "" { is_mfa = true }
+
+      is_interactive = to_bool(props.isInteractive) ?? false
+      logon_type_id = 3
+      logon_type = "Network"
+      if is_interactive { logon_type_id = 2; logon_type = "Interactive" }
+
+      auth_proto = downcase(to_string(props.authenticationProtocol) ?? "")
+      auth_protocol_id = 6
+      auth_protocol = "OAUTH 2.0"
+      if auth_proto == "saml" { auth_protocol_id = 5; auth_protocol = "SAML" }
+      if auth_proto == "openidconnect" || auth_proto == "oidc" { auth_protocol_id = 4; auth_protocol = "OpenID" }
+      if auth_proto == "ropc" || auth_proto == "password" { auth_protocol_id = 11; auth_protocol = "Basic Authentication" }
+      if auth_proto == "wsfederation" || auth_proto == "ws-fed" { auth_protocol_id = 99; auth_protocol = "Other" }
+
+      # ---- risk ----
+      risk = downcase(to_string(props.riskLevelDuringSignIn) ?? "")
+      if risk == "" || risk == "none" { risk = downcase(to_string(props.riskLevelAggregated) ?? "") }
+      risk_level_id = 0
+      risk_level = "Info"
+      if risk == "low" { risk_level_id = 1; risk_level = "Low" }
+      if risk == "medium" { risk_level_id = 2; risk_level = "Medium" }
+      if risk == "high" { risk_level_id = 3; risk_level = "High" }
+      if risk_level_id >= 2 && severity_id < 3 { severity_id = 3; severity = "Medium" }
+
+      # ---- device (host profile) ----
+      dev_detail = object(props.deviceDetail) ?? {}
+      device = {}
+      dev_name = to_string(dev_detail.displayName) ?? ""
+      if dev_name != "" { device.hostname = dev_name }
+      dev_id = to_string(dev_detail.deviceId) ?? ""
+      if dev_id != "" { device.uid = dev_id }
+      dev_os = to_string(dev_detail.operatingSystem) ?? ""
+      if dev_os != "" {
+          os_l = downcase(dev_os)
+          os_type_id = 0
+          if contains(os_l, "windows") { os_type_id = 100 }
+          if contains(os_l, "android") { os_type_id = 201 }
+          if contains(os_l, "linux") || contains(os_l, "ubuntu") { os_type_id = 200 }
+          if contains(os_l, "macos") || contains(os_l, "mac os") || contains(os_l, "os x") { os_type_id = 300 }
+          if contains(os_l, "ios") && !contains(os_l, "bios") { os_type_id = 301 }
+          if contains(os_l, "ipados") { os_type_id = 302 }
+          device.os = { "name": dev_os, "type_id": os_type_id }
+      }
+      if length(keys(device)) > 0 { device.type_id = 0 }
+
+      # ---- session ----
+      correlation = to_string(props.correlationId) ?? ""
+      if correlation == "" { correlation = to_string(top.correlationId) ?? "" }
+      session = { "is_mfa": is_mfa }
+      session_uid = to_string(props.id) ?? ""
+      if session_uid != "" { session.uid = session_uid }
+      if is_interactive { session.is_remote = true }
+
+      tenant_id = to_string(top.tenantId) ?? ""
+      cloud = { "provider": "Azure" }
+      if tenant_id != "" {
+          cloud.account = { "uid": tenant_id }
+          cloud.org = { "uid": tenant_id }
+      }
+
+      ocsf = {
+          "class_uid": class_uid,
+          "class_name": "Authentication",
+          "category_uid": 3,
+          "category_name": "Identity & Access Management",
+          "activity_id": 1,
+          "activity_name": "Logon",
+          "type_uid": class_uid * 100 + 1,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "is_mfa": is_mfa,
+          "logon_type_id": logon_type_id,
+          "logon_type": logon_type,
+          "auth_protocol_id": auth_protocol_id,
+          "auth_protocol": auth_protocol,
+          "risk_level_id": risk_level_id,
+          "risk_level": risk_level,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud", "host", "security_control"],
+              "uid": uuid_v4(),
+              "log_name": "SignInLogs",
+              "log_provider": "Microsoft Entra ID",
+              "product": { "name": "Microsoft Entra ID", "vendor_name": "Microsoft" }
+          },
+          "cloud": cloud,
+          "api": { "operation": "SignIn", "service": { "name": "entra_id" } },
+          "user": user,
+          "service": service,
+          "src_endpoint": src_endpoint,
+          "session": session
+      }
+      if session_uid != "" { ocsf.metadata.uid = session_uid }
+      if correlation != "" { ocsf.metadata.correlation_uid = correlation }
+      if error_code > 0 { ocsf.status_code = to_string(error_code) }
+      if failure_reason != "" { ocsf.status_detail = failure_reason }
+      if length(keys(device)) > 0 { ocsf.device = device }
+
+      unmapped = {}
+      app_id = to_string(props.appId) ?? ""
+      if app_id != "" { unmapped.app_id = app_id }
+      app_disp = to_string(props.appDisplayName) ?? ""
+      if app_disp != "" { unmapped.app_display_name = app_disp }
+      if auth_req != "" { unmapped.authentication_requirement = auth_req }
+      if mfa_method != "" { unmapped.mfa_method = mfa_method }
+      ca_status = to_string(props.conditionalAccessStatus) ?? ""
+      if ca_status != "" { unmapped.conditional_access_status = ca_status }
+      risk_state = to_string(props.riskState) ?? ""
+      if risk_state != "" { unmapped.risk_state = risk_state }
+      risk_detail = to_string(props.riskDetail) ?? ""
+      if risk_detail != "" { unmapped.risk_detail = risk_detail }
+      if additional != "" { unmapped.status_additional_details = additional }
+      if tenant_id != "" { unmapped.tenant_id = tenant_id }
+      home_tenant = to_string(props.homeTenantId) ?? ""
+      if home_tenant != "" { unmapped.home_tenant_id = home_tenant }
+      client_app = to_string(props.clientAppUsed) ?? ""
+      if client_app != "" { unmapped.client_app_used = client_app }
+      browser = to_string(dev_detail.browser) ?? ""
+      if browser != "" { unmapped.device_browser = browser }
+      trust = to_string(dev_detail.trustType) ?? ""
+      if trust != "" { unmapped.device_trust_type = trust }
+      compliant = to_bool(dev_detail.isCompliant) ?? null
+      if compliant != null { unmapped.device_is_compliant = compliant }
+      managed = to_bool(dev_detail.isManaged) ?? null
+      if managed != null { unmapped.device_is_managed = managed }
+      ca_policies = array(props.appliedConditionalAccessPolicies) ?? []
+      if length(ca_policies) > 0 { unmapped.conditional_access_policies = encode_json(ca_policies) }
+      net_locs = array(props.networkLocationDetails) ?? []
+      if length(net_locs) > 0 { unmapped.network_location_details = encode_json(net_locs) }
+      ptime = to_int(props.processingTimeInMs) ?? 0
+      if ptime > 0 { unmapped.processing_time_ms = ptime }
+      if length(keys(unmapped)) > 0 { ocsf.unmapped = unmapped }
+
+      . = ocsf
+  }

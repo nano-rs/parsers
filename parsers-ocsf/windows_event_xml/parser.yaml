@@ -1,0 +1,571 @@
+name: windows_event_xml_ocsf
+display_name: Windows Event Log (XML, OCSF)
+version: "1.0.0"
+description: >
+  Parses Windows Event Log records in NATIVE XML (WEF, EVTX export, wevtutil)
+  into complete OCSF 1.9.0 records. This is the XML-wire-format sibling of the
+  windows_event (JSON) OCSF parser and claims the same `windows_event` source
+  type — deploy exactly one parser per source type.
+  Routing by EventID:
+    4624/4625/4648/4776   -> Authentication 3002 (Logon)
+    4634/4647             -> Authentication 3002 (Logoff)
+    4768/4769/4771        -> Authentication 3002 (Ticket / Preauth)
+    4672                  -> Authorize Session 3003 (Assign Privileges)
+    4688/4689             -> Process Activity 1007 (Launch / Terminate)
+    4697/7045             -> Windows Service Activity 201004 (Create)
+    4698-4702             -> Scheduled Job Activity 1006
+    4720/4722/4723/4724/4725/4726/4738/4740/4767 -> User Management 3007
+    4728/4732/4756/4729/4733/4757 -> Group Management 3006 (Add/Remove User)
+    4657                  -> Registry Value Activity 201002 (win extension)
+    4663/5140/5145        -> File System Activity 1001
+    1102                  -> Event Log Activity 1008 (Clear)
+    4104                  -> Script Activity 1009 (Execute)
+    anything else         -> Base Event 0 (event_code preserved, nothing invented)
+  NOTE on OCSF 1.9: account-lifecycle events map to User Management 3007 and
+  group-membership events to Group Management 3006. Account Change 3001 and User
+  Access Management 3005 are DEPRECATED in 1.9 and are deliberately not emitted.
+  Carries metadata.profiles ["host"] on every branch that emits `device`,
+  because `device` is profile-bound on the IAM classes.
+  Emits the whole OCSF object on the root so it lands in ocsf_logs.event and the
+  promoted columns materialize. Mirrors the UDM windows_event_xml parser but
+  targets OCSF instead of `.udm.*`.
+ocsf_version: "1.9.0"
+match_values:
+  - windows_event
+category: endpoint
+vendor: "Microsoft"
+product: "Windows"
+parser_vrl: |
+  # Windows Event Log native XML -> OCSF 1.9.0. Emits the COMPLETE record on root.
+  raw_log = string!(.message)
+  parsed, perr = parse_xml(raw_log)
+
+  if perr != null || !is_object(parsed) {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 2,
+          "severity": "Low",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_name": "Security",
+              "log_provider": "Microsoft-Windows-Security-Auditing",
+              "event_code": "unparsed",
+              "product": { "name": "Windows", "vendor_name": "Microsoft" }
+          }
+      }
+  } else {
+      root = object!(parsed)
+      event = object(root.Event) ?? {}
+      system = object(event.System) ?? {}
+
+      # ---- EventID: int, or object with `text` + `@Qualifiers` ----
+      eid = 0
+      raw_eid = system.EventID
+      if is_object(raw_eid) {
+          eid = to_int(object!(raw_eid).text) ?? 0
+      } else if raw_eid != null {
+          eid = to_int(raw_eid) ?? 0
+      }
+
+      computer = downcase(string(system.Computer) ?? "")
+      channel = string(system.Channel) ?? ""
+      if channel == "" { channel = "Security" }
+      provider_obj = object(system.Provider) ?? {}
+      provider = string(provider_obj."@Name") ?? ""
+      if provider == "" { provider = "Microsoft-Windows-Security-Auditing" }
+      record_id = to_string(system.EventRecordID) ?? ""
+
+      # ---- Windows Level -> OCSF severity ----
+      level_int = to_int(system.Level) ?? 4
+      severity_id = 1
+      severity = "Informational"
+      if level_int == 3 { severity_id = 3; severity = "Medium" }
+      if level_int == 2 { severity_id = 4; severity = "High" }
+      if level_int == 1 { severity_id = 5; severity = "Critical" }
+
+      # ---- event time (System/TimeCreated/@SystemTime) -> epoch ms ----
+      time_ms = 0
+      tc = object(system.TimeCreated) ?? {}
+      ts_str = string(tc."@SystemTime") ?? ""
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- EventData/Data[@Name] -> flat map ----
+      ed = {}
+      eds = object(event.EventData) ?? {}
+      data_items = eds.Data
+      items_array = []
+      if is_array(data_items) {
+          items_array = array!(data_items)
+      } else if is_object(data_items) {
+          items_array = [data_items]
+      }
+      for_each(items_array) -> |_idx, item| {
+          if is_object(item) {
+              io = object!(item)
+              dname = string(io."@Name") ?? ""
+              if dname != "" {
+                  dval = io.text
+                  if dval != null {
+                      ed = set!(ed, [dname], dval)
+                  } else {
+                      ed = set!(ed, [dname], "")
+                  }
+              }
+          }
+      }
+      # UserData (1102 audit-log-cleared and friends) -> same flat map
+      ud = object(event.UserData) ?? {}
+      for_each(ud) -> |_key, child| {
+          if is_object(child) {
+              for_each(object!(child)) -> |fname, fval| {
+                  if !starts_with(fname, "@") { ed = set!(ed, [fname], fval) }
+              }
+          }
+      }
+
+      # ---- common actors / targets ----
+      subj_user = downcase(string(ed.SubjectUserName) ?? "")
+      subj_domain = downcase(string(ed.SubjectDomainName) ?? "")
+      subj_sid = string(ed.SubjectUserSid) ?? ""
+      tgt_user = downcase(string(ed.TargetUserName) ?? "")
+      tgt_domain = downcase(string(ed.TargetDomainName) ?? "")
+      tgt_sid = string(ed.TargetUserSid) ?? ""
+      if tgt_sid == "" { tgt_sid = string(ed.TargetSid) ?? "" }
+
+      actor_user = { "name": subj_user, "domain": subj_domain, "uid": subj_sid }
+      device = { "hostname": computer, "type_id": 0 }
+
+      msg = raw_log
+      um = {}
+      if computer != "" { um = set!(um, ["host_name"], computer) }
+
+      ocsf = {}
+      wants_host_profile = true
+
+      if eid == 4688 || eid == 4689 {
+          # ---- Process Activity 1007 ----
+          npn = string(ed.NewProcessName) ?? ""
+          if eid == 4689 { npn = string(ed.ProcessName) ?? "" }
+          proc_name = ""
+          nm, nmerr = parse_regex(npn, r'(?P<b>[^\\/]+)$')
+          if nmerr == null { proc_name = to_string(nm.b) }
+          ppn = string(ed.ParentProcessName) ?? ""
+          parent_name = ""
+          pm, pmerr = parse_regex(ppn, r'(?P<b>[^\\/]+)$')
+          if pmerr == null { parent_name = to_string(pm.b) }
+
+          activity_id = 1
+          activity_name = "Launch"
+          if eid == 4689 { activity_id = 2; activity_name = "Terminate" }
+
+          new_pid = parse_int(string(ed.NewProcessId) ?? "0") ?? 0
+          if new_pid == 0 { new_pid = parse_int(string(ed.ProcessId) ?? "0") ?? 0 }
+
+          ocsf.class_uid = 1007
+          ocsf.class_name = "Process Activity"
+          ocsf.category_uid = 1
+          ocsf.category_name = "System Activity"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          ocsf.process = {
+              "name": proc_name,
+              "cmd_line": string(ed.CommandLine) ?? "",
+              "pid": new_pid,
+              "file": { "name": proc_name, "path": npn, "type_id": 1 }
+          }
+          actor = { "user": actor_user }
+          if eid == 4688 {
+              actor = set!(actor, ["process"], {
+                  "name": parent_name,
+                  "pid": parse_int(string(ed.ProcessId) ?? "0") ?? 0,
+                  "file": { "name": parent_name, "path": ppn, "type_id": 1 }
+              })
+          }
+          ocsf.actor = actor
+          ocsf.device = device
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+      } else if eid == 4697 || eid == 7045 {
+          # ---- Windows Service Activity 201004 (win extension) ----
+          svc_name = string(ed.ServiceName) ?? ""
+          svc_cmd = string(ed.ServiceFileName) ?? ""
+          if svc_cmd == "" { svc_cmd = string(ed.ImagePath) ?? "" }
+          svc_account = string(ed.ServiceAccount) ?? ""
+          if svc_account == "" { svc_account = string(ed.AccountName) ?? "" }
+
+          ocsf.class_uid = 201004
+          ocsf.class_name = "Windows Service Activity"
+          ocsf.category_uid = 1
+          ocsf.category_name = "System Activity"
+          ocsf.activity_id = 1
+          ocsf.activity_name = "Create"
+          ocsf.win_service = { "name": svc_name, "cmd_line": svc_cmd, "service_start_name": svc_account }
+          ocsf.actor = { "user": actor_user }
+          ocsf.device = device
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+          if severity_id < 3 { severity_id = 3; severity = "Medium" }
+          if svc_name != "" { um = set!(um, ["service_name"], svc_name) }
+      } else if eid == 4698 || eid == 4699 || eid == 4700 || eid == 4701 || eid == 4702 {
+          # ---- Scheduled Job Activity 1006 ----
+          activity_id = 1
+          activity_name = "Create"
+          if eid == 4699 { activity_id = 3; activity_name = "Delete" }
+          if eid == 4700 { activity_id = 4; activity_name = "Enable" }
+          if eid == 4701 { activity_id = 5; activity_name = "Disable" }
+          if eid == 4702 { activity_id = 2; activity_name = "Update" }
+
+          task_name = string(ed.TaskName) ?? ""
+          leaf = task_name
+          lm, lmerr = parse_regex(task_name, r'(?P<b>[^\\/]+)$')
+          if lmerr == null { leaf = to_string(lm.b) }
+
+          ocsf.class_uid = 1006
+          ocsf.class_name = "Scheduled Job Activity"
+          ocsf.category_uid = 1
+          ocsf.category_name = "System Activity"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          ocsf.job = {
+              "name": leaf,
+              "file": { "name": leaf, "path": task_name, "type_id": 1 }
+          }
+          ocsf.actor = { "user": actor_user }
+          ocsf.device = device
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+      } else if eid == 4720 || eid == 4722 || eid == 4723 || eid == 4724 || eid == 4725 || eid == 4726 || eid == 4738 || eid == 4740 || eid == 4767 {
+          # ---- User Management 3007 (OCSF 1.9 replacement for 3001/3005) ----
+          activity_id = 99
+          activity_name = "Other"
+          if eid == 4720 { activity_id = 1; activity_name = "Create" }
+          if eid == 4738 { activity_id = 2; activity_name = "Update" }
+          if eid == 4726 { activity_id = 3; activity_name = "Delete" }
+          if eid == 4722 { activity_id = 4; activity_name = "Enable" }
+          if eid == 4725 { activity_id = 5; activity_name = "Disable" }
+          if eid == 4740 { activity_id = 6; activity_name = "Lock" }
+          if eid == 4767 { activity_id = 7; activity_name = "Unlock" }
+          if eid == 4723 { activity_id = 8; activity_name = "Password Change" }
+          if eid == 4724 { activity_id = 9; activity_name = "Password Reset" }
+
+          ocsf.class_uid = 3007
+          ocsf.class_name = "User Management"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          ocsf.user = { "name": tgt_user, "domain": tgt_domain, "uid": tgt_sid }
+          ocsf.actor = { "user": actor_user }
+          ocsf.device = device
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+          if eid == 4740 && severity_id < 3 { severity_id = 3; severity = "Medium" }
+      } else if eid == 4728 || eid == 4732 || eid == 4756 || eid == 4729 || eid == 4733 || eid == 4757 {
+          # ---- Group Management 3006 ----
+          activity_id = 3
+          activity_name = "Add User"
+          if eid == 4729 || eid == 4733 || eid == 4757 { activity_id = 4; activity_name = "Remove User" }
+
+          member = string(ed.MemberName) ?? ""
+          member_sid = string(ed.MemberSid) ?? ""
+
+          ocsf.class_uid = 3006
+          ocsf.class_name = "Group Management"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          ocsf.group = { "name": tgt_user, "uid": tgt_sid, "domain": tgt_domain }
+          ocsf.user = { "name": downcase(member), "uid": member_sid, "domain": tgt_domain }
+          ocsf.actor = { "user": actor_user }
+          ocsf.device = device
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+          if severity_id < 3 { severity_id = 3; severity = "Medium" }
+      } else if eid == 4657 {
+          # ---- Registry Value Activity 201002 (win extension) ----
+          key_path = string(ed.ObjectName) ?? ""
+          value_name = string(ed.ObjectValueName) ?? ""
+          op = string(ed.OperationType) ?? ""
+          activity_id = 3
+          activity_name = "Modify"
+          if op == "%%1905" { activity_id = 2; activity_name = "Set" }
+          if op == "%%1906" { activity_id = 4; activity_name = "Delete" }
+
+          full_path = key_path
+          if value_name != "" { full_path = key_path + "\\" + value_name }
+          new_value = string(ed.NewValue) ?? ""
+
+          ocsf.class_uid = 201002
+          ocsf.class_name = "Registry Value Activity"
+          ocsf.category_uid = 1
+          ocsf.category_name = "System Activity"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          ocsf.reg_value = { "name": value_name, "path": full_path, "data": { "string": new_value } }
+          ocsf.actor = {
+              "user": actor_user,
+              "process": { "name": string(ed.ProcessName) ?? "", "pid": parse_int(string(ed.ProcessId) ?? "0") ?? 0 }
+          }
+          ocsf.device = device
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+      } else if eid == 4663 || eid == 5140 || eid == 5145 {
+          # ---- File System Activity 1001 ----
+          activity_id = 99
+          activity_name = "Access Attempt"
+          if eid == 5140 { activity_id = 14; activity_name = "Open" }
+          if eid == 5145 { activity_name = "Share Access Check" }
+
+          obj_path = string(ed.ObjectName) ?? ""
+          if obj_path == "" { obj_path = string(ed.ShareLocalPath) ?? "" }
+          if obj_path == "" { obj_path = string(ed.ShareName) ?? "" }
+          if obj_path == "" { obj_path = string(ed.RelativeTargetName) ?? "" }
+          file_name = obj_path
+          fm, fmerr = parse_regex(obj_path, r'(?P<b>[^\\/]+)$')
+          if fmerr == null { file_name = to_string(fm.b) }
+          file_type_id = 1
+          if eid == 5140 { file_type_id = 2 }
+
+          ocsf.class_uid = 1001
+          ocsf.class_name = "File System Activity"
+          ocsf.category_uid = 1
+          ocsf.category_name = "System Activity"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          ocsf.file = { "name": file_name, "path": obj_path, "type_id": file_type_id }
+          ocsf.actor = {
+              "user": actor_user,
+              "process": { "name": string(ed.ProcessName) ?? "", "pid": parse_int(string(ed.ProcessId) ?? "0") ?? 0 }
+          }
+          ocsf.device = device
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+          # OCSF 1001 defines no src_endpoint; the share client stays in unmapped.
+          ip = string(ed.IpAddress) ?? ""
+          if ip != "" { um = set!(um, ["client_address"], downcase(ip)) }
+          access = string(ed.AccessMask) ?? ""
+          if access != "" { um = set!(um, ["details", "mode"], access) }
+      } else if eid == 1102 {
+          # ---- Event Log Activity 1008 (audit log cleared) ----
+          ocsf.class_uid = 1008
+          ocsf.class_name = "Event Log Activity"
+          ocsf.category_uid = 1
+          ocsf.category_name = "System Activity"
+          ocsf.activity_id = 1
+          ocsf.activity_name = "Clear"
+          ocsf.log_name = channel
+          ocsf.log_provider = provider
+          clearer = downcase(string(ed.SubjectUserName) ?? "")
+          if clearer == "" { clearer = downcase(string(ed.UserName) ?? "") }
+          clearer_domain = downcase(string(ed.SubjectDomainName) ?? "")
+          if clearer_domain == "" { clearer_domain = downcase(string(ed.DomainName) ?? "") }
+          clearer_sid = string(ed.SubjectUserSid) ?? ""
+          if clearer_sid == "" { clearer_sid = string(ed.UserSid) ?? "" }
+          ocsf.actor = { "user": { "name": clearer, "domain": clearer_domain, "uid": clearer_sid } }
+          ocsf.device = device
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+          if severity_id < 4 { severity_id = 4; severity = "High" }
+      } else if eid == 4104 {
+          # ---- Script Activity 1009 (PowerShell script block logging) ----
+          script_text = string(ed.ScriptBlockText) ?? ""
+          script_path = string(ed.Path) ?? ""
+          script_name = script_path
+          sm, smerr = parse_regex(script_path, r'(?P<b>[^\\/]+)$')
+          if smerr == null { script_name = to_string(sm.b) }
+          if script_name == "" { script_name = "ScriptBlock" }
+
+          ocsf.class_uid = 1009
+          ocsf.class_name = "Script Activity"
+          ocsf.category_uid = 1
+          ocsf.category_name = "System Activity"
+          ocsf.activity_id = 1
+          ocsf.activity_name = "Execute"
+          ocsf.script = {
+              "name": script_name,
+              "type_id": 3,
+              "type": "PowerShell",
+              "uid": string(ed.ScriptBlockId) ?? "",
+              "script_content": { "value": script_text },
+              "file": { "name": script_name, "path": script_path, "type_id": 1 }
+          }
+          ocsf.actor = { "user": actor_user }
+          ocsf.device = device
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+          msg = script_text
+      } else if eid == 4624 || eid == 4625 || eid == 4634 || eid == 4647 || eid == 4648 || eid == 4768 || eid == 4769 || eid == 4771 || eid == 4776 {
+          # ---- Authentication 3002 ----
+          activity_id = 1
+          activity_name = "Logon"
+          status_id = 1
+          status_str = "Success"
+          if eid == 4634 || eid == 4647 { activity_id = 2; activity_name = "Logoff" }
+          if eid == 4768 { activity_id = 3; activity_name = "Authentication Ticket" }
+          if eid == 4769 { activity_id = 4; activity_name = "Service Ticket Request" }
+          if eid == 4771 { activity_id = 6; activity_name = "Preauth" }
+          if eid == 4625 || eid == 4771 {
+              status_id = 2
+              status_str = "Failure"
+              if severity_id < 3 { severity_id = 3; severity = "Medium" }
+          }
+
+          uname = tgt_user
+          udom = tgt_domain
+          usid = tgt_sid
+          if uname == "" { uname = subj_user; udom = subj_domain; usid = subj_sid }
+
+          ocsf.class_uid = 3002
+          ocsf.class_name = "Authentication"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          ocsf.status_id = status_id
+          ocsf.status = status_str
+          ocsf.user = { "name": uname, "domain": udom, "uid": usid }
+          ocsf.actor = { "user": actor_user }
+
+          logon_id = string(ed.TargetLogonId) ?? ""
+          if logon_id == "" { logon_id = string(ed.SubjectLogonId) ?? "" }
+          if logon_id != "" { ocsf.session = { "uid": logon_id } }
+
+          pkg = string(ed.AuthenticationPackageName) ?? ""
+          if pkg == "" { pkg = string(ed.AuthenticationPackage) ?? "" }
+          pkg_l = downcase(pkg)
+          auth_protocol_id = 0
+          if pkg_l == "ntlm" || pkg_l == "microsoft_authentication_package_v1_0" { auth_protocol_id = 1 }
+          if pkg_l == "kerberos" { auth_protocol_id = 2 }
+          if eid == 4768 || eid == 4769 || eid == 4771 { auth_protocol_id = 2; pkg = "Kerberos" }
+          if pkg != "" && auth_protocol_id == 0 { auth_protocol_id = 99 }
+          if auth_protocol_id != 0 {
+              ocsf.auth_protocol_id = auth_protocol_id
+              ocsf.auth_protocol = pkg
+          }
+
+          ip = string(ed.IpAddress) ?? ""
+          if ip == "" { ip = string(ed.ClientAddress) ?? "" }
+          ip = replace(ip, "::ffff:", "")
+          ws = string(ed.WorkstationName) ?? ""
+          if ip != "" || ws != "" {
+              port = parse_int(string(ed.IpPort) ?? "0") ?? 0
+              if port == 0 { port = parse_int(string(ed.ClientPort) ?? "0") ?? 0 }
+              ocsf.src_endpoint = { "ip": downcase(ip), "port": port, "hostname": downcase(ws) }
+          }
+          # 3002 requires at_least_one(service, dst_endpoint): the logon TARGET
+          # is the reporting machine.
+          ocsf.dst_endpoint = { "hostname": computer }
+          ocsf.device = device
+
+          logon_type_raw = string(ed.LogonType) ?? ""
+          logon_type_id = parse_int(string(ed.LogonType) ?? "0") ?? 0
+          logon_type = "Unknown"
+          if logon_type_id == 1 { logon_type = "System" }
+          if logon_type_id == 2 { logon_type = "Interactive" }
+          if logon_type_id == 3 { logon_type = "Network" }
+          if logon_type_id == 4 { logon_type = "Batch" }
+          if logon_type_id == 5 { logon_type = "OS Service" }
+          if logon_type_id == 7 { logon_type = "Unlock" }
+          if logon_type_id == 8 { logon_type = "Network Cleartext" }
+          if logon_type_id == 9 { logon_type = "New Credentials" }
+          if logon_type_id == 10 { logon_type = "Remote Interactive" }
+          if logon_type_id == 11 { logon_type = "Cached Interactive" }
+          if logon_type_id == 12 { logon_type = "Cached Remote Interactive" }
+          if logon_type_id == 13 { logon_type = "Cached Unlock" }
+          if logon_type_raw != "" && logon_type != "Unknown" {
+              ocsf.logon_type_id = logon_type_id
+              ocsf.logon_type = logon_type
+              ocsf.is_remote = logon_type_id == 3 || logon_type_id == 8 || logon_type_id == 10 || logon_type_id == 12
+              ocsf.is_cleartext = logon_type_id == 8
+          }
+
+          if status_id == 2 {
+              ocsf.status_code = string(ed.Status) ?? ""
+              ocsf.status_detail = string(ed.FailureReason) ?? ""
+              sub = string(ed.SubStatus) ?? ""
+              if sub != "" { um = set!(um, ["sub_status"], sub) }
+          }
+          svc_name = string(ed.ServiceName) ?? ""
+          if svc_name != "" { um = set!(um, ["service_name"], svc_name) }
+      } else if eid == 4672 {
+          # ---- Authorize Session 3003 (special privileges assigned) ----
+          ocsf.class_uid = 3003
+          ocsf.class_name = "Authorize Session"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = 1
+          ocsf.activity_name = "Assign Privileges"
+          ocsf.user = { "name": subj_user, "domain": subj_domain, "uid": subj_sid }
+          priv_raw = strip_whitespace(string(ed.PrivilegeList) ?? "")
+          privileges = []
+          if priv_raw != "" { privileges = split(priv_raw, r'\s+') }
+          ocsf.privileges = privileges
+          ocsf.device = device
+          logon_id = string(ed.SubjectLogonId) ?? ""
+          if logon_id != "" { ocsf.session = { "uid": logon_id } }
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+      } else {
+          # ---- everything else: Base Event 0, nothing invented ----
+          # Base Event defines no `device`/`actor`; host stays in unmapped.
+          ocsf.class_uid = 0
+          ocsf.class_name = "Base Event"
+          ocsf.category_uid = 0
+          ocsf.category_name = "Uncategorized"
+          ocsf.activity_id = 0
+          ocsf.activity_name = "Unknown"
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+          wants_host_profile = false
+          if subj_user != "" { um = set!(um, ["actor_name"], subj_user) }
+          if subj_sid != "" { um = set!(um, ["actor_id"], subj_sid) }
+      }
+
+      # ---- common envelope ----
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.type_uid = to_int(ocsf.class_uid) * 100 + to_int(ocsf.activity_id)
+      ocsf.time = time_ms
+      ocsf.message = msg
+      ocsf.raw_data = raw_log
+      if um != {} { ocsf.unmapped = um }
+
+      # Windows EventRecordID is only unique within a host/channel stream and can
+      # be reused after a log reset. Fold in the host, channel and source event
+      # time so replay stays idempotent while a reused RecordID cannot collide.
+      record_uid = ""
+      if record_id != "" && computer != "" && ts_str != "" {
+          record_uid = join!(["windows_event_xml", computer, downcase(channel), downcase(provider), record_id, ts_str], "|")
+      }
+      if record_uid == "" { record_uid = uuid_v4() }
+
+      md = {
+          "version": "1.9.0",
+          "uid": record_uid,
+          "original_event_uid": record_uid,
+          "event_code": to_string(eid),
+          "log_name": channel,
+          "log_provider": provider,
+          "product": { "name": "Windows", "vendor_name": "Microsoft" }
+      }
+      if wants_host_profile { md = set!(md, ["profiles"], ["host"]) }
+      ocsf.metadata = md
+
+      . = ocsf
+  }

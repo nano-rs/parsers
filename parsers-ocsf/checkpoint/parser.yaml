@@ -1,0 +1,578 @@
+name: checkpoint_ocsf
+display_name: Check Point (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Check Point logs in both shipped formats — RFC 5424 syslog carrying a
+  bracketed key:"value" payload, and the LEA pipe-delimited key=value format —
+  into OCSF 1.9.0. Threat Prevention / IPS / Anti-Bot / Anti-Virus records route
+  to Detection Finding (2004); URL Filtering and Application Control records
+  carrying a resource URL route to HTTP Activity (4002); Identity Awareness and
+  other authentication records route to Authentication (3002); firewall, NAT,
+  VPN and System Monitor records route to Network Activity (4001). Lines that
+  parse into no recognisable keys still emit a Network Activity record with
+  activity_id 99 and the raw line in `message`.
+match_values:
+  - checkpoint
+category: network
+vendor: "Check Point"
+product: "Firewall"
+parser_vrl: |
+  # Check Point -> OCSF 1.9.0
+
+  raw_log = string!(.message)
+
+  # ---- format detection ----
+  is_lea = false
+  lm, le = parse_regex(raw_log, r'^loc=|^\d+\|')
+  if le == null && lm != null { is_lea = true }
+  if !is_lea {
+      pm2, pe2 = parse_regex(raw_log, r'^[a-z_/]+=[^|]+\|[a-z_/]+=[^|]+')
+      if pe2 == null && pm2 != null { is_lea = true }
+  }
+
+  time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
+  dvc_host = ""
+  kv = {}
+  log_format = "lea"
+
+  if is_lea {
+      kv = parse_key_value(raw_log, key_value_delimiter: "=", field_delimiter: "|") ?? {}
+      tv = to_string(kv.time) ?? ""
+      if tv != "" {
+          ts, ts_err = parse_timestamp(tv, "%d%b%Y %H:%M:%S")
+          if ts_err == null { time_ms = to_int(to_unix_timestamp(ts, unit: "milliseconds")) }
+      }
+  } else {
+      log_format = "syslog_structured"
+      payload = raw_log
+      sh, she = parse_regex(raw_log, r'^<(?P<pri>\d+)>\d?\s*(?P<ts>\S+)\s+(?P<host>\S+)\s+(?P<app>\S+)\s+(?P<procid>\S+)\s+(?P<msgid>\S+)\s+(?P<payload>.*)$')
+      if she == null && sh != null {
+          dvc_host = to_string(sh.host)
+          payload = string!(sh.payload)
+          tsv = to_string(sh.ts)
+          if tsv != "" {
+              ts2, ts2_err = parse_timestamp(tsv, "%Y-%m-%dT%H:%M:%S%.fZ")
+              if ts2_err == null {
+                  time_ms = to_int(to_unix_timestamp(ts2, unit: "milliseconds"))
+              } else {
+                  ts3, ts3_err = parse_timestamp(tsv, "%Y-%m-%dT%H:%M:%S%z")
+                  if ts3_err == null { time_ms = to_int(to_unix_timestamp(ts3, unit: "milliseconds")) }
+              }
+          }
+      }
+      bm, be = parse_regex(payload, r'\x5B(?P<content>.*)\x5D\s*$')
+      content = payload
+      if be == null && bm != null { content = string!(bm.content) }
+      kv = parse_key_value(content, key_value_delimiter: ":", field_delimiter: ";") ?? {}
+  }
+
+  # ---- common fields (both formats share these names) ----
+  src_ip = to_string(kv.src) ?? ""
+  dst_ip = to_string(kv.dst) ?? ""
+  src_port = to_int(to_string(kv.s_port) ?? "") ?? 0
+  dst_port = to_int(to_string(kv.service) ?? "") ?? 0
+  svc_id = downcase(to_string(kv.service_id) ?? "")
+  if dst_port == 0 {
+      if svc_id == "http" { dst_port = 80 }
+      if svc_id == "https" || svc_id == "ssl" { dst_port = 443 }
+      if svc_id == "domain-udp" || svc_id == "domain-tcp" || svc_id == "dns" { dst_port = 53 }
+      if svc_id == "ssh" { dst_port = 22 }
+      if svc_id == "smtp" { dst_port = 25 }
+      if svc_id == "rdp" || svc_id == "ms-rdp" { dst_port = 3389 }
+      if svc_id == "smb" || svc_id == "microsoft-ds" { dst_port = 445 }
+  }
+
+  proto_raw = downcase(to_string(kv.proto) ?? "")
+  proto_num = to_int(proto_raw) ?? 0
+  proto = ""
+  if proto_num == 1 { proto = "icmp" }
+  if proto_num == 6 { proto = "tcp" }
+  if proto_num == 17 { proto = "udp" }
+  if proto_num == 47 { proto = "gre" }
+  if proto_num == 50 { proto = "esp" }
+  if proto_num == 58 { proto = "icmpv6" }
+  if proto_num == 0 && proto_raw != "" {
+      proto = proto_raw
+      if proto_raw == "tcp" { proto_num = 6 }
+      if proto_raw == "udp" { proto_num = 17 }
+      if proto_raw == "icmp" { proto_num = 1 }
+  }
+
+  ifdir = downcase(to_string(kv.ifdir) ?? "")
+  if ifdir == "" { ifdir = downcase(to_string(kv."i/f_dir") ?? "") }
+  direction_id = 0
+  if ifdir == "inbound" { direction_id = 1 }
+  if ifdir == "outbound" { direction_id = 2 }
+  ifname = to_string(kv.ifname) ?? ""
+  if ifname == "" { ifname = to_string(kv."i/f_name") ?? "" }
+
+  cp_action = downcase(to_string(kv.rule_action) ?? "")
+  if cp_action == "" { cp_action = downcase(to_string(kv.action) ?? "") }
+
+  rule_name = to_string(kv.rule_name) ?? ""
+  if rule_name == "" { rule_name = to_string(kv.rule) ?? "" }
+  rule_uid = to_string(kv.rule_uid) ?? ""
+  if rule_uid == "" { rule_uid = to_string(kv.rule) ?? "" }
+
+  user_name = to_string(kv.src_user_name) ?? ""
+  if user_name == "" { user_name = to_string(kv.user) ?? "" }
+  src_host = to_string(kv.src_machine_name) ?? ""
+  dst_host = to_string(kv.dst_machine_name) ?? ""
+
+  bytes_out = to_int(to_string(kv.client_outbound_bytes) ?? "") ?? 0
+  if bytes_out == 0 { bytes_out = to_int(to_string(kv.sent_bytes) ?? "") ?? 0 }
+  if bytes_out == 0 { bytes_out = to_int(to_string(kv.bytes) ?? "") ?? 0 }
+  bytes_in = to_int(to_string(kv.client_inbound_bytes) ?? "") ?? 0
+  if bytes_in == 0 { bytes_in = to_int(to_string(kv.received_bytes) ?? "") ?? 0 }
+  pkts_out = to_int(to_string(kv.client_outbound_packets) ?? "") ?? 0
+  pkts_in = to_int(to_string(kv.client_inbound_packets) ?? "") ?? 0
+  duration_s = to_int(to_string(kv.elapsed) ?? "") ?? 0
+  if duration_s == 0 { duration_s = to_int(to_string(kv.duration) ?? "") ?? 0 }
+
+  origin = to_string(kv.origin) ?? ""
+  if origin == "" { origin = to_string(kv.orig) ?? "" }
+  origin_name = to_string(kv.originsicname) ?? ""
+  product = to_string(kv.product) ?? ""
+  session_id = to_string(kv.session_id) ?? ""
+  reason = to_string(kv.reason) ?? ""
+  sys_message = to_string(kv.sys_message) ?? ""
+  if sys_message == "" { sys_message = to_string(kv.message_info) ?? "" }
+  app = to_string(kv.appi_name) ?? ""
+  if app == "" { app = to_string(kv.app_name) ?? "" }
+  resource = to_string(kv.resource) ?? ""
+  ssl_host = to_string(kv.ssl_server_name) ?? ""
+  matched_cat = to_string(kv.matched_category) ?? ""
+  if matched_cat == "" { matched_cat = to_string(kv.app_category) ?? "" }
+  http_method = upcase(to_string(kv.method) ?? "")
+
+  attack = to_string(kv.attack) ?? ""
+  protection_name = to_string(kv.protection_name) ?? ""
+  protection_id = to_string(kv.protection_id) ?? ""
+  if protection_id == "" { protection_id = to_string(kv.IPS_id) ?? "" }
+  malware_family = to_string(kv.malware_family) ?? ""
+  virus_name = to_string(kv.virus_name) ?? ""
+  bot_name = to_string(kv.bot_name) ?? ""
+  cve = to_string(kv.CVE) ?? ""
+  auth_status = downcase(to_string(kv.auth_status) ?? "")
+  auth_method = to_string(kv.auth_method) ?? ""
+
+  # ---- severity ----
+  sev_raw = downcase(to_string(kv.severity) ?? "")
+  if sev_raw == "" { sev_raw = downcase(to_string(kv.attack_severity) ?? "") }
+  severity_id = 1
+  severity = "Informational"
+  if sev_raw == "low" { severity_id = 2; severity = "Low" }
+  if sev_raw == "medium" { severity_id = 3; severity = "Medium" }
+  if sev_raw == "high" { severity_id = 4; severity = "High" }
+  if sev_raw == "critical" { severity_id = 5; severity = "Critical" }
+
+  # ---- action / disposition ----
+  action_id = 3
+  action = "Observed"
+  disposition_id = 17
+  disposition = "Logged"
+  status_id = 1
+  status_str = "Success"
+  if cp_action == "accept" || cp_action == "allow" || cp_action == "encrypt" || cp_action == "decrypt" || cp_action == "inspect" {
+      action_id = 1
+      action = "Allowed"
+      disposition_id = 1
+      disposition = "Allowed"
+  }
+  if cp_action == "drop" {
+      action_id = 2
+      action = "Denied"
+      disposition_id = 6
+      disposition = "Dropped"
+      status_id = 2
+      status_str = "Failure"
+  }
+  if cp_action == "reject" || cp_action == "block" || cp_action == "prevent" {
+      action_id = 2
+      action = "Denied"
+      disposition_id = 2
+      disposition = "Blocked"
+      status_id = 2
+      status_str = "Failure"
+  }
+  if cp_action == "detect" || cp_action == "monitor" {
+      action_id = 3
+      action = "Observed"
+      disposition_id = 15
+      disposition = "Detected"
+  }
+
+  # ---- routing ----
+  pl = downcase(product)
+  route = "network"
+  is_threat = attack != "" || protection_name != "" || virus_name != "" || bot_name != "" || malware_family != ""
+  if contains(pl, "threat") || contains(pl, "anti-bot") || contains(pl, "anti-virus") || contains(pl, "smartdefense") || contains(pl, "ips") { is_threat = true }
+  if is_threat {
+      route = "finding"
+      if severity_id < 2 { severity_id = 2; severity = "Low" }
+  } else if resource != "" || contains(pl, "url filtering") || contains(pl, "application control") {
+      route = "http"
+  } else if auth_status != "" || contains(pl, "identity") {
+      route = "auth"
+  }
+
+  # ---- network activity_id ----
+  activity_id = 6
+  activity_name = "Traffic"
+  if cp_action == "drop" || cp_action == "reject" || cp_action == "block" || cp_action == "prevent" {
+      activity_id = 5
+      activity_name = "Refuse"
+  }
+  if cp_action == "" { activity_id = 99; activity_name = "Other" }
+
+  # ---- objects ----
+  src = {}
+  if src_ip != "" && src_ip != "0.0.0.0" { src.ip = downcase(src_ip) }
+  if src_port > 0 { src.port = src_port }
+  if src_host != "" { src.hostname = src_host }
+  if ifname != "" && direction_id != 2 { src.interface_name = ifname }
+  iz = to_string(kv.inzone) ?? ""
+  if iz != "" { src.zone = iz }
+
+  dst = {}
+  if dst_ip != "" && dst_ip != "0.0.0.0" { dst.ip = downcase(dst_ip) }
+  if dst_port > 0 { dst.port = dst_port }
+  if dst_host != "" { dst.hostname = dst_host }
+  if ifname != "" && direction_id == 2 { dst.interface_name = ifname }
+  oz = to_string(kv.outzone) ?? ""
+  if oz != "" { dst.zone = oz }
+  if svc_id != "" { dst.svc_name = svc_id }
+
+  traffic = {}
+  if bytes_in > 0 { traffic.bytes_in = bytes_in }
+  if bytes_out > 0 { traffic.bytes_out = bytes_out }
+  if pkts_in > 0 { traffic.packets_in = pkts_in }
+  if pkts_out > 0 { traffic.packets_out = pkts_out }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": uuid_v4(),
+      "log_source": "checkpoint",
+      "log_provider": "Check Point",
+      "profiles": ["host", "security_control"],
+      "product": {
+          "name": "Check Point Security Gateway",
+          "vendor_name": "Check Point",
+          "feature": { "name": "firewall" }
+      }
+  }
+  if product != "" { metadata.product.feature = { "name": product } }
+  metadata.log_name = log_format
+  lid = to_string(kv.logid) ?? ""
+  if lid != "" { metadata.event_code = lid }
+  luid = to_string(kv.loguid) ?? ""
+  if luid != "" { metadata.original_event_uid = luid }
+
+  device = { "type_id": 9, "type": "Firewall" }
+  has_device = false
+  if dvc_host != "" { device.hostname = dvc_host; has_device = true }
+  if origin != "" { device.ip = downcase(origin); has_device = true }
+  if origin_name != "" { device.name = origin_name; has_device = true }
+
+  fw_rule = {}
+  if rule_name != "" { fw_rule.name = rule_name }
+  if rule_uid != "" { fw_rule.uid = rule_uid }
+  if rule_name == "" && rule_uid != "" { fw_rule.name = "rule " + rule_uid }
+  ln = to_string(kv.layer_name) ?? ""
+  if ln != "" { fw_rule.category = ln }
+
+  unmapped = {}
+  if session_id != "" { unmapped.session_id = session_id }
+  if cp_action != "" { unmapped.checkpoint_action = cp_action }
+  if reason != "" { unmapped.reason = reason }
+  if sys_message != "" { unmapped.sys_message = sys_message }
+  xs = to_string(kv.xlatesrc) ?? ""
+  if xs != "" && xs != "0.0.0.0" { unmapped.nat_src_ip = xs }
+  xd = to_string(kv.xlatedst) ?? ""
+  if xd != "" && xd != "0.0.0.0" { unmapped.nat_dst_ip = xd }
+  xsp = to_string(kv.xlatesport) ?? ""
+  if xsp != "" && xsp != "0" { unmapped.nat_src_port = xsp }
+  xdp = to_string(kv.xlatedport) ?? ""
+  if xdp != "" && xdp != "0" { unmapped.nat_dst_port = xdp }
+  vpnc = to_string(kv.community) ?? ""
+  if vpnc != "" { unmapped.vpn_community = vpnc }
+  pg = to_string(kv.peer_gateway) ?? ""
+  if pg != "" { unmapped.peer_gateway = pg }
+  if cve != "" { unmapped.cve = cve }
+  if malware_family != "" { unmapped.malware_family = malware_family }
+  if length(kv) == 0 { unmapped.parse_status = "no_checkpoint_fields" }
+
+  obs = []
+  if src_ip != "" && src_ip != "0.0.0.0" { obs = push(obs, { "name": "src_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(src_ip) }) }
+  if dst_ip != "" && dst_ip != "0.0.0.0" { obs = push(obs, { "name": "dst_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(dst_ip) }) }
+  if user_name != "" { obs = push(obs, { "name": "user.name", "type": "User Name", "type_id": 4, "value": user_name }) }
+
+  # ---- URL object (http + finding) ----
+  url = {}
+  if resource != "" {
+      if starts_with(resource, "http://") || starts_with(resource, "https://") {
+          url.url_string = resource
+      } else {
+          url.url_string = "http://" + resource
+      }
+      dm3, de3 = parse_regex(resource, r'^(?:https?://)?(?P<domain>[^/:\s]+)')
+      if de3 == null && dm3 != null { url.hostname = string!(dm3.domain) }
+      pm3, pe3 = parse_regex(resource, r'^(?:https?://)?[^/]+(?P<path>/[^\s]*)$')
+      if pe3 == null && pm3 != null { url.path = string!(pm3.path) }
+  }
+  if ssl_host != "" && !exists(url.hostname) { url.hostname = ssl_host }
+  if matched_cat != "" { url.categories = [matched_cat] }
+
+  # ============================================================
+  # Assemble
+  # ============================================================
+  if route == "finding" {
+      class_uid = 2004
+      title = protection_name
+      if title == "" { title = attack }
+      if title == "" { title = virus_name }
+      if title == "" { title = bot_name }
+      if title == "" { title = "Check Point threat detection" }
+      fuid = protection_id
+      if fuid == "" { fuid = to_string(kv.malware_rule_id) ?? "" }
+      if fuid == "" { fuid = title }
+      evidence = {}
+      if length(src) > 0 { evidence.src_endpoint = src }
+      if length(dst) > 0 { evidence.dst_endpoint = dst }
+      if proto_num > 0 { evidence.connection_info = { "direction_id": direction_id, "protocol_num": proto_num } }
+      if user_name != "" { evidence.user = { "name": user_name } }
+      if length(url) > 0 { evidence.url = url }
+      evidence.name = "Check Point threat"
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Detection Finding",
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": 1,
+          "activity_name": "Create",
+          "type_uid": class_uid * 100 + 1,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "is_alert": true,
+          "metadata": metadata,
+          "finding_info": {
+              "uid": fuid,
+              "title": title,
+              "data_sources": ["checkpoint"],
+              "analytic": { "name": title, "uid": fuid, "type_id": 1, "type": "Rule" }
+          },
+          "evidences": [evidence]
+      }
+      if length(fw_rule) > 0 { .firewall_rule = fw_rule }
+      if has_device { .device = device }
+      cl = to_int(to_string(kv.confidence_level) ?? "") ?? 0
+      if cl > 0 { .confidence_score = cl }
+
+  } else if route == "http" {
+      class_uid = 4002
+      http_activity = 99
+      http_activity_name = "Other"
+      if http_method == "CONNECT" { http_activity = 1;  http_activity_name = "Connect" }
+      if http_method == "DELETE"  { http_activity = 2;  http_activity_name = "Delete" }
+      if http_method == "GET"     { http_activity = 3;  http_activity_name = "Get" }
+      if http_method == "HEAD"    { http_activity = 4;  http_activity_name = "Head" }
+      if http_method == "OPTIONS" { http_activity = 5;  http_activity_name = "Options" }
+      if http_method == "POST"    { http_activity = 6;  http_activity_name = "Post" }
+      if http_method == "PUT"     { http_activity = 7;  http_activity_name = "Put" }
+      if http_method == "TRACE"   { http_activity = 8;  http_activity_name = "Trace" }
+      if http_method == "PATCH"   { http_activity = 9;  http_activity_name = "Patch" }
+      req = {}
+      if http_activity != 99 { req.http_method = http_method }
+      if length(url) > 0 { req.url = url }
+      ua = to_string(kv.user_agent) ?? ""
+      if ua != "" { req.user_agent = ua }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": http_activity,
+          "activity_name": http_activity_name,
+          "type_uid": class_uid * 100 + http_activity,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "http_request": req,
+          "connection_info": { "direction_id": direction_id, "protocol_num": proto_num }
+      }
+      if proto != "" { .connection_info.protocol_name = proto }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if length(src) == 0 && length(dst) == 0 { .dst_endpoint = { "svc_name": "http" } }
+      if length(traffic) > 0 { .traffic = traffic }
+      if length(fw_rule) > 0 { .firewall_rule = fw_rule }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if app != "" { .app_name = app }
+      if has_device { .device = device }
+
+  } else if route == "auth" {
+      class_uid = 3002
+      auth_activity = 1
+      auth_activity_name = "Logon"
+      if contains(cp_action, "logout") { auth_activity = 2; auth_activity_name = "Logoff" }
+      if auth_status == "failure" || auth_status == "failed" {
+          status_id = 2
+          status_str = "Failure"
+          action_id = 2
+          action = "Denied"
+          disposition_id = 2
+          disposition = "Blocked"
+          if severity_id < 2 { severity_id = 2; severity = "Low" }
+      }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Authentication",
+          "category_uid": 3,
+          "category_name": "Identity & Access Management",
+          "activity_id": auth_activity,
+          "activity_name": auth_activity_name,
+          "type_uid": class_uid * 100 + auth_activity,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "user": { "name": user_name }
+      }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 {
+          .dst_endpoint = dst
+      } else {
+          .service = { "name": "Check Point Identity Awareness" }
+      }
+      if auth_method != "" { .auth_protocol = auth_method }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if reason != "" { .status_detail = reason }
+      if has_device { .device = device }
+
+  } else {
+      class_uid = 4001
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Network Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": { "direction_id": direction_id, "protocol_num": proto_num }
+      }
+      if proto != "" { .connection_info.protocol_name = proto }
+      if session_id != "" { .connection_info.uid = session_id }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if length(src) == 0 && length(dst) == 0 {
+          fb = {}
+          if dvc_host != "" { fb.hostname = dvc_host }
+          if length(fb) == 0 && origin != "" { fb.ip = downcase(origin) }
+          if length(fb) == 0 { fb.hostname = "unknown" }
+          .src_endpoint = fb
+      }
+      if length(traffic) > 0 { .traffic = traffic }
+      if duration_s > 0 { .duration = duration_s }
+      if length(fw_rule) > 0 { .firewall_rule = fw_rule }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if app != "" { .app_name = app }
+      if sys_message != "" { .status_detail = sys_message }
+      if has_device { .device = device }
+  }
+
+  if length(unmapped) > 0 { .unmapped = unmapped }
+  if length(obs) > 0 { .observables = obs }
+
+  .
+samples:
+- raw: <134>1 2024-10-30T09:46:12Z cp-gw-01 CheckPoint 12345 - [action:"accept"; flags:"444692"; ifdir:"inbound"; ifname:"eth0"; loguid:"{0x66d2,0x0,0x1}"; origin:"192.168.1.1"; originsicname:"CN=cp-gw-01,O=corp"; sequencenum:"1"; time:"1730281572"; version:"5"; product:"VPN-1 & FireWall-1"; dst:"10.10.1.20"; inzone:"External"; layer_name:"Network"; layer_uuid:"abc"; match_id:"1"; parent_rule:"0"; rule_action:"Accept"; rule_name:"allow-web"; rule_uid:"aaa-bbb"; outzone:"Internal"; proto:"6"; s_port:"51422"; service:"443"; service_id:"https"; src:"203.0.113.5"]
+  expect:
+    class_uid: 4001
+    activity_id: 6
+    src_endpoint.ip: 203.0.113.5
+    dst_endpoint.ip: 10.10.1.20
+    disposition_id: 1
+- raw: <134>1 2024-10-30T09:47:00Z cp-gw-01 CheckPoint 12345 - [action:"drop"; ifdir:"inbound"; ifname:"eth0"; origin:"192.168.1.1"; product:"VPN-1 & FireWall-1"; dst:"10.10.1.20"; rule_action:"Drop"; rule_name:"Cleanup rule"; rule_uid:"zzz"; proto:"6"; s_port:"44112"; service:"3389"; service_id:"ms-rdp"; src:"203.0.113.44"; inzone:"External"; outzone:"Internal"]
+  expect:
+    class_uid: 4001
+    activity_id: 5
+    src_endpoint.ip: 203.0.113.44
+    dst_endpoint.ip: 10.10.1.20
+    disposition_id: 6
+- raw: <134>1 2024-10-30T09:50:00Z cp-gw-01 CheckPoint 12345 - [origin:"192.168.1.1"; product:"Identity Awareness"; auth_status:"Failure"; auth_method:"Captive Portal"; src:"10.10.1.55"; src_user_name:"jsmith"; reason:"Invalid credentials"; severity:"medium"]
+  expect:
+    class_uid: 3002
+    activity_id: 1
+    src_endpoint.ip: 10.10.1.55
+    user.name: jsmith
+    actor.user.name: jsmith
+    disposition_id: 2
+- raw: loc=1234|filename=fw.log|fileid=1730281572|time=26Sep2017 20:18:31|action=accept|orig=192.168.1.1|i/f_dir=inbound|i/f_name=eth0|has_accounting=0|product=VPN-1 & FireWall-1|src=203.0.113.5|s_port=51422|dst=10.10.1.20|service=443|proto=tcp|rule=7|rule_name=allow-web|bytes=4210|user=jsmith
+  expect:
+    class_uid: 4001
+    activity_id: 6
+    src_endpoint.ip: 203.0.113.5
+    dst_endpoint.ip: 10.10.1.20
+    actor.user.name: jsmith
+    disposition_id: 1
+- raw: not a check point line
+  expect:
+    class_uid: 4001
+    activity_id: 99
+    disposition_id: 17
+- raw: <134>1 2024-10-30T09:51:00Z cp-gw-01 CheckPoint 12345 - [origin:"192.168.1.1"; product:"System Monitor"; sys_message:"The eth1 interface is down"; severity:"high"]
+  expect:
+    class_uid: 4001
+    activity_id: 99
+    disposition_id: 17
+- raw: <134>1 2024-10-30T09:48:00Z cp-gw-01 CheckPoint 12345 - [action:"prevent"; origin:"192.168.1.1"; product:"Threat Emulation"; protection_name:"Trojan.Win32.Generic"; protection_id:"00A1B2C3"; protection_type:"file"; malware_family:"Emotet"; confidence_level:"4"; severity:"critical"; src:"10.10.1.55"; dst:"93.184.216.34"; proto:"6"; s_port:"51423"; service:"80"; src_user_name:"jsmith"; resource:"http://malware.example.com/payload.exe"]
+  expect:
+    class_uid: 2004
+    activity_id: 1
+    finding_info.uid: 00A1B2C3
+    disposition_id: 2
+- raw: <134>1 2024-10-30T09:49:00Z cp-gw-01 CheckPoint 12345 - [action:"block"; origin:"192.168.1.1"; product:"URL Filtering"; appi_name:"Facebook"; app_category:"Social Networking"; matched_category:"Social Networking"; resource:"https://www.facebook.com/feed"; method:"GET"; src:"10.10.1.55"; dst:"157.240.1.35"; proto:"6"; s_port:"51424"; service:"443"; src_user_name:"jsmith"; rule_name:"block-social"; rule_uid:"ccc"]
+  expect:
+    class_uid: 4002
+    activity_id: 3
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 157.240.1.35
+    actor.user.name: jsmith
+    http_request.url.path: /feed
+    disposition_id: 2

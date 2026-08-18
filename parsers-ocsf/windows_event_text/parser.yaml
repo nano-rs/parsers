@@ -1,0 +1,1059 @@
+name: windows_event_text_ocsf
+display_name: Windows Event Log (Rendered Text, OCSF)
+version: "1.0.0"
+description: >
+  Parses Windows Event Logs in RENDERED TEXT form - as sent by Splunk
+  Universal Forwarder, wevtutil and syslog agents - into complete OCSF 1.9.0
+  records. Accepts both the multi-line `Key=Value` + section-aware `Message` body
+  shape and the single-line MSWinEventLog tab-delimited syslog wrapper.
+  EventID routing:
+    4624/4625/4634/4647/4648/4768/4769/4771/4776 -> Authentication 3002
+    4672                                         -> Authorize Session 3003
+    4688/4689                                    -> Process Activity 1007
+    4697/7045                                    -> Windows Service Activity 201004
+    4720/4722/4723/4724/4725/4726/4740/4767      -> User Management 3007
+    4728/4732/4756/4729/4733/4757                -> Group Management 3006
+    4663 (File) / 4663 (Key) / 4657              -> 1001 / 201001 / 201002
+    4698-4702                                    -> Scheduled Job Activity 1006
+    4946/4947/4948/4950                          -> Entity Management 3004 (firewall rule)
+    5140/5145                                    -> SMB Activity 4006
+    1102 and every unrouted EventID              -> Event Log Activity 1008
+  Carries metadata.profiles ["host"] (plus "security_control" on firewall-rule
+  changes, which is what firewall_rule is bound to). The OCSF counterpart of
+  parsers/windows_event_text - deploy one or the other.
+ocsf_version: "1.9.0"
+match_values:
+  - windows_event
+category: endpoint
+vendor: "Microsoft"
+product: "Windows"
+parser_vrl: |
+  # Windows Event Log in RENDERED TEXT form (Splunk UF / wevtutil / syslog agents)
+  # -> OCSF 1.9.0. Emits the COMPLETE OCSF record on the root.
+  #
+  # Two wire shapes are accepted:
+  #   * multi-line rendered text: header `Key=Value` lines, then `Message=` and a
+  #     section-aware `\tKey:\tValue` body ("Subject:", "New Logon:", ...)
+  #   * single-line MSWinEventLog syslog-wrapped tab-delimited records
+  #
+  # EventID -> OCSF class routing:
+  #   4624/4625/4634/4647/4648/4768/4769/4771/4776 -> Authentication 3002
+  #   4672                                          -> Authorize Session 3003
+  #   4688/4689                                     -> Process Activity 1007
+  #   4697/7045                                     -> Windows Service Activity 201004 (win ext)
+  #   4720/4722/4723/4724/4725/4726/4740/4767       -> User Management 3007 (3001/3005 deprecated)
+  #   4728/4732/4756/4729/4733/4757                 -> Group Management 3006
+  #   4663 (File)                                   -> File System Activity 1001
+  #   4663 (Key)                                    -> Registry Key Activity 201001 (win ext)
+  #   4657                                          -> Registry Value Activity 201002 (win ext)
+  #   4698/4699/4700/4701/4702                      -> Scheduled Job Activity 1006
+  #   4946/4947/4948/4950                           -> Entity Management 3004 (firewall rule)
+  #   5140/5145                                     -> SMB Activity 4006
+  #   1102                                          -> Event Log Activity 1008 (Clear)
+  #   anything else / unparsable                    -> Event Log Activity 1008 (Other)
+  raw_log = string!(.message)
+
+  working = raw_log
+  pri_match, pri_err = parse_regex(working, r'^<\d+>')
+  if pri_err == null {
+      working = strip_whitespace(replace(working, r'^<\d+>', ""))
+  }
+
+  event_id = 0
+  computer_name = ""
+  channel = ""
+  provider_name = ""
+  record_number = ""
+  keywords_str = ""
+  event_type = ""
+  header_timestamp = ""
+  time_ms = 0
+  body_fields = {}
+  message_summary = ""
+  task_category = ""
+
+  is_syslog_wrapped = false
+
+  if contains(working, "MSWinEventLog") {
+      # ---- single-line tab-delimited MSWinEventLog ---------------------
+      # MSWinEventLog \t sev \t channel \t recnum \t date \t eventid \t source
+      #               \t user \t sidtype \t eventtype \t host \t category \t message...
+      is_syslog_wrapped = true
+      mswin_match, mswin_err = parse_regex(working, r'(?s)MSWinEventLog\t(?P<rest>.*)')
+      if mswin_err == null {
+          tab_fields = split(string(mswin_match.rest) ?? "", "\t")
+          if length(tab_fields) > 9 {
+              channel = to_string(get(tab_fields, [1]) ?? "") ?? ""
+              record_number = to_string(get(tab_fields, [2]) ?? "") ?? ""
+              event_id = to_int(get(tab_fields, [4]) ?? "0") ?? 0
+              provider_name = to_string(get(tab_fields, [5]) ?? "") ?? ""
+              computer_name = to_string(get(tab_fields, [9]) ?? "") ?? ""
+              task_category = to_string(get(tab_fields, [10]) ?? "") ?? ""
+              keywords_str = to_string(get(tab_fields, [8]) ?? "") ?? ""
+
+              date_str = to_string(get(tab_fields, [3]) ?? "") ?? ""
+              if date_str != "" {
+                  ts, ts_err = parse_timestamp(date_str, "%a %b %d %H:%M:%S %Y")
+                  if ts_err == null { time_ms = to_unix_timestamp(ts, unit: "milliseconds") }
+              }
+              if length(tab_fields) > 11 {
+                  remaining = slice(tab_fields, 11) ?? []
+                  message_summary = join(remaining, "\t") ?? ""
+              }
+          }
+      }
+  } else {
+      # ---- multi-line rendered text ------------------------------------
+      lines = split(raw_log, "\n")
+      message_start_idx = -1
+
+      for_each(lines) -> |idx, line| {
+          line_str = strip_whitespace(to_string(line))
+          if line_str != "" && message_start_idx < 0 {
+              kv_match, kv_err = parse_regex(line_str, r'^(?P<key>[A-Za-z]+)=(?P<val>.*)$')
+              if kv_err == null {
+                  k = string(kv_match.key) ?? ""
+                  v = string(kv_match.val) ?? ""
+                  if k == "LogName" {
+                      channel = v
+                  } else if k == "SourceName" {
+                      provider_name = v
+                  } else if k == "EventCode" {
+                      event_id = to_int(v) ?? 0
+                  } else if k == "ComputerName" {
+                      computer_name = v
+                  } else if k == "TaskCategory" {
+                      task_category = v
+                  } else if k == "Keywords" {
+                      keywords_str = v
+                  } else if k == "Type" {
+                      event_type = v
+                  } else if k == "RecordNumber" {
+                      record_number = v
+                  } else if k == "Message" {
+                      message_start_idx = idx
+                      message_summary = v
+                  }
+              } else {
+                  ts_match, ts_err = parse_regex(line_str, r'^\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[AP]M$')
+                  if ts_err == null { header_timestamp = line_str }
+              }
+          }
+      }
+
+      if header_timestamp != "" {
+          ts, ts_err = parse_timestamp(header_timestamp, "%m/%d/%Y %I:%M:%S %p")
+          if ts_err == null { time_ms = to_unix_timestamp(ts, unit: "milliseconds") }
+      }
+
+      # ---- section-aware body: "Section.Key" -> value -------------------
+      current_section = "General"
+      last_key = ""
+      if message_start_idx >= 0 {
+          body_lines = slice(lines, message_start_idx + 1) ?? []
+          for_each(body_lines) -> |_idx, bline| {
+              bline_str = to_string(bline)
+              section_match, section_err = parse_regex(bline_str, r'^(?P<section>[A-Za-z][A-Za-z0-9 ()]+):\s*$')
+              if section_err == null {
+                  current_section = strip_whitespace(string(section_match.section) ?? "")
+                  last_key = ""
+              } else {
+                  kv_body_match, kv_body_err = parse_regex(bline_str, r'^\t(?P<key>[^\t:]+):\t+(?P<val>.*)$')
+                  if kv_body_err == null {
+                      k = strip_whitespace(string(kv_body_match.key) ?? "")
+                      v = strip_whitespace(string(kv_body_match.val) ?? "")
+                      full_key = current_section + "." + k
+                      body_fields = set!(body_fields, [full_key], v)
+                      last_key = full_key
+                  } else {
+                      kv_flat_match, kv_flat_err = parse_regex(bline_str, r'^(?P<key>[A-Za-z][^\t:]+):\t+(?P<val>.*)$')
+                      if kv_flat_err == null {
+                          k = strip_whitespace(string(kv_flat_match.key) ?? "")
+                          v = strip_whitespace(string(kv_flat_match.val) ?? "")
+                          full_key = current_section + "." + k
+                          body_fields = set!(body_fields, [full_key], v)
+                          last_key = full_key
+                      } else {
+                          kv_space_match, kv_space_err = parse_regex(bline_str, r'^(?P<key>[A-Za-z][^:]+):\s{2,}(?P<val>.+)$')
+                          if kv_space_err == null {
+                              k = strip_whitespace(string(kv_space_match.key) ?? "")
+                              v = strip_whitespace(string(kv_space_match.val) ?? "")
+                              full_key = current_section + "." + k
+                              body_fields = set!(body_fields, [full_key], v)
+                              last_key = full_key
+                          } else {
+                              cont_match, cont_err = parse_regex(bline_str, r'^\t+(?P<val>\S.*)$')
+                              if cont_err == null && last_key != "" {
+                                  existing = to_string(get(body_fields, [last_key]) ?? "") ?? ""
+                                  cont_val = strip_whitespace(string(cont_match.val) ?? "")
+                                  if existing != "" {
+                                      body_fields = set!(body_fields, [last_key], existing + "\n" + cont_val)
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+      }
+  }
+
+  computer = downcase(computer_name)
+  device = { "hostname": computer, "type_id": 0 }
+
+  # ---- frequently used body fields -----------------------------------
+  subj_name = downcase(to_string(get(body_fields, ["Subject.Account Name"]) ?? "") ?? "")
+  subj_domain = downcase(to_string(get(body_fields, ["Subject.Account Domain"]) ?? "") ?? "")
+  subj_sid = to_string(get(body_fields, ["Subject.Security ID"]) ?? "") ?? ""
+  subj_logon_id = to_string(get(body_fields, ["Subject.Logon ID"]) ?? "") ?? ""
+
+  tgt_name = downcase(to_string(get(body_fields, ["Target Account.Account Name"]) ?? "") ?? "")
+  tgt_domain = downcase(to_string(get(body_fields, ["Target Account.Account Domain"]) ?? "") ?? "")
+  tgt_sid = to_string(get(body_fields, ["Target Account.Security ID"]) ?? "") ?? ""
+
+  actor_user = { "name": subj_name, "domain": subj_domain }
+  if subj_sid != "" { actor_user.uid = subj_sid }
+
+  src_ip = downcase(to_string(get(body_fields, ["Network Information.Source Network Address"]) ?? "") ?? "")
+  if src_ip == "" {
+      src_ip = downcase(to_string(get(body_fields, ["Network Information.Client Address"]) ?? "") ?? "")
+  }
+  if src_ip == "" {
+      src_ip = downcase(to_string(get(body_fields, ["Network Information.Source Address"]) ?? "") ?? "")
+  }
+  if src_ip == "" {
+      src_ip = downcase(to_string(get(body_fields, ["Network Information.Network Address"]) ?? "") ?? "")
+  }
+  if starts_with(src_ip, "::ffff:") { src_ip = slice!(src_ip, 7) }
+  if src_ip == "-" { src_ip = "" }
+
+  src_port_str = to_string(get(body_fields, ["Network Information.Source Port"]) ?? "") ?? ""
+  if src_port_str == "" { src_port_str = to_string(get(body_fields, ["Network Information.Client Port"]) ?? "") ?? "" }
+  if src_port_str == "" { src_port_str = to_string(get(body_fields, ["Network Information.Port"]) ?? "") ?? "" }
+  src_port = to_int(src_port_str) ?? 0
+
+  workstation = downcase(to_string(get(body_fields, ["Network Information.Workstation Name"]) ?? "") ?? "")
+
+  # ---- logon type ------------------------------------------------------
+  logon_type_str = to_string(get(body_fields, ["Logon Information.Logon Type"]) ?? "") ?? ""
+  if logon_type_str == "" { logon_type_str = to_string(get(body_fields, ["New Logon.Logon Type"]) ?? "") ?? "" }
+  if logon_type_str == "" { logon_type_str = to_string(get(body_fields, ["Subject.Logon Type"]) ?? "") ?? "" }
+  if logon_type_str == "" { logon_type_str = to_string(get(body_fields, ["General.Logon Type"]) ?? "") ?? "" }
+  logon_type_id = to_int(logon_type_str) ?? 0
+  logon_type = "Unknown"
+  if logon_type_id == 1 { logon_type = "System" }
+  if logon_type_id == 2 { logon_type = "Interactive" }
+  if logon_type_id == 3 { logon_type = "Network" }
+  if logon_type_id == 4 { logon_type = "Batch" }
+  if logon_type_id == 5 { logon_type = "OS Service" }
+  if logon_type_id == 7 { logon_type = "Unlock" }
+  if logon_type_id == 8 { logon_type = "Network Cleartext" }
+  if logon_type_id == 9 { logon_type = "New Credentials" }
+  if logon_type_id == 10 { logon_type = "Remote Interactive" }
+  if logon_type_id == 11 { logon_type = "Cached Interactive" }
+  if logon_type_id == 12 { logon_type = "Cached Remote Interactive" }
+  if logon_type_id == 13 { logon_type = "Cached Unlock" }
+
+  # ---- severity from the rendered Type / Keywords ---------------------
+  severity_id = 1
+  severity = "Informational"
+  event_type_lower = downcase(event_type)
+  if event_type_lower == "warning" {
+      severity_id = 3; severity = "Medium"
+  } else if event_type_lower == "error" {
+      severity_id = 4; severity = "High"
+  } else if event_type_lower == "critical" {
+      severity_id = 5; severity = "Critical"
+  }
+
+  kw_lower = downcase(keywords_str)
+  is_failure = contains(kw_lower, "failure")
+
+  # ---- defaults; overridden per branch below --------------------------
+  class_uid = 1008
+  class_name = "Event Log Activity"
+  category_uid = 1
+  category_name = "System Activity"
+  activity_id = 99
+  activity_name = "Other"
+  profiles = ["host"]
+
+  ocsf = {}
+
+  is_auth_event = event_id == 4624 || event_id == 4625 || event_id == 4634 || event_id == 4647 || event_id == 4648 || event_id == 4768 || event_id == 4769 || event_id == 4771 || event_id == 4776
+  is_user_mgmt = event_id == 4720 || event_id == 4722 || event_id == 4723 || event_id == 4724 || event_id == 4725 || event_id == 4726 || event_id == 4740 || event_id == 4767
+  is_group_add = event_id == 4728 || event_id == 4732 || event_id == 4756
+  is_group_remove = event_id == 4729 || event_id == 4733 || event_id == 4757
+  is_service_install = event_id == 4697 || event_id == 7045
+  is_sched_task = event_id == 4698 || event_id == 4699 || event_id == 4700 || event_id == 4701 || event_id == 4702
+  is_fw_rule = event_id == 4946 || event_id == 4947 || event_id == 4948 || event_id == 4950
+  is_share = event_id == 5140 || event_id == 5145
+
+  if is_auth_event {
+      # ---- Authentication 3002 ----------------------------------------
+      class_uid = 3002; class_name = "Authentication"
+      category_uid = 3; category_name = "Identity & Access Management"
+
+      uname = ""
+      udomain = ""
+      usid = ""
+      status_id = 1
+      status_str = "Success"
+      auth_sub_status = ""
+
+      if event_id == 4624 {
+          activity_id = 1; activity_name = "Logon"
+          uname = downcase(to_string(get(body_fields, ["New Logon.Account Name"]) ?? "") ?? "")
+          udomain = downcase(to_string(get(body_fields, ["New Logon.Account Domain"]) ?? "") ?? "")
+          usid = to_string(get(body_fields, ["New Logon.Security ID"]) ?? "") ?? ""
+      } else if event_id == 4625 {
+          activity_id = 1; activity_name = "Logon"
+          status_id = 2; status_str = "Failure"
+          severity_id = 2; severity = "Low"
+          uname = downcase(to_string(get(body_fields, ["Account For Which Logon Failed.Account Name"]) ?? "") ?? "")
+          udomain = downcase(to_string(get(body_fields, ["Account For Which Logon Failed.Account Domain"]) ?? "") ?? "")
+          usid = to_string(get(body_fields, ["Account For Which Logon Failed.Security ID"]) ?? "") ?? ""
+          ocsf.status_code = to_string(get(body_fields, ["Failure Information.Status"]) ?? "") ?? ""
+          ocsf.status_detail = to_string(get(body_fields, ["Failure Information.Failure Reason"]) ?? "") ?? ""
+          auth_sub_status = to_string(get(body_fields, ["Failure Information.Sub Status"]) ?? "") ?? ""
+      } else if event_id == 4634 || event_id == 4647 {
+          activity_id = 2; activity_name = "Logoff"
+          uname = subj_name; udomain = subj_domain; usid = subj_sid
+      } else if event_id == 4648 {
+          # Logon attempted using explicit credentials — the SUBJECT is the actor,
+          # the account whose credentials were used is the authenticating user.
+          activity_id = 1; activity_name = "Logon"
+          uname = downcase(to_string(get(body_fields, ["Account Whose Credentials Were Used.Account Name"]) ?? "") ?? "")
+          if uname == "" { uname = downcase(to_string(get(body_fields, ["General.Account Name"]) ?? "") ?? "") }
+          udomain = downcase(to_string(get(body_fields, ["Account Whose Credentials Were Used.Account Domain"]) ?? "") ?? "")
+          if udomain == "" { udomain = downcase(to_string(get(body_fields, ["General.Account Domain"]) ?? "") ?? "") }
+      } else if event_id == 4768 {
+          activity_id = 3; activity_name = "Authentication Ticket"
+          uname = downcase(to_string(get(body_fields, ["Account Information.Account Name"]) ?? "") ?? "")
+          udomain = downcase(to_string(get(body_fields, ["Account Information.Supplied Realm Name"]) ?? "") ?? "")
+          usid = to_string(get(body_fields, ["Account Information.User ID"]) ?? "") ?? ""
+          result_code = downcase(to_string(get(body_fields, ["Additional Information.Result Code"]) ?? "") ?? "")
+          if result_code == "" { result_code = downcase(to_string(get(body_fields, ["Additional Information.Failure Code"]) ?? "") ?? "") }
+          if result_code != "" && result_code != "0x0" {
+              status_id = 2; status_str = "Failure"
+              severity_id = 2; severity = "Low"
+              ocsf.status_code = result_code
+          }
+          ocsf.auth_protocol_id = 2
+          ocsf.auth_protocol = "Kerberos"
+      } else if event_id == 4769 {
+          activity_id = 4; activity_name = "Service Ticket Request"
+          uname = downcase(to_string(get(body_fields, ["Account Information.Account Name"]) ?? "") ?? "")
+          udomain = downcase(to_string(get(body_fields, ["Account Information.Account Domain"]) ?? "") ?? "")
+          failure_code = downcase(to_string(get(body_fields, ["Additional Information.Failure Code"]) ?? "") ?? "")
+          if failure_code != "" && failure_code != "0x0" {
+              status_id = 2; status_str = "Failure"
+              severity_id = 2; severity = "Low"
+              ocsf.status_code = failure_code
+          }
+          ocsf.auth_protocol_id = 2
+          ocsf.auth_protocol = "Kerberos"
+      } else if event_id == 4771 {
+          activity_id = 6; activity_name = "Preauth"
+          status_id = 2; status_str = "Failure"
+          severity_id = 2; severity = "Low"
+          uname = downcase(to_string(get(body_fields, ["Account Information.Account Name"]) ?? "") ?? "")
+          usid = to_string(get(body_fields, ["Account Information.Security ID"]) ?? "") ?? ""
+          ocsf.status_code = downcase(to_string(get(body_fields, ["Additional Information.Failure Code"]) ?? "") ?? "")
+          ocsf.auth_protocol_id = 2
+          ocsf.auth_protocol = "Kerberos"
+      } else {
+          # 4776 — NTLM credential validation
+          activity_id = 1; activity_name = "Logon"
+          uname = downcase(to_string(get(body_fields, ["General.Logon Account"]) ?? "") ?? "")
+          error_code = downcase(to_string(get(body_fields, ["General.Error Code"]) ?? "") ?? "")
+          if error_code != "" && error_code != "0x0" {
+              status_id = 2; status_str = "Failure"
+              severity_id = 2; severity = "Low"
+              ocsf.status_code = error_code
+          }
+          ocsf.auth_protocol_id = 1
+          ocsf.auth_protocol = "NTLM"
+      }
+
+      if is_failure && status_id == 1 {
+          status_id = 2; status_str = "Failure"
+          severity_id = 2; severity = "Low"
+      }
+
+      user_obj = { "name": uname, "domain": udomain }
+      if usid != "" { user_obj.uid = usid }
+      ocsf.user = user_obj
+      ocsf.actor = { "user": actor_user }
+      # 3002 requires user + one of [service, dst_endpoint]; the host that logged
+      # the record is the authentication target.
+      ocsf.dst_endpoint = { "hostname": computer }
+      ocsf.device = device
+      ocsf.status_id = status_id
+      ocsf.status = status_str
+
+      if src_ip != "" || workstation != "" {
+          src = {}
+          if src_ip != "" { src.ip = src_ip }
+          if src_port != 0 { src.port = src_port }
+          if workstation != "" { src.hostname = workstation }
+          ocsf.src_endpoint = src
+      }
+
+      logon_id = to_string(get(body_fields, ["New Logon.Logon ID"]) ?? "") ?? ""
+      if logon_id == "" { logon_id = subj_logon_id }
+      if logon_id != "" { ocsf.session = { "uid": logon_id } }
+
+      if logon_type_str != "" {
+          if logon_type == "Unknown" && logon_type_id != 0 {
+              logon_type_id = 99
+              logon_type = logon_type_str
+          }
+          ocsf.logon_type_id = logon_type_id
+          ocsf.logon_type = logon_type
+          ocsf.is_remote = logon_type_id == 3 || logon_type_id == 8 || logon_type_id == 10 || logon_type_id == 12
+          ocsf.is_cleartext = logon_type_id == 8
+      }
+
+      auth_pkg = to_string(get(body_fields, ["Detailed Authentication Information.Authentication Package"]) ?? "") ?? ""
+      if auth_pkg != "" {
+          pkg_l = downcase(auth_pkg)
+          if pkg_l == "ntlm" {
+              ocsf.auth_protocol_id = 1; ocsf.auth_protocol = "NTLM"
+          } else if pkg_l == "kerberos" {
+              ocsf.auth_protocol_id = 2; ocsf.auth_protocol = "Kerberos"
+          } else {
+              ocsf.auth_protocol_id = 99; ocsf.auth_protocol = auth_pkg
+          }
+      }
+      # OCSF logon_process is a full `process` object (it needs pid/uid/cpid);
+      # Windows only renders the package NAME here, so it stays unmapped.
+      logon_process = to_string(get(body_fields, ["Detailed Authentication Information.Logon Process"]) ?? "") ?? ""
+      ocsf.unmapped = {
+          "logon_process": logon_process,
+          "sub_status": auth_sub_status,
+          "windows_event_id": to_string(event_id),
+          "subject_logon_id": subj_logon_id,
+          "ticket_options": to_string(get(body_fields, ["Additional Information.Ticket Options"]) ?? "") ?? null,
+          "ticket_encryption_type": to_string(get(body_fields, ["Additional Information.Ticket Encryption Type"]) ?? "") ?? null,
+          "pre_auth_type": to_string(get(body_fields, ["Additional Information.Pre-Authentication Type"]) ?? "") ?? null,
+          "kerberos_service_name": to_string(get(body_fields, ["Service Information.Service Name"]) ?? "") ?? null,
+          "target_server_name": to_string(get(body_fields, ["Target Server.Target Server Name"]) ?? "") ?? null
+      }
+  } else if event_id == 4672 {
+      # ---- Authorize Session 3003 -------------------------------------
+      class_uid = 3003; class_name = "Authorize Session"
+      category_uid = 3; category_name = "Identity & Access Management"
+      activity_id = 1; activity_name = "Assign Privileges"
+      priv_raw = strip_whitespace(to_string(get(body_fields, ["General.Privileges"]) ?? "") ?? "")
+      if priv_raw == "" { priv_raw = strip_whitespace(to_string(get(body_fields, ["Subject.Privileges"]) ?? "") ?? "") }
+      privileges = []
+      if priv_raw != "" { privileges = split(priv_raw, r'\s+') }
+      ocsf.privileges = privileges
+      user_obj = { "name": subj_name, "domain": subj_domain }
+      if subj_sid != "" { user_obj.uid = subj_sid }
+      ocsf.user = user_obj
+      ocsf.device = device
+      if subj_logon_id != "" { ocsf.session = { "uid": subj_logon_id } }
+      # A special-privileges assignment to a privileged account is worth noticing.
+      severity_id = 2; severity = "Low"
+  } else if event_id == 4688 || event_id == 4689 {
+      # ---- Process Activity 1007 --------------------------------------
+      class_uid = 1007; class_name = "Process Activity"
+      category_uid = 1; category_name = "System Activity"
+
+      if event_id == 4688 {
+          activity_id = 1; activity_name = "Launch"
+          new_proc_path = to_string(get(body_fields, ["Process Information.New Process Name"]) ?? "") ?? ""
+          new_proc_name = ""
+          nm, nmerr = parse_regex(new_proc_path, r'(?P<b>[^\\/]+)$')
+          if nmerr == null { new_proc_name = string(nm.b) ?? "" }
+
+          new_pid = 0
+          new_pid_str = downcase(to_string(get(body_fields, ["Process Information.New Process ID"]) ?? "") ?? "")
+          if starts_with(new_pid_str, "0x") {
+              hv, hverr = parse_int(replace(new_pid_str, "0x", ""), base: 16)
+              if hverr == null { new_pid = hv }
+          } else {
+              new_pid = to_int(new_pid_str) ?? 0
+          }
+
+          parent_path = to_string(get(body_fields, ["Process Information.Creator Process Name"]) ?? "") ?? ""
+          parent_name = ""
+          pm, pmerr = parse_regex(parent_path, r'(?P<b>[^\\/]+)$')
+          if pmerr == null { parent_name = string(pm.b) ?? "" }
+          parent_pid = 0
+          parent_pid_str = downcase(to_string(get(body_fields, ["Process Information.Creator Process ID"]) ?? "") ?? "")
+          if starts_with(parent_pid_str, "0x") {
+              hv2, hv2err = parse_int(replace(parent_pid_str, "0x", ""), base: 16)
+              if hv2err == null { parent_pid = hv2 }
+          } else {
+              parent_pid = to_int(parent_pid_str) ?? 0
+          }
+
+          # The NEW process is the subject; its creator is the actor.
+          ocsf.process = {
+              "name": new_proc_name,
+              "pid": new_pid,
+              "cmd_line": to_string(get(body_fields, ["Process Information.Process Command Line"]) ?? "") ?? "",
+              "file": { "name": new_proc_name, "path": new_proc_path, "type_id": 1 }
+          }
+          # 4688 names the process owner in Target Subject and the launcher in
+          # Creator Subject; prefer Creator Subject as the actor identity.
+          creator_name = downcase(to_string(get(body_fields, ["Creator Subject.Account Name"]) ?? "") ?? "")
+          creator_domain = downcase(to_string(get(body_fields, ["Creator Subject.Account Domain"]) ?? "") ?? "")
+          creator_sid = to_string(get(body_fields, ["Creator Subject.Security ID"]) ?? "") ?? ""
+          if creator_name == "" { creator_name = subj_name }
+          if creator_domain == "" { creator_domain = subj_domain }
+          if creator_sid == "" { creator_sid = subj_sid }
+          act_user = { "name": creator_name, "domain": creator_domain }
+          if creator_sid != "" { act_user.uid = creator_sid }
+          ocsf.actor = {
+              "process": {
+                  "name": parent_name,
+                  "pid": parent_pid,
+                  "file": { "name": parent_name, "path": parent_path, "type_id": 1 }
+              },
+              "user": act_user
+          }
+          ocsf.unmapped = {
+              "token_elevation_type": to_string(get(body_fields, ["Process Information.Token Elevation Type"]) ?? "") ?? null,
+              "mandatory_label": to_string(get(body_fields, ["Process Information.Mandatory Label"]) ?? "") ?? null,
+              "target_account_name": to_string(get(body_fields, ["Target Subject.Account Name"]) ?? "") ?? null
+          }
+      } else {
+          activity_id = 2; activity_name = "Terminate"
+          proc_path = to_string(get(body_fields, ["Process Information.Process Name"]) ?? "") ?? ""
+          proc_name = ""
+          nm, nmerr = parse_regex(proc_path, r'(?P<b>[^\\/]+)$')
+          if nmerr == null { proc_name = string(nm.b) ?? "" }
+          pid = 0
+          pid_str = downcase(to_string(get(body_fields, ["Process Information.Process ID"]) ?? "") ?? "")
+          if starts_with(pid_str, "0x") {
+              hv3, hv3err = parse_int(replace(pid_str, "0x", ""), base: 16)
+              if hv3err == null { pid = hv3 }
+          } else {
+              pid = to_int(pid_str) ?? 0
+          }
+          ocsf.process = {
+              "name": proc_name,
+              "pid": pid,
+              "file": { "name": proc_name, "path": proc_path, "type_id": 1 }
+          }
+          # Terminate has no separate initiator; the actor is the subject user.
+          ocsf.actor = { "user": actor_user }
+          exit_status = to_string(get(body_fields, ["Process Information.Exit Status"]) ?? "") ?? ""
+          if exit_status != "" { ocsf.status_code = exit_status }
+      }
+      ocsf.device = device
+      if subj_logon_id != "" { ocsf.unmapped = { "subject_logon_id": subj_logon_id } }
+  } else if is_service_install {
+      # ---- Windows Service Activity 201004 ----------------------------
+      class_uid = 201004; class_name = "Windows Service Activity"
+      category_uid = 1; category_name = "System Activity"
+      activity_id = 1; activity_name = "Create"
+
+      svc_name = to_string(get(body_fields, ["Service Information.Service Name"]) ?? "") ?? ""
+      svc_file = to_string(get(body_fields, ["Service Information.Service File Name"]) ?? "") ?? ""
+      svc_type = to_string(get(body_fields, ["Service Information.Service Type"]) ?? "") ?? ""
+      svc_start = to_string(get(body_fields, ["Service Information.Service Start Type"]) ?? "") ?? ""
+      svc_account = to_string(get(body_fields, ["Service Information.Service Account"]) ?? "") ?? ""
+      # 7045 (System log) renders the same fields without a section header.
+      if svc_name == "" { svc_name = to_string(get(body_fields, ["General.Service Name"]) ?? "") ?? "" }
+      if svc_file == "" { svc_file = to_string(get(body_fields, ["General.Service File Name"]) ?? "") ?? "" }
+      if svc_type == "" { svc_type = to_string(get(body_fields, ["General.Service Type"]) ?? "") ?? "" }
+      if svc_start == "" { svc_start = to_string(get(body_fields, ["General.Start Type"]) ?? "") ?? "" }
+      if svc_account == "" { svc_account = to_string(get(body_fields, ["General.Service Account"]) ?? "") ?? "" }
+
+      svc_file_name = ""
+      sm, smerr = parse_regex(svc_file, r'(?P<b>[^\\/]+)$')
+      if smerr == null { svc_file_name = string(sm.b) ?? "" }
+
+      start_l = downcase(svc_start)
+      start_type_id = 0
+      if contains(start_l, "boot") {
+          start_type_id = 1
+      } else if contains(start_l, "system") {
+          start_type_id = 2
+      } else if contains(start_l, "auto") {
+          start_type_id = 3
+      } else if contains(start_l, "demand") {
+          start_type_id = 4
+      } else if contains(start_l, "disabled") {
+          start_type_id = 5
+      }
+
+      win_service = {
+          "name": svc_name,
+          # The Windows "Service File Name" is the service's launch command line.
+          "cmd_line": svc_file
+      }
+      if svc_file != "" { win_service.service_file = { "name": svc_file_name, "path": svc_file, "type_id": 1 } }
+      if svc_account != "" { win_service.service_start_name = svc_account }
+      if start_type_id != 0 {
+          win_service.service_start_type_id = start_type_id
+          win_service.service_start_type = svc_start
+      }
+      ocsf.win_service = win_service
+      ocsf.actor = { "user": actor_user }
+      ocsf.device = device
+      ocsf.unmapped = { "service_type": svc_type }
+      # Service installation is a classic persistence foothold.
+      severity_id = 2; severity = "Low"
+  } else if is_user_mgmt {
+      # ---- User Management 3007 (3001/3005 deprecated in 1.9) ---------
+      class_uid = 3007; class_name = "User Management"
+      category_uid = 3; category_name = "Identity & Access Management"
+      if event_id == 4720 {
+          activity_id = 1; activity_name = "Create"
+      } else if event_id == 4722 {
+          activity_id = 4; activity_name = "Enable"
+      } else if event_id == 4723 {
+          activity_id = 8; activity_name = "Password Change"
+      } else if event_id == 4724 {
+          activity_id = 9; activity_name = "Password Reset"
+      } else if event_id == 4725 {
+          activity_id = 5; activity_name = "Disable"
+      } else if event_id == 4726 {
+          activity_id = 3; activity_name = "Delete"
+      } else if event_id == 4740 {
+          activity_id = 6; activity_name = "Lock"
+      } else {
+          activity_id = 7; activity_name = "Unlock"
+      }
+      uname = tgt_name
+      udomain = tgt_domain
+      usid = tgt_sid
+      if uname == "" { uname = downcase(to_string(get(body_fields, ["New Account.Account Name"]) ?? "") ?? "") }
+      if udomain == "" { udomain = downcase(to_string(get(body_fields, ["New Account.Account Domain"]) ?? "") ?? "") }
+      if usid == "" { usid = to_string(get(body_fields, ["New Account.Security ID"]) ?? "") ?? "" }
+      if uname == "" { uname = downcase(to_string(get(body_fields, ["Account That Was Locked Out.Account Name"]) ?? "") ?? "") }
+      if usid == "" { usid = to_string(get(body_fields, ["Account That Was Locked Out.Security ID"]) ?? "") ?? "" }
+      user_obj = { "name": uname, "domain": udomain }
+      if usid != "" { user_obj.uid = usid }
+      ocsf.user = user_obj
+      ocsf.actor = { "user": actor_user }
+      ocsf.device = device
+      ocsf.status_id = 1
+      ocsf.status = "Success"
+      ocsf.unmapped = {
+          "sam_account_name": to_string(get(body_fields, ["Attributes.SAM Account Name"]) ?? "") ?? null,
+          "display_name": to_string(get(body_fields, ["Attributes.Display Name"]) ?? "") ?? null,
+          "user_principal_name": to_string(get(body_fields, ["Attributes.User Principal Name"]) ?? "") ?? null,
+          "caller_computer_name": to_string(get(body_fields, ["Additional Information.Caller Computer Name"]) ?? "") ?? null,
+          "subject_logon_id": subj_logon_id
+      }
+      severity_id = 2; severity = "Low"
+  } else if is_group_add || is_group_remove {
+      # ---- Group Management 3006 --------------------------------------
+      class_uid = 3006; class_name = "Group Management"
+      category_uid = 3; category_name = "Identity & Access Management"
+      if is_group_add {
+          activity_id = 3; activity_name = "Add User"
+      } else {
+          activity_id = 4; activity_name = "Remove User"
+      }
+      group_obj = {
+          "name": downcase(to_string(get(body_fields, ["Group.Group Name"]) ?? "") ?? ""),
+          "domain": downcase(to_string(get(body_fields, ["Group.Group Domain"]) ?? "") ?? "")
+      }
+      group_sid = to_string(get(body_fields, ["Group.Security ID"]) ?? "") ?? ""
+      if group_sid != "" { group_obj.uid = group_sid }
+      ocsf.group = group_obj
+      member_name = downcase(to_string(get(body_fields, ["Member.Account Name"]) ?? "") ?? "")
+      member_sid = to_string(get(body_fields, ["Member.Security ID"]) ?? "") ?? ""
+      member_obj = { "name": member_name }
+      if member_sid != "" { member_obj.uid = member_sid }
+      ocsf.user = member_obj
+      ocsf.actor = { "user": actor_user }
+      ocsf.device = device
+      ocsf.unmapped = { "subject_logon_id": subj_logon_id, "windows_event_id": to_string(event_id) }
+      severity_id = 2; severity = "Low"
+  } else if event_id == 4663 || event_id == 4657 {
+      # ---- object / registry access ------------------------------------
+      obj_name = to_string(get(body_fields, ["Object.Object Name"]) ?? "") ?? ""
+      obj_type = downcase(to_string(get(body_fields, ["Object.Object Type"]) ?? "") ?? "")
+      proc_path = to_string(get(body_fields, ["Process Information.Process Name"]) ?? "") ?? ""
+      proc_name = ""
+      nm, nmerr = parse_regex(proc_path, r'(?P<b>[^\\/]+)$')
+      if nmerr == null { proc_name = string(nm.b) ?? "" }
+      proc_pid = 0
+      proc_pid_str = downcase(to_string(get(body_fields, ["Process Information.Process ID"]) ?? "") ?? "")
+      if starts_with(proc_pid_str, "0x") {
+          hv4, hv4err = parse_int(replace(proc_pid_str, "0x", ""), base: 16)
+          if hv4err == null { proc_pid = hv4 }
+      } else {
+          proc_pid = to_int(proc_pid_str) ?? 0
+      }
+      access_actor = {
+          "process": {
+              "name": proc_name,
+              "pid": proc_pid,
+              "file": { "name": proc_name, "path": proc_path, "type_id": 1 }
+          },
+          "user": actor_user
+      }
+
+      if event_id == 4657 {
+          # ---- Registry Value Activity 201002 -------------------------
+          class_uid = 201002; class_name = "Registry Value Activity"
+          category_uid = 1; category_name = "System Activity"
+          activity_id = 3; activity_name = "Modify"
+          ocsf.reg_value = {
+              "name": to_string(get(body_fields, ["Object.Object Value Name"]) ?? "") ?? "",
+              "path": obj_name,
+              "data": to_string(get(body_fields, ["Object.New Value"]) ?? "") ?? ""
+          }
+          ocsf.actor = access_actor
+          ocsf.device = device
+          ocsf.unmapped = {
+              "old_value": to_string(get(body_fields, ["Object.Old Value"]) ?? "") ?? null,
+              "old_value_type": to_string(get(body_fields, ["Object.Old Value Type"]) ?? "") ?? null,
+              "new_value_type": to_string(get(body_fields, ["Object.New Value Type"]) ?? "") ?? null,
+              "operation_type": to_string(get(body_fields, ["Object.Operation Type"]) ?? "") ?? null,
+              "subject_logon_id": subj_logon_id
+          }
+      } else if obj_type == "key" {
+          # ---- 4663 on a registry key -> Registry Key Activity 201001 --
+          class_uid = 201001; class_name = "Registry Key Activity"
+          category_uid = 1; category_name = "System Activity"
+          activity_id = 99; activity_name = "Other"
+          ocsf.reg_key = { "path": obj_name }
+          ocsf.actor = access_actor
+          ocsf.device = device
+          ocsf.unmapped = {
+              "accesses": to_string(get(body_fields, ["Process Request Information.Accesses"]) ?? "") ?? null,
+              "handle_id": to_string(get(body_fields, ["Object.Handle ID"]) ?? "") ?? null,
+              "subject_logon_id": subj_logon_id
+          }
+      } else {
+          # ---- 4663 on a file -> File System Activity 1001 -------------
+          class_uid = 1001; class_name = "File System Activity"
+          category_uid = 1; category_name = "System Activity"
+          accesses = to_string(get(body_fields, ["Process Request Information.Accesses"]) ?? "") ?? ""
+          acc_l = downcase(accesses)
+          if contains(acc_l, "delete") {
+              activity_id = 4; activity_name = "Delete"
+          } else if contains(acc_l, "writedata") || contains(acc_l, "appenddata") {
+              activity_id = 3; activity_name = "Update"
+          } else if contains(acc_l, "readdata") {
+              activity_id = 2; activity_name = "Read"
+          } else {
+              activity_id = 14; activity_name = "Open"
+          }
+          fname = ""
+          fm, fmerr = parse_regex(obj_name, r'(?P<b>[^\\/]+)$')
+          if fmerr == null { fname = string(fm.b) ?? "" }
+          ocsf.file = { "name": fname, "path": obj_name, "type_id": 1 }
+          ocsf.actor = access_actor
+          ocsf.device = device
+          ocsf.unmapped = {
+              "accesses": accesses,
+              "object_type": obj_type,
+              "handle_id": to_string(get(body_fields, ["Object.Handle ID"]) ?? "") ?? null,
+              "subject_logon_id": subj_logon_id
+          }
+      }
+  } else if is_sched_task {
+      # ---- Scheduled Job Activity 1006 --------------------------------
+      class_uid = 1006; class_name = "Scheduled Job Activity"
+      category_uid = 1; category_name = "System Activity"
+      if event_id == 4698 {
+          activity_id = 1; activity_name = "Create"
+      } else if event_id == 4699 {
+          activity_id = 3; activity_name = "Delete"
+      } else if event_id == 4700 {
+          activity_id = 4; activity_name = "Enable"
+      } else if event_id == 4701 {
+          activity_id = 5; activity_name = "Disable"
+      } else {
+          activity_id = 2; activity_name = "Update"
+      }
+      task_name = to_string(get(body_fields, ["Task Information.Task Name"]) ?? "") ?? ""
+      task_file_name = ""
+      tm, tmerr = parse_regex(task_name, r'(?P<b>[^\\/]+)$')
+      if tmerr == null { task_file_name = string(tm.b) ?? "" }
+      job = { "name": task_name }
+      if task_name != "" { job.file = { "name": task_file_name, "path": task_name, "type_id": 1 } }
+      ocsf.job = job
+      ocsf.actor = { "user": actor_user }
+      ocsf.device = device
+      ocsf.unmapped = {
+          "task_content": to_string(get(body_fields, ["Task Information.Task Content"]) ?? "") ?? null,
+          "subject_logon_id": subj_logon_id
+      }
+      severity_id = 2; severity = "Low"
+  } else if is_fw_rule {
+      # ---- Entity Management 3004 (the managed entity is the rule) ----
+      # OCSF 1.9 has no firewall-rule-management class; Entity Management is the
+      # generic create/update/delete of a named object, and `firewall_rule`
+      # (security_control profile) carries the rule itself.
+      class_uid = 3004; class_name = "Entity Management"
+      category_uid = 3; category_name = "Identity & Access Management"
+      profiles = ["host", "security_control"]
+      if event_id == 4946 {
+          activity_id = 1; activity_name = "Create"
+      } else if event_id == 4948 {
+          activity_id = 4; activity_name = "Delete"
+      } else {
+          activity_id = 3; activity_name = "Update"
+      }
+      rule_name = to_string(get(body_fields, ["Rule Information.Rule Name"]) ?? "") ?? ""
+      if rule_name == "" { rule_name = to_string(get(body_fields, ["General.Rule Name"]) ?? "") ?? "" }
+      rule_id = to_string(get(body_fields, ["Rule Information.Rule ID"]) ?? "") ?? ""
+      if rule_id == "" { rule_id = to_string(get(body_fields, ["General.Rule ID"]) ?? "") ?? "" }
+      entity = { "name": rule_name, "type": "Firewall Rule" }
+      if rule_id != "" { entity.uid = rule_id }
+      ocsf.entity = entity
+      fw = { "name": rule_name }
+      if rule_id != "" { fw.uid = rule_id }
+      ocsf.firewall_rule = fw
+      ocsf.actor = { "user": actor_user }
+      ocsf.device = device
+      ocsf.unmapped = { "profile_changed": to_string(get(body_fields, ["General.Profile Changed"]) ?? "") ?? null }
+      severity_id = 2; severity = "Low"
+  } else if is_share {
+      # ---- SMB Activity 4006 ------------------------------------------
+      class_uid = 4006; class_name = "SMB Activity"
+      category_uid = 4; category_name = "Network Activity"
+      if event_id == 5145 {
+          activity_id = 2; activity_name = "File Open"
+      } else {
+          # 5140 is the share connect itself, not a file operation.
+          activity_id = 99; activity_name = "Other"
+      }
+      share_name = to_string(get(body_fields, ["Network Information.Share Name"]) ?? "") ?? ""
+      if share_name == "" { share_name = to_string(get(body_fields, ["Share Information.Share Name"]) ?? "") ?? "" }
+      ocsf.share = share_name
+      rel_path = to_string(get(body_fields, ["Network Information.Relative Target Name"]) ?? "") ?? ""
+      if rel_path == "" { rel_path = to_string(get(body_fields, ["Share Information.Relative Target Name"]) ?? "") ?? "" }
+      if rel_path != "" {
+          rel_name = ""
+          rm, rmerr = parse_regex(rel_path, r'(?P<b>[^\\/]+)$')
+          if rmerr == null { rel_name = string(rm.b) ?? "" }
+          ocsf.file = { "name": rel_name, "path": rel_path, "type_id": 1 }
+      }
+      if src_ip != "" {
+          src = { "ip": src_ip }
+          if src_port != 0 { src.port = src_port }
+          ocsf.src_endpoint = src
+      }
+      # The server that logged the record is the SMB destination.
+      ocsf.dst_endpoint = { "hostname": computer }
+      ocsf.actor = { "user": actor_user }
+      ocsf.device = device
+      ocsf.unmapped = {
+          "share_local_path": to_string(get(body_fields, ["Network Information.Share Path"]) ?? "") ?? null,
+          "access_mask": to_string(get(body_fields, ["Access Request Information.Access Mask"]) ?? "") ?? null,
+          "subject_logon_id": subj_logon_id
+      }
+  } else {
+      # ---- Event Log Activity 1008 ------------------------------------
+      # 1102 is a genuine log-clear; every other unrouted EventID lands here as
+      # an unclassified record of the log it came from (1008 only asserts "a log
+      # record", which is honest, where 3002/1007 would assert an event type).
+      class_uid = 1008; class_name = "Event Log Activity"
+      category_uid = 1; category_name = "System Activity"
+      if event_id == 1102 {
+          activity_id = 1; activity_name = "Clear"
+          severity_id = 4; severity = "High"
+      } else {
+          activity_id = 99; activity_name = "Other"
+      }
+      ocsf.log_name = channel
+      if provider_name != "" { ocsf.log_provider = provider_name }
+      ocsf.actor = { "user": actor_user }
+      ocsf.device = device
+      ocsf.unmapped = { "windows_event_id": to_string(event_id), "subject_logon_id": subj_logon_id }
+  }
+
+  # ---- common envelope -------------------------------------------------
+  ocsf.class_uid = class_uid
+  ocsf.class_name = class_name
+  ocsf.category_uid = category_uid
+  ocsf.category_name = category_name
+  ocsf.activity_id = activity_id
+  ocsf.activity_name = activity_name
+  ocsf.type_uid = class_uid * 100 + activity_id
+  ocsf.severity_id = severity_id
+  ocsf.severity = severity
+  ocsf.time = time_ms
+  # OCSF `message` is the source's own description of the event -- for a rendered
+  # Windows record that is the `Message=` summary line, not the whole record.
+  # The full record is preserved verbatim in `raw_data`.
+  msg = message_summary
+  if msg == "" { msg = raw_log }
+  ocsf.message = msg
+  ocsf.raw_data = raw_log
+
+  # Windows RecordNumber is only unique within a host/channel stream and can be
+  # reused after a log reset, so bind it to host, channel and the rendered
+  # timestamp — replaying the same record stays idempotent, a reused number does
+  # not collide.
+  log_name_l = downcase(channel)
+  log_provider_l = downcase(provider_name)
+  record_uid = ""
+  if record_number != "" && computer != "" {
+      record_uid = join!(["windows_event_text", computer, log_name_l, log_provider_l, record_number, to_string(time_ms)], "|")
+  }
+  if record_uid == "" { record_uid = uuid_v4() }
+
+  ocsf.metadata = {
+      "version": "1.9.0",
+      "profiles": profiles,
+      "uid": record_uid,
+      "original_event_uid": record_uid,
+      "event_code": to_string(event_id),
+      "log_name": channel,
+      "log_provider": provider_name,
+      "log_source": "windows_event_text",
+      "product": { "name": "Windows", "vendor_name": "Microsoft" }
+  }
+
+  . = ocsf
+samples:
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft-Windows-Eventlog\nEventCode=1102\nEventType=0\nType=Information\nComputerName=DC-01.corp.local\nTaskCategory=Log clear\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=The audit log was cleared.\nSubject:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-500\n\tAccount Name:\t\tadmin\n\tAccount Domain:\t\tCORP\n\tLogon ID:\t\t0x3E7ABD\n"
+    expect:
+      "class_uid": 1008
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=4624\nEventType=0\nType=Information\nComputerName=DC-01.corp.local\nTaskCategory=Logon\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=An account was successfully logged on.\nSubject:\n\tSecurity ID:\t\tS-1-5-18\n\tAccount Name:\t\tDC-01$\n\tAccount Domain:\t\tCORP\n\tLogon ID:\t\t0x3E7\n\nLogon Information:\n\tLogon Type:\t\t10\n\tRestricted Admin Mode:\t\t-\n\tVirtual Account:\t\tNo\n\tElevated Token:\t\tYes\n\nNew Logon:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-1001\n\tAccount Name:\t\talice\n\tAccount Domain:\t\tCORP\n\tLogon ID:\t\t0x3E7ABC\n\tLogon GUID:\t\t{00000000-0000-0000-0000-000000000000}\n\nProcess Information:\n\tProcess ID:\t\t0x1e8\n\tProcess Name:\t\tC:\\Windows\\System32\\winlogon.exe\n\nNetwork Information:\n\tWorkstation Name:\t\tWKS-09\n\tSource Network Address:\t\t10.4.5.6\n\tSource Port:\t\t49152\n\nDetailed Authentication Information:\n\tLogon Process:\t\tKerberos\n\tAuthentication Package:\t\tKerberos\n\tTransited Services:\t\t-\n\tPackage Name (NTLM only):\t\t-\n\tKey Length:\t\t0\n"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=4625\nEventType=0\nType=Information\nComputerName=DC-01.corp.local\nTaskCategory=Logon\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Failure\nMessage=An account failed to log on.\nSubject:\n\tSecurity ID:\t\tS-1-0-0\n\tAccount Name:\t\t-\n\tAccount Domain:\t\t-\n\tLogon ID:\t\t0x0\n\nAccount For Which Logon Failed:\n\tSecurity ID:\t\tS-1-0-0\n\tAccount Name:\t\tadministrator\n\tAccount Domain:\t\tCORP\n\nFailure Information:\n\tFailure Reason:\t\tUnknown user name or bad password.\n\tStatus:\t\t0xC000006D\n\tSub Status:\t\t0xC000006A\n\nNetwork Information:\n\tWorkstation Name:\t\tEVILBOX\n\tSource Network Address:\t\t203.0.113.44\n\tSource Port:\t\t55123\n\nDetailed Authentication Information:\n\tLogon Process:\t\tNtLmSsp\n\tAuthentication Package:\t\tNTLM\n\nLogon Type:\t3\n"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=4634\nEventType=0\nType=Information\nComputerName=DC-01.corp.local\nTaskCategory=Logon\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=An account was logged off.\nSubject:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-1001\n\tAccount Name:\t\talice\n\tAccount Domain:\t\tCORP\n\tLogon ID:\t\t0x3E7ABC\nLogon Type:\t10\n"
+    expect:
+      "class_uid": 3002
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=4648\nEventType=0\nType=Information\nComputerName=DC-01.corp.local\nTaskCategory=Logon\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=A logon was attempted using explicit credentials.\nSubject:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-1001\n\tAccount Name:\t\talice\n\tAccount Domain:\t\tCORP\n\tLogon ID:\t\t0x3E7ABC\n\nAccount Whose Credentials Were Used:\n\tAccount Name:\t\tsvc_backup\n\tAccount Domain:\t\tCORP\n\tLogon GUID:\t\t{0}\n\nTarget Server:\n\tTarget Server Name:\t\tFS-01\n\tAdditional Information:\t\tcifs/FS-01\n\nProcess Information:\n\tProcess ID:\t\t0x2b8\n\tProcess Name:\t\tC:\\Windows\\System32\\runas.exe\n\nNetwork Information:\n\tNetwork Address:\t\t10.4.5.6\n\tPort:\t\t0\n"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=4657\nEventType=0\nType=Information\nComputerName=WKS-09.corp.local\nTaskCategory=Registry\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=A registry value was modified.\nSubject:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-1001\n\tAccount Name:\t\talice\n\tAccount Domain:\t\tCORP\n\tLogon ID:\t\t0x3E7ABC\n\nObject:\n\tObject Name:\t\t\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\n\tObject Value Name:\t\tUpdater\n\tHandle ID:\t\t0x2a0\n\tOperation Type:\t\tExisting registry value modified\n\tOld Value Type:\t\tREG_SZ\n\tOld Value:\t\t\n\tNew Value Type:\t\tREG_SZ\n\tNew Value:\t\tC:\\Windows\\Temp\\evil.exe\n\nProcess Information:\n\tProcess ID:\t\t0x5f0\n\tProcess Name:\t\tC:\\Windows\\regedit.exe\n"
+    expect:
+      "class_uid": 201002
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=4663\nEventType=0\nType=Information\nComputerName=FS-01.corp.local\nTaskCategory=File System\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=An attempt was made to access an object.\nSubject:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-1001\n\tAccount Name:\t\talice\n\tAccount Domain:\t\tCORP\n\tLogon ID:\t\t0x3E7ABC\n\nObject:\n\tObject Server:\t\tSecurity\n\tObject Type:\t\tFile\n\tObject Name:\t\tD:\\Finance\\2026\\budget.xlsx\n\tHandle ID:\t\t0x9d4\n\nProcess Information:\n\tProcess ID:\t\t0x4e8\n\tProcess Name:\t\tC:\\Windows\\System32\\notepad.exe\n\nProcess Request Information:\n\tAccesses:\t\tWriteData (or AddFile)\n\tAccess Mask:\t\t0x2\n"
+    expect:
+      "class_uid": 1001
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=4663\nEventType=0\nType=Information\nComputerName=WKS-09.corp.local\nTaskCategory=Registry\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=An attempt was made to access an object.\nSubject:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-1001\n\tAccount Name:\t\talice\n\tAccount Domain:\t\tCORP\n\tLogon ID:\t\t0x3E7ABC\n\nObject:\n\tObject Server:\t\tSecurity\n\tObject Type:\t\tKey\n\tObject Name:\t\t\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\n\tHandle ID:\t\t0x2a0\n\nProcess Information:\n\tProcess ID:\t\t0x5f0\n\tProcess Name:\t\tC:\\Windows\\regedit.exe\n\nProcess Request Information:\n\tAccesses:\t\tSet key value\n\tAccess Mask:\t\t0x2\n"
+    expect:
+      "class_uid": 201001
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=4672\nEventType=0\nType=Information\nComputerName=DC-01.corp.local\nTaskCategory=Special Logon\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=Special privileges assigned to new logon.\nSubject:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-500\n\tAccount Name:\t\tadmin\n\tAccount Domain:\t\tCORP\n\tLogon ID:\t\t0x3E7ABD\nPrivileges:\t\tSeSecurityPrivilege\n\t\t\tSeBackupPrivilege\n\t\t\tSeDebugPrivilege\n"
+    expect:
+      "class_uid": 3003
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=4688\nEventType=0\nType=Information\nComputerName=WKS-09.corp.local\nTaskCategory=Process Creation\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=A new process has been created.\nCreator Subject:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-1001\n\tAccount Name:\t\talice\n\tAccount Domain:\t\tCORP\n\tLogon ID:\t\t0x3E7ABC\n\nTarget Subject:\n\tSecurity ID:\t\tS-1-0-0\n\tAccount Name:\t\t-\n\tAccount Domain:\t\t-\n\tLogon ID:\t\t0x0\n\nProcess Information:\n\tNew Process ID:\t\t0x1a4\n\tNew Process Name:\t\tC:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\n\tToken Elevation Type:\t\t%%1936\n\tMandatory Label:\t\tS-1-16-12288\n\tCreator Process ID:\t\t0x2b8\n\tCreator Process Name:\t\tC:\\Windows\\explorer.exe\n\tProcess Command Line:\t\tpowershell.exe -enc SQBFAFgA\n"
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=4689\nEventType=0\nType=Information\nComputerName=WKS-09.corp.local\nTaskCategory=Logon\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=A process has exited.\nSubject:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-1001\n\tAccount Name:\t\talice\n\tAccount Domain:\t\tCORP\n\tLogon ID:\t\t0x3E7ABC\n\nProcess Information:\n\tProcess ID:\t\t0x1a4\n\tProcess Name:\t\tC:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\n\tExit Status:\t\t0x0\n"
+    expect:
+      "class_uid": 1007
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=4697\nEventType=0\nType=Information\nComputerName=WKS-09.corp.local\nTaskCategory=Logon\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=A service was installed in the system.\nSubject:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-500\n\tAccount Name:\t\tadmin\n\tAccount Domain:\t\tCORP\n\tLogon ID:\t\t0x3E7ABD\n\nService Information:\n\tService Name:\t\tEvilSvc\n\tService File Name:\t\tC:\\Windows\\Temp\\evil.exe -k netsvcs\n\tService Type:\t\t0x10\n\tService Start Type:\t\t2\n\tService Account:\t\tLocalSystem\n"
+    expect:
+      "class_uid": 201004
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=4698\nEventType=0\nType=Information\nComputerName=WKS-09.corp.local\nTaskCategory=Other Object Access Events\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=A scheduled task was created.\nSubject:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-1001\n\tAccount Name:\t\talice\n\tAccount Domain:\t\tCORP\n\tLogon ID:\t\t0x3E7ABC\n\nTask Information:\n\tTask Name:\t\t\\Microsoft\\Windows\\Updater\n\tTask Content:\t\t<?xml version=\"1.0\"?><Task></Task>\n"
+    expect:
+      "class_uid": 1006
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=4720\nEventType=0\nType=Information\nComputerName=DC-01.corp.local\nTaskCategory=Logon\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=A user account was created.\nSubject:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-500\n\tAccount Name:\t\tadmin\n\tAccount Domain:\t\tCORP\n\tLogon ID:\t\t0x3E7ABD\n\nNew Account:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-1500\n\tAccount Name:\t\tbackdoor\n\tAccount Domain:\t\tCORP\n\nAttributes:\n\tSAM Account Name:\t\tbackdoor\n\tDisplay Name:\t\t-\n\tUser Principal Name:\t\t-\n"
+    expect:
+      "class_uid": 3007
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=4726\nEventType=0\nType=Information\nComputerName=DC-01.corp.local\nTaskCategory=Logon\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=A user account was deleted.\nSubject:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-500\n\tAccount Name:\t\tadmin\n\tAccount Domain:\t\tCORP\n\tLogon ID:\t\t0x3E7ABD\n\nTarget Account:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-1500\n\tAccount Name:\t\ttempsvc\n\tAccount Domain:\t\tCORP\n"
+    expect:
+      "class_uid": 3007
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=4728\nEventType=0\nType=Information\nComputerName=DC-01.corp.local\nTaskCategory=Logon\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=A member was added to a security-enabled global group.\nSubject:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-500\n\tAccount Name:\t\tadmin\n\tAccount Domain:\t\tCORP\n\tLogon ID:\t\t0x3E7ABD\n\nMember:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-1001\n\tAccount Name:\t\talice\n\nGroup:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-512\n\tGroup Name:\t\tDomain Admins\n\tGroup Domain:\t\tCORP\n"
+    expect:
+      "class_uid": 3006
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=4733\nEventType=0\nType=Information\nComputerName=DC-01.corp.local\nTaskCategory=Logon\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=A member was removed from a security-enabled local group.\nSubject:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-500\n\tAccount Name:\t\tadmin\n\tAccount Domain:\t\tCORP\n\tLogon ID:\t\t0x3E7ABD\n\nMember:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-1001\n\tAccount Name:\t\talice\n\nGroup:\n\tSecurity ID:\t\tS-1-5-32-544\n\tGroup Name:\t\tAdministrators\n\tGroup Domain:\t\tBuiltin\n"
+    expect:
+      "class_uid": 3006
+      "activity_id": 4
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=4740\nEventType=0\nType=Information\nComputerName=DC-01.corp.local\nTaskCategory=Logon\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=A user account was locked out.\nSubject:\n\tSecurity ID:\t\tS-1-5-18\n\tAccount Name:\t\tDC-01$\n\tAccount Domain:\t\tCORP\n\tLogon ID:\t\t0x3E7\n\nAccount That Was Locked Out:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-1001\n\tAccount Name:\t\talice\n\nAdditional Information:\n\tCaller Computer Name:\t\tWKS-09\n"
+    expect:
+      "class_uid": 3007
+      "activity_id": 6
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=4768\nEventType=0\nType=Information\nComputerName=DC-01.corp.local\nTaskCategory=Kerberos Authentication Service\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=A Kerberos authentication ticket (TGT) was requested.\nAccount Information:\n\tAccount Name:\t\talice\n\tSupplied Realm Name:\t\tCORP\n\tUser ID:\t\tCORP\\alice\n\nService Information:\n\tService Name:\t\tkrbtgt\n\tService ID:\t\tCORP\\krbtgt\n\nNetwork Information:\n\tClient Address:\t\t::ffff:10.4.5.6\n\tClient Port:\t\t49152\n\nAdditional Information:\n\tTicket Options:\t\t0x40810010\n\tResult Code:\t\t0x0\n\tTicket Encryption Type:\t\t0x12\n\tPre-Authentication Type:\t\t2\n"
+    expect:
+      "class_uid": 3002
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=4769\nEventType=0\nType=Information\nComputerName=DC-01.corp.local\nTaskCategory=Kerberos Service Ticket Operations\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=A Kerberos service ticket was requested.\nAccount Information:\n\tAccount Name:\t\talice@CORP\n\tAccount Domain:\t\tCORP\n\nService Information:\n\tService Name:\t\tMSSQLSvc/db01.corp.local:1433\n\tService ID:\t\tCORP\\svc_sql\n\nNetwork Information:\n\tClient Address:\t\t::ffff:10.4.5.6\n\tClient Port:\t\t49155\n\nAdditional Information:\n\tTicket Options:\t\t0x40810000\n\tTicket Encryption Type:\t\t0x17\n\tFailure Code:\t\t0x0\n\tTransited Services:\t\t-\n"
+    expect:
+      "class_uid": 3002
+      "activity_id": 4
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=4771\nEventType=0\nType=Information\nComputerName=DC-01.corp.local\nTaskCategory=Logon\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Failure\nMessage=Kerberos pre-authentication failed.\nAccount Information:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-1001\n\tAccount Name:\t\talice\n\nService Information:\n\tService Name:\t\tkrbtgt/CORP\n\nNetwork Information:\n\tClient Address:\t\t::ffff:203.0.113.44\n\tClient Port:\t\t0\n\nAdditional Information:\n\tTicket Options:\t\t0x40810010\n\tFailure Code:\t\t0x18\n\tPre-Authentication Type:\t\t2\n"
+    expect:
+      "class_uid": 3002
+      "activity_id": 6
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=4776\nEventType=0\nType=Information\nComputerName=DC-01.corp.local\nTaskCategory=Logon\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=The computer attempted to validate the credentials for an account.\nAuthentication Package:\tMICROSOFT_AUTHENTICATION_PACKAGE_V1_0\nLogon Account:\tbob\nSource Workstation:\tWKS-11\nError Code:\t0x0\n"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=4946\nEventType=0\nType=Information\nComputerName=WKS-09.corp.local\nTaskCategory=MPSSVC Rule-Level Policy Change\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=A change has been made to Windows Firewall exception list. A rule was added.\nRule Information:\n\tProfile Changed:\t\tAll\n\tRule ID:\t\t{A1B2-C3D4}\n\tRule Name:\t\tAllow Inbound 4444\n"
+    expect:
+      "class_uid": 3004
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=5140\nEventType=0\nType=Information\nComputerName=FS-01.corp.local\nTaskCategory=File Share\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=A network share object was accessed.\nSubject:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-1001\n\tAccount Name:\t\talice\n\tAccount Domain:\t\tCORP\n\tLogon ID:\t\t0x3E7ABC\n\nNetwork Information:\n\tObject Type:\t\tFile\n\tSource Address:\t\t10.4.5.6\n\tSource Port:\t\t49200\n\tShare Name:\t\t\\\\*\\Finance\n\tShare Path:\t\t\\??\\D:\\Finance\n\nAccess Request Information:\n\tAccess Mask:\t\t0x1\n\tAccesses:\t\tReadData (or ListDirectory)\n"
+    expect:
+      "class_uid": 4006
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft Windows security auditing.\nEventCode=5145\nEventType=0\nType=Information\nComputerName=FS-01.corp.local\nTaskCategory=Detailed File Share\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=A network share object was checked to see whether client can be granted desired access.\nSubject:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-1001\n\tAccount Name:\t\talice\n\tAccount Domain:\t\tCORP\n\tLogon ID:\t\t0x3E7ABC\n\nNetwork Information:\n\tObject Type:\t\tFile\n\tSource Address:\t\t10.4.5.6\n\tSource Port:\t\t49200\n\tShare Name:\t\t\\\\*\\Finance\n\tShare Path:\t\t\\??\\D:\\Finance\n\tRelative Target Name:\t\t2026\\budget.xlsx\n"
+    expect:
+      "class_uid": 4006
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=System\nSourceName=Service Control Manager\nEventCode=7045\nEventType=0\nType=Information\nComputerName=WKS-09.corp.local\nTaskCategory=None\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=A service was installed in the system.\nService Name:  PSEXESVC\nService File Name:  C:\\Windows\\PSEXESVC.exe\nService Type:  user mode service\nService Start Type:  demand start\nService Account:  LocalSystem\n"
+    expect:
+      "class_uid": 201004
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "this is not a windows event at all, just a stray line"
+    expect:
+      "class_uid": 1008
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "<13>Oct 15 14:23:45 wks-09 MSWinEventLog\t1\tSecurity\t91250\tWed Oct 15 14:23:45 2025\t4624\tMicrosoft-Windows-Security-Auditing\tCORP\\alice\tUser\tAudit Success\tWKS-09.corp.local\tLogon\tAn account was successfully logged on."
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Microsoft-Windows-PowerShell/Operational\nSourceName=Microsoft-Windows-PowerShell\nEventCode=4104\nEventType=0\nType=Information\nComputerName=WKS-09.corp.local\nTaskCategory=Execute a Remote Command\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=Creating Scriptblock text (1 of 1):\nScriptBlock ID:\t{9f9c9c}\nPath:\t\n"
+    expect:
+      "class_uid": 1008
+      "activity_id": 99
+      "metadata.version": "1.9.0"

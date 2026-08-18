@@ -1,0 +1,446 @@
+name: google_workspace_ocsf
+display_name: Google Workspace Audit (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Google Workspace Admin SDK Reports API activities into complete OCSF
+  1.9.0 records, routed by id.applicationName and the first event name:
+    login                              -> Authentication 3002
+    admin + user-lifecycle event names -> User Management 3007
+    admin + group event names          -> Group Management 3006
+    admin (everything else) and token  -> API Activity 6003
+    drive                              -> File Hosting Activity 6006
+  One activity carries an `events[]` array; as in the UDM parser the FIRST
+  event drives the mapping and the whole array stays available, so the nano row
+  count still matches the Google audit-record count.
+  `events[].parameters[]` is flattened into `unmapped.params` with dots in
+  parameter names replaced by underscores — dotted keys under `unmapped` wedge
+  lake publication.
+  On admin events the Google `actor` is the administrator (`actor.user`) and the
+  USER_EMAIL / affected parameter names the subject (`user`).
+match_values:
+  - gws_login
+  - gws_admin
+  - gws_token
+  - gws_drive
+  - google_workspace
+category: cloud
+vendor: "Google"
+product: "Google Workspace"
+parser_vrl: |
+  # Google Workspace Reports API activity JSON -> OCSF 1.9.0.
+  raw_log = string!(.message)
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      # Unparseable input is emitted as an OCSF Base Event (class_uid 0)
+      # rather than being guessed into a security class: it stays valid, and
+      # therefore visible, without fabricating a user or an outcome.
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_name": "Google Workspace Reports",
+              "log_provider": "Google Workspace",
+              "product": { "name": "Google Workspace", "vendor_name": "Google" }
+          },
+          "unmapped": { "parse_error": "not a JSON object" }
+      }
+  } else {
+      p = object!(parsed)
+      id = object(p.id) ?? {}
+      actor_in = object(p.actor) ?? {}
+      actor_app = object(actor_in.applicationInfo) ?? {}
+      net = object(p.networkInfo) ?? {}
+
+      app = downcase(string(id.applicationName) ?? "")
+
+      # ---- time: id.time is RFC3339 in practice, epoch seconds historically ----
+      time_ms = 0
+      time_raw = to_string(id.time) ?? ""
+      if time_raw != "" {
+          t, terr = parse_timestamp(time_raw, "%+")
+          if terr == null {
+              time_ms = to_unix_timestamp(t, unit: "milliseconds")
+          } else {
+              epoch = to_int(time_raw) ?? 0
+              if epoch > 0 { time_ms = epoch * 1000 }
+          }
+      }
+
+      # ---- first event + flattened parameters ----
+      events_arr = array(p.events) ?? []
+      first = {}
+      if length(events_arr) > 0 { first = object(events_arr[0]) ?? {} }
+      event_name = string(first.name) ?? ""
+      event_kind = string(first.type) ?? ""
+
+      params = {}
+      for_each(array(first.parameters) ?? []) -> |_i, prm| {
+          po = object(prm) ?? {}
+          pname = to_string(po.name) ?? ""
+          if pname != "" {
+              # Dots in an unmapped key wedge lake publication.
+              key = replace(pname, ".", "_")
+              if exists(po.value) {
+                  params = set!(params, [key], to_string(po.value) ?? "")
+              } else if exists(po.intValue) {
+                  params = set!(params, [key], to_string(po.intValue) ?? "")
+              } else if exists(po.boolValue) {
+                  params = set!(params, [key], to_string(po.boolValue) ?? "")
+              } else if exists(po.multiValue) {
+                  params = set!(params, [key], encode_json(array(po.multiValue) ?? []))
+              }
+          }
+      }
+
+      # ---- acting principal ----
+      actor_email = string(actor_in.email) ?? ""
+      actor_user = { "name": downcase(actor_email) }
+      if actor_email == "" { actor_user = { "name": "unknown" } }
+      profile_id = to_string(actor_in.profileId) ?? ""
+      if profile_id != "" { actor_user = set!(actor_user, ["uid"], profile_id) }
+      if match(actor_email, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') {
+          actor_user = set!(actor_user, ["email_addr"], downcase(actor_email))
+          ap = split(actor_email, "@")
+          if length(ap) == 2 { actor_user = set!(actor_user, ["domain"], downcase(string(ap[1]) ?? "")) }
+      }
+
+      # ---- subject user named by the admin event parameters ----
+      subj_email = string(params.USER_EMAIL) ?? string(params.affected_email_address) ?? string(params.NEW_VALUE) ?? ""
+      have_subject = match(subj_email, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$')
+      subject = { "name": downcase(subj_email), "email_addr": downcase(subj_email) }
+
+      group_email = string(params.GROUP_EMAIL) ?? ""
+
+      # ---- class routing ----
+      is_usermgmt = event_name == "CREATE_USER" || event_name == "DELETE_USER" || event_name == "SUSPEND_USER" ||
+                    event_name == "UNSUSPEND_USER" || event_name == "CHANGE_PASSWORD" || event_name == "CHANGE_PASSWORD_ON_NEXT_LOGIN" ||
+                    event_name == "GRANT_ADMIN_PRIVILEGE" || event_name == "REVOKE_ADMIN_PRIVILEGE" ||
+                    event_name == "GRANT_DELEGATED_ADMIN_PRIVILEGES" || event_name == "REVOKE_DELEGATED_ADMIN_PRIVILEGES" ||
+                    event_name == "UNENROLL_USER_FROM_STRONG_AUTH" || event_name == "ENROLL_USER_IN_STRONG_AUTH" ||
+                    event_name == "TURN_OFF_2_STEP_VERIFICATION" || event_name == "RENAME_USER" ||
+                    event_name == "MOVE_USER_TO_ORG_UNIT" || event_name == "ARCHIVE_USER" || event_name == "UNARCHIVE_USER"
+      is_groupmgmt = event_name == "CREATE_GROUP" || event_name == "DELETE_GROUP" || event_name == "ADD_GROUP_MEMBER" ||
+                     event_name == "REMOVE_GROUP_MEMBER" || event_name == "UPDATE_GROUP_MEMBER" ||
+                     event_name == "UPDATE_GROUP_SETTING" || event_name == "CHANGE_GROUP_NAME" || group_email != ""
+
+      class_uid = 6003
+      if app == "login" {
+          class_uid = 3002
+      } else if app == "drive" {
+          class_uid = 6006
+      } else if is_usermgmt {
+          class_uid = 3007
+      } else if is_groupmgmt {
+          class_uid = 3006
+      }
+
+      status_id = 1
+      status_str = "Success"
+      severity_id = 1
+      severity = "Informational"
+
+      ocsf = {}
+
+      if class_uid == 3002 {
+          activity_id = 1
+          activity_name = "Logon"
+          if event_name == "logout" { activity_id = 2; activity_name = "Logoff" }
+          if event_name == "login_failure" {
+              status_id = 2; status_str = "Failure"; severity_id = 2; severity = "Low"
+          } else if event_name == "login_success" {
+              status_id = 1; status_str = "Success"
+          } else if event_name != "logout" {
+              status_id = 0; status_str = "Unknown"
+          }
+          if event_name == "suspicious_login" || event_name == "suspicious_login_less_secure_app" {
+              severity_id = 4; severity = "High"
+          }
+
+          ocsf.class_uid = 3002
+          ocsf.class_name = "Authentication"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          # Authentication 3002 carries the authenticating principal in `user`.
+          ocsf.user = actor_user
+          ocsf.service = { "name": "Google Workspace" }
+          ocsf.is_remote = true
+
+          # login_type distinguishes password / saml / google_password /
+          # exchange — the field that shows whether SSO was bypassed.
+          login_type = string(params.login_type) ?? ""
+          if login_type != "" {
+              lt = downcase(login_type)
+              ap_id = 99
+              if lt == "saml" { ap_id = 5 }
+              if lt == "oauth" || lt == "exchange" { ap_id = 6 }
+              ocsf.auth_protocol_id = ap_id
+              ocsf.auth_protocol = login_type
+          }
+          challenge = string(params.login_challenge_method) ?? ""
+          ocsf.is_mfa = challenge != "" || downcase(login_type) == "2sv"
+          if challenge != "" { ocsf.status_detail = challenge }
+      } else if class_uid == 3007 {
+          activity_id = 2
+          activity_name = "Update"
+          if event_name == "CREATE_USER" { activity_id = 1; activity_name = "Create" }
+          if event_name == "DELETE_USER" { activity_id = 3; activity_name = "Delete" }
+          if event_name == "UNSUSPEND_USER" || event_name == "UNARCHIVE_USER" { activity_id = 4; activity_name = "Enable" }
+          if event_name == "SUSPEND_USER" || event_name == "ARCHIVE_USER" { activity_id = 5; activity_name = "Disable" }
+          if event_name == "CHANGE_PASSWORD" { activity_id = 8; activity_name = "Password Change" }
+          if event_name == "CHANGE_PASSWORD_ON_NEXT_LOGIN" { activity_id = 9; activity_name = "Password Reset" }
+          if event_name == "ENROLL_USER_IN_STRONG_AUTH" { activity_id = 12; activity_name = "Enable MFA Factors" }
+          if event_name == "UNENROLL_USER_FROM_STRONG_AUTH" || event_name == "TURN_OFF_2_STEP_VERIFICATION" { activity_id = 13; activity_name = "Disable MFA Factors" }
+          if event_name == "GRANT_ADMIN_PRIVILEGE" || event_name == "GRANT_DELEGATED_ADMIN_PRIVILEGES" { activity_id = 14; activity_name = "Assign Privileges" }
+          if event_name == "REVOKE_ADMIN_PRIVILEGE" || event_name == "REVOKE_DELEGATED_ADMIN_PRIVILEGES" { activity_id = 15; activity_name = "Remove Privileges" }
+
+          ocsf.class_uid = 3007
+          ocsf.class_name = "User Management"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          if have_subject { ocsf.user = subject } else { ocsf.user = actor_user }
+          ocsf.actor = { "user": actor_user }
+          priv = string(params.PRIVILEGE_NAME) ?? ""
+          if priv != "" { ocsf.privileges = [priv] }
+      } else if class_uid == 3006 {
+          activity_id = 99
+          activity_name = "Other"
+          if event_name == "CREATE_GROUP" { activity_id = 6; activity_name = "Create" }
+          if event_name == "DELETE_GROUP" { activity_id = 5; activity_name = "Delete" }
+          if event_name == "ADD_GROUP_MEMBER" { activity_id = 3; activity_name = "Add User" }
+          if event_name == "REMOVE_GROUP_MEMBER" { activity_id = 4; activity_name = "Remove User" }
+          if event_name == "UPDATE_GROUP_SETTING" || event_name == "CHANGE_GROUP_NAME" || event_name == "UPDATE_GROUP_MEMBER" { activity_id = 9; activity_name = "Update" }
+
+          ocsf.class_uid = 3006
+          ocsf.class_name = "Group Management"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          gname = group_email
+          if gname == "" { gname = "unknown" }
+          ocsf.group = { "name": gname }
+          if have_subject { ocsf.user = subject }
+          ocsf.actor = { "user": actor_user }
+      } else if class_uid == 6006 {
+          activity_id = 99
+          activity_name = "Other"
+          en = downcase(event_name)
+          if en == "upload" || en == "create" { activity_id = 1; activity_name = "Upload" }
+          if en == "download" { activity_id = 2; activity_name = "Download" }
+          if en == "edit" { activity_id = 3; activity_name = "Update" }
+          if en == "trash" || en == "delete" { activity_id = 4; activity_name = "Delete" }
+          if en == "rename" { activity_id = 5; activity_name = "Rename" }
+          if en == "copy" { activity_id = 6; activity_name = "Copy" }
+          if en == "move" || en == "add_to_folder" || en == "remove_from_folder" { activity_id = 7; activity_name = "Move" }
+          if en == "untrash" { activity_id = 8; activity_name = "Restore" }
+          if en == "preview" { activity_id = 9; activity_name = "Preview" }
+          if en == "view" { activity_id = 14; activity_name = "Open" }
+          if starts_with(en, "change_user_access") || starts_with(en, "change_document_access") || starts_with(en, "change_acl_editors") || en == "add_to_shared_drive" { activity_id = 12; activity_name = "Share" }
+          if starts_with(en, "sheets_import_range") { activity_id = 15; activity_name = "Sync" }
+
+          ocsf.class_uid = 6006
+          ocsf.class_name = "File Hosting Activity"
+          ocsf.category_uid = 6
+          ocsf.category_name = "Application Activity"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          ocsf.actor = { "user": actor_user }
+          doc_title = string(params.doc_title) ?? ""
+          if doc_title == "" { doc_title = string(params.doc_id) ?? "" }
+          if doc_title == "" { doc_title = "unknown" }
+          file_obj = { "name": doc_title, "type_id": 1 }
+          doc_id = string(params.doc_id) ?? ""
+          if doc_id != "" { file_obj = set!(file_obj, ["uid"], doc_id) }
+          doc_type = string(params.doc_type) ?? ""
+          if doc_type != "" { file_obj = set!(file_obj, ["mime_type"], doc_type) }
+          owner = string(params.owner) ?? ""
+          if match(owner, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') {
+              file_obj = set!(file_obj, ["owner"], { "name": downcase(owner), "email_addr": downcase(owner) })
+          }
+          ocsf.file = file_obj
+      } else {
+          activity_id = 99
+          activity_name = "Other"
+          en = downcase(event_name)
+          if contains(en, "create") || contains(en, "add") || contains(en, "authorize") { activity_id = 1; activity_name = "Create" }
+          if contains(en, "view") || contains(en, "list") || contains(en, "download") { activity_id = 2; activity_name = "Read" }
+          if contains(en, "change") || contains(en, "update") || contains(en, "edit") { activity_id = 3; activity_name = "Update" }
+          if contains(en, "delete") || contains(en, "remove") || contains(en, "revoke") { activity_id = 4; activity_name = "Delete" }
+
+          ocsf.class_uid = 6003
+          ocsf.class_name = "API Activity"
+          ocsf.category_uid = 6
+          ocsf.category_name = "Application Activity"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          op = event_name
+          if op == "" { op = "unknown" }
+          svc_name = "Google Workspace"
+          if app != "" { svc_name = "Google Workspace " + app }
+          ocsf.api = { "operation": op, "service": { "name": svc_name } }
+          ocsf.actor = { "user": actor_user }
+          # The OAuth application acting on the user's behalf — the single most
+          # useful signal in the token stream.
+          oauth_app = string(actor_app.applicationName) ?? string(params.app_name) ?? ""
+          oauth_client = string(actor_app.oauthClientId) ?? string(params.client_id) ?? ""
+          if oauth_app != "" || oauth_client != "" {
+              res = { "type": "OAuthApplication" }
+              if oauth_app != "" { res = set!(res, ["name"], oauth_app) }
+              if oauth_client != "" { res = set!(res, ["uid"], oauth_client) }
+              ocsf.resources = [res]
+          }
+      }
+
+      # ---- source endpoint ----
+      src_ip = string(p.ipAddress) ?? ""
+      src_ep = {}
+      if src_ip != "" { src_ep = set!(src_ep, ["ip"], downcase(src_ip)) }
+      region_code = string(net.regionCode) ?? ""
+      if region_code != "" { src_ep = set!(src_ep, ["location"], { "country": region_code }) }
+      if length(src_ep) == 0 { src_ep = { "hostname": "unknown" } }
+      ocsf.src_endpoint = src_ep
+
+      # ---- common envelope ----
+      ocsf.status_id = status_id
+      ocsf.status = status_str
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.type_uid = to_int(ocsf.class_uid) * 100 + to_int(ocsf.activity_id)
+      ocsf.time = time_ms
+      msg = event_name
+      if msg == "" { msg = app }
+      if msg == "" { msg = "google_workspace_event" }
+      ocsf.message = msg
+      ocsf.raw_data = raw_log
+
+      # Google documents (time, uniqueQualifier, applicationName, customerId) as
+      # the composite key; the collector is at-least-once around the watermark.
+      uniq = to_string(id.uniqueQualifier) ?? ""
+      customer = to_string(id.customerId) ?? ""
+      record_uid = ""
+      if uniq != "" && time_raw != "" {
+          record_uid = join!(["gws", app, customer, uniq, time_raw], "|")
+      }
+      if record_uid == "" { record_uid = uuid_v4() }
+      ocsf.metadata = {
+          "version": "1.9.0",
+          "uid": record_uid,
+          "original_event_uid": record_uid,
+          "event_code": event_name,
+          "log_name": "Google Workspace Reports",
+          "log_provider": "Google Workspace",
+          "tenant_uid": customer,
+          "product": { "name": "Google Workspace", "vendor_name": "Google" }
+      }
+
+      cand = {
+          "application": app,
+          "event_category": event_kind,
+          "actor_caller_type": string(actor_in.callerType) ?? "",
+          "oauth_application": string(actor_app.applicationName) ?? "",
+          "oauth_client_id": string(actor_app.oauthClientId) ?? "",
+          "oauth_impersonation": to_string(actor_app.impersonation) ?? "",
+          "owner_domain": string(p.ownerDomain) ?? "",
+          "region_code": region_code,
+          "subdivision_code": string(net.subdivisionCode) ?? "",
+          "unique_qualifier": uniq
+      }
+      unmapped = {}
+      for_each(cand) -> |k, v| {
+          if v != "" { unmapped = set!(unmapped, [k], v) }
+      }
+      unmapped = set!(unmapped, ["event_count"], length(events_arr))
+      if length(params) > 0 { unmapped = set!(unmapped, ["params"], params) }
+      if length(events_arr) > 1 { unmapped = set!(unmapped, ["events_json"], encode_json(events_arr)) }
+      ocsf.unmapped = unmapped
+
+      . = ocsf
+  }
+samples:
+  # admin_add_group_member.json
+  - raw: "{\"kind\":\"admin#reports#activity\",\"id\":{\"time\":\"2026-08-18T17:03:55.907Z\",\"uniqueQualifier\":\"-6234567890123456789\",\"applicationName\":\"admin\",\"customerId\":\"C01ab2cd3\"},\"actor\":{\"email\":\"admin@example.com\",\"profileId\":\"114500000000000000001\",\"callerType\":\"USER\"},\"ipAddress\":\"192.0.2.77\",\"events\":[{\"type\":\"GROUP_SETTINGS\",\"name\":\"ADD_GROUP_MEMBER\",\"parameters\":[{\"name\":\"GROUP_EMAIL\",\"value\":\"security-team@example.com\"},{\"name\":\"USER_EMAIL\",\"value\":\"bob.smith@example.com\"},{\"name\":\"NEW_VALUE\",\"value\":\"MEMBER\"}]}]}"
+    expect:
+      "class_uid": 3006
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  # admin_grant_admin.json
+  - raw: "{\"kind\":\"admin#reports#activity\",\"id\":{\"time\":\"2026-08-18T16:50:00.000Z\",\"uniqueQualifier\":\"-5234567890123456789\",\"applicationName\":\"admin\",\"customerId\":\"C01ab2cd3\"},\"actor\":{\"email\":\"admin@example.com\",\"profileId\":\"114500000000000000001\",\"callerType\":\"USER\"},\"ipAddress\":\"192.0.2.77\",\"events\":[{\"type\":\"DELEGATED_ADMIN_SETTINGS\",\"name\":\"GRANT_DELEGATED_ADMIN_PRIVILEGES\",\"parameters\":[{\"name\":\"USER_EMAIL\",\"value\":\"bob.smith@example.com\"},{\"name\":\"PRIVILEGE_NAME\",\"value\":\"SUPER_ADMIN\"}]}]}"
+    expect:
+      "class_uid": 3007
+      "activity_id": 14
+      "metadata.version": "1.9.0"
+  # admin_other.json
+  - raw: "{\"kind\":\"admin#reports#activity\",\"id\":{\"time\":\"2026-08-18T17:20:00.000Z\",\"uniqueQualifier\":\"-7234567890123456789\",\"applicationName\":\"admin\",\"customerId\":\"C01ab2cd3\"},\"actor\":{\"email\":\"admin@example.com\",\"profileId\":\"114500000000000000001\",\"callerType\":\"USER\"},\"ipAddress\":\"192.0.2.77\",\"events\":[{\"type\":\"DOMAIN_SETTINGS\",\"name\":\"CHANGE_APPLICATION_SETTING\",\"parameters\":[{\"name\":\"SETTING_NAME\",\"value\":\"Drive and Docs Sharing\"},{\"name\":\"NEW_VALUE\",\"value\":\"SHARING_ALLOWED\"},{\"name\":\"OLD_VALUE\",\"value\":\"SHARING_NOT_ALLOWED\"}]}]}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  # admin_suspend_user.json
+  - raw: "{\"kind\":\"admin#reports#activity\",\"id\":{\"time\":\"2026-08-18T16:41:09.330Z\",\"uniqueQualifier\":\"-4234567890123456789\",\"applicationName\":\"admin\",\"customerId\":\"C01ab2cd3\"},\"actor\":{\"email\":\"admin@example.com\",\"profileId\":\"114500000000000000001\",\"callerType\":\"USER\"},\"ipAddress\":\"192.0.2.77\",\"networkInfo\":{\"regionCode\":\"US\"},\"events\":[{\"type\":\"USER_SETTINGS\",\"name\":\"SUSPEND_USER\",\"parameters\":[{\"name\":\"USER_EMAIL\",\"value\":\"bob.smith@example.com\"},{\"name\":\"DOMAIN_NAME\",\"value\":\"example.com\"}]}]}"
+    expect:
+      "class_uid": 3007
+      "activity_id": 5
+      "metadata.version": "1.9.0"
+  # drive_download.json
+  - raw: "{\"kind\":\"admin#reports#activity\",\"id\":{\"time\":\"2026-08-18T18:11:02.559Z\",\"uniqueQualifier\":\"-9234567890123456789\",\"applicationName\":\"drive\",\"customerId\":\"C01ab2cd3\"},\"actor\":{\"email\":\"jane.doe@example.com\",\"profileId\":\"114511223344556677889\"},\"ipAddress\":\"203.0.113.55\",\"networkInfo\":{\"regionCode\":\"US\"},\"events\":[{\"type\":\"access\",\"name\":\"download\",\"parameters\":[{\"name\":\"primary_event\",\"boolValue\":true},{\"name\":\"doc_id\",\"value\":\"1AbCdEfGhIjKlMnOpQrStUvWxYz\"},{\"name\":\"doc_type\",\"value\":\"spreadsheet\"},{\"name\":\"doc_title\",\"value\":\"Q3 Customer List\"},{\"name\":\"owner\",\"value\":\"finance@example.com\"},{\"name\":\"visibility\",\"value\":\"private\"}]}]}"
+    expect:
+      "class_uid": 6006
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  # drive_share.json
+  - raw: "{\"kind\":\"admin#reports#activity\",\"id\":{\"time\":\"2026-08-18T18:15:40.101Z\",\"uniqueQualifier\":\"-1034567890123456789\",\"applicationName\":\"drive\",\"customerId\":\"C01ab2cd3\"},\"actor\":{\"email\":\"jane.doe@example.com\",\"profileId\":\"114511223344556677889\"},\"ipAddress\":\"203.0.113.55\",\"events\":[{\"type\":\"acl_change\",\"name\":\"change_user_access\",\"parameters\":[{\"name\":\"doc_id\",\"value\":\"1AbCdEfGhIjKlMnOpQrStUvWxYz\"},{\"name\":\"doc_type\",\"value\":\"spreadsheet\"},{\"name\":\"doc_title\",\"value\":\"Q3 Customer List\"},{\"name\":\"owner\",\"value\":\"finance@example.com\"},{\"name\":\"target_user\",\"value\":\"external@partner.example\"},{\"name\":\"old_value\",\"multiValue\":[\"none\"]},{\"name\":\"new_value\",\"multiValue\":[\"can_edit\"]}]}]}"
+    expect:
+      "class_uid": 6006
+      "activity_id": 12
+      "metadata.version": "1.9.0"
+  # login_failure.json
+  - raw: "{\"kind\":\"admin#reports#activity\",\"id\":{\"time\":\"2026-08-18T14:07:52.882Z\",\"uniqueQualifier\":\"-2234567890123456789\",\"applicationName\":\"login\",\"customerId\":\"C01ab2cd3\"},\"actor\":{\"email\":\"jane.doe@example.com\",\"profileId\":\"114511223344556677889\"},\"ipAddress\":\"198.51.100.201\",\"networkInfo\":{\"regionCode\":\"NL\"},\"events\":[{\"type\":\"login\",\"name\":\"login_failure\",\"parameters\":[{\"name\":\"login_type\",\"value\":\"google_password\"},{\"name\":\"login_failure_type\",\"value\":\"login_failure_invalid_password\"}]}]}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # login_success.json
+  - raw: "{\"kind\":\"admin#reports#activity\",\"id\":{\"time\":\"2026-08-18T14:02:11.104Z\",\"uniqueQualifier\":\"-1234567890123456789\",\"applicationName\":\"login\",\"customerId\":\"C01ab2cd3\"},\"etag\":\"\\\"abc123\\\"\",\"actor\":{\"email\":\"jane.doe@example.com\",\"profileId\":\"114511223344556677889\"},\"ipAddress\":\"203.0.113.55\",\"networkInfo\":{\"regionCode\":\"US\",\"subdivisionCode\":\"US-MA\"},\"events\":[{\"type\":\"login\",\"name\":\"login_success\",\"parameters\":[{\"name\":\"login_type\",\"value\":\"google_password\"},{\"name\":\"login_challenge_method\",\"multiValue\":[\"password\",\"idv_preregistered_phone\"]},{\"name\":\"is_suspicious\",\"boolValue\":false}]}]}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # logout.json
+  - raw: "{\"kind\":\"admin#reports#activity\",\"id\":{\"time\":\"2026-08-18T15:30:00.010Z\",\"uniqueQualifier\":\"-3234567890123456789\",\"applicationName\":\"login\",\"customerId\":\"C01ab2cd3\"},\"actor\":{\"email\":\"jane.doe@example.com\",\"profileId\":\"114511223344556677889\"},\"ipAddress\":\"203.0.113.55\",\"events\":[{\"type\":\"logout\",\"name\":\"logout\",\"parameters\":[]}]}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  # malformed.txt
+  - raw: "gws not json"
+    expect:
+      "class_uid": 0
+      "activity_id": 0
+      "metadata.version": "1.9.0"
+  # token_authorize.json
+  - raw: "{\"kind\":\"admin#reports#activity\",\"id\":{\"time\":\"2026-08-18T13:05:44.221Z\",\"uniqueQualifier\":\"-8234567890123456789\",\"applicationName\":\"token\",\"customerId\":\"C01ab2cd3\"},\"actor\":{\"email\":\"jane.doe@example.com\",\"profileId\":\"114511223344556677889\",\"applicationInfo\":{\"applicationName\":\"Third Party Backup Tool\",\"oauthClientId\":\"1234567890-abcdefg.apps.googleusercontent.com\",\"impersonation\":false}},\"ipAddress\":\"203.0.113.55\",\"events\":[{\"type\":\"auth\",\"name\":\"authorize\",\"parameters\":[{\"name\":\"client_id\",\"value\":\"1234567890-abcdefg.apps.googleusercontent.com\"},{\"name\":\"app_name\",\"value\":\"Third Party Backup Tool\"},{\"name\":\"scope\",\"multiValue\":[\"https://www.googleapis.com/auth/drive\",\"https://mail.google.com/\"]}]}]}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 1
+      "metadata.version": "1.9.0"

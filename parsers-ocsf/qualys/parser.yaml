@@ -1,0 +1,325 @@
+name: qualys_ocsf
+display_name: Qualys (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Qualys VMDR host detections, Knowledge Base QID detail, WAS web
+  application findings and Policy Compliance results into OCSF 1.9.0
+  "Detection Finding" (class_uid 2004). The scanned asset becomes
+  `resources[]` (resource_details), the QID/title becomes `finding_info`, and
+  CVEs become `vulnerabilities[].cve.uid` — the promoted path. Note that the
+  OCSF `vulnerability` object carries a just-one [advisory, cve, cwe]
+  constraint, so a detection with no CVE deliberately emits no
+  `vulnerabilities[]` entry rather than an empty one. Unrecognised shapes
+  become Base Event (class_uid 0). Mirrors the UDM qualys parser
+  (../parsers/parsers/qualys/parser.yaml).
+match_values:
+  - qualys
+category: security
+vendor: "Qualys"
+product: "VMDR"
+parser_vrl: |
+  # Qualys -> OCSF 1.9.0 Detection Finding (2004) / Base Event (0)
+  raw_log = string!(.message)
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
+
+  p, perr = parse_json(raw_log)
+  ok = perr == null && is_object(p)
+  e = {}
+  if ok { e = object!(p) }
+
+  shape = "unknown"
+  if ok {
+      if exists(e.DETECTION_LIST) || (exists(e.IP) && exists(e.QID)) { shape = "host_detection" } else if exists(e.webApp) || (exists(e.vulnType) && exists(e.uri)) { shape = "was" } else if exists(e.controlId) || exists(e.policyName) { shape = "compliance" } else if exists(e.VULN_TYPE) && exists(e.QID) && exists(e.TITLE) { shape = "knowledge_base" }
+  }
+
+  # Qualys severity is 1..5 (5 worst). OCSF severity_id is 1..6.
+  qsev_to_ocsf = { "1": 1, "2": 2, "3": 3, "4": 4, "5": 5 }
+  sev_names = { "1": "Informational", "2": "Low", "3": "Medium", "4": "High", "5": "Critical" }
+
+  severity_id = 1
+  severity = "Informational"
+  time_ms = 0
+  finding_uid = ""
+  title = ""
+  host_ip = ""
+  host_name = ""
+  cves = []
+  port = 0
+  protocol = ""
+  detection_status = ""
+  solution = ""
+  category = ""
+  cvss_base = ""
+  url_str = ""
+  http_method = ""
+  status_id = 1
+  status_str = "New"
+  activity_id = 1
+  activity_name = "Create"
+  types = []
+  unmapped = {}
+
+  set_sev = null
+
+  if shape == "host_detection" {
+      types = ["Vulnerability"]
+      host_ip = to_string(e.IP) ?? ""
+      host_name = to_string(e.DNS) ?? ""
+      if host_name == "" { host_name = to_string(e.NETBIOS) ?? "" }
+      osv = to_string(e.OS) ?? ""
+      if osv != "" { unmapped.os = osv }
+      tm = to_string(e.TRACKING_METHOD) ?? ""
+      if tm != "" { unmapped.tracking_method = tm }
+
+      lsd = to_string(e.LAST_SCAN_DATETIME) ?? ""
+      if lsd != "" {
+          t, terr = parse_timestamp(lsd, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      dets = array(e.DETECTION_LIST) ?? []
+      unmapped.detection_count = length(dets)
+      if length(dets) > 0 {
+          d0 = object(dets[0]) ?? {}
+          finding_uid = to_string(d0.QID) ?? ""
+          sv = to_string(d0.SEVERITY) ?? ""
+          mapped = to_int(get(qsev_to_ocsf, [sv]) ?? 1) ?? 1
+          severity_id = mapped
+          severity = to_string(get(sev_names, [sv]) ?? "Informational") ?? "Informational"
+          pv = to_string(d0.PORT) ?? ""
+          if pv != "" && pv != "0" { port = to_int(pv) ?? 0 }
+          protocol = to_string(d0.PROTOCOL) ?? ""
+          detection_status = to_string(d0.STATUS) ?? ""
+          dt = to_string(d0.TYPE) ?? ""
+          if dt != "" { unmapped.detection_type = dt }
+          rs = to_string(d0.RESULTS) ?? ""
+          if rs != "" { unmapped.results = rs }
+          ff = to_string(d0.FIRST_FOUND_DATETIME) ?? ""
+          if ff != "" { unmapped.first_found = ff }
+          lf = to_string(d0.LAST_FOUND_DATETIME) ?? ""
+          if lf != "" { unmapped.last_found = lf }
+      }
+      if finding_uid == "" { finding_uid = to_string(e.QID) ?? "" }
+      title = "Qualys QID " + finding_uid
+  } else if shape == "was" {
+      types = ["Web Application Vulnerability"]
+      finding_uid = to_string(e.qid) ?? ""
+      if finding_uid == "" { finding_uid = to_string(e.id) ?? "" }
+      title = to_string(e.title) ?? ""
+      sv = to_string(e.severity) ?? ""
+      severity_id = to_int(get(qsev_to_ocsf, [sv]) ?? 1) ?? 1
+      severity = to_string(get(sev_names, [sv]) ?? "Informational") ?? "Informational"
+      url_str = to_string(e.uri) ?? ""
+      http_method = upcase(to_string(e.method) ?? "")
+      detection_status = to_string(e.status) ?? ""
+      pm = to_string(e.param) ?? ""
+      if pm != "" { unmapped.param = pm }
+      wa = object(e.webApp) ?? {}
+      wan = to_string(wa.name) ?? ""
+      if wan != "" { unmapped.web_app_name = wan }
+      wau = to_string(wa.url) ?? ""
+      if wau != "" { unmapped.web_app_url = wau }
+      c3 = object(e.cvss_v3) ?? {}
+      cvss_base = to_string(c3.base) ?? ""
+      fdd = to_string(e.firstDetectedDate) ?? ""
+      if fdd != "" {
+          t, terr = parse_timestamp(fdd, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+  } else if shape == "compliance" {
+      types = ["Compliance"]
+      finding_uid = to_string(e.controlId) ?? ""
+      if finding_uid == "" { finding_uid = to_string(e.id) ?? "" }
+      title = to_string(e.title) ?? ""
+      pol = to_string(e.policyName) ?? ""
+      if pol != "" { unmapped.policy_name = pol }
+      st = upcase(to_string(e.status) ?? "")
+      detection_status = st
+      if st == "PASS" {
+          status_id = 4
+          status_str = "Resolved"
+      }
+      sv = downcase(to_string(e.severity) ?? "")
+      if contains(sv, "critical") { severity_id = 5; severity = "Critical" } else if contains(sv, "high") { severity_id = 4; severity = "High" } else if contains(sv, "medium") { severity_id = 3; severity = "Medium" } else if contains(sv, "low") { severity_id = 2; severity = "Low" }
+      host_ip = to_string(e.hostIp) ?? ""
+      host_name = to_string(e.hostName) ?? ""
+      tech = to_string(e.technology) ?? ""
+      if tech != "" { unmapped.technology = tech }
+      rat = to_string(e.rationale) ?? ""
+      if rat != "" { unmapped.rationale = rat }
+      evd = to_string(e.evidence) ?? ""
+      if evd != "" { unmapped.evidence = evd }
+      le = to_string(e.lastEvaluated) ?? ""
+      if le != "" {
+          t, terr = parse_timestamp(le, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+  } else if shape == "knowledge_base" {
+      types = ["Vulnerability Definition"]
+      finding_uid = to_string(e.QID) ?? ""
+      title = to_string(e.TITLE) ?? ""
+      sv = to_string(e.SEVERITY) ?? ""
+      severity_id = to_int(get(qsev_to_ocsf, [sv]) ?? 1) ?? 1
+      severity = to_string(get(sev_names, [sv]) ?? "Informational") ?? "Informational"
+      category = to_string(e.CATEGORY) ?? ""
+      cvss_base = to_string(e.CVSS_V3_BASE) ?? ""
+      if cvss_base == "" { cvss_base = to_string(e.CVSS_BASE) ?? "" }
+      solution = to_string(e.SOLUTION) ?? ""
+      cl = array(e.CVE_LIST) ?? []
+      for_each(cl) -> |_i, c| {
+          cs = to_string(c) ?? ""
+          if cs == "" {
+              co = object(c) ?? {}
+              cs = to_string(co.ID) ?? ""
+          }
+          if cs != "" { cves = push(cves, cs) }
+      }
+      vt = to_string(e.VULN_TYPE) ?? ""
+      if vt != "" { unmapped.vuln_type = vt }
+      pd = to_string(e.PUBLISHED_DATETIME) ?? ""
+      if pd != "" {
+          t, terr = parse_timestamp(pd, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+  }
+
+  if ok && shape != "unknown" {
+      if finding_uid == "" { finding_uid = uuid_v4() }
+      if title == "" { title = "Qualys finding " + finding_uid }
+
+      finding_info = { "uid": finding_uid, "title": title, "data_sources": ["qualys"] }
+      if length(types) > 0 { finding_info.types = types }
+      finding_info.analytic = { "name": "Qualys " + shape, "type_id": 1, "type": "Rule" }
+
+      . = {
+          "class_uid": 2004,
+          "class_name": "Detection Finding",
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": 200400 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "is_alert": severity_id >= 4,
+          "time": time_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_name": "qualys-" + shape,
+              "product": { "name": "VMDR", "vendor_name": "Qualys" }
+          },
+          "finding_info": finding_info
+      }
+
+      res = {}
+      if match(host_ip, ip_re) { res.ip = host_ip }
+      if host_name != "" { res.hostname = downcase(host_name); res.name = host_name }
+      if !exists(res.name) && exists(res.ip) { res.name = host_ip }
+      if length(res) > 0 { res.type = "Host"; .resources = [res] }
+
+      ev = {}
+      if match(host_ip, ip_re) {
+          de = { "ip": host_ip }
+          if port != 0 { de.port = port }
+          if host_name != "" { de.hostname = downcase(host_name) }
+          ev.dst_endpoint = de
+      }
+      if url_str != "" { ev.url = { "url_string": url_str } }
+      if http_method != "" { ev.http_request = { "http_method": http_method } }
+      if length(ev) > 0 { .evidences = [ev] }
+
+      # The OCSF vulnerability object requires EXACTLY ONE of advisory/cve/cwe,
+      # so an entry is only emitted for a finding that names a CVE.
+      if length(cves) > 0 {
+          vulns = []
+          for_each(cves) -> |_i, c| {
+              v = { "cve": { "uid": to_string(c) ?? "" } }
+              if title != "" { v.title = title }
+              if severity != "" { v.severity = severity }
+              if solution != "" { v.remediation = { "desc": solution } }
+              vulns = push(vulns, v)
+          }
+          .vulnerabilities = vulns
+      } else if solution != "" {
+          .remediation = { "desc": solution }
+      }
+
+      # `evidences.*` and `vulnerabilities[].cve.uid` are NOT addressable in
+      # nPL on this deployment (the bracketed promoted path cannot be typed and
+      # the dotted form is rejected). OCSF observables ARE promoted
+      # (observables.value / .type / .type_id), so every pivotable entity is
+      # ALSO emitted there — this is what makes CVE and asset hunting work.
+      obs = []
+      for_each(cves) -> |_i, c| {
+          cv = to_string(c) ?? ""
+          if cv != "" { obs = push(obs, { "name": "vulnerabilities.cve.uid", "type": "CVE Object: uid", "type_id": 18, "value": cv }) }
+      }
+      if match(host_ip, ip_re) { obs = push(obs, { "name": "resources.ip", "type": "IP Address", "type_id": 2, "value": host_ip }) }
+      if host_name != "" { obs = push(obs, { "name": "resources.hostname", "type": "Hostname", "type_id": 1, "value": downcase(host_name) }) }
+      if url_str != "" { obs = push(obs, { "name": "evidences.url.url_string", "type": "URL String", "type_id": 6, "value": url_str }) }
+      if length(obs) > 0 { .observables = obs }
+
+      if detection_status != "" { .status_detail = detection_status }
+      if cvss_base != "" { unmapped.cvss_base = cvss_base }
+      if category != "" { unmapped.vuln_category = category }
+      if protocol != "" { unmapped.protocol = protocol }
+      if length(unmapped) > 0 { .unmapped = unmapped }
+  } else {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_name": "qualys",
+              "product": { "name": "VMDR", "vendor_name": "Qualys" }
+          }
+      }
+      if !ok { .metadata.log_level = "error" }
+  }
+
+  .
+
+# Runtime samples (NAN-2327): one per event shape this parser routes.
+# `class_uid` is asserted because class routing is the whole point of the
+# OCSF conversion — a silent reroute is the defect most likely to survive
+# a compile-only check.
+samples:
+  - raw: '{"id":"cc-771","controlId":"1234","title":"Ensure SSH root login is disabled","policyName":"CIS RHEL9 Benchmark","status":"FAIL","severity":"High","hostIp":"10.90.4.22","hostName":"db01.corp.example","os":"Red Hat Enterprise Linux 9","technology":"OpenSSH","rationale":"Direct root login weakens accountability","evidence":"PermitRootLogin yes","lastEvaluated":"2026-08-12T08:00:00Z"}'
+    expect:
+      class_uid: 2004
+      activity_id: 1
+  - raw: '{"IP":"10.90.4.21","DNS":"web01.corp.example","NETBIOS":"WEB01","OS":"Red Hat Enterprise Linux 9","TRACKING_METHOD":"IP","LAST_SCAN_DATETIME":"2026-08-12T09:00:00Z","QID":38657,"DETECTION_LIST":[{"QID":"38657","TYPE":"Confirmed","SEVERITY":"4","PORT":"443","PROTOCOL":"tcp","STATUS":"Active","RESULTS":"TLSv1.0 supported","FIRST_FOUND_DATETIME":"2026-06-01T00:00:00Z","LAST_FOUND_DATETIME":"2026-08-12T09:00:00Z","TIMES_FOUND":"11"}]}'
+    expect:
+      class_uid: 2004
+      activity_id: 1
+  - raw: '{"QID":"91234","TITLE":"Microsoft Windows Remote Code Execution Vulnerability","VULN_TYPE":"Vulnerability","SEVERITY":"5","CATEGORY":"Windows","CVSS_BASE":"9.8","CVSS_V3_BASE":"9.8","CVE_LIST":["CVE-2026-1234","CVE-2026-1235"],"SOLUTION":"Apply the vendor patch KB5051234.","CONSEQUENCE":"Remote code execution","DISCOVERY_METHOD":"Remote","PATCHABLE":"1","PUBLISHED_DATETIME":"2026-07-14T00:00:00Z"}'
+    expect:
+      class_uid: 2004
+      activity_id: 1
+  - raw: '{"SOMETHING":"else"}'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: '{"id":"88123","qid":150001,"title":"Reflected Cross-Site Scripting","severity":"4","uri":"https://app.example.com/search?q=test","method":"GET","param":"q","status":"ACTIVE","vulnType":"VULNERABILITY","webApp":{"id":9001,"name":"Corp Portal","url":"https://app.example.com"},"cvss_v3":{"base":"7.4","temporal":"6.6"},"cwe":[79],"owasp":["A03"],"firstDetectedDate":"2026-08-01T10:00:00Z","lastDetectedDate":"2026-08-12T09:00:00Z","timesDetected":4}'
+    expect:
+      class_uid: 2004
+      activity_id: 1

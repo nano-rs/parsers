@@ -1,0 +1,231 @@
+name: aws_waf_ocsf
+display_name: AWS WAF (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses AWS WAF v2 access logs into complete OCSF 1.9.0 "HTTP Activity"
+  (class_uid 4002) records carrying the security_control profile, so the WAF
+  verdict lands on action_id / disposition_id / firewall_rule and the inspected
+  request lands on http_request. The whole OCSF object is emitted on the root so
+  it lands in ocsf_logs.event and the promoted columns materialize. Mirrors the
+  UDM aws_waf parser but targets OCSF instead of `.udm.*`.
+match_values:
+  - aws_waf
+category: cloud
+vendor: "Amazon"
+product: "WAF"
+parser_vrl: |
+  # AWS WAF v2 JSON log -> OCSF 1.9.0 HTTP Activity (class_uid 4002)
+  raw_log = to_string(.message) ?? ""
+  class_uid = 4002
+
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      . = {
+          "class_uid": class_uid,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": class_uid * 100 + 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud", "security_control"],
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_name": "AWS WAF",
+              "product": { "name": "AWS WAF", "vendor_name": "Amazon" }
+          },
+          "cloud": { "provider": "AWS" },
+          "http_request": { "url": { "path": "/" } }
+      }
+  } else {
+      p = object!(parsed)
+      req = object(p.httpRequest) ?? {}
+
+      # ---- time: WAF emits epoch milliseconds ----
+      time_ms = to_int(p.timestamp) ?? 0
+
+      # ---- method -> activity_id ----
+      method = upcase(to_string(req.httpMethod) ?? "")
+      activity_id = 99
+      activity_name = "Other"
+      if method == "CONNECT" { activity_id = 1; activity_name = "Connect" }
+      if method == "DELETE"  { activity_id = 2; activity_name = "Delete" }
+      if method == "GET"     { activity_id = 3; activity_name = "Get" }
+      if method == "HEAD"    { activity_id = 4; activity_name = "Head" }
+      if method == "OPTIONS" { activity_id = 5; activity_name = "Options" }
+      if method == "POST"    { activity_id = 6; activity_name = "Post" }
+      if method == "PUT"     { activity_id = 7; activity_name = "Put" }
+      if method == "TRACE"   { activity_id = 8; activity_name = "Trace" }
+      if method == "PATCH"   { activity_id = 9; activity_name = "Patch" }
+
+      # ---- WAF verdict -> security_control action/disposition ----
+      waf_action = upcase(to_string(p.action) ?? "")
+      action_id = 0
+      action_str = "Unknown"
+      disposition_id = 0
+      disposition = "Unknown"
+      is_alert = false
+      severity_id = 1
+      severity = "Informational"
+      if waf_action == "ALLOW" {
+          action_id = 1; action_str = "Allowed"; disposition_id = 1; disposition = "Allowed"
+      }
+      if waf_action == "BLOCK" {
+          action_id = 2; action_str = "Denied"; disposition_id = 2; disposition = "Blocked"
+          is_alert = true; severity_id = 3; severity = "Medium"
+      }
+      if waf_action == "COUNT" {
+          action_id = 3; action_str = "Observed"; disposition_id = 20; disposition = "Count"
+      }
+      if waf_action == "CAPTCHA" {
+          action_id = 2; action_str = "Denied"; disposition_id = 22; disposition = "Captcha"
+          is_alert = true; severity_id = 2; severity = "Low"
+      }
+      if waf_action == "CHALLENGE" {
+          action_id = 2; action_str = "Denied"; disposition_id = 23; disposition = "Challenge"
+          is_alert = true; severity_id = 2; severity = "Low"
+      }
+      if waf_action == "EXCLUDED_AS_COUNT" {
+          action_id = 3; action_str = "Observed"; disposition_id = 20; disposition = "Count"
+      }
+
+      # ---- headers: host / user-agent / referer ----
+      host = ""
+      user_agent = ""
+      referrer = ""
+      headers = array(req.headers) ?? []
+      for_each(headers) -> |_i, h| {
+          hname = downcase(to_string(get(h, ["name"]) ?? "") ?? "")
+          hval = to_string(get(h, ["value"]) ?? "") ?? ""
+          if hname == "host" { host = hval }
+          if hname == "user-agent" { user_agent = hval }
+          if hname == "referer" { referrer = hval }
+      }
+
+      # ---- url ----
+      uri = to_string(req.uri) ?? ""
+      args = to_string(req.args) ?? ""
+      url_obj = {}
+      if uri != "" { url_obj.path = uri }
+      if args != "" { url_obj.query_string = args }
+      if host != "" {
+          url_obj.hostname = host
+          url_obj.scheme = "https"
+          if args != "" {
+              url_obj.url_string = "https://" + host + uri + "?" + args
+          } else {
+              url_obj.url_string = "https://" + host + uri
+          }
+      }
+      if length(keys(url_obj)) == 0 { url_obj.path = "/" }
+
+      http_request = { "url": url_obj }
+      if method != "" { http_request.http_method = method }
+      if user_agent != "" { http_request.user_agent = user_agent }
+      if referrer != "" { http_request.referrer = referrer }
+      hver = to_string(req.httpVersion) ?? ""
+      if hver != "" { http_request.version = hver }
+      rid = to_string(req.requestId) ?? ""
+      if rid != "" { http_request.uid = rid }
+
+      # ---- response ----
+      code = to_int(p.responseCodeSent) ?? 0
+      status_id = 0
+      status_str = "Unknown"
+      if code > 0 {
+          if code >= 200 && code < 400 { status_id = 1; status_str = "Success" } else { status_id = 2; status_str = "Failure" }
+      } else if waf_action == "ALLOW" {
+          status_id = 1
+          status_str = "Success"
+      }
+
+      # ---- source endpoint (+ WAF-resolved country) ----
+      src_endpoint = {}
+      client_ip = to_string(req.clientIp) ?? ""
+      if client_ip != "" { src_endpoint.ip = downcase(client_ip) }
+      country = to_string(req.country) ?? ""
+      if country != "" { src_endpoint.location = { "country": country } }
+      if length(keys(src_endpoint)) == 0 { src_endpoint.ip = "0.0.0.0" }
+
+      # ---- the terminating rule -> firewall_rule ----
+      fw = {}
+      rule_id = to_string(p.terminatingRuleId) ?? ""
+      if rule_id != "" { fw.uid = rule_id; fw.name = rule_id }
+      rule_type = to_string(p.terminatingRuleType) ?? ""
+      if rule_type != "" { fw.type = rule_type }
+      match_details = array(p.terminatingRuleMatchDetails) ?? []
+      first_match = get(match_details, [0]) ?? null
+      if first_match != null {
+          cond = to_string(get(first_match, ["conditionType"]) ?? "") ?? ""
+          if cond != "" { fw.category = cond }
+          fw.match_details = [encode_json(first_match)]
+          loc = to_string(get(first_match, ["location"]) ?? "") ?? ""
+          if loc != "" { fw.match_location = loc }
+      }
+
+      ocsf = {
+          "class_uid": class_uid,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "action_id": action_id,
+          "action": action_str,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "is_alert": is_alert,
+          "time": time_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud", "security_control"],
+              "uid": rid,
+              "log_name": "AWS WAF",
+              "log_provider": "AWS WAF",
+              "product": { "name": "AWS WAF", "vendor_name": "Amazon" }
+          },
+          "cloud": { "provider": "AWS" },
+          "src_endpoint": src_endpoint,
+          "http_request": http_request
+      }
+      if rid == "" { ocsf.metadata.uid = uuid_v4() }
+      if code > 0 { ocsf.http_response = { "code": code, "status": status_str } }
+      if length(keys(fw)) > 0 { ocsf.firewall_rule = fw }
+
+      unmapped = {}
+      webacl = to_string(p.webaclId) ?? ""
+      if webacl != "" { unmapped.web_acl_id = webacl }
+      if waf_action != "" { unmapped.waf_action = waf_action }
+      src_name = to_string(p.httpSourceName) ?? ""
+      if src_name != "" { unmapped.http_source_name = src_name }
+      src_id = to_string(p.httpSourceId) ?? ""
+      if src_id != "" { unmapped.http_source_id = src_id }
+      labels = array(p.labels) ?? []
+      if length(labels) > 0 { unmapped.labels = encode_json(labels) }
+      rgl = array(p.ruleGroupList) ?? []
+      if length(rgl) > 0 { unmapped.rule_group_list = encode_json(rgl) }
+      rbrl = array(p.rateBasedRuleList) ?? []
+      if length(rbrl) > 0 { unmapped.rate_based_rule_list = encode_json(rbrl) }
+      ntmr = array(p.nonTerminatingMatchingRules) ?? []
+      if length(ntmr) > 0 { unmapped.non_terminating_matching_rules = encode_json(ntmr) }
+      if length(keys(unmapped)) > 0 { ocsf.unmapped = unmapped }
+
+      . = ocsf
+  }

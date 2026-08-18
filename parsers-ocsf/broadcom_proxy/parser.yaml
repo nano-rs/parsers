@@ -1,0 +1,308 @@
+name: broadcom_proxy_ocsf
+display_name: Broadcom ProxySG (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Broadcom / Symantec / Blue Coat ProxySG ELFF access logs
+  (BCREPORTERMAIN field order) into OCSF 1.9.0 "HTTP Activity"
+  (class_uid 4002). Handles syslog-wrapped delivery, quoted ELFF fields and
+  "-" placeholders. The proxy's own address becomes `proxy` (network_proxy),
+  the filter result drives the security-control action/disposition, and the
+  URL category lands in http_request.url.categories. ELFF comment/header
+  lines and short lines become Base Event (class_uid 0). Mirrors the UDM
+  broadcom_proxy parser (../parsers/parsers/broadcom_proxy/parser.yaml).
+match_values:
+  - broadcom_proxy
+category: network
+vendor: "Broadcom"
+product: "ProxySG"
+parser_vrl: |
+  # Broadcom ProxySG ELFF -> OCSF 1.9.0 HTTP Activity (4002) / Base Event (0)
+  # BCREPORTERMAIN:
+  #   0 date  1 time  2 time-taken  3 c-ip  4 sc-status  5 s-action
+  #   6 sc-bytes  7 cs-bytes  8 cs-method  9 cs-uri-scheme  10 cs-host
+  #   11 cs-uri-port  12 cs-uri-path  13 cs-uri-query  14 cs-username
+  #   15 cs-auth-group  16 s-hierarchy  17 s-supplier-name  18 rs(Content-Type)
+  #   19 cs(User-Agent)  20 sc-filter-result  21 cs-categories  22 x-virus-id
+  #   23 s-ip
+
+  raw_log = string!(.message)
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
+
+  # ---- strip a syslog wrapper if the collector added one ----
+  payload = raw_log
+  sm = parse_regex(raw_log, r'^<\d+>\s*\w+\s+\d+\s+[\d:]+\s+\S+\s+\S+:\s+(?P<payload>.+)$') ?? null
+  if sm != null {
+      payload = to_string(sm.payload)
+  } else {
+      sm2 = parse_regex(raw_log, r'^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d+\s+[\d:]+\s+\S+\s+\S+:\s+(?P<payload>.+)$') ?? null
+      if sm2 != null { payload = to_string(sm2.payload) }
+  }
+
+  # ---- tokenize, honouring "quoted fields" ----
+  tokens = []
+  if !starts_with(payload, "#") {
+      toks, terr = parse_regex_all(payload, r'(?:"(?P<quoted>[^"]*)")|(?P<unquoted>\S+)')
+      if terr == null {
+          for_each(toks) -> |_i, m| {
+              q = to_string(m.quoted)
+              u = to_string(m.unquoted)
+              if q != "" { tokens = push(tokens, q) } else if u != "" { tokens = push(tokens, u) }
+          }
+      }
+  }
+  n = length(tokens)
+  fields = tokens
+
+
+  if n >= 6 {
+
+
+      # ---- 0+1: date + time ----
+      time_ms = 0
+      ts_combined = (string(fields[0]) ?? "") + " " + (string(fields[1]) ?? "")
+      t, terr2 = parse_timestamp(ts_combined, "%Y-%m-%d %H:%M:%S")
+      if terr2 == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+
+      # ---- 2: time-taken (ms) ----
+      duration_ms = 0
+      tt = string(fields[2]) ?? ""
+      if tt != "-" { duration_ms = to_int(tt) ?? 0 }
+
+      # ---- 3: c-ip ----
+      c_ip = string(fields[3]) ?? ""
+      if c_ip == "-" { c_ip = "" }
+
+      # ---- 4: sc-status ----
+      code = 0
+      st = string(fields[4]) ?? ""
+      if st != "-" { code = to_int(st) ?? 0 }
+
+      # ---- 5: s-action ----
+      s_action = ""
+      sa = string(fields[5]) ?? ""
+      if sa != "-" { s_action = sa }
+
+      sc_bytes = 0
+      cs_bytes = 0
+      method = ""
+      scheme = ""
+      cs_host = ""
+      cs_port = 0
+      cs_path = ""
+      cs_query = ""
+      username = ""
+      auth_group = ""
+      hierarchy = ""
+      supplier = ""
+      content_type = ""
+      user_agent = ""
+      filter_result = ""
+      categories = ""
+      virus_id = ""
+      s_ip = ""
+
+      if n > 6 { v = string(fields[6]) ?? ""; if v != "-" { sc_bytes = to_int(v) ?? 0 } }
+      if n > 7 { v = string(fields[7]) ?? ""; if v != "-" { cs_bytes = to_int(v) ?? 0 } }
+      if n > 8 { v = string(fields[8]) ?? ""; if v != "-" { method = upcase(v) } }
+      if n > 9 { v = string(fields[9]) ?? ""; if v != "-" { scheme = downcase(v) } }
+      if n > 10 { v = string(fields[10]) ?? ""; if v != "-" { cs_host = v } }
+      if n > 11 { v = string(fields[11]) ?? ""; if v != "-" { cs_port = to_int(v) ?? 0 } }
+      if n > 12 { v = string(fields[12]) ?? ""; if v != "-" { cs_path = v } }
+      if n > 13 { v = string(fields[13]) ?? ""; if v != "-" { cs_query = v } }
+      if n > 14 { v = string(fields[14]) ?? ""; if v != "-" { username = v } }
+      if n > 15 { v = string(fields[15]) ?? ""; if v != "-" { auth_group = v } }
+      if n > 16 { v = string(fields[16]) ?? ""; if v != "-" { hierarchy = v } }
+      if n > 17 { v = string(fields[17]) ?? ""; if v != "-" { supplier = v } }
+      if n > 18 { v = string(fields[18]) ?? ""; if v != "-" { content_type = v } }
+      if n > 19 { v = string(fields[19]) ?? ""; if v != "-" { user_agent = v } }
+      if n > 20 { v = string(fields[20]) ?? ""; if v != "-" { filter_result = v } }
+      if n > 21 { v = string(fields[21]) ?? ""; if v != "-" && v != "none" { categories = v } }
+      if n > 22 { v = string(fields[22]) ?? ""; if v != "-" { virus_id = v } }
+      if n > 23 { v = string(fields[23]) ?? ""; if v != "-" { s_ip = v } }
+
+      # ---- reconstruct the absolute URL ----
+      url_obj = {}
+      if cs_host != "" { url_obj.hostname = downcase(cs_host) }
+      if scheme != "" { url_obj.scheme = scheme }
+      if cs_port != 0 { url_obj.port = cs_port }
+      if cs_path != "" { url_obj.path = cs_path }
+      if cs_query != "" { url_obj.query_string = cs_query }
+      if categories != "" { url_obj.categories = [categories] }
+      if scheme != "" && cs_host != "" {
+          full_url = scheme + "://" + cs_host
+          is_default = (scheme == "http" && cs_port == 80) || (scheme == "https" && cs_port == 443)
+          if cs_port != 0 && !is_default { full_url = full_url + ":" + to_string(cs_port) }
+          if cs_path != "" { full_url = full_url + cs_path } else { full_url = full_url + "/" }
+          if cs_query != "" { full_url = full_url + "?" + cs_query }
+          url_obj.url_string = full_url
+      }
+      if !exists(url_obj.path) && !exists(url_obj.url_string) { url_obj.path = "/" }
+
+      # ---- method -> activity_id ----
+      activity_id = 99
+      activity_name = "Other"
+      if method == "CONNECT" { activity_id = 1; activity_name = "Connect" }
+      if method == "DELETE"  { activity_id = 2; activity_name = "Delete" }
+      if method == "GET"     { activity_id = 3; activity_name = "Get" }
+      if method == "HEAD"    { activity_id = 4; activity_name = "Head" }
+      if method == "OPTIONS" { activity_id = 5; activity_name = "Options" }
+      if method == "POST"    { activity_id = 6; activity_name = "Post" }
+      if method == "PUT"     { activity_id = 7; activity_name = "Put" }
+      if method == "TRACE"   { activity_id = 8; activity_name = "Trace" }
+      if method == "PATCH"   { activity_id = 9; activity_name = "Patch" }
+
+      status_id = 2
+      status_str = "Failure"
+      if code >= 200 && code < 400 { status_id = 1; status_str = "Success" }
+      if code == 0 { status_id = 0; status_str = "Unknown" }
+
+      # ---- s-action + sc-filter-result -> action / disposition ----
+      sau = upcase(s_action)
+      fr = downcase(filter_result)
+      action_id = 0
+      action_name = "Unknown"
+      disposition_id = 0
+      disposition_name = "Unknown"
+      if contains(sau, "DENIED") || fr == "denied" {
+          action_id = 2; action_name = "Denied"
+          disposition_id = 2; disposition_name = "Blocked"
+      } else if sau != "" || fr != "" {
+          action_id = 1; action_name = "Allowed"
+          disposition_id = 1; disposition_name = "Allowed"
+      }
+
+      # ---- severity: a virus hit outranks the HTTP status ----
+      severity_id = 1
+      severity = "Informational"
+      if code >= 500 { severity_id = 4; severity = "High" } else if code >= 400 { severity_id = 3; severity = "Medium" } else if code >= 300 { severity_id = 2; severity = "Low" }
+      if virus_id != "" { severity_id = 5; severity = "Critical" }
+
+      http_request = { "url": url_obj }
+      if method != "" { http_request.http_method = method }
+      if user_agent != "" { http_request.user_agent = user_agent }
+
+      http_response = { "code": code, "status": status_str }
+      if sc_bytes != 0 { http_response.length = sc_bytes }
+      if content_type != "" { http_response.content_type = content_type }
+
+      unmapped = {}
+      if s_action != "" { unmapped.cache_status = s_action }
+      if filter_result != "" { unmapped.filter_result = filter_result }
+      if auth_group != "" { unmapped.auth_group = auth_group }
+      if hierarchy != "" { unmapped.hierarchy_code = hierarchy }
+      if supplier != "" { unmapped.supplier_name = supplier }
+      if n > 24 {
+          extra = []
+          for_each(fields) -> |i, val| {
+              if i >= 24 { extra = push(extra, to_string(val) ?? "") }
+          }
+          if length(extra) > 0 { unmapped.extra_fields = extra }
+      }
+
+      . = {
+          "class_uid": 4002,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": 400200 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "action_id": action_id,
+          "action": action_name,
+          "disposition_id": disposition_id,
+          "disposition": disposition_name,
+          "time": time_ms,
+          "duration": duration_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "profiles": ["host", "security_control"],
+              "log_name": "proxysg-elff",
+              "product": { "name": "ProxySG", "vendor_name": "Broadcom" }
+          },
+          "http_request": http_request,
+          "http_response": http_response,
+          # OCSF: bytes_in = client -> server, bytes_out = server -> client.
+          # ELFF cs-bytes is client->server, sc-bytes is server->client.
+          "traffic": { "bytes_in": cs_bytes, "bytes_out": sc_bytes },
+          "unmapped": unmapped
+      }
+
+      if match(c_ip, ip_re) { .src_endpoint = { "ip": c_ip } }
+
+      dst_endpoint = {}
+      if match(cs_host, ip_re) { dst_endpoint.ip = cs_host } else if cs_host != "" { dst_endpoint.hostname = downcase(cs_host) }
+      if !exists(dst_endpoint.ip) && match(supplier, ip_re) { dst_endpoint.ip = supplier }
+      if cs_port != 0 { dst_endpoint.port = cs_port }
+      if exists(dst_endpoint.ip) || exists(dst_endpoint.hostname) { .dst_endpoint = dst_endpoint }
+
+      # s-ip is the ProxySG appliance itself -> OCSF `proxy` (network_proxy).
+      if match(s_ip, ip_re) { .proxy = { "ip": s_ip } }
+
+      if username != "" { .actor = { "user": { "name": username } } }
+
+      # x-virus-id is an antivirus verdict, which OCSF models as `malware`.
+      if virus_id != "" {
+          .malware = [{ "name": virus_id, "classification_ids": [0], "provider": "ProxySG" }]
+          .is_alert = true
+      }
+  } else {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_name": "proxysg-elff",
+              "product": { "name": "ProxySG", "vendor_name": "Broadcom" }
+          }
+      }
+      if starts_with(payload, "#") {
+          .metadata.log_level = "info"
+      } else {
+          .metadata.log_level = "error"
+      }
+  }
+
+  .
+
+# Runtime samples (NAN-2327): one per event shape this parser routes.
+# `class_uid` is asserted because class routing is the whole point of the
+# OCSF conversion — a silent reroute is the defect most likely to survive
+# a compile-only check.
+samples:
+  - raw: '<134>Aug 12 09:15:30 proxysg01 bcreportermain: 2026-08-12 09:15:30 12 10.30.2.90 403 TCP_DENIED 1024 700 GET http gambling.example.net 80 / - - - DIRECT - text/html "curl/8.4.0" DENIED "Gambling" - 10.30.0.5'
+    expect:
+      class_uid: 4002
+      activity_id: 3
+  - raw: '2026-08-12 09:15:22 231 10.30.2.44 200 TCP_NC_MISS 48210 812 GET https www.example.com 443 /docs/index.html ver=2 jdoe corp-users DIRECT 93.184.216.34 text/html "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" OBSERVED "Technology/Internet" - 10.30.0.5'
+    expect:
+      class_uid: 4002
+      activity_id: 3
+  - raw: '#Fields: date time time-taken c-ip sc-status s-action sc-bytes cs-bytes cs-method'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: '2026-08-12 09:15:40 900 10.30.2.51 200 TCP_MISS 15000 900 GET http files.example.org 80 /setup.exe - bsmith corp-users DIRECT 198.51.100.9 application/octet-stream "Wget/1.21" OBSERVED "Software Downloads" EICAR-Test-File 10.30.0.5'
+    expect:
+      class_uid: 4002
+      activity_id: 3

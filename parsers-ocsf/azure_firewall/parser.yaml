@@ -1,0 +1,353 @@
+name: azure_firewall_ocsf
+display_name: Azure Firewall (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Azure Firewall diagnostic logs into OCSF 1.9.0 records, routed by log
+  category: DNS proxy queries become "DNS Activity" (class_uid 4003),
+  application-rule (FQDN/URL) hits become "HTTP Activity" (class_uid 4002), and
+  network-rule / NAT / threat-intel hits become "Network Activity"
+  (class_uid 4001). All three carry the cloud and security_control profiles so
+  the firewall verdict lands on action_id / disposition_id / firewall_rule. The
+  whole OCSF object is emitted on the root so it lands in ocsf_logs.event and
+  the promoted columns materialize. Mirrors the UDM azure_firewall parser but
+  targets OCSF instead of `.udm.*`.
+match_values:
+  - azure_firewall
+category: cloud
+vendor: "Microsoft"
+product: "Azure Firewall"
+parser_vrl: |
+  # Azure Firewall diagnostic log -> OCSF 1.9.0 (4001 / 4002 / 4003)
+  raw_log = to_string(.message) ?? ""
+
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      . = {
+          "class_uid": 4001,
+          "class_name": "Network Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 400199,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud", "security_control"],
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_name": "AzureFirewall",
+              "product": { "name": "Azure Firewall", "vendor_name": "Microsoft" }
+          },
+          "cloud": { "provider": "Azure" },
+          "src_endpoint": { "ip": "0.0.0.0" }
+      }
+  } else {
+      p = object!(parsed)
+      props = object(p.properties) ?? {}
+
+      # ---- time ----
+      time_ms = 0
+      ts_str = to_string(p.time) ?? ""
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      log_category = to_string(p.category) ?? ""
+
+      # ---- subscription id out of the ARM resource id ----
+      res_id = to_string(p.resourceId) ?? ""
+      sub_id = ""
+      if res_id != "" {
+          sm, smerr = parse_regex(res_id, r'(?i)/SUBSCRIPTIONS/(?P<sub>[^/]+)/')
+          if smerr == null { sub_id = to_string(sm.sub) }
+      }
+      cloud = { "provider": "Azure" }
+      if sub_id != "" { cloud.account = { "uid": sub_id } }
+
+      # ---- endpoints ----
+      src_ip = to_string(props.SourceIP) ?? ""
+      src_port = to_int(props.SourcePort) ?? 0
+      dst_ip = to_string(props.DestinationIP) ?? ""
+      dst_port = to_int(props.DestinationPort) ?? 0
+      fqdn = to_string(props.Fqdn) ?? ""
+      if fqdn == "" { fqdn = to_string(props.FQDN) ?? "" }
+      target_url = to_string(props.TargetUrl) ?? ""
+      query_name = to_string(props.QueryName) ?? ""
+
+      src_endpoint = {}
+      if src_ip != "" { src_endpoint.ip = downcase(src_ip) }
+      if src_port > 0 { src_endpoint.port = src_port }
+      dst_endpoint = {}
+      if dst_ip != "" { dst_endpoint.ip = downcase(dst_ip) }
+      if dst_port > 0 { dst_endpoint.port = dst_port }
+      if fqdn != "" { dst_endpoint.hostname = fqdn }
+      if length(keys(src_endpoint)) == 0 && length(keys(dst_endpoint)) == 0 {
+          src_endpoint.ip = "0.0.0.0"
+      }
+
+      # ---- Allow/Deny -> security_control verdict ----
+      fw_action = downcase(to_string(props.Action) ?? "")
+      action_id = 0
+      action_str = "Unknown"
+      disposition_id = 0
+      disposition = "Unknown"
+      if fw_action == "allow" {
+          action_id = 1; action_str = "Allowed"; disposition_id = 1; disposition = "Allowed"
+      }
+      if fw_action == "deny" || fw_action == "drop" {
+          action_id = 2; action_str = "Denied"; disposition_id = 2; disposition = "Blocked"
+      }
+      if fw_action == "dnat" || fw_action == "snat" {
+          action_id = 4; action_str = "Modified"; disposition_id = 7; disposition = "Custom Action"
+      }
+
+      # ---- threat intel raises severity and flags the alert ----
+      threat = to_string(props.ThreatIntel) ?? ""
+      threat_desc = to_string(props.ThreatDescription) ?? ""
+      severity_id = 1
+      severity = "Informational"
+      is_alert = false
+      if log_category == "AzureFirewallThreatIntel" || (threat != "" && threat != "No threat detected") {
+          severity_id = 4
+          severity = "High"
+          is_alert = true
+      }
+
+      # ---- firewall_rule ----
+      fw = {}
+      rule = to_string(props.Rule) ?? ""
+      if rule != "" { fw.name = rule; fw.uid = rule }
+      rule_coll = to_string(props.RuleCollection) ?? ""
+      if rule_coll != "" { fw.category = rule_coll }
+      # OCSF firewall_rule requires name or uid; fall back to the collection.
+      if rule == "" && rule_coll != "" { fw.name = rule_coll }
+      policy_name = to_string(props.Policy) ?? ""
+      if policy_name != "" { fw.version = policy_name }
+      if log_category != "" { fw.type = log_category }
+
+      # ---- protocol ----
+      proto = downcase(to_string(props.Protocol) ?? "")
+      proto_num = 0
+      if proto == "tcp" || proto == "https" || proto == "http" { proto_num = 6 }
+      if proto == "udp" { proto_num = 17 }
+      if proto == "icmp" { proto_num = 1 }
+
+      metadata = {
+          "version": "1.9.0",
+          "profiles": ["cloud", "security_control"],
+          "uid": uuid_v4(),
+          "log_name": "AzureFirewall",
+          "log_provider": "Azure Firewall",
+          "product": { "name": "Azure Firewall", "vendor_name": "Microsoft" }
+      }
+      if log_category != "" { metadata.log_source = log_category }
+      op_name = to_string(p.operationName) ?? ""
+      if op_name != "" { metadata.event_code = op_name }
+
+      unmapped = {}
+      if log_category != "" { unmapped.azure_category = log_category }
+      if res_id != "" { unmapped.resource_id = res_id }
+      rcg = to_string(props.RuleCollectionGroup) ?? ""
+      if rcg != "" { unmapped.rule_collection_group = rcg }
+      if policy_name != "" { unmapped.policy = policy_name }
+      if rule_coll != "" { unmapped.rule_collection = rule_coll }
+      if threat != "" { unmapped.threat_intel = threat }
+      if threat_desc != "" { unmapped.threat_description = threat_desc }
+      raw_msg = to_string(props.msg) ?? ""
+      if raw_msg != "" { unmapped.raw_msg = raw_msg }
+      web_cat = to_string(props.WebCategory) ?? ""
+      if web_cat != "" { unmapped.web_category = web_cat }
+      reason = to_string(props.Reason) ?? ""
+      if reason != "" { unmapped.reason = reason }
+
+      # ---- route to a class ----
+      is_dns = false
+      if query_name != "" { is_dns = true }
+      if log_category == "AzureFirewallDnsProxy" { is_dns = true }
+      is_http = false
+      if !is_dns && (target_url != "" || (fqdn != "" && (proto == "http" || proto == "https"))) { is_http = true }
+      if !is_dns && log_category == "AzureFirewallApplicationRule" { is_http = true }
+
+      if is_dns {
+          class_uid = 4003
+          query = { "hostname": query_name }
+          qtype = to_string(props.QueryType) ?? ""
+          if qtype != "" { query.type = qtype }
+          qclass = to_string(props.QueryClass) ?? ""
+          if qclass != "" { query.class = qclass }
+          if query_name == "" { query.hostname = "unknown" }
+
+          rcode_raw = upcase(to_string(props.ResponseCode) ?? "")
+          rcode_id = 99
+          rcode = "Other"
+          if rcode_raw == "NOERROR" { rcode_id = 0; rcode = "NoError" }
+          if rcode_raw == "FORMERR" { rcode_id = 1; rcode = "FormError" }
+          if rcode_raw == "SERVFAIL" { rcode_id = 2; rcode = "ServError" }
+          if rcode_raw == "NXDOMAIN" { rcode_id = 3; rcode = "NXDomain" }
+          if rcode_raw == "NOTIMP" { rcode_id = 4; rcode = "NotImp" }
+          if rcode_raw == "REFUSED" { rcode_id = 5; rcode = "Refused" }
+
+          status_id = 1
+          status_str = "Success"
+          dns_err = to_string(props.Error) ?? ""
+          if dns_err != "" || (rcode_raw != "" && rcode_raw != "NOERROR") {
+              status_id = 2
+              status_str = "Failure"
+          }
+
+          ocsf = {
+              "class_uid": class_uid,
+              "class_name": "DNS Activity",
+              "category_uid": 4,
+              "category_name": "Network Activity",
+              "activity_id": 1,
+              "activity_name": "Query",
+              "type_uid": class_uid * 100 + 1,
+              "severity_id": severity_id,
+              "severity": severity,
+              "status_id": status_id,
+              "status": status_str,
+              "action_id": action_id,
+              "action": action_str,
+              "disposition_id": disposition_id,
+              "disposition": disposition,
+              "is_alert": is_alert,
+              "time": time_ms,
+              "message": raw_log,
+              "raw_data": raw_log,
+              "metadata": metadata,
+              "cloud": cloud,
+              "src_endpoint": src_endpoint,
+              "query": query
+          }
+          if rcode_raw != "" { ocsf.rcode_id = rcode_id; ocsf.rcode = rcode }
+          txid = to_int(props.QueryId) ?? 0
+          if txid > 0 { ocsf.transaction_id = txid }
+          if dns_err != "" { ocsf.status_detail = dns_err }
+          if length(keys(dst_endpoint)) > 0 { ocsf.dst_endpoint = dst_endpoint }
+          if exists(fw.name) { ocsf.firewall_rule = fw }
+          rsize = to_int(props.ResponseSize) ?? 0
+          qsize = to_int(props.RequestSize) ?? 0
+          if rsize > 0 || qsize > 0 { ocsf.traffic = { "bytes_in": rsize, "bytes_out": qsize } }
+          rflags = to_string(props.ResponseFlags) ?? ""
+          if rflags != "" { unmapped.dns_response_flags = rflags }
+          if length(keys(unmapped)) > 0 { ocsf.unmapped = unmapped }
+          . = ocsf
+      } else if is_http {
+          class_uid = 4002
+          url_obj = {}
+          host = fqdn
+          if target_url != "" {
+              full = target_url
+              if !starts_with(full, "http://") && !starts_with(full, "https://") {
+                  scheme = "http://"
+                  if proto == "https" { scheme = "https://" }
+                  full = scheme + target_url
+              }
+              u, uerr = parse_url(full)
+              if uerr == null {
+                  url_obj.url_string = full
+                  uh = to_string(u.host)
+                  if uh != "" { url_obj.hostname = uh; host = uh }
+                  us = to_string(u.scheme)
+                  if us != "" { url_obj.scheme = us }
+                  up = to_string(u.path)
+                  if up != "" { url_obj.path = up }
+                  uq = to_string(u.query) ?? ""
+                  if uq != "" && uq != "{}" { url_obj.query_string = uq }
+              }
+          }
+          if length(keys(url_obj)) == 0 {
+              if host != "" {
+                  url_obj.hostname = host
+                  url_obj.path = "/"
+              } else {
+                  url_obj.path = "/"
+              }
+          }
+          if host != "" && !exists(dst_endpoint.hostname) { dst_endpoint.hostname = host }
+
+          status_id = 1
+          status_str = "Success"
+          if action_id == 2 { status_id = 2; status_str = "Failure" }
+
+          ocsf = {
+              "class_uid": class_uid,
+              "class_name": "HTTP Activity",
+              "category_uid": 4,
+              "category_name": "Network Activity",
+              "activity_id": 99,
+              "activity_name": "Other",
+              "type_uid": class_uid * 100 + 99,
+              "severity_id": severity_id,
+              "severity": severity,
+              "status_id": status_id,
+              "status": status_str,
+              "action_id": action_id,
+              "action": action_str,
+              "disposition_id": disposition_id,
+              "disposition": disposition,
+              "is_alert": is_alert,
+              "time": time_ms,
+              "message": raw_log,
+              "raw_data": raw_log,
+              "metadata": metadata,
+              "cloud": cloud,
+              "src_endpoint": src_endpoint,
+              "http_request": { "url": url_obj }
+          }
+          if length(keys(dst_endpoint)) > 0 { ocsf.dst_endpoint = dst_endpoint }
+          if exists(fw.name) { ocsf.firewall_rule = fw }
+          if proto != "" { ocsf.app_protocol_name = proto }
+          if length(keys(unmapped)) > 0 { ocsf.unmapped = unmapped }
+          . = ocsf
+      } else {
+          class_uid = 4001
+          status_id = 1
+          status_str = "Success"
+          if action_id == 2 { status_id = 2; status_str = "Failure" }
+
+          connection_info = { "direction_id": 0, "direction": "Unknown" }
+          if proto_num > 0 { connection_info.protocol_num = proto_num }
+          if proto != "" { connection_info.protocol_name = proto }
+
+          ocsf = {
+              "class_uid": class_uid,
+              "class_name": "Network Activity",
+              "category_uid": 4,
+              "category_name": "Network Activity",
+              "activity_id": 6,
+              "activity_name": "Traffic",
+              "type_uid": class_uid * 100 + 6,
+              "severity_id": severity_id,
+              "severity": severity,
+              "status_id": status_id,
+              "status": status_str,
+              "action_id": action_id,
+              "action": action_str,
+              "disposition_id": disposition_id,
+              "disposition": disposition,
+              "is_alert": is_alert,
+              "time": time_ms,
+              "message": raw_log,
+              "raw_data": raw_log,
+              "metadata": metadata,
+              "cloud": cloud,
+              "src_endpoint": src_endpoint,
+              "connection_info": connection_info
+          }
+          if length(keys(dst_endpoint)) > 0 { ocsf.dst_endpoint = dst_endpoint }
+          if exists(fw.name) { ocsf.firewall_rule = fw }
+          if length(keys(unmapped)) > 0 { ocsf.unmapped = unmapped }
+          . = ocsf
+      }
+  }

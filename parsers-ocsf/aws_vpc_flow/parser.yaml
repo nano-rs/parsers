@@ -1,0 +1,280 @@
+name: aws_vpc_flow_ocsf
+display_name: AWS VPC Flow Logs (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses AWS VPC Flow Logs (v2-v5, space-delimited and CloudWatch JSON) into
+  complete OCSF 1.9.0 "Network Activity" (class_uid 4001) records. The whole
+  OCSF object is emitted on the root so it lands in ocsf_logs.event and the
+  promoted columns materialize (src_endpoint, dst_endpoint, connection_info,
+  traffic.*, cloud.*). Mirrors the UDM aws_vpc_flow parser but targets OCSF
+  instead of `.udm.*`.
+match_values:
+  - aws_vpc_flow
+category: cloud
+vendor: "Amazon"
+product: "VPC Flow Logs"
+parser_vrl: |
+  # AWS VPC Flow Log -> OCSF 1.9.0 Network Activity (class_uid 4001)
+  raw_log = to_string(.message) ?? ""
+
+  class_uid = 4001
+
+  # ---- normalized fields, filled by whichever branch matches ----
+  src_ip = ""
+  dst_ip = ""
+  src_port = 0
+  dst_port = 0
+  proto_num = -1
+  packets = 0
+  bytes_total = 0
+  start_ms = 0
+  end_ms = 0
+  raw_action = ""
+  log_status = ""
+  account_id = ""
+  region = ""
+  iface_id = ""
+  vpc_id = ""
+  subnet_id = ""
+  instance_id = ""
+  az_id = ""
+  direction = ""
+  dst_svc = ""
+  src_svc = ""
+  tcp_flags = ""
+  traffic_path = ""
+  ip_type = ""
+  pkt_srcaddr = ""
+  pkt_dstaddr = ""
+  flow_version = 0
+  matched = false
+
+  parsed, jerr = parse_json(raw_log)
+
+  if jerr == null && is_object(parsed) {
+      # ---- CloudWatch Logs JSON delivery ----
+      p = object!(parsed)
+      if exists(p.srcaddr) || exists(p.interface_id) || exists(p.log_status) {
+          matched = true
+          src_ip = to_string(p.srcaddr) ?? ""
+          dst_ip = to_string(p.dstaddr) ?? ""
+          src_port = to_int(p.srcport) ?? 0
+          dst_port = to_int(p.dstport) ?? 0
+          proto_num = to_int(p.protocol) ?? -1
+          packets = to_int(p.packets) ?? 0
+          bytes_total = to_int(p.bytes) ?? 0
+          start_ms = (to_int(p.start) ?? 0) * 1000
+          end_ms = (to_int(p.end) ?? 0) * 1000
+          raw_action = to_string(p.action) ?? ""
+          log_status = to_string(p.log_status) ?? ""
+          account_id = to_string(p.account_id) ?? ""
+          iface_id = to_string(p.interface_id) ?? ""
+          vpc_id = to_string(p.vpc_id) ?? ""
+          subnet_id = to_string(p.subnet_id) ?? ""
+          instance_id = to_string(p.instance_id) ?? ""
+          region = to_string(p.region) ?? ""
+          az_id = to_string(p.az_id) ?? ""
+          direction = to_string(p."flow-direction") ?? to_string(p.flow_direction) ?? ""
+          dst_svc = to_string(p."pkt-dst-aws-service") ?? ""
+          src_svc = to_string(p."pkt-src-aws-service") ?? ""
+          tcp_flags = to_string(p.tcp_flags) ?? ""
+          ip_type = to_string(p.type) ?? ""
+          flow_version = to_int(p.version) ?? 0
+      }
+  } else {
+      # ---- space-delimited delivery (S3 / Kinesis) ----
+      parts = split(raw_log, " ")
+      if length(parts) >= 14 {
+          matched = true
+          flow_version = to_int(to_string(get(parts, [0]) ?? "") ?? "") ?? 0
+          account_id = to_string(get(parts, [1]) ?? "") ?? ""
+          iface_id = to_string(get(parts, [2]) ?? "") ?? ""
+          src_ip = to_string(get(parts, [3]) ?? "") ?? ""
+          dst_ip = to_string(get(parts, [4]) ?? "") ?? ""
+          src_port = to_int(to_string(get(parts, [5]) ?? "") ?? "") ?? 0
+          dst_port = to_int(to_string(get(parts, [6]) ?? "") ?? "") ?? 0
+          proto_num = to_int(to_string(get(parts, [7]) ?? "") ?? "") ?? -1
+          packets = to_int(to_string(get(parts, [8]) ?? "") ?? "") ?? 0
+          bytes_total = to_int(to_string(get(parts, [9]) ?? "") ?? "") ?? 0
+          start_ms = (to_int(to_string(get(parts, [10]) ?? "") ?? "") ?? 0) * 1000
+          end_ms = (to_int(to_string(get(parts, [11]) ?? "") ?? "") ?? 0) * 1000
+          raw_action = to_string(get(parts, [12]) ?? "") ?? ""
+          log_status = to_string(get(parts, [13]) ?? "") ?? ""
+
+          if length(parts) >= 15 { vpc_id = to_string(get(parts, [14]) ?? "") ?? "" }
+          if length(parts) >= 16 { subnet_id = to_string(get(parts, [15]) ?? "") ?? "" }
+          if length(parts) >= 17 { instance_id = to_string(get(parts, [16]) ?? "") ?? "" }
+
+          # v3+ extended fields arrive as key:value tokens
+          if length(parts) > 17 {
+              tail = array(slice(parts, start: 17) ?? [])
+              for_each(tail) -> |_i, field| {
+                  kv = split(to_string(field), ":", limit: 2)
+                  if length(kv) == 2 {
+                      k = to_string(kv[0])
+                      v = to_string(kv[1])
+                      if v != "-" {
+                          if k == "flow-direction" { direction = v }
+                          if k == "region" { region = v }
+                          if k == "az-id" { az_id = v }
+                          if k == "pkt-srcaddr" { pkt_srcaddr = v }
+                          if k == "pkt-dstaddr" { pkt_dstaddr = v }
+                          if k == "pkt-dst-aws-service" { dst_svc = v }
+                          if k == "pkt-src-aws-service" { src_svc = v }
+                          if k == "traffic-path" { traffic_path = v }
+                          if k == "tcp-flags" { tcp_flags = v }
+                          if k == "type" { ip_type = v }
+                      }
+                  }
+              }
+          }
+      }
+  }
+
+  # "-" is VPC Flow's null marker
+  if src_ip == "-" { src_ip = "" }
+  if dst_ip == "-" { dst_ip = "" }
+  if vpc_id == "-" { vpc_id = "" }
+  if subnet_id == "-" { subnet_id = "" }
+  if instance_id == "-" { instance_id = "" }
+
+  # ---- protocol number -> name ----
+  proto_name = ""
+  if proto_num == 1 { proto_name = "icmp" }
+  if proto_num == 6 { proto_name = "tcp" }
+  if proto_num == 17 { proto_name = "udp" }
+  if proto_num == 47 { proto_name = "gre" }
+  if proto_num == 50 { proto_name = "esp" }
+  if proto_num == 58 { proto_name = "ipv6-icmp" }
+
+  # ---- ACCEPT/REJECT -> security_control action + disposition ----
+  act = upcase(raw_action)
+  action_id = 0
+  action_str = "Unknown"
+  disposition_id = 0
+  disposition = "Unknown"
+  if act == "ACCEPT" {
+      action_id = 1
+      action_str = "Allowed"
+      disposition_id = 1
+      disposition = "Allowed"
+  }
+  if act == "REJECT" {
+      action_id = 2
+      action_str = "Denied"
+      disposition_id = 2
+      disposition = "Blocked"
+  }
+
+  # ---- log-status -> status ----
+  status_id = 0
+  status_str = "Unknown"
+  ls = upcase(log_status)
+  if ls == "OK" { status_id = 1; status_str = "Success" }
+  if ls == "NODATA" || ls == "SKIPDATA" { status_id = 2; status_str = "Failure" }
+
+  # ---- direction ----
+  direction_id = 0
+  direction_str = "Unknown"
+  d = downcase(direction)
+  if d == "ingress" { direction_id = 1; direction_str = "Inbound" }
+  if d == "egress" { direction_id = 2; direction_str = "Outbound" }
+
+  # ---- endpoints ----
+  src_endpoint = {}
+  if src_ip != "" { src_endpoint.ip = downcase(src_ip) }
+  if src_port > 0 { src_endpoint.port = src_port }
+  if src_svc != "" { src_endpoint.svc_name = src_svc }
+
+  dst_endpoint = {}
+  if dst_ip != "" { dst_endpoint.ip = downcase(dst_ip) }
+  if dst_port > 0 { dst_endpoint.port = dst_port }
+  if dst_svc != "" { dst_endpoint.svc_name = dst_svc }
+  if iface_id != "" && iface_id != "-" { dst_endpoint.interface_uid = iface_id }
+  if vpc_id != "" { dst_endpoint.vpc_uid = vpc_id }
+  if subnet_id != "" { dst_endpoint.subnet_uid = subnet_id }
+  if instance_id != "" { dst_endpoint.instance_uid = instance_id }
+
+  # OCSF Network Activity requires at least one endpoint.
+  if length(keys(src_endpoint)) == 0 && length(keys(dst_endpoint)) == 0 {
+      src_endpoint.ip = "0.0.0.0"
+  }
+
+  # ---- connection_info ----
+  connection_info = {}
+  if proto_num >= 0 { connection_info.protocol_num = proto_num }
+  if proto_name != "" { connection_info.protocol_name = proto_name }
+  connection_info.direction_id = direction_id
+  connection_info.direction = direction_str
+  if ip_type == "IPv4" { connection_info.protocol_ver_id = 4 }
+  if ip_type == "IPv6" { connection_info.protocol_ver_id = 6 }
+
+  # ---- cloud ----
+  cloud = { "provider": "AWS" }
+  if account_id != "" && account_id != "-" { cloud.account = { "uid": account_id } }
+  if region != "" { cloud.region = region }
+  if az_id != "" { cloud.zone = az_id }
+
+  ocsf = {
+      "class_uid": class_uid,
+      "class_name": "Network Activity",
+      "category_uid": 4,
+      "category_name": "Network Activity",
+      "activity_id": 6,
+      "activity_name": "Traffic",
+      "type_uid": class_uid * 100 + 6,
+      "severity_id": 1,
+      "severity": "Informational",
+      "status_id": status_id,
+      "status": status_str,
+      "action_id": action_id,
+      "action": action_str,
+      "disposition_id": disposition_id,
+      "disposition": disposition,
+      "time": start_ms,
+      "message": raw_log,
+      "raw_data": raw_log,
+      "metadata": {
+          "version": "1.9.0",
+          "profiles": ["cloud", "security_control"],
+          "uid": uuid_v4(),
+          "log_name": "VPC Flow Logs",
+          "log_provider": "AWS VPC Flow Logs",
+          "product": { "name": "AWS VPC Flow Logs", "vendor_name": "Amazon" }
+      },
+      "cloud": cloud,
+      "traffic": {
+          "bytes": bytes_total,
+          "packets": packets,
+          "bytes_out": bytes_total,
+          "packets_out": packets
+      }
+  }
+  if length(keys(src_endpoint)) > 0 { ocsf.src_endpoint = src_endpoint }
+  if length(keys(dst_endpoint)) > 0 { ocsf.dst_endpoint = dst_endpoint }
+  if length(keys(connection_info)) > 0 { ocsf.connection_info = connection_info }
+  if start_ms > 0 { ocsf.start_time = start_ms }
+  if end_ms > 0 { ocsf.end_time = end_ms }
+  if end_ms > start_ms { ocsf.duration = end_ms - start_ms }
+
+  unmapped = {}
+  if flow_version > 0 { unmapped.flow_log_version = flow_version }
+  if log_status != "" && log_status != "-" { unmapped.log_status = log_status }
+  if iface_id != "" && iface_id != "-" { unmapped.interface_id = iface_id }
+  if tcp_flags != "" { unmapped.tcp_flags = tcp_flags }
+  if traffic_path != "" { unmapped.traffic_path = traffic_path }
+  if pkt_srcaddr != "" { unmapped.pkt_srcaddr = pkt_srcaddr }
+  if pkt_dstaddr != "" { unmapped.pkt_dstaddr = pkt_dstaddr }
+  if ip_type != "" { unmapped.ip_type = ip_type }
+  if !matched { unmapped.parse_note = "unrecognised VPC Flow Log record shape" }
+  if length(keys(unmapped)) > 0 { ocsf.unmapped = unmapped }
+
+  if !matched {
+      ocsf.activity_id = 99
+      ocsf.activity_name = "Other"
+      ocsf.type_uid = class_uid * 100 + 99
+      ocsf.metadata.log_level = "error"
+  }
+
+  . = ocsf

@@ -1,24 +1,26 @@
 name: windows_event_ocsf
 display_name: Windows Event Log (OCSF)
-version: "1.0.0"
+version: "1.1.0"
 description: >
   Parses Windows Security Event Log records (JSON; top-level event_id +
-  event_data) into complete OCSF 1.8.0 records, routed by EventID:
-    4624 Successful Logon       -> Authentication 3002 (Logon, Success)
-    4625 Failed Logon           -> Authentication 3002 (Logon, Failure)
-    4634 Logoff                 -> Authentication 3002 (Logoff)
-    4672 Special Privileges     -> Authorize Session 3003 (Assign Privileges)
-    4688 Process Creation       -> Process Activity 1007 (Launch)
+  event_data) into complete OCSF 1.9.0 records, routed by EventID:
+    4624 Successful Logon   -> Authentication 3002 (Logon, Success)
+    4625 Failed Logon       -> Authentication 3002 (Logon, Failure)
+    4634 Logoff             -> Authentication 3002 (Logoff)
+    4672 Special Privileges -> Authorize Session 3003 (Assign Privileges)
+    4688 Process Creation   -> Process Activity 1007 (Launch)
   Emits the whole OCSF object on the root so it lands in ocsf_logs.event and the
-  promoted columns materialize. Mirrors the UDM windows_event parser but targets
-  OCSF instead of `.udm.*`.
+  promoted columns materialize. Carries metadata.profiles ["host"] because the
+  `device` object is profile-bound in OCSF 1.9. Mirrors the UDM windows_event
+  parser but targets OCSF instead of `.udm.*`.
+ocsf_version: "1.9.0"
 match_values:
   - windows_event
 category: endpoint
 vendor: "Microsoft"
 product: "Windows"
 parser_vrl: |
-  # Windows Security Event Log JSON -> OCSF 1.8.0. Emits the COMPLETE record on root.
+  # Windows Security Event Log JSON -> OCSF 1.9.0. Emits the COMPLETE record on root.
   raw_log = string!(.message)
   parsed, err = parse_json(raw_log)
 
@@ -32,8 +34,14 @@ parser_vrl: |
           "status_id": 0,
           "time": 0,
           "message": raw_log,
+          "raw_data": raw_log,
+          # 3002 requires `user` plus one of service/dst_endpoint, even on the
+          # unparseable path.
+          "user": { "name": "" },
+          "dst_endpoint": { "hostname": "" },
           "metadata": {
-              "version": "1.8.0",
+              "version": "1.9.0",
+              "profiles": ["host"],
               "uid": uuid_v4(),
               "log_level": "error",
               "product": { "name": "Windows", "vendor_name": "Microsoft" }
@@ -85,14 +93,18 @@ parser_vrl: |
               "pid": parse_int(string(ed.NewProcessId) ?? "0") ?? 0,
               "file": { "name": proc_name, "path": npn, "type_id": 1 }
           }
-          ocsf.actor = {
-              "process": { "name": parent_name, "file": { "name": parent_name, "path": ppn, "type_id": 1 } },
-              "user": { "name": downcase(string(ed.SubjectUserName) ?? "") }
-          }
-          ocsf.user = {
+          actor_user = {
               "name": downcase(string(ed.SubjectUserName) ?? ""),
               "domain": downcase(string(ed.SubjectDomainName) ?? ""),
               "uid": string(ed.SubjectUserSid) ?? ""
+          }
+          ocsf.actor = {
+              "process": {
+                  "name": parent_name,
+                  "pid": parse_int(string(ed.ProcessId) ?? "0") ?? 0,
+                  "file": { "name": parent_name, "path": ppn, "type_id": 1 }
+              },
+              "user": actor_user
           }
           ocsf.device = { "hostname": computer }
           ocsf.status_id = 1
@@ -120,7 +132,6 @@ parser_vrl: |
           ocsf.privileges = privileges
           ocsf.device = { "hostname": computer }
           ocsf.session = { "uid": string(ed.SubjectLogonId) ?? "" }
-          ocsf.unmapped = { "windows_event_id": eid }
       } else {
           # Authentication family -> 3002
           ocsf.class_uid = 3002
@@ -158,8 +169,6 @@ parser_vrl: |
           ocsf.severity_id = severity_id
           ocsf.severity = severity
           ocsf.user = { "name": downcase(uname), "domain": downcase(udom), "uid": usid }
-          ocsf.is_mfa = false
-
           logon_id = string(ed.TargetLogonId) ?? string(ed.SubjectLogonId) ?? ""
           if logon_id != "" { ocsf.session = { "uid": logon_id } }
           if auth_protocol_id != 0 {
@@ -182,28 +191,62 @@ parser_vrl: |
           ocsf.dst_endpoint = { "hostname": computer }
           ocsf.device = { "hostname": computer }
 
-          unmapped = { "windows_event_id": eid, "logon_type": string(ed.LogonType) ?? null }
-          if eid == 4625 {
-              unmapped.failure_reason = string(ed.FailureReason) ?? null
-              unmapped.status = string(ed.Status) ?? null
-              unmapped.sub_status = string(ed.SubStatus) ?? null
+          logon_type_raw = string(ed.LogonType) ?? ""
+          logon_type_id = to_int(ed.LogonType) ?? 0
+          logon_type = "Unknown"
+          if logon_type_id == 1 { logon_type = "System" }
+          if logon_type_id == 2 { logon_type = "Interactive" }
+          if logon_type_id == 3 { logon_type = "Network" }
+          if logon_type_id == 4 { logon_type = "Batch" }
+          if logon_type_id == 5 { logon_type = "OS Service" }
+          if logon_type_id == 7 { logon_type = "Unlock" }
+          if logon_type_id == 8 { logon_type = "Network Cleartext" }
+          if logon_type_id == 9 { logon_type = "New Credentials" }
+          if logon_type_id == 10 { logon_type = "Remote Interactive" }
+          if logon_type_id == 11 { logon_type = "Cached Interactive" }
+          if logon_type_id == 12 { logon_type = "Cached Remote Interactive" }
+          if logon_type_id == 13 { logon_type = "Cached Unlock" }
+          if logon_type_raw != "" {
+              if logon_type_id != 1 && logon_type_id != 2 && logon_type_id != 3 && logon_type_id != 4 && logon_type_id != 5 && logon_type_id != 7 && logon_type_id != 8 && logon_type_id != 9 && logon_type_id != 10 && logon_type_id != 11 && logon_type_id != 12 && logon_type_id != 13 {
+                  logon_type_id = 99
+                  logon_type = logon_type_raw
+              }
+              ocsf.logon_type_id = logon_type_id
+              ocsf.logon_type = logon_type
+              ocsf.is_remote = logon_type_id == 3 || logon_type_id == 8 || logon_type_id == 10 || logon_type_id == 12
+              ocsf.is_cleartext = logon_type_id == 8
           }
-          ocsf.unmapped = unmapped
+
+          if eid == 4625 {
+              ocsf.status_code = string(ed.Status) ?? ""
+              ocsf.status_detail = string(ed.FailureReason) ?? ""
+              ocsf.unmapped = { "sub_status": string(ed.SubStatus) ?? null }
+          }
       }
 
       # ---- common envelope ----
       ocsf.type_uid = to_int(ocsf.class_uid) * 100 + to_int(ocsf.activity_id)
       ocsf.time = time_ms
       ocsf.message = msg
-      # NAN-1403: record_id arrives as an integer and string() errors on
-      # integers, so string(p.record_id) ?? uuid_v4() randomized every uid.
-      # to_string coerces int → decimal string, string → itself, null/absent
-      # → "" — the guard routes "" to the genuinely-absent uuid_v4 fallback.
-      record_uid = to_string(p.record_id) ?? ""
+      ocsf.raw_data = raw_log
+      # Windows record_id is only unique within a host/channel stream and can be
+      # reused after a log reset. Include the source event time so replaying the
+      # same event stays idempotent while a later reused RecordID cannot collide.
+      record_id = to_string(p.record_id) ?? ""
+      log_name = downcase(string(p.channel) ?? "Security")
+      log_provider = downcase(string(p.provider_name) ?? "Microsoft-Windows-Security-Auditing")
+      record_uid = ""
+      if record_id != "" && computer != "" && ts_str != "" {
+          record_uid = join!(["windows_event", computer, log_name, log_provider, record_id, ts_str], "|")
+      }
       if record_uid == "" { record_uid = uuid_v4() }
+      if is_object(ocsf.device) { ocsf.device.type_id = 0 }
       ocsf.metadata = {
-          "version": "1.8.0",
+          "version": "1.9.0",
+          "profiles": ["host"],
           "uid": record_uid,
+          "original_event_uid": record_uid,
+          "event_code": to_string(eid),
           "log_name": string(p.channel) ?? "Security",
           "log_provider": string(p.provider_name) ?? "Microsoft-Windows-Security-Auditing",
           "product": { "name": "Windows", "vendor_name": "Microsoft" }
@@ -211,3 +254,39 @@ parser_vrl: |
 
       . = ocsf
   }
+samples:
+  - raw: "{\"event_id\":4624,\"record_id\":5001,\"channel\":\"Security\",\"provider_name\":\"Microsoft-Windows-Security-Auditing\",\"computer\":\"DC-01.corp.local\",\"timestamp\":\"2026-08-18T11:00:00Z\",\"message\":\"An account was successfully logged on.\",\"event_data\":{\"TargetUserName\":\"alice\",\"TargetDomainName\":\"CORP\",\"TargetUserSid\":\"S-1-5-21-1-2-3-1001\",\"TargetLogonId\":\"0x3e7abc\",\"SubjectUserName\":\"DC-01$\",\"LogonType\":\"10\",\"AuthenticationPackageName\":\"Kerberos\",\"IpAddress\":\"10.2.3.4\",\"IpPort\":\"49152\",\"WorkstationName\":\"WKS-09\",\"LogonProcessName\":\"Kerberos\"}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":4625,\"record_id\":5002,\"computer\":\"DC-01\",\"timestamp\":\"2026-08-18T11:01:00Z\",\"event_data\":{\"TargetUserName\":\"admin\",\"TargetDomainName\":\"CORP\",\"LogonType\":\"3\",\"AuthenticationPackageName\":\"NTLM\",\"IpAddress\":\"203.0.113.9\",\"IpPort\":\"445\",\"Status\":\"0xC000006D\",\"SubStatus\":\"0xC000006A\",\"FailureReason\":\"Unknown user name or bad password\",\"WorkstationName\":\"EVIL\"}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":4634,\"record_id\":5003,\"computer\":\"DC-01\",\"timestamp\":\"2026-08-18T11:02:00Z\",\"event_data\":{\"TargetUserName\":\"alice\",\"TargetDomainName\":\"CORP\",\"TargetLogonId\":\"0x3e7abc\",\"LogonType\":\"2\"}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":4672,\"record_id\":5004,\"computer\":\"DC-01\",\"timestamp\":\"2026-08-18T11:03:00Z\",\"event_data\":{\"SubjectUserName\":\"admin\",\"SubjectDomainName\":\"CORP\",\"SubjectUserSid\":\"S-1-5-21-1-2-3-500\",\"SubjectLogonId\":\"0x3e7abd\",\"PrivilegeList\":\"SeDebugPrivilege SeTcbPrivilege\"}}"
+    expect:
+      "class_uid": 3003
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":4688,\"record_id\":5005,\"computer\":\"WKS-09\",\"timestamp\":\"2026-08-18T11:04:00Z\",\"event_data\":{\"NewProcessName\":\"C:\\\\Windows\\\\System32\\\\powershell.exe\",\"NewProcessId\":\"0x1a4\",\"ProcessId\":\"0x2b8\",\"ParentProcessName\":\"C:\\\\Windows\\\\explorer.exe\",\"CommandLine\":\"powershell -enc AAA\",\"SubjectUserName\":\"alice\",\"SubjectDomainName\":\"CORP\",\"SubjectUserSid\":\"S-1-5-21-1-2-3-1001\"}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=not-json/>"
+    expect:
+      "class_uid": 3002
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":4776,\"record_id\":5006,\"computer\":\"DC-01\",\"timestamp\":\"2026-08-18T11:05:00Z\",\"event_data\":{\"TargetUserName\":\"bob\"}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 99
+      "metadata.version": "1.9.0"

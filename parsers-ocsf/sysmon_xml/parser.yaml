@@ -1,0 +1,819 @@
+name: sysmon_xml_ocsf
+display_name: Microsoft Sysmon (XML, OCSF)
+version: "1.0.0"
+description: >
+  Parses raw Windows Sysmon EVTX **XML** records into complete OCSF 1.9.0
+  events, routed by Sysmon EventID:
+    1  Process Create        -> Process Activity 1007 (Launch)
+    2  File Creation Time    -> File System Activity 1001 (Set Attributes)
+    3  Network Connect       -> Network Activity 4001 (Open)
+    4  Sysmon State Change   -> Application Lifecycle 6002 (Start/Stop)
+    5  Process Terminate     -> Process Activity 1007 (Terminate)
+    6  Driver Loaded         -> Kernel Extension Activity 1002 (Load)
+    7  Image Loaded          -> Module Activity 1005 (Load)
+    8  CreateRemoteThread    -> Process Activity 1007 (Inject)
+    9  RawAccessRead         -> File System Activity 1001 (Read; device as file)
+    10 Process Access        -> Process Activity 1007 (Open)
+    11 File Create           -> File System Activity 1001 (Create)
+    12 Registry Key          -> Registry Key Activity 201001 (Win ext)
+    13 Registry Value        -> Registry Value Activity 201002 (Win ext; Set)
+    14 Registry Rename       -> Registry Key Activity 201001 (Rename)
+    15 File Stream (ADS)     -> File System Activity 1001 (Create)
+    16 Config Change         -> Application Lifecycle 6002 (Update)
+    17 Pipe Created          -> File System Activity 1001 (Create; file.type_id 6)
+    18 Pipe Connected        -> File System Activity 1001 (Open; file.type_id 6)
+    19/20/21 WMI             -> Windows Resource Activity 201003 (Access; WmiGuid)
+    22 DNS Query             -> DNS Activity 4003 (Query)
+    23/26 File Delete        -> File System Activity 1001 (Delete)
+    24 Clipboard Change      -> Clipboard Activity 1012 (Write)
+    25 Process Tampering     -> Process Activity 1007 (Other)
+    27/28 File Block         -> File System Activity 1001 + disposition Blocked
+    29 Executable Detected   -> File System Activity 1001 + disposition Detected
+  Emits the whole OCSF object on the root so it lands in ocsf_logs.event and the
+  promoted columns materialize. Carries metadata.profiles ["host"] (plus
+  "security_control" on the 27/28/29 blocking events). The OCSF counterpart of
+  parsers/sysmon_xml - deploy one or the other, never both.
+ocsf_version: "1.9.0"
+match_values:
+  - windows_sysmon
+category: endpoint
+vendor: "Microsoft"
+product: "Sysmon"
+parser_vrl: |
+  # Windows Sysmon EVTX **XML** -> OCSF 1.9.0. Emits the COMPLETE record on root.
+  # The wire format is the raw <Event><System>..</System><EventData><Data Name=..>
+  # rendering, so extraction is XML-based; routing mirrors parsers-ocsf/windows_sysmon.
+  raw_log = string!(.message)
+  parsed, err = parse_xml(raw_log)
+
+  if err != null || !is_object(parsed) {
+      . = {
+          "class_uid": 1007,
+          "class_name": "Process Activity",
+          "category_uid": 1,
+          "category_name": "System Activity",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 100799,
+          "severity_id": 1,
+          "severity": "Informational",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          # 1007 requires actor/device/process even on the unparseable path.
+          "process": { "pid": 0 },
+          "actor": { "process": { "pid": 0 } },
+          "device": { "hostname": "", "type_id": 0 },
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["host"],
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_source": "windows_sysmon",
+              "product": { "name": "Sysmon", "vendor_name": "Microsoft" }
+          }
+      }
+  } else {
+      ev = object(parsed.Event) ?? {}
+      system = object(ev.System) ?? {}
+
+      # EventID renders as a bare number, or as an element with attributes (then
+      # the number lands under the text key).
+      eid = to_int(system.EventID) ?? 0
+      if eid == 0 { eid = to_int(system.EventID.text) ?? 0 }
+
+      computer = downcase(to_string(system.Computer) ?? "")
+      channel = to_string(system.Channel) ?? ""
+      if channel == "" { channel = "Microsoft-Windows-Sysmon/Operational" }
+      log_provider = to_string(system.Provider."@Name") ?? ""
+      if log_provider == "" { log_provider = "Microsoft-Windows-Sysmon" }
+      record_id = to_string(system.EventRecordID) ?? ""
+
+      # ---- event time: System/TimeCreated/@SystemTime -> epoch ms -------
+      time_ms = 0
+      ts_str = to_string(system.TimeCreated."@SystemTime") ?? ""
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- Windows Level -> OCSF severity ------------------------------
+      level_int = to_int(system.Level) ?? 4
+      severity_id = 1
+      severity = "Informational"
+      if level_int == 1 {
+          severity_id = 5; severity = "Critical"
+      } else if level_int == 2 {
+          severity_id = 4; severity = "High"
+      } else if level_int == 3 {
+          severity_id = 3; severity = "Medium"
+      }
+
+      # ---- EventData/Data[@Name] -> flat key/value map ------------------
+      data_items = ev.EventData.Data
+      items = []
+      if is_array(data_items) {
+          items = array(data_items) ?? []
+      } else if is_object(data_items) {
+          items = [data_items]
+      }
+      kv = {}
+      for_each(items) -> |_i, item| {
+          iname = to_string(item."@Name") ?? ""
+          ivalue = to_string(item.text) ?? ""
+          if iname != "" { kv = set!(kv, [iname], ivalue) }
+      }
+
+      # ---- shared extraction -------------------------------------------
+      # Sysmon writes "-" for "not available"; normalise it to empty.
+      actor_user = ""
+      au_raw = to_string(get(kv, ["User"]) ?? null) ?? ""
+      if au_raw == "-" { au_raw = "" }
+      if au_raw != "" {
+          aup = split(au_raw, "\\")
+          actor_user = string(aup[0]) ?? ""
+          if length(aup) >= 2 { actor_user = string(aup[1]) ?? "" }
+          actor_user = downcase(actor_user)
+      }
+
+      img = to_string(get(kv, ["Image"]) ?? null) ?? ""
+      if img == "-" { img = "" }
+      proc_name = ""
+      anm, anmerr = parse_regex(img, r'(?P<b>[^\\/]+)$')
+      if anmerr == null { proc_name = string(anm.b) ?? "" }
+
+      pimg = to_string(get(kv, ["ParentImage"]) ?? null) ?? ""
+      if pimg == "-" { pimg = "" }
+      parent_name = ""
+      pnm, pnmerr = parse_regex(pimg, r'(?P<b>[^\\/]+)$')
+      if pnmerr == null { parent_name = string(pnm.b) ?? "" }
+
+      # SHA-256 out of the "SHA256=..,MD5=.." Hashes string
+      sha = ""
+      hs = to_string(get(kv, ["Hashes"]) ?? null) ?? ""
+      if hs != "" {
+          hm, hmerr = parse_regex(hs, r'SHA256=(?P<h>[0-9A-Fa-f]+)')
+          if hmerr == null { sha = downcase(string(hm.h) ?? "") }
+      }
+
+      # The Image-based process. For the 1007 process-family events this is the
+      # OCSF top-level `process` (the SUBJECT); everywhere else it is the
+      # initiator (actor.process).
+      subject_file = { "name": proc_name, "path": img, "type_id": 1 }
+      if sha != "" { subject_file.hashes = [{ "algorithm_id": 3, "value": sha }] }
+      subject_process = {
+          "name": proc_name,
+          "cmd_line": to_string(get(kv, ["CommandLine"]) ?? null) ?? "",
+          "pid": to_int(get(kv, ["ProcessId"]) ?? null) ?? 0,
+          "uid": to_string(get(kv, ["ProcessGuid"]) ?? null) ?? "",
+          "file": subject_file
+      }
+
+      parent_process = {
+          "name": parent_name,
+          "cmd_line": to_string(get(kv, ["ParentCommandLine"]) ?? null) ?? "",
+          "pid": to_int(get(kv, ["ParentProcessId"]) ?? null) ?? 0,
+          "uid": to_string(get(kv, ["ParentProcessGuid"]) ?? null) ?? "",
+          "file": { "name": parent_name, "path": pimg, "type_id": 1 }
+      }
+      has_parent = pimg != "" || (to_string(get(kv, ["ParentCommandLine"]) ?? null) ?? "") != ""
+
+      actor_process = subject_process
+      if has_parent { actor_process.parent_process = parent_process }
+
+      device = { "hostname": computer, "type_id": 0 }
+
+      # TargetFilename, used by every file-flavoured EventID
+      tf = to_string(get(kv, ["TargetFilename"]) ?? null) ?? ""
+      file_name = ""
+      fnm, fnmerr = parse_regex(tf, r'(?P<b>[^\\/]+)$')
+      if fnmerr == null { file_name = string(fnm.b) ?? "" }
+      target_file = { "name": file_name, "path": tf, "type_id": 1 }
+      if sha != "" { target_file.hashes = [{ "algorithm_id": 3, "value": sha }] }
+
+      # RuleName carries the Sysmon config's MITRE annotation.
+      rule_name = to_string(get(kv, ["RuleName"]) ?? null) ?? ""
+      if rule_name == "-" { rule_name = "" }
+      technique_id = ""
+      if rule_name != "" {
+          tm, tmerr = parse_regex(rule_name, r'(?i)technique[_]?id=(?P<tid>[^,\s]+)')
+          if tmerr == null { technique_id = upcase(string(tm.tid) ?? "") }
+      }
+
+      # ---- defaults; overridden per branch below ------------------------
+      class_uid = 1007
+      class_name = "Process Activity"
+      category_uid = 1
+      category_name = "System Activity"
+      activity_id = 99
+      activity_name = "Other"
+      profiles = ["host"]
+
+      ocsf = {}
+
+      if eid == 1 || eid == 5 {
+          # Process Create / Terminate -> Process Activity 1007
+          if eid == 1 {
+              activity_id = 1; activity_name = "Launch"
+          } else {
+              activity_id = 2; activity_name = "Terminate"
+          }
+          # The NEW process is `process`; its launcher is `actor.process`.
+          ocsf.process = subject_process
+          if eid == 1 && has_parent {
+              ocsf.actor = { "process": parent_process, "user": { "name": actor_user } }
+          } else {
+              ocsf.actor = { "process": subject_process, "user": { "name": actor_user } }
+          }
+          ocsf.device = device
+          ocsf.unmapped = {
+              "current_directory": to_string(get(kv, ["CurrentDirectory"]) ?? null) ?? "",
+              "integrity_level": to_string(get(kv, ["IntegrityLevel"]) ?? null) ?? "",
+              "logon_id": to_string(get(kv, ["LogonId"]) ?? null) ?? "",
+              "logon_guid": to_string(get(kv, ["LogonGuid"]) ?? null) ?? "",
+              "terminal_session_id": to_string(get(kv, ["TerminalSessionId"]) ?? null) ?? "",
+              "original_file_name": to_string(get(kv, ["OriginalFileName"]) ?? null) ?? "",
+              "file_version": to_string(get(kv, ["FileVersion"]) ?? null) ?? "",
+              "description": to_string(get(kv, ["Description"]) ?? null) ?? "",
+              "company": to_string(get(kv, ["Company"]) ?? null) ?? "",
+              "hashes_raw": to_string(get(kv, ["Hashes"]) ?? null) ?? ""
+          }
+      } else if eid == 10 {
+          # Process Access -> 1007 (Open). Source = actor, Target = subject.
+          activity_id = 3; activity_name = "Open"
+          simg = to_string(get(kv, ["SourceImage"]) ?? null) ?? ""
+          src_proc_name = ""
+          snm, snmerr = parse_regex(simg, r'(?P<b>[^\\/]+)$')
+          if snmerr == null { src_proc_name = string(snm.b) ?? "" }
+          timg = to_string(get(kv, ["TargetImage"]) ?? null) ?? ""
+          tgt_proc_name = ""
+          tnm, tnmerr = parse_regex(timg, r'(?P<b>[^\\/]+)$')
+          if tnmerr == null { tgt_proc_name = string(tnm.b) ?? "" }
+
+          src_user = downcase(to_string(get(kv, ["SourceUser"]) ?? null) ?? "")
+          if src_user == "-" { src_user = "" }
+          if src_user == "" { src_user = actor_user }
+          sup = split(src_user, "\\")
+          if length(sup) >= 2 { src_user = string(sup[1]) ?? "" }
+
+          ocsf.actor = {
+              "process": {
+                  "name": src_proc_name,
+                  "uid": to_string(get(kv, ["SourceProcessGUID"]) ?? null) ?? "",
+                  "pid": to_int(get(kv, ["SourceProcessId"]) ?? null) ?? 0,
+                  "file": { "name": src_proc_name, "path": simg, "type_id": 1 }
+              },
+              "user": { "name": src_user }
+          }
+          ocsf.process = {
+              "name": tgt_proc_name,
+              "uid": to_string(get(kv, ["TargetProcessGUID"]) ?? null) ?? "",
+              "pid": to_int(get(kv, ["TargetProcessId"]) ?? null) ?? 0,
+              "file": { "name": tgt_proc_name, "path": timg, "type_id": 1 }
+          }
+          ocsf.device = device
+          # actual_permissions is integer_t; Sysmon emits a hex access mask.
+          ga_raw = downcase(to_string(get(kv, ["GrantedAccess"]) ?? null) ?? "")
+          if ga_raw != "" {
+              ga_hex = replace(ga_raw, "0x", "")
+              ga, gaerr = parse_int(ga_hex, base: 16)
+              if gaerr == null { ocsf.actual_permissions = ga }
+          }
+          ocsf.unmapped = {
+              "call_trace": to_string(get(kv, ["CallTrace"]) ?? null) ?? "",
+              "source_thread_id": to_string(get(kv, ["SourceThreadId"]) ?? null) ?? "",
+              "target_user": to_string(get(kv, ["TargetUser"]) ?? null) ?? "",
+              "granted_access": to_string(get(kv, ["GrantedAccess"]) ?? null) ?? ""
+          }
+      } else if eid == 8 {
+          # CreateRemoteThread -> 1007 Inject. The injecting process is the
+          # ACTOR; the process receiving the thread is the SUBJECT.
+          activity_id = 4; activity_name = "Inject"
+          simg = to_string(get(kv, ["SourceImage"]) ?? null) ?? ""
+          src_proc_name = ""
+          snm, snmerr = parse_regex(simg, r'(?P<b>[^\\/]+)$')
+          if snmerr == null { src_proc_name = string(snm.b) ?? "" }
+          timg = to_string(get(kv, ["TargetImage"]) ?? null) ?? ""
+          tgt_proc_name = ""
+          tnm, tnmerr = parse_regex(timg, r'(?P<b>[^\\/]+)$')
+          if tnmerr == null { tgt_proc_name = string(tnm.b) ?? "" }
+          ocsf.actor = {
+              "process": {
+                  "name": src_proc_name,
+                  "uid": to_string(get(kv, ["SourceProcessGuid"]) ?? null) ?? "",
+                  "pid": to_int(get(kv, ["SourceProcessId"]) ?? null) ?? 0,
+                  "file": { "name": src_proc_name, "path": simg, "type_id": 1 }
+              },
+              "user": { "name": actor_user }
+          }
+          ocsf.process = {
+              "name": tgt_proc_name,
+              "uid": to_string(get(kv, ["TargetProcessGuid"]) ?? null) ?? "",
+              "pid": to_int(get(kv, ["TargetProcessId"]) ?? null) ?? 0,
+              "file": { "name": tgt_proc_name, "path": timg, "type_id": 1 }
+          }
+          # Remote-thread creation is OCSF injection type 1 (Remote Thread).
+          ocsf.injection_type_id = 1
+          ocsf.injection_type = "Remote Thread"
+          ocsf.device = device
+          ocsf.unmapped = {
+              "new_thread_id": to_string(get(kv, ["NewThreadId"]) ?? null) ?? "",
+              "start_address": to_string(get(kv, ["StartAddress"]) ?? null) ?? "",
+              "start_module": to_string(get(kv, ["StartModule"]) ?? null) ?? "",
+              "start_function": to_string(get(kv, ["StartFunction"]) ?? null) ?? ""
+          }
+      } else if eid == 25 {
+          # Process Tampering (image replaced / hollowed) -> 1007 Other. The
+          # tampered process is the subject; Sysmon names no separate actor.
+          activity_id = 99; activity_name = "Other"
+          ocsf.process = subject_process
+          ocsf.actor = { "process": subject_process, "user": { "name": actor_user } }
+          ocsf.device = device
+          ocsf.unmapped = { "tampering_type": to_string(get(kv, ["Type"]) ?? null) ?? "" }
+      } else if eid == 7 {
+          # Image Loaded -> Module Activity 1005 (Load).
+          class_uid = 1005; class_name = "Module Activity"
+          activity_id = 1; activity_name = "Load"
+          loaded = to_string(get(kv, ["ImageLoaded"]) ?? null) ?? ""
+          mod_name = ""
+          mnm, mnmerr = parse_regex(loaded, r'(?P<b>[^\\/]+)$')
+          if mnmerr == null { mod_name = string(mnm.b) ?? "" }
+          module_file = { "path": loaded, "name": mod_name, "type_id": 1 }
+          if sha != "" { module_file.hashes = [{ "algorithm_id": 3, "value": sha }] }
+          signed_raw = downcase(to_string(get(kv, ["Signed"]) ?? null) ?? "")
+          signature_state = to_string(get(kv, ["SignatureStatus"]) ?? null) ?? ""
+          signature_state_id = 99
+          if downcase(signature_state) == "valid" { signature_state_id = 1; signature_state = "Valid" }
+          if downcase(signature_state) == "expired" { signature_state_id = 2; signature_state = "Expired" }
+          if downcase(signature_state) == "revoked" { signature_state_id = 3; signature_state = "Revoked" }
+          if downcase(signature_state) == "untrusted" { signature_state_id = 6; signature_state = "Untrusted" }
+          if signed_raw == "true" {
+              module_file.signatures = [{
+                  "algorithm_id": 4,
+                  "algorithm": "Authenticode",
+                  "serialization_id": 6,
+                  "serialization": "Authenticode",
+                  "developer_uid": to_string(get(kv, ["Signature"]) ?? null) ?? "",
+                  "state_id": signature_state_id,
+                  "state": signature_state
+              }]
+          } else {
+              # OCSF models positive signing evidence as signatures[] and has no
+              # unsigned boolean; keep the negative assertion in unmapped.
+              ocsf.unmapped = {
+                  "signed": to_string(get(kv, ["Signed"]) ?? null) ?? "",
+                  "signature": to_string(get(kv, ["Signature"]) ?? null) ?? "",
+                  "signature_status": to_string(get(kv, ["SignatureStatus"]) ?? null) ?? ""
+              }
+          }
+          ocsf.module = { "load_type_id": 1, "file": module_file }
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          ocsf.device = device
+      } else if eid == 6 {
+          # Driver Loaded -> Kernel Extension Activity 1002 (Load). A kernel
+          # driver is not a user-space module, so 1002 (driver) beats 1005.
+          class_uid = 1002; class_name = "Kernel Extension Activity"
+          activity_id = 1; activity_name = "Load"
+          loaded = to_string(get(kv, ["ImageLoaded"]) ?? null) ?? ""
+          drv_name = ""
+          dnm, dnmerr = parse_regex(loaded, r'(?P<b>[^\\/]+)$')
+          if dnmerr == null { drv_name = string(dnm.b) ?? "" }
+          driver_file = { "path": loaded, "name": drv_name, "type_id": 1 }
+          if sha != "" { driver_file.hashes = [{ "algorithm_id": 3, "value": sha }] }
+          ocsf.driver = { "file": driver_file }
+          # EID 6 has no Image/initiating process of its own; the kernel loads it.
+          ocsf.actor = { "user": { "name": actor_user } }
+          if img != "" { ocsf.actor = { "process": actor_process, "user": { "name": actor_user } } }
+          ocsf.device = device
+          ocsf.unmapped = {
+              "signed": to_string(get(kv, ["Signed"]) ?? null) ?? "",
+              "signature": to_string(get(kv, ["Signature"]) ?? null) ?? "",
+              "signature_status": to_string(get(kv, ["SignatureStatus"]) ?? null) ?? "",
+              "hashes_raw": to_string(get(kv, ["Hashes"]) ?? null) ?? ""
+          }
+      } else if eid == 3 {
+          # Network Connection -> Network Activity 4001 (Open)
+          class_uid = 4001; class_name = "Network Activity"
+          category_uid = 4; category_name = "Network Activity"
+          activity_id = 1; activity_name = "Open"
+          src_host = downcase(to_string(get(kv, ["SourceHostname"]) ?? null) ?? "")
+          if src_host == "-" { src_host = "" }
+          dst_host = downcase(to_string(get(kv, ["DestinationHostname"]) ?? null) ?? "")
+          if dst_host == "-" { dst_host = "" }
+          ocsf.src_endpoint = {
+              "ip": downcase(to_string(get(kv, ["SourceIp"]) ?? null) ?? ""),
+              "port": to_int(get(kv, ["SourcePort"]) ?? null) ?? 0,
+              "hostname": src_host
+          }
+          ocsf.dst_endpoint = {
+              "ip": downcase(to_string(get(kv, ["DestinationIp"]) ?? null) ?? ""),
+              "port": to_int(get(kv, ["DestinationPort"]) ?? null) ?? 0,
+              "hostname": dst_host
+          }
+          # Initiated=true means this host opened the connection -> Outbound.
+          direction_id = 0
+          if downcase(to_string(get(kv, ["Initiated"]) ?? null) ?? "") == "true" { direction_id = 2 }
+          if downcase(to_string(get(kv, ["Initiated"]) ?? null) ?? "") == "false" { direction_id = 1 }
+          conn = { "direction_id": direction_id }
+          proto = downcase(to_string(get(kv, ["Protocol"]) ?? null) ?? "")
+          # protocol_num is an IANA number; only emit it when known.
+          if proto == "tcp" { conn.protocol_num = 6 }
+          if proto == "udp" { conn.protocol_num = 17 }
+          ocsf.connection_info = conn
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          ocsf.device = device
+          ocsf.unmapped = {
+              "source_is_ipv6": to_string(get(kv, ["SourceIsIpv6"]) ?? null) ?? "",
+              "destination_is_ipv6": to_string(get(kv, ["DestinationIsIpv6"]) ?? null) ?? "",
+              "source_port_name": to_string(get(kv, ["SourcePortName"]) ?? null) ?? "",
+              "destination_port_name": to_string(get(kv, ["DestinationPortName"]) ?? null) ?? ""
+          }
+      } else if eid == 22 {
+          # DNS Query -> DNS Activity 4003 (Query)
+          class_uid = 4003; class_name = "DNS Activity"
+          category_uid = 4; category_name = "Network Activity"
+          activity_id = 1; activity_name = "Query"
+          # 4003 wants at least one endpoint; Sysmon observes the query on this
+          # host and EID 22 carries no resolver address, so the host is the src.
+          if computer != "" { ocsf.src_endpoint = { "hostname": computer } }
+          qtype_int = to_int(get(kv, ["QueryType"]) ?? null) ?? 0
+          qtype = ""
+          if qtype_int == 1 { qtype = "A" }
+          if qtype_int == 2 { qtype = "NS" }
+          if qtype_int == 5 { qtype = "CNAME" }
+          if qtype_int == 6 { qtype = "SOA" }
+          if qtype_int == 12 { qtype = "PTR" }
+          if qtype_int == 15 { qtype = "MX" }
+          if qtype_int == 16 { qtype = "TXT" }
+          if qtype_int == 28 { qtype = "AAAA" }
+          if qtype_int == 33 { qtype = "SRV" }
+          if qtype_int == 65 { qtype = "HTTPS" }
+          if qtype_int == 255 { qtype = "ANY" }
+          query = { "hostname": downcase(to_string(get(kv, ["QueryName"]) ?? null) ?? "") }
+          if qtype != "" { query.type = qtype }
+          ocsf.query = query
+          qr = to_string(get(kv, ["QueryResults"]) ?? null) ?? ""
+          if qr != "" { ocsf.answers = [{ "rdata": qr }] }
+          # QueryStatus 0 is success; anything else is a resolver failure.
+          qstatus = to_string(get(kv, ["QueryStatus"]) ?? null) ?? ""
+          if qstatus != "" && qstatus != "0" {
+              ocsf.status_id = 2
+              ocsf.status = "Failure"
+              ocsf.status_code = qstatus
+          }
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          ocsf.device = device
+      } else if eid == 12 || eid == 14 {
+          # Registry key Create/Delete/Rename -> Registry Key Activity 201001
+          class_uid = 201001; class_name = "Registry Key Activity"
+          reg_event = to_string(get(kv, ["EventType"]) ?? null) ?? ""
+          activity_id = 99; activity_name = "Other"
+          if reg_event == "CreateKey" { activity_id = 1; activity_name = "Create" }
+          if reg_event == "DeleteKey" { activity_id = 4; activity_name = "Delete" }
+          if eid == 14 { activity_id = 5; activity_name = "Rename" }
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          ocsf.reg_key = { "path": to_string(get(kv, ["TargetObject"]) ?? null) ?? "" }
+          new_name = to_string(get(kv, ["NewName"]) ?? null) ?? ""
+          if new_name != "" { ocsf.prev_reg_key = { "path": to_string(get(kv, ["TargetObject"]) ?? null) ?? "" } }
+          if new_name != "" { ocsf.reg_key = { "path": new_name } }
+          ocsf.device = device
+      } else if eid == 13 {
+          # Registry value Set -> Registry Value Activity 201002 (Set)
+          class_uid = 201002; class_name = "Registry Value Activity"
+          activity_id = 2; activity_name = "Set"
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          # TargetObject is the full key\value; split on the LAST backslash:
+          # tail -> reg_value.name (required), head -> reg_value.path (required).
+          tgt = to_string(get(kv, ["TargetObject"]) ?? null) ?? ""
+          rv_name = ""
+          rvm, rvmerr = parse_regex(tgt, r'(?P<n>[^\\]+)$')
+          if rvmerr == null { rv_name = string(rvm.n) ?? "" }
+          rv_path = tgt
+          rpm, rpmerr = parse_regex(tgt, r'^(?P<p>.*)\\[^\\]+$')
+          if rpmerr == null { rv_path = string(rpm.p) ?? "" }
+          ocsf.reg_value = { "name": rv_name, "path": rv_path, "data": to_string(get(kv, ["Details"]) ?? null) ?? "" }
+          ocsf.device = device
+      } else if eid == 19 || eid == 20 || eid == 21 {
+          # WMI filter / consumer / binding -> Windows Resource Activity 201003.
+          # win_resource.type_id 19 is WmiGuid, the closest typed WMI resource.
+          class_uid = 201003; class_name = "Windows Resource Activity"
+          activity_id = 1; activity_name = "Access"
+          wmi_name = to_string(get(kv, ["Name"]) ?? null) ?? ""
+          if wmi_name == "" { wmi_name = to_string(get(kv, ["Operation"]) ?? null) ?? "" }
+          ocsf.win_resource = {
+              "type_id": 19,
+              "type": "WmiGuid",
+              "name": wmi_name,
+              "uid": to_string(get(kv, ["EventNamespace"]) ?? null) ?? ""
+          }
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          ocsf.device = device
+          ocsf.unmapped = {
+              "wmi_operation": to_string(get(kv, ["Operation"]) ?? null) ?? "",
+              "wmi_namespace": to_string(get(kv, ["EventNamespace"]) ?? null) ?? "",
+              "wmi_query": to_string(get(kv, ["Query"]) ?? null) ?? "",
+              "wmi_type": to_string(get(kv, ["Type"]) ?? null) ?? "",
+              "wmi_destination": to_string(get(kv, ["Destination"]) ?? null) ?? "",
+              "wmi_consumer": to_string(get(kv, ["Consumer"]) ?? null) ?? "",
+              "wmi_filter": to_string(get(kv, ["Filter"]) ?? null) ?? ""
+          }
+      } else if eid == 24 {
+          # Clipboard change -> Clipboard Activity 1012 (Write). Sysmon records
+          # that the clipboard was written, never the contents (they go to the
+          # archive directory), so `clipboard.contents` stays unset.
+          class_uid = 1012; class_name = "Clipboard Activity"
+          activity_id = 2; activity_name = "Write"
+          ocsf.clipboard = { "name": "Windows Clipboard" }
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          ocsf.device = device
+          ocsf.unmapped = {
+              "client_info": to_string(get(kv, ["ClientInfo"]) ?? null) ?? "",
+              "archived": to_string(get(kv, ["Archived"]) ?? null) ?? "",
+              "session": to_string(get(kv, ["Session"]) ?? null) ?? "",
+              "hashes_raw": to_string(get(kv, ["Hashes"]) ?? null) ?? ""
+          }
+      } else if eid == 4 || eid == 16 {
+          # Sysmon service state / config change -> Application Lifecycle 6002.
+          # This is the agent itself starting, stopping or reconfiguring.
+          class_uid = 6002; class_name = "Application Lifecycle"
+          category_uid = 6; category_name = "Application Activity"
+          state = downcase(to_string(get(kv, ["State"]) ?? null) ?? "")
+          if eid == 16 {
+              activity_id = 8; activity_name = "Update"
+          } else if state == "started" {
+              activity_id = 3; activity_name = "Start"
+          } else if state == "stopped" {
+              activity_id = 4; activity_name = "Stop"
+          } else {
+              activity_id = 99; activity_name = "Other"
+          }
+          # 6002 constrains on one of [app, application]; the "application"
+          # whose lifecycle this is, is the Sysmon agent itself.
+          app = { "name": "Sysmon", "vendor_name": "Microsoft" }
+          app_version = to_string(get(kv, ["Version"]) ?? null) ?? ""
+          if app_version != "" { app.version = app_version }
+          ocsf.app = app
+          ocsf.device = device
+          ocsf.unmapped = {
+              "sysmon_state": to_string(get(kv, ["State"]) ?? null) ?? "",
+              "sysmon_version": to_string(get(kv, ["Version"]) ?? null) ?? "",
+              "sysmon_schema_version": to_string(get(kv, ["SchemaVersion"]) ?? null) ?? "",
+              "configuration": to_string(get(kv, ["Configuration"]) ?? null) ?? "",
+              "configuration_file_hash": to_string(get(kv, ["ConfigurationFileHash"]) ?? null) ?? ""
+          }
+      } else if eid == 9 {
+          # RawAccessRead -> File System Activity 1001 (Read) against the raw
+          # device. The device path is the "file"; type_id 4 is Block Device.
+          class_uid = 1001; class_name = "File System Activity"
+          activity_id = 2; activity_name = "Read"
+          dev_path = to_string(get(kv, ["Device"]) ?? null) ?? ""
+          dev_name = ""
+          dvm, dvmerr = parse_regex(dev_path, r'(?P<b>[^\\/]+)$')
+          if dvmerr == null { dev_name = string(dvm.b) ?? "" }
+          ocsf.file = { "name": dev_name, "path": dev_path, "type_id": 4 }
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          ocsf.device = device
+      } else if eid == 17 || eid == 18 {
+          # Named pipe created / connected -> File System Activity 1001 with
+          # file.type_id 6 (Named Pipe). OCSF has no dedicated pipe class.
+          class_uid = 1001; class_name = "File System Activity"
+          if eid == 17 {
+              activity_id = 1; activity_name = "Create"
+          } else {
+              activity_id = 14; activity_name = "Open"
+          }
+          pipe_path = to_string(get(kv, ["PipeName"]) ?? null) ?? ""
+          pipe_name = ""
+          ppm, ppmerr = parse_regex(pipe_path, r'(?P<b>[^\\/]+)$')
+          if ppmerr == null { pipe_name = string(ppm.b) ?? "" }
+          ocsf.file = { "name": pipe_name, "path": pipe_path, "type_id": 6 }
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          ocsf.device = device
+      } else if eid == 11 || eid == 15 || eid == 2 || eid == 23 || eid == 26 || eid == 27 || eid == 28 || eid == 29 {
+          # File System Activity 1001 family.
+          class_uid = 1001; class_name = "File System Activity"
+          if eid == 11 || eid == 15 || eid == 27 || eid == 29 {
+              activity_id = 1; activity_name = "Create"
+          } else if eid == 2 {
+              activity_id = 6; activity_name = "Set Attributes"
+          } else {
+              activity_id = 4; activity_name = "Delete"
+          }
+          ocsf.file = target_file
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          ocsf.device = device
+          # 27/28 are Sysmon BLOCKING the operation, 29 is detect-only. Those are
+          # security_control outcomes, not plain telemetry.
+          if eid == 27 || eid == 28 {
+              profiles = ["host", "security_control"]
+              ocsf.disposition_id = 2
+              ocsf.disposition = "Blocked"
+              ocsf.action_id = 2
+              ocsf.action = "Denied"
+          }
+          if eid == 29 {
+              profiles = ["host", "security_control"]
+              ocsf.disposition_id = 15
+              ocsf.disposition = "Detected"
+              ocsf.action_id = 3
+              ocsf.action = "Observed"
+          }
+          ocsf.unmapped = {
+              "creation_utc_time": to_string(get(kv, ["CreationUtcTime"]) ?? null) ?? "",
+              "previous_creation_utc_time": to_string(get(kv, ["PreviousCreationUtcTime"]) ?? null) ?? "",
+              "contents": to_string(get(kv, ["Contents"]) ?? null) ?? "",
+              "hashes_raw": to_string(get(kv, ["Hashes"]) ?? null) ?? "",
+              "is_executable": to_string(get(kv, ["IsExecutable"]) ?? null) ?? ""
+          }
+      } else {
+          # unknown EventID -> Process Activity / Other, carry context.
+          ocsf.process = subject_process
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          ocsf.device = device
+      }
+
+      # ---- common envelope ----------------------------------------------
+      ocsf.class_uid = class_uid
+      ocsf.class_name = class_name
+      ocsf.category_uid = category_uid
+      ocsf.category_name = category_name
+      ocsf.activity_id = activity_id
+      ocsf.activity_name = activity_name
+      ocsf.type_uid = class_uid * 100 + activity_id
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.time = time_ms
+      ocsf.message = raw_log
+      ocsf.raw_data = raw_log
+      # `attacks` is bound to the security_control profile in Nano's embedded
+      # 1.9.0 contract (the public schema.ocsf.io lists it as unprofiled), so the
+      # profile has to be declared alongside it or the event is rejected.
+      if technique_id != "" {
+          ocsf.attacks = [{ "technique": { "uid": technique_id } }]
+          if !includes(profiles, "security_control") { profiles = push(profiles, "security_control") }
+      }
+
+      # Windows EventRecordID is only unique within a host/channel stream and can
+      # be reused after a log reset; fold in host + event time so a replay stays
+      # idempotent while a later reused RecordID cannot collide.
+      record_uid = ""
+      if record_id != "" && computer != "" && ts_str != "" {
+          record_uid = join!(["sysmon_xml", computer, downcase(channel), downcase(log_provider), record_id, ts_str], "|")
+      }
+      if record_uid == "" { record_uid = uuid_v4() }
+
+      ocsf.metadata = {
+          "version": "1.9.0",
+          "profiles": profiles,
+          "uid": record_uid,
+          "original_event_uid": record_uid,
+          "event_code": to_string(eid),
+          "log_name": channel,
+          "log_provider": log_provider,
+          "log_source": "windows_sysmon",
+          "product": { "name": "Sysmon", "vendor_name": "Microsoft" }
+      }
+
+      . = ocsf
+  }
+samples:
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>1</EventID><Version>5</Version><Level>4</Level><Task>1</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:01:00.1234567Z\"/><EventRecordID>1001</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">technique_id=T1059.001,technique_name=PowerShell</Data><Data Name=\"UtcTime\">2026-08-18 12:00:00.123</Data><Data Name=\"ProcessGuid\">{aaaaaaaa-0001-0000-0000-000000000001}</Data><Data Name=\"ProcessId\">4444</Data><Data Name=\"Image\">C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe</Data><Data Name=\"FileVersion\">10.0.19041.1</Data><Data Name=\"Description\">Windows PowerShell</Data><Data Name=\"Product\">Microsoft Windows Operating System</Data><Data Name=\"Company\">Microsoft Corporation</Data><Data Name=\"OriginalFileName\">PowerShell.EXE</Data><Data Name=\"CommandLine\">powershell.exe -nop -w hidden -enc SQBFAFgA</Data><Data Name=\"CurrentDirectory\">C:\\Users\\alice\\</Data><Data Name=\"User\">CORP\\alice</Data><Data Name=\"LogonGuid\">{aaaaaaaa-0002-0000-0000-000000000002}</Data><Data Name=\"LogonId\">0x3e7abc</Data><Data Name=\"TerminalSessionId\">1</Data><Data Name=\"IntegrityLevel\">High</Data><Data Name=\"Hashes\">SHA1=AABBCC,MD5=00112233445566778899AABBCCDDEEFF,SHA256=9F914D42706FE215501044ACD85A32D58AAEF1419D404FDDFA5D3B48F66CCD9F,IMPHASH=DEAD</Data><Data Name=\"ParentProcessGuid\">{aaaaaaaa-0003-0000-0000-000000000003}</Data><Data Name=\"ParentProcessId\">1200</Data><Data Name=\"ParentImage\">C:\\Windows\\explorer.exe</Data><Data Name=\"ParentCommandLine\">C:\\Windows\\Explorer.EXE</Data><Data Name=\"ParentUser\">CORP\\alice</Data></EventData></Event>"
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>2</EventID><Version>5</Version><Level>4</Level><Task>2</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:02:00.1234567Z\"/><EventRecordID>1002</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"UtcTime\">2026-08-18 12:02:00.1</Data><Data Name=\"ProcessGuid\">{aaaaaaaa-0001-0000-0000-000000000001}</Data><Data Name=\"ProcessId\">4444</Data><Data Name=\"Image\">C:\\tmp\\stomper.exe</Data><Data Name=\"TargetFilename\">C:\\Windows\\Temp\\payload.dll</Data><Data Name=\"CreationUtcTime\">2019-01-01 00:00:00.000</Data><Data Name=\"PreviousCreationUtcTime\">2026-08-18 12:01:00.000</Data><Data Name=\"User\">CORP\\alice</Data></EventData></Event>"
+    expect:
+      "class_uid": 1001
+      "activity_id": 6
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>3</EventID><Version>5</Version><Level>4</Level><Task>3</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:03:00.1234567Z\"/><EventRecordID>1003</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"UtcTime\">2026-08-18 12:03:00.1</Data><Data Name=\"ProcessGuid\">{aaaaaaaa-0001-0000-0000-000000000001}</Data><Data Name=\"ProcessId\">888</Data><Data Name=\"Image\">C:\\Windows\\System32\\curl.exe</Data><Data Name=\"User\">CORP\\alice</Data><Data Name=\"Protocol\">tcp</Data><Data Name=\"Initiated\">true</Data><Data Name=\"SourceIsIpv6\">false</Data><Data Name=\"SourceIp\">10.1.2.3</Data><Data Name=\"SourceHostname\">WKS-11.corp.local</Data><Data Name=\"SourcePort\">51234</Data><Data Name=\"SourcePortName\">-</Data><Data Name=\"DestinationIsIpv6\">false</Data><Data Name=\"DestinationIp\">93.184.216.34</Data><Data Name=\"DestinationHostname\">example.com</Data><Data Name=\"DestinationPort\">443</Data><Data Name=\"DestinationPortName\">https</Data></EventData></Event>"
+    expect:
+      "class_uid": 4001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>4</EventID><Version>5</Version><Level>4</Level><Task>4</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:04:00.1234567Z\"/><EventRecordID>1004</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"UtcTime\">2026-08-18 12:04:00.1</Data><Data Name=\"State\">Started</Data><Data Name=\"Version\">15.15</Data><Data Name=\"SchemaVersion\">4.90</Data></EventData></Event>"
+    expect:
+      "class_uid": 6002
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>5</EventID><Version>5</Version><Level>4</Level><Task>5</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:05:00.1234567Z\"/><EventRecordID>1005</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"UtcTime\">2026-08-18 12:05:00.1</Data><Data Name=\"ProcessGuid\">{aaaaaaaa-0001-0000-0000-000000000001}</Data><Data Name=\"ProcessId\">4444</Data><Data Name=\"Image\">C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe</Data><Data Name=\"User\">CORP\\alice</Data></EventData></Event>"
+    expect:
+      "class_uid": 1007
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>6</EventID><Version>5</Version><Level>4</Level><Task>6</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:06:00.1234567Z\"/><EventRecordID>1006</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"UtcTime\">2026-08-18 12:06:00.1</Data><Data Name=\"ImageLoaded\">C:\\Windows\\System32\\drivers\\evilrk.sys</Data><Data Name=\"Hashes\">SHA256=BEEF0011223344556677889900AABBCCDDEEFF00112233445566778899AABB</Data><Data Name=\"Signed\">false</Data><Data Name=\"Signature\">-</Data><Data Name=\"SignatureStatus\">Unavailable</Data></EventData></Event>"
+    expect:
+      "class_uid": 1002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>7</EventID><Version>5</Version><Level>4</Level><Task>7</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:07:00.1234567Z\"/><EventRecordID>1007</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"UtcTime\">2026-08-18 12:07:00.1</Data><Data Name=\"ProcessGuid\">{aaaaaaaa-0004-0000-0000-000000000004}</Data><Data Name=\"ProcessId\">900</Data><Data Name=\"Image\">C:\\Windows\\System32\\svchost.exe</Data><Data Name=\"ImageLoaded\">C:\\Windows\\System32\\ntdll.dll</Data><Data Name=\"FileVersion\">10.0.19041.1</Data><Data Name=\"Description\">NT Layer DLL</Data><Data Name=\"Product\">Microsoft Windows Operating System</Data><Data Name=\"Company\">Microsoft Corporation</Data><Data Name=\"OriginalFileName\">ntdll.dll</Data><Data Name=\"Hashes\">SHA256=1122334455667788990011223344556677889900112233445566778899001122</Data><Data Name=\"Signed\">true</Data><Data Name=\"Signature\">Microsoft Windows</Data><Data Name=\"SignatureStatus\">Valid</Data><Data Name=\"User\">NT AUTHORITY\\SYSTEM</Data></EventData></Event>"
+    expect:
+      "class_uid": 1005
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>8</EventID><Version>5</Version><Level>4</Level><Task>8</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:08:00.1234567Z\"/><EventRecordID>1008</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">technique_id=T1055,technique_name=Process Injection</Data><Data Name=\"UtcTime\">2026-08-18 12:08:00.1</Data><Data Name=\"SourceProcessGuid\">{aaaaaaaa-0005-0000-0000-000000000005}</Data><Data Name=\"SourceProcessId\">7777</Data><Data Name=\"SourceImage\">C:\\tmp\\injector.exe</Data><Data Name=\"TargetProcessGuid\">{aaaaaaaa-0006-0000-0000-000000000006}</Data><Data Name=\"TargetProcessId\">640</Data><Data Name=\"TargetImage\">C:\\Windows\\System32\\lsass.exe</Data><Data Name=\"NewThreadId\">9012</Data><Data Name=\"StartAddress\">0x00007FFAB1230000</Data><Data Name=\"StartModule\">C:\\Windows\\System32\\ntdll.dll</Data><Data Name=\"StartFunction\">RtlUserThreadStart</Data><Data Name=\"SourceUser\">CORP\\alice</Data><Data Name=\"TargetUser\">NT AUTHORITY\\SYSTEM</Data></EventData></Event>"
+    expect:
+      "class_uid": 1007
+      "activity_id": 4
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>9</EventID><Version>5</Version><Level>4</Level><Task>9</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:09:00.1234567Z\"/><EventRecordID>1009</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"UtcTime\">2026-08-18 12:09:00.1</Data><Data Name=\"ProcessGuid\">{aaaaaaaa-0007-0000-0000-000000000007}</Data><Data Name=\"ProcessId\">5150</Data><Data Name=\"Image\">C:\\tmp\\rawread.exe</Data><Data Name=\"Device\">\\Device\\HarddiskVolume1</Data><Data Name=\"User\">CORP\\alice</Data></EventData></Event>"
+    expect:
+      "class_uid": 1001
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>10</EventID><Version>5</Version><Level>4</Level><Task>10</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:10:00.1234567Z\"/><EventRecordID>1010</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">technique_id=T1003.001,technique_name=LSASS Memory</Data><Data Name=\"UtcTime\">2026-08-18 12:10:00.1</Data><Data Name=\"SourceProcessGUID\">{aaaaaaaa-0008-0000-0000-000000000008}</Data><Data Name=\"SourceProcessId\">7788</Data><Data Name=\"SourceThreadId\">4321</Data><Data Name=\"SourceImage\">C:\\tools\\mimikatz.exe</Data><Data Name=\"TargetProcessGUID\">{aaaaaaaa-0009-0000-0000-000000000009}</Data><Data Name=\"TargetProcessId\">640</Data><Data Name=\"TargetImage\">C:\\Windows\\System32\\lsass.exe</Data><Data Name=\"GrantedAccess\">0x1FFFFF</Data><Data Name=\"CallTrace\">C:\\Windows\\SYSTEM32\\ntdll.dll+9d234</Data><Data Name=\"SourceUser\">CORP\\alice</Data><Data Name=\"TargetUser\">NT AUTHORITY\\SYSTEM</Data></EventData></Event>"
+    expect:
+      "class_uid": 1007
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>11</EventID><Version>5</Version><Level>4</Level><Task>11</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:11:00.1234567Z\"/><EventRecordID>1011</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"UtcTime\">2026-08-18 12:11:00.1</Data><Data Name=\"ProcessGuid\">{aaaaaaaa-0010-0000-0000-000000000010}</Data><Data Name=\"ProcessId\">1010</Data><Data Name=\"Image\">C:\\Windows\\System32\\notepad.exe</Data><Data Name=\"TargetFilename\">C:\\Users\\alice\\notes.txt</Data><Data Name=\"CreationUtcTime\">2026-08-18 12:11:00.000</Data><Data Name=\"User\">CORP\\alice</Data></EventData></Event>"
+    expect:
+      "class_uid": 1001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>12</EventID><Version>5</Version><Level>4</Level><Task>12</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:12:00.1234567Z\"/><EventRecordID>1012</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"EventType\">CreateKey</Data><Data Name=\"UtcTime\">2026-08-18 12:12:00.1</Data><Data Name=\"ProcessGuid\">{aaaaaaaa-0011-0000-0000-000000000011}</Data><Data Name=\"ProcessId\">555</Data><Data Name=\"Image\">C:\\Windows\\regedit.exe</Data><Data Name=\"TargetObject\">HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run</Data><Data Name=\"User\">CORP\\bob</Data></EventData></Event>"
+    expect:
+      "class_uid": 201001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>13</EventID><Version>5</Version><Level>4</Level><Task>13</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:13:00.1234567Z\"/><EventRecordID>1013</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">technique_id=T1547.001,technique_name=Registry Run Keys</Data><Data Name=\"EventType\">SetValue</Data><Data Name=\"UtcTime\">2026-08-18 12:13:00.1</Data><Data Name=\"ProcessGuid\">{aaaaaaaa-0011-0000-0000-000000000011}</Data><Data Name=\"ProcessId\">555</Data><Data Name=\"Image\">C:\\Windows\\regedit.exe</Data><Data Name=\"TargetObject\">HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\\Updater</Data><Data Name=\"Details\">C:\\tmp\\bad.exe</Data><Data Name=\"User\">CORP\\bob</Data></EventData></Event>"
+    expect:
+      "class_uid": 201002
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>14</EventID><Version>5</Version><Level>4</Level><Task>14</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:14:00.1234567Z\"/><EventRecordID>1014</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"EventType\">RenameKey</Data><Data Name=\"UtcTime\">2026-08-18 12:14:00.1</Data><Data Name=\"ProcessGuid\">{aaaaaaaa-0011-0000-0000-000000000011}</Data><Data Name=\"ProcessId\">555</Data><Data Name=\"Image\">C:\\Windows\\regedit.exe</Data><Data Name=\"TargetObject\">HKLM\\SOFTWARE\\Vendor\\OldKey</Data><Data Name=\"NewName\">HKLM\\SOFTWARE\\Vendor\\NewKey</Data><Data Name=\"User\">CORP\\bob</Data></EventData></Event>"
+    expect:
+      "class_uid": 201001
+      "activity_id": 5
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>15</EventID><Version>5</Version><Level>4</Level><Task>15</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:15:00.1234567Z\"/><EventRecordID>1015</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"UtcTime\">2026-08-18 12:15:00.1</Data><Data Name=\"ProcessGuid\">{aaaaaaaa-0012-0000-0000-000000000012}</Data><Data Name=\"ProcessId\">3030</Data><Data Name=\"Image\">C:\\Windows\\System32\\cmd.exe</Data><Data Name=\"TargetFilename\">C:\\Users\\alice\\Downloads\\setup.exe:Zone.Identifier</Data><Data Name=\"CreationUtcTime\">2026-08-18 12:15:00.000</Data><Data Name=\"Hashes\">SHA256=AA00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDD</Data><Data Name=\"Contents\">[ZoneTransfer] ZoneId=3</Data><Data Name=\"User\">CORP\\alice</Data></EventData></Event>"
+    expect:
+      "class_uid": 1001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>16</EventID><Version>5</Version><Level>4</Level><Task>16</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:16:00.1234567Z\"/><EventRecordID>1016</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"UtcTime\">2026-08-18 12:16:00.1</Data><Data Name=\"Configuration\">C:\\Windows\\config.xml</Data><Data Name=\"ConfigurationFileHash\">SHA256=CAFE00112233</Data></EventData></Event>"
+    expect:
+      "class_uid": 6002
+      "activity_id": 8
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>17</EventID><Version>5</Version><Level>4</Level><Task>17</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:17:00.1234567Z\"/><EventRecordID>1017</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"EventType\">CreatePipe</Data><Data Name=\"UtcTime\">2026-08-18 12:17:00.1</Data><Data Name=\"ProcessGuid\">{aaaaaaaa-0013-0000-0000-000000000013}</Data><Data Name=\"ProcessId\">6060</Data><Data Name=\"PipeName\">\\msagent_42</Data><Data Name=\"Image\">C:\\tmp\\beacon.exe</Data><Data Name=\"User\">CORP\\alice</Data></EventData></Event>"
+    expect:
+      "class_uid": 1001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>18</EventID><Version>5</Version><Level>4</Level><Task>18</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:18:00.1234567Z\"/><EventRecordID>1018</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"EventType\">ConnectPipe</Data><Data Name=\"UtcTime\">2026-08-18 12:18:00.1</Data><Data Name=\"ProcessGuid\">{aaaaaaaa-0014-0000-0000-000000000014}</Data><Data Name=\"ProcessId\">6061</Data><Data Name=\"PipeName\">\\msagent_42</Data><Data Name=\"Image\">C:\\Windows\\System32\\rundll32.exe</Data><Data Name=\"User\">CORP\\alice</Data></EventData></Event>"
+    expect:
+      "class_uid": 1001
+      "activity_id": 14
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>19</EventID><Version>5</Version><Level>4</Level><Task>19</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:19:00.1234567Z\"/><EventRecordID>1019</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"EventType\">WmiFilterEvent</Data><Data Name=\"UtcTime\">2026-08-18 12:19:00.1</Data><Data Name=\"Operation\">Created</Data><Data Name=\"User\">CORP\\bob</Data><Data Name=\"EventNamespace\">root\\subscription</Data><Data Name=\"Name\">EvilFilter</Data><Data Name=\"Query\">SELECT * FROM __InstanceModificationEvent WITHIN 60</Data></EventData></Event>"
+    expect:
+      "class_uid": 201003
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>22</EventID><Version>5</Version><Level>4</Level><Task>22</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:22:00.1234567Z\"/><EventRecordID>1022</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"UtcTime\">2026-08-18 12:22:00.1</Data><Data Name=\"ProcessGuid\">{aaaaaaaa-0015-0000-0000-000000000015}</Data><Data Name=\"ProcessId\">1012</Data><Data Name=\"QueryName\">evil.example.com</Data><Data Name=\"QueryStatus\">0</Data><Data Name=\"QueryType\">1</Data><Data Name=\"QueryResults\">type:  5 evil.cdn.net;::ffff:1.2.3.4;</Data><Data Name=\"Image\">C:\\Windows\\System32\\svchost.exe</Data><Data Name=\"User\">NT AUTHORITY\\SYSTEM</Data></EventData></Event>"
+    expect:
+      "class_uid": 4003
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>23</EventID><Version>5</Version><Level>4</Level><Task>23</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:23:00.1234567Z\"/><EventRecordID>1023</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"UtcTime\">2026-08-18 12:23:00.1</Data><Data Name=\"ProcessGuid\">{aaaaaaaa-0016-0000-0000-000000000016}</Data><Data Name=\"ProcessId\">1011</Data><Data Name=\"User\">CORP\\alice</Data><Data Name=\"Image\">C:\\Windows\\System32\\cmd.exe</Data><Data Name=\"TargetFilename\">C:\\Users\\alice\\secret.docx</Data><Data Name=\"Hashes\">SHA256=FFEE0011223344556677889900AABBCCDDEEFF00112233445566778899AABB</Data><Data Name=\"IsExecutable\">false</Data><Data Name=\"Archived\">true</Data></EventData></Event>"
+    expect:
+      "class_uid": 1001
+      "activity_id": 4
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>24</EventID><Version>5</Version><Level>4</Level><Task>24</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:24:00.1234567Z\"/><EventRecordID>1024</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"UtcTime\">2026-08-18 12:24:00.1</Data><Data Name=\"ProcessGuid\">{aaaaaaaa-0017-0000-0000-000000000017}</Data><Data Name=\"ProcessId\">2020</Data><Data Name=\"Image\">C:\\Windows\\System32\\mstsc.exe</Data><Data Name=\"Session\">1</Data><Data Name=\"ClientInfo\">user: CORP\\alice</Data><Data Name=\"Hashes\">SHA256=1234</Data><Data Name=\"Archived\">true</Data><Data Name=\"User\">CORP\\alice</Data></EventData></Event>"
+    expect:
+      "class_uid": 1012
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>25</EventID><Version>5</Version><Level>4</Level><Task>25</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:25:00.1234567Z\"/><EventRecordID>1025</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">technique_id=T1055.012,technique_name=Process Hollowing</Data><Data Name=\"UtcTime\">2026-08-18 12:25:00.1</Data><Data Name=\"ProcessGuid\">{aaaaaaaa-0018-0000-0000-000000000018}</Data><Data Name=\"ProcessId\">3131</Data><Data Name=\"Image\">C:\\Windows\\System32\\svchost.exe</Data><Data Name=\"Type\">Image is replaced</Data><Data Name=\"User\">CORP\\alice</Data></EventData></Event>"
+    expect:
+      "class_uid": 1007
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>26</EventID><Version>5</Version><Level>4</Level><Task>26</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:26:00.1234567Z\"/><EventRecordID>1026</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"UtcTime\">2026-08-18 12:26:00.1</Data><Data Name=\"ProcessGuid\">{aaaaaaaa-0019-0000-0000-000000000019}</Data><Data Name=\"ProcessId\">4141</Data><Data Name=\"User\">CORP\\alice</Data><Data Name=\"Image\">C:\\Windows\\System32\\cmd.exe</Data><Data Name=\"TargetFilename\">C:\\Users\\alice\\gone.txt</Data><Data Name=\"Hashes\">SHA256=ABCD</Data><Data Name=\"IsExecutable\">false</Data></EventData></Event>"
+    expect:
+      "class_uid": 1001
+      "activity_id": 4
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>27</EventID><Version>5</Version><Level>4</Level><Task>27</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:27:00.1234567Z\"/><EventRecordID>1027</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"UtcTime\">2026-08-18 12:27:00.1</Data><Data Name=\"ProcessGuid\">{aaaaaaaa-0020-0000-0000-000000000020}</Data><Data Name=\"ProcessId\">5151</Data><Data Name=\"User\">CORP\\alice</Data><Data Name=\"Image\">C:\\Windows\\System32\\cmd.exe</Data><Data Name=\"TargetFilename\">C:\\Users\\alice\\Downloads\\malware.exe</Data><Data Name=\"Hashes\">SHA256=BAD1</Data></EventData></Event>"
+    expect:
+      "class_uid": 1001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>29</EventID><Version>5</Version><Level>4</Level><Task>29</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:29:00.1234567Z\"/><EventRecordID>1029</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"UtcTime\">2026-08-18 12:29:00.1</Data><Data Name=\"ProcessGuid\">{aaaaaaaa-0021-0000-0000-000000000021}</Data><Data Name=\"ProcessId\">5252</Data><Data Name=\"User\">CORP\\alice</Data><Data Name=\"Image\">C:\\Windows\\System32\\cmd.exe</Data><Data Name=\"TargetFilename\">C:\\Users\\alice\\Downloads\\tool.exe</Data><Data Name=\"Hashes\">SHA256=F00D</Data></EventData></Event>"
+    expect:
+      "class_uid": 1001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>255</EventID><Version>5</Version><Level>4</Level><Task>255</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:55:00.1234567Z\"/><EventRecordID>1055</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"UtcTime\">2026-08-18 12:55:00.1</Data><Data Name=\"Image\">C:\\Windows\\Sysmon.exe</Data></EventData></Event>"
+    expect:
+      "class_uid": 1007
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "Aug 18 12:00:00 wks-11 sysmon: this is not xml at all"
+    expect:
+      "class_uid": 1007
+      "activity_id": 99
+      "metadata.version": "1.9.0"

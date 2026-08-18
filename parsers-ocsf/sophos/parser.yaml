@@ -1,0 +1,658 @@
+name: sophos_ocsf
+display_name: Sophos Firewall (OCSF)
+version: "1.0.0"
+description: >
+  Parses Sophos XG/XGS Firewall syslog (key=value) records into complete
+  OCSF 1.9.0 records, routed by log_type:
+    Firewall                              -> Network Activity 4001 (Open/Traffic/Refuse)
+    Event + *authentication*              -> Authentication 3002 (Logon)
+    Event + IPSec / SSL VPN               -> Tunnel Activity 4014 (Open)
+    Content Filtering, WAF                -> HTTP Activity 4002 (by method)
+    Anti-Virus, ATP, IDP, Sandstorm       -> Detection Finding 2004 (Create)
+    Anti-Spam                             -> Email Activity 4009 (Scan)
+    Event + system/HA/admin, Wireless,
+    System Health, unrecognized           -> Base Event 0 (Other)
+  Strips the syslog PRI header and any "Mmm dd HH:MM:SS host" / ISO-8601 host
+  prefix before parsing. Carries metadata.profiles ["host"], plus
+  "security_control" wherever an allow/deny verdict is a real control decision
+  (not on 3002, where allow/deny is the authentication OUTCOME -> status_id).
+  The OCSF counterpart of parsers/sophos - deploy one or the other, never both.
+ocsf_version: "1.9.0"
+match_values:
+  - sophos
+category: network
+vendor: "Sophos"
+product: "Firewall"
+parser_vrl: |
+  # Sophos XG/XGS Firewall syslog (key=value) -> OCSF 1.9.0.
+  # Emits the COMPLETE OCSF record on the root.
+  #
+  #   log_type=Firewall                       -> Network Activity 4001
+  #   log_type=Event  component=*auth*        -> Authentication 3002
+  #   log_type=Event  component=*ipsec|ssl vpn* -> Tunnel Activity 4014
+  #   log_type=Event  component=system|ha|admin -> Base Event 0
+  #   log_type=Content Filtering | WAF        -> HTTP Activity 4002
+  #   log_type=Anti-Virus | ATP | IDP | Sandstorm -> Detection Finding 2004
+  #   log_type=Anti-Spam                      -> Email Activity 4009
+  #   log_type=Wireless | System Health | anything else -> Base Event 0
+  raw_log = string!(.message)
+
+  # ---- strip the syslog PRI header: <30>... --------------------------
+  stripped = raw_log
+  syslog_priority = null
+  pri_m, pri_err = parse_regex(raw_log, r'^<(?P<pri>\d+)>(?P<body>.*)$')
+  if pri_err == null {
+      stripped = string(pri_m.body) ?? stripped
+      syslog_priority = to_int(pri_m.pri) ?? null
+  }
+
+  # ---- strip "May 18 14:38:57 host " / "2020-05-18T14:38:57+02:00 host " ----
+  hdr_m, hdr_err = parse_regex(stripped, r'^[A-Z][a-z]{2}\s+\d+\s+\d+:\d+:\d+\s+\S+\s+(?P<body>device=.*)$')
+  if hdr_err == null { stripped = string(hdr_m.body) ?? stripped }
+  iso_m, iso_err = parse_regex(stripped, r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\S*\s+\S+\s+(?P<body>device=.*)$')
+  if iso_err == null { stripped = string(iso_m.body) ?? stripped }
+
+  kv = parse_key_value(stripped, key_value_delimiter: "=", field_delimiter: " ") ?? {}
+
+  # ---- time: Sophos splits it into date + time -----------------------
+  time_ms = 0
+  date_str = to_string(kv.date) ?? ""
+  time_str = to_string(kv.time) ?? ""
+  if date_str != "" && time_str != "" {
+      t, terr = parse_timestamp(date_str + " " + time_str, "%Y-%m-%d %H:%M:%S")
+      if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+  }
+
+  log_type = to_string(kv.log_type) ?? ""
+  log_component = to_string(kv.log_component) ?? ""
+  log_subtype = to_string(kv.log_subtype) ?? ""
+  component_lc = downcase(log_component)
+  subtype_lc = downcase(log_subtype)
+
+  # ---- the firewall itself is the reporting device -------------------
+  device = { "hostname": downcase(to_string(kv.device_name) ?? ""), "type_id": 9 }
+  device_id = to_string(kv.device_id) ?? ""
+  if device_id != "" { device.uid = device_id }
+
+  # ---- severity from Sophos's syslog-style priority ------------------
+  priority_lc = downcase(to_string(kv.priority) ?? "")
+  severity_id = 1
+  severity = "Informational"
+  if priority_lc == "emergency" || priority_lc == "alert" || priority_lc == "critical" {
+      severity_id = 5; severity = "Critical"
+  } else if priority_lc == "error" {
+      severity_id = 4; severity = "High"
+  } else if priority_lc == "warning" || priority_lc == "warn" {
+      severity_id = 3; severity = "Medium"
+  } else if priority_lc == "notice" || priority_lc == "notification" {
+      severity_id = 2; severity = "Low"
+  }
+
+  # ---- allow/deny verdict -> security_control action + disposition ----
+  status_raw = to_string(kv.status) ?? ""
+  status_lc = downcase(status_raw)
+  verdict = ""
+  if status_lc == "allow" || status_lc == "allowed" || status_lc == "successful" || status_lc == "success" || status_lc == "accept" {
+      verdict = "allow"
+  } else if status_lc == "deny" || status_lc == "denied" || status_lc == "drop" || status_lc == "dropped" || status_lc == "block" || status_lc == "blocked" || status_lc == "failed" || status_lc == "failure" {
+      verdict = "deny"
+  } else if status_lc == "alert" {
+      verdict = "alert"
+  }
+  # log_subtype is the more specific signal when both are present.
+  if subtype_lc == "allowed" || subtype_lc == "allow" {
+      verdict = "allow"
+  } else if subtype_lc == "denied" || subtype_lc == "deny" || subtype_lc == "drop" || subtype_lc == "dropped" {
+      verdict = "deny"
+  }
+  action_id = 0
+  action = "Unknown"
+  disposition_id = 0
+  disposition = "Unknown"
+  if verdict == "allow" {
+      action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed"
+  } else if verdict == "deny" {
+      action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
+  } else if verdict == "alert" {
+      action_id = 3; action = "Observed"; disposition_id = 19; disposition = "Alert"
+  }
+
+  # ---- endpoints -----------------------------------------------------
+  src_ip = downcase(to_string(kv.src_ip) ?? "")
+  dst_ip = downcase(to_string(kv.dst_ip) ?? "")
+  src_country = to_string(kv.src_country_code) ?? ""
+  dst_country = to_string(kv.dst_country_code) ?? ""
+
+  src_endpoint = {}
+  if src_ip != "" { src_endpoint.ip = src_ip }
+  src_port = to_int(kv.src_port) ?? 0
+  if src_port > 0 { src_endpoint.port = src_port }
+  src_mac = downcase(to_string(kv.src_mac) ?? "")
+  if src_mac != "" { src_endpoint.mac = src_mac }
+  # Sophos emits R1 for "reserved / non-routable", which is not a country.
+  if src_country != "" && src_country != "R1" { src_endpoint.location = { "country": src_country } }
+
+  dst_endpoint = {}
+  if dst_ip != "" { dst_endpoint.ip = dst_ip }
+  dst_port = to_int(kv.dst_port) ?? 0
+  if dst_port > 0 { dst_endpoint.port = dst_port }
+  dst_mac = downcase(to_string(kv.dst_mac) ?? "")
+  if dst_mac != "" { dst_endpoint.mac = dst_mac }
+  if dst_country != "" && dst_country != "R1" { dst_endpoint.location = { "country": dst_country } }
+
+  # ---- protocol ------------------------------------------------------
+  protocol_lc = downcase(to_string(kv.protocol) ?? "")
+  protocol_num = 0
+  if protocol_lc == "tcp" { protocol_num = 6 }
+  if protocol_lc == "udp" { protocol_num = 17 }
+  if protocol_lc == "icmp" { protocol_num = 1 }
+  if protocol_lc == "icmpv6" { protocol_num = 58 }
+  if protocol_lc == "gre" { protocol_num = 47 }
+  if protocol_lc == "esp" { protocol_num = 50 }
+  if protocol_lc == "ah" { protocol_num = 51 }
+
+  # ---- traffic counters ----------------------------------------------
+  bytes_out = to_int(kv.sent_bytes) ?? 0
+  bytes_in = to_int(kv.recv_bytes) ?? 0
+  packets_out = to_int(kv.sent_pkts) ?? 0
+  packets_in = to_int(kv.recv_pkts) ?? 0
+  has_traffic = bytes_out > 0 || bytes_in > 0 || packets_out > 0 || packets_in > 0
+  traffic = {
+      "bytes_in": bytes_in,
+      "bytes_out": bytes_out,
+      "packets_in": packets_in,
+      "packets_out": packets_out
+  }
+
+  user_name = downcase(to_string(kv.user_name) ?? "")
+  connid = to_string(kv.connid) ?? ""
+
+  # ---- source detail with no promoted OCSF home ----------------------
+  unmapped = {
+      "log_type": log_type,
+      "log_component": log_component,
+      "log_subtype": log_subtype,
+      "log_id": to_string(kv.log_id) ?? null,
+      "sophos_status": status_raw,
+      "priority": to_string(kv.priority) ?? null,
+      "syslog_priority": syslog_priority,
+      "device_model": to_string(kv.device) ?? null,
+      "timezone": to_string(kv.timezone) ?? null,
+      "fw_rule_id": to_string(kv.fw_rule_id) ?? null,
+      "nat_rule_id": to_string(kv.nat_rule_id) ?? null,
+      "policy_type": to_string(kv.policy_type) ?? null,
+      "src_zone": to_string(kv.src_zone) ?? null,
+      "dst_zone": to_string(kv.dst_zone) ?? null,
+      "src_zone_type": to_string(kv.srczonetype) ?? null,
+      "dst_zone_type": to_string(kv.dstzonetype) ?? null,
+      "in_interface": to_string(kv.in_interface) ?? null,
+      "out_interface": to_string(kv.out_interface) ?? null,
+      "tran_src_ip": to_string(kv.tran_src_ip) ?? null,
+      "tran_src_port": to_string(kv.tran_src_port) ?? null,
+      "tran_dst_ip": to_string(kv.tran_dst_ip) ?? null,
+      "tran_dst_port": to_string(kv.tran_dst_port) ?? null,
+      "snat_ip": to_string(kv.snat_ip) ?? null,
+      "snat_port": to_string(kv.snat_port) ?? null,
+      "dnat_ip": to_string(kv.dnat_ip) ?? null,
+      "dnat_port": to_string(kv.dnat_port) ?? null,
+      "app_name": to_string(kv.application) ?? null,
+      "app_category": to_string(kv.app_category) ?? null,
+      "user_group": to_string(kv.user_gp) ?? null,
+      "icmp_type": to_string(kv.icmp_type) ?? null,
+      "icmp_code": to_string(kv.icmp_code) ?? null,
+      "hb_health": to_string(kv.hb_health) ?? null,
+      "conn_event": to_string(kv.connevent) ?? null,
+      "connid": connid,
+      "vconnid": to_string(kv.vconnid) ?? null,
+      "dir_disp": to_string(kv.dir_disp) ?? null,
+      "iap": to_string(kv.iap) ?? null,
+      "reason": to_string(kv.reason) ?? null,
+      "sophos_message": to_string(kv.message) ?? null
+  }
+
+  # ---- defaults; overridden per branch below --------------------------
+  class_uid = 0
+  class_name = "Base Event"
+  category_uid = 0
+  category_name = "Uncategorized"
+  activity_id = 99
+  activity_name = "Other"
+  profiles = ["host"]
+  has_verdict = verdict != ""
+
+  ocsf = {}
+
+  if log_type == "Firewall" {
+      # Traffic through a firewall rule -> Network Activity 4001.
+      class_uid = 4001; class_name = "Network Activity"
+      category_uid = 4; category_name = "Network Activity"
+      if verdict == "deny" {
+          activity_id = 5; activity_name = "Refuse"
+      } else if has_traffic {
+          activity_id = 6; activity_name = "Traffic"
+      } else {
+          activity_id = 1; activity_name = "Open"
+      }
+      # 4001 needs at least one endpoint; fall back to the firewall itself.
+      if !is_empty(src_endpoint) { ocsf.src_endpoint = src_endpoint }
+      if !is_empty(dst_endpoint) { ocsf.dst_endpoint = dst_endpoint }
+      if is_empty(src_endpoint) && is_empty(dst_endpoint) {
+          ocsf.src_endpoint = { "hostname": downcase(to_string(kv.device_name) ?? "") }
+      }
+      connection_info = { "direction_id": 0 }
+      if protocol_num > 0 { connection_info.protocol_num = protocol_num }
+      # OCSF 4001 has no `session`; the Sophos connection id belongs on
+      # connection_info.uid (and is repeated in unmapped, which is queryable).
+      if connid != "" { connection_info.uid = connid }
+      ocsf.connection_info = connection_info
+      if has_traffic { ocsf.traffic = traffic }
+      # `duration` is a reserved VRL identifier, hence conn_duration.
+      conn_duration = to_int(kv.duration) ?? 0
+      if conn_duration > 0 { ocsf.duration = conn_duration }
+      if user_name != "" { ocsf.actor = { "user": { "name": user_name } } }
+      ocsf.device = device
+  } else if log_type == "Event" && (contains(component_lc, "auth") || contains(component_lc, "authentication")) {
+      # Firewall / user authentication -> Authentication 3002.
+      class_uid = 3002; class_name = "Authentication"
+      category_uid = 3; category_name = "Identity & Access Management"
+      activity_id = 1; activity_name = "Logon"
+      ocsf.user = { "name": user_name }
+      # 3002 needs one of [service, dst_endpoint]; the firewall is the target.
+      if !is_empty(dst_endpoint) {
+          ocsf.dst_endpoint = dst_endpoint
+      } else {
+          ocsf.dst_endpoint = { "hostname": downcase(to_string(kv.device_name) ?? "") }
+      }
+      if !is_empty(src_endpoint) { ocsf.src_endpoint = src_endpoint }
+      if verdict == "deny" {
+          ocsf.status_id = 2; ocsf.status = "Failure"
+      } else if verdict == "allow" {
+          ocsf.status_id = 1; ocsf.status = "Success"
+      } else {
+          ocsf.status_id = 0; ocsf.status = "Unknown"
+      }
+      reason = to_string(kv.reason) ?? ""
+      if reason != "" { ocsf.status_detail = reason }
+      ocsf.device = device
+      unmapped.auth_client = to_string(kv.auth_client) ?? null
+      unmapped.auth_mechanism = to_string(kv.auth_mechanism) ?? null
+      unmapped.auth_name = to_string(kv.name) ?? null
+      # An allow/deny verdict here is the auth OUTCOME (status_id), not a
+      # security-control disposition, so 3002 does not carry action/disposition.
+      has_verdict = false
+  } else if log_type == "Event" && (contains(component_lc, "ipsec") || (contains(component_lc, "ssl") && contains(component_lc, "vpn"))) {
+      # IPSec / SSL VPN -> Tunnel Activity 4014.
+      class_uid = 4014; class_name = "Tunnel Activity"
+      category_uid = 4; category_name = "Network Activity"
+      if verdict == "deny" {
+          activity_id = 99; activity_name = "Other"
+      } else {
+          activity_id = 1; activity_name = "Open"
+      }
+      # 4014 needs one of [connection_info, session, src_endpoint, traffic,
+      # tunnel_interface, tunnel_type_id].
+      vpn_src = src_endpoint
+      local_ip = downcase(to_string(kv.localinterfaceip) ?? "")
+      if is_empty(vpn_src) && local_ip != "" { vpn_src = { "ip": local_ip } }
+      if is_empty(vpn_src) { vpn_src = { "hostname": downcase(to_string(kv.device_name) ?? "") } }
+      ocsf.src_endpoint = vpn_src
+      vpn_dst = dst_endpoint
+      remote_ip = downcase(to_string(kv.remoteinterfaceip) ?? "")
+      if is_empty(vpn_dst) && remote_ip != "" { vpn_dst = { "ip": remote_ip } }
+      if !is_empty(vpn_dst) { ocsf.dst_endpoint = vpn_dst }
+      # NOTE: OCSF tunnel_type_id is Split/Full Tunnel, NOT the VPN protocol, and
+      # Sophos does not report which. The IPSec-vs-SSL distinction is kept in
+      # unmapped rather than forced into the wrong enum.
+      vpn_protocol = "SSL"
+      if contains(component_lc, "ipsec") { vpn_protocol = "IPSec" }
+      if user_name != "" { ocsf.user = { "name": user_name } }
+      if has_traffic { ocsf.traffic = traffic }
+      ocsf.device = device
+      unmapped.vpn_protocol = vpn_protocol
+      unmapped.vpn_connection_name = to_string(kv.connectionname) ?? null
+      unmapped.vpn_connection_type = to_string(kv.connectiontype) ?? null
+      unmapped.local_gateway = to_string(kv.localgateway) ?? null
+      unmapped.local_network = to_string(kv.localnetwork) ?? null
+      unmapped.remote_network = to_string(kv.remotenetwork) ?? null
+      unmapped.tunnel_ip = to_string(kv.tunnelip) ?? null
+      has_verdict = false
+  } else if log_type == "Content Filtering" || log_type == "WAF" {
+      # Web proxy / WAF -> HTTP Activity 4002.
+      class_uid = 4002; class_name = "HTTP Activity"
+      category_uid = 4; category_name = "Network Activity"
+      method = upcase(to_string(kv.method) ?? "")
+      if method == "GET" {
+          activity_id = 3; activity_name = "Get"
+      } else if method == "POST" {
+          activity_id = 6; activity_name = "Post"
+      } else if method == "PUT" {
+          activity_id = 7; activity_name = "Put"
+      } else if method == "HEAD" {
+          activity_id = 4; activity_name = "Head"
+      } else if method == "DELETE" {
+          activity_id = 2; activity_name = "Delete"
+      } else if method == "CONNECT" {
+          activity_id = 1; activity_name = "Connect"
+      } else if method == "OPTIONS" {
+          activity_id = 5; activity_name = "Options"
+      } else {
+          activity_id = 99; activity_name = "Other"
+      }
+
+      url_string = to_string(kv.url) ?? ""
+      url_host = to_string(kv.domain) ?? ""
+      url_scheme = ""
+      url_path = ""
+      um, umerr = parse_regex(url_string, r'^(?P<scheme>[a-zA-Z]+)://(?P<host>[^/?#]+)(?P<path>/[^?#]*)?')
+      if umerr == null {
+          url_scheme = downcase(string(um.scheme) ?? "")
+          if url_host == "" { url_host = string(um.host) ?? "" }
+          url_path = string(um.path) ?? ""
+      }
+      url_obj = {}
+      if url_string != "" { url_obj.url_string = url_string }
+      if url_host != "" { url_obj.hostname = downcase(url_host) }
+      if url_scheme != "" { url_obj.scheme = url_scheme }
+      if url_path != "" { url_obj.path = url_path }
+      http_category = to_string(kv.http_category) ?? ""
+      if http_category != "" { url_obj.categories = [http_category] }
+
+      http_request = {}
+      if !is_empty(url_obj) { http_request.url = url_obj }
+      if method != "" { http_request.http_method = method }
+      user_agent = to_string(kv.user_agent) ?? ""
+      if user_agent != "" { http_request.user_agent = user_agent }
+      referrer = to_string(kv.referer) ?? ""
+      if referrer != "" { http_request.referrer = referrer }
+
+      # httpresponsecode, else a numeric `status` in the HTTP range.
+      response_code = to_int(kv.httpresponsecode) ?? 0
+      if response_code == 0 {
+          status_int = to_int(kv.status) ?? 0
+          if status_int >= 100 && status_int <= 599 { response_code = status_int }
+      }
+      http_response = {}
+      if response_code > 0 { http_response.code = response_code }
+      content_type = to_string(kv.contenttype) ?? ""
+      if content_type != "" { http_response.content_type = content_type }
+
+      # 4002 needs at least one of [http_request, http_response].
+      if is_empty(http_request) && is_empty(http_response) {
+          http_request = { "http_method": "UNKNOWN" }
+      }
+      if !is_empty(http_request) { ocsf.http_request = http_request }
+      if !is_empty(http_response) { ocsf.http_response = http_response }
+      if !is_empty(src_endpoint) { ocsf.src_endpoint = src_endpoint }
+      if !is_empty(dst_endpoint) { ocsf.dst_endpoint = dst_endpoint }
+      if user_name != "" { ocsf.actor = { "user": { "name": user_name } } }
+      if has_traffic { ocsf.traffic = traffic }
+      ocsf.device = device
+      unmapped.http_category = http_category
+      unmapped.http_category_type = to_string(kv.http_category_type) ?? null
+      unmapped.override_token = to_string(kv.override_token) ?? null
+      unmapped.exceptions = to_string(kv.exceptions) ?? null
+      unmapped.activityname = to_string(kv.activityname) ?? null
+      unmapped.waf_extra = to_string(kv.extra) ?? null
+  } else if log_type == "Anti-Virus" || log_type == "ATP" || log_type == "IDP" || log_type == "Sandstorm" {
+      # Signature / threat detections -> Detection Finding 2004.
+      class_uid = 2004; class_name = "Detection Finding"
+      category_uid = 2; category_name = "Findings"
+      activity_id = 1; activity_name = "Create"
+
+      threat_name = to_string(kv.threatname) ?? ""
+      if threat_name == "" { threat_name = to_string(kv.signature_msg) ?? "" }
+      finding_uid = to_string(kv.signature_id) ?? ""
+      if finding_uid == "" { finding_uid = to_string(kv.eventid) ?? "" }
+      if finding_uid == "" { finding_uid = to_string(kv.log_id) ?? "" }
+      if finding_uid == "" { finding_uid = uuid_v4() }
+      title = threat_name
+      if title == "" { title = log_type }
+
+      finding_info = {
+          "uid": finding_uid,
+          "title": title,
+          "types": [log_type],
+          "data_sources": ["sophos"]
+      }
+      rule_name = to_string(kv.rule) ?? ""
+      if rule_name == "" { rule_name = threat_name }
+      if rule_name != "" {
+          finding_info.analytic = {
+              "name": rule_name,
+              "uid": finding_uid,
+              "type_id": 1,
+              "type": "Rule"
+          }
+      }
+      ocsf.finding_info = finding_info
+      ocsf.is_alert = true
+      ocsf.status_id = 1
+      ocsf.status = "New"
+      ocsf.device = device
+      if user_name != "" { ocsf.actor = { "user": { "name": user_name } } }
+
+      # Evidence: the endpoints involved, and the file for AV/Sandstorm.
+      evidence = {}
+      if !is_empty(src_endpoint) { evidence.src_endpoint = src_endpoint }
+      if !is_empty(dst_endpoint) { evidence.dst_endpoint = dst_endpoint }
+      file_path = to_string(kv.filename) ?? ""
+      if file_path != "" {
+          file_name = ""
+          fm, fmerr = parse_regex(file_path, r'(?P<b>[^\\/]+)$')
+          if fmerr == null { file_name = string(fm.b) ?? "" }
+          if file_name == "" { file_name = file_path }
+          file_obj = { "name": file_name, "path": file_path, "type_id": 1 }
+          file_hash = downcase(to_string(kv.filehash) ?? "")
+          if file_hash != "" { file_obj.hashes = [{ "algorithm_id": 3, "value": file_hash }] }
+          evidence.file = file_obj
+      }
+      if !is_empty(evidence) { ocsf.evidences = [evidence] }
+
+      # Anti-Virus / Sandstorm name a malware family; Sophos's threattype is a
+      # free-text label, not an OCSF classification, so classification_ids stays
+      # Unknown and threattype is preserved in unmapped.
+      if (log_type == "Anti-Virus" || log_type == "Sandstorm") && threat_name != "" {
+          ocsf.malware = [{ "name": threat_name, "classification_ids": [0] }]
+      }
+      unmapped.threatname = to_string(kv.threatname) ?? null
+      unmapped.threattype = to_string(kv.threattype) ?? null
+      unmapped.quarantine = to_string(kv.quarantine) ?? null
+      unmapped.quarantine_reason = to_string(kv.quarantine_reason) ?? null
+      unmapped.classification = to_string(kv.classification) ?? null
+      unmapped.ips_policy = to_string(kv.ips_policy) ?? null
+      unmapped.gid = to_string(kv.gid) ?? null
+      unmapped.sid = to_string(kv.sid) ?? null
+      unmapped.revision = to_string(kv.rev) ?? null
+      unmapped.reference = to_string(kv.reference) ?? null
+      unmapped.url = to_string(kv.url) ?? null
+  } else if log_type == "Anti-Spam" {
+      # Mail scanning -> Email Activity 4009.
+      class_uid = 4009; class_name = "Email Activity"
+      category_uid = 4; category_name = "Network Activity"
+      activity_id = 3; activity_name = "Scan"
+      # direction_id is REQUIRED on 4009; Sophos does not state it.
+      ocsf.direction_id = 0
+      ocsf.direction = "Unknown"
+
+      email_from = to_string(kv.from_email_addr) ?? ""
+      if email_from == "" { email_from = to_string(kv.sender) ?? "" }
+      email_to = to_string(kv.to_email_addr) ?? ""
+      if email_to == "" { email_to = to_string(kv.receiver) ?? "" }
+      email = {}
+      if email_from != "" { email.from = email_from }
+      if email_to != "" { email.to = [email_to] }
+      # `email` needs at least one of [from, to].
+      if is_empty(email) { email.from = "" }
+      subject = to_string(kv.subject) ?? ""
+      if subject != "" { email.subject = subject }
+      mailid = to_string(kv.mailid) ?? ""
+      if mailid != "" { email.message_uid = mailid }
+      mailsize = to_int(kv.mailsize) ?? 0
+      if mailsize > 0 { email.size = mailsize }
+      ocsf.email = email
+      if !is_empty(src_endpoint) { ocsf.src_endpoint = src_endpoint }
+      if !is_empty(dst_endpoint) { ocsf.dst_endpoint = dst_endpoint }
+      ocsf.device = device
+  } else {
+      # log_type=Event/system|ha|admin, Wireless, System Health, and anything the
+      # firewall emits that OCSF has no class for. These land on the Base Event
+      # rather than being forced into a class whose required attributes would
+      # have to be fabricated.
+      class_uid = 0; class_name = "Base Event"
+      category_uid = 0; category_name = "Uncategorized"
+      activity_id = 99; activity_name = "Other"
+      ocsf.device = device
+      unmapped.wifi_ssid = to_string(kv.ssid) ?? null
+      unmapped.access_point = to_string(kv.ap) ?? null
+      unmapped.client_mac = to_string(kv.client_mac) ?? null
+      unmapped.cpu_percent = to_string(kv.cpu) ?? null
+      unmapped.memory_percent = to_string(kv.mem) ?? null
+      unmapped.disk_percent = to_string(kv.disk) ?? null
+      unmapped.live_users = to_string(kv.live_users) ?? null
+      unmapped.user_name = user_name
+      # Base Event carries no endpoints, so preserve them here.
+      unmapped.src_ip = src_ip
+      unmapped.dst_ip = dst_ip
+      has_verdict = false
+  }
+
+  # ---- security_control verdict (only where it is a control decision) ----
+  if has_verdict {
+      ocsf.action_id = action_id
+      ocsf.action = action
+      ocsf.disposition_id = disposition_id
+      ocsf.disposition = disposition
+      profiles = ["host", "security_control"]
+  }
+
+  # ---- common envelope -------------------------------------------------
+  ocsf.class_uid = class_uid
+  ocsf.class_name = class_name
+  ocsf.category_uid = category_uid
+  ocsf.category_name = category_name
+  ocsf.activity_id = activity_id
+  ocsf.activity_name = activity_name
+  ocsf.type_uid = class_uid * 100 + activity_id
+  ocsf.severity_id = severity_id
+  ocsf.severity = severity
+  ocsf.time = time_ms
+  ocsf.message = raw_log
+  ocsf.raw_data = raw_log
+  ocsf.unmapped = unmapped
+
+  record_uid = to_string(kv.log_id) ?? ""
+  if record_uid == "" { record_uid = connid }
+  if record_uid == "" { record_uid = uuid_v4() }
+
+  ocsf.metadata = {
+      "version": "1.9.0",
+      "profiles": profiles,
+      "uid": record_uid,
+      "original_event_uid": record_uid,
+      "event_code": log_type,
+      "log_source": "sophos",
+      "product": { "name": "Firewall", "vendor_name": "Sophos" }
+  }
+
+  . = ocsf
+samples:
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:46:00 timezone=\"UTC\" device_name=\"XGS2100\" log_id=062516617101 log_type=\"Event\" log_component=\"Admin\" log_subtype=\"Admin\" status=\"Successful\" priority=Information user_name=\"admin\" message=\"Admin logged in from 10.1.1.5\" reason=\"\""
+    expect:
+      "class_uid": 0
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:40:00 timezone=\"UTC\" device_name=\"XGS2100\" log_id=018101618001 log_type=\"Anti-Spam\" log_component=\"SMTP\" log_subtype=\"Denied\" status=\"Blocked\" priority=Notice src_ip=203.0.113.77 dst_ip=10.1.1.25 src_port=40000 dst_port=25 protocol=\"TCP\" from_email_addr=\"attacker@evil.example\" to_email_addr=\"victim@corp.example\" subject=\"Urgent invoice\" mailid=\"1abcd2-000001\" mailsize=51200 reason=\"Spam\""
+    expect:
+      "class_uid": 4009
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:35:00 timezone=\"UTC\" device_name=\"XGS2100\" log_id=015003618001 log_type=\"Anti-Virus\" log_component=\"HTTP\" log_subtype=\"Denied\" status=\"Blocked\" priority=Critical user_name=\"erin\" src_ip=10.1.1.61 dst_ip=198.51.100.9 src_port=52100 dst_port=80 protocol=\"TCP\" threatname=\"EICAR-AV-Test\" threattype=\"Virus\" filename=\"/downloads/eicar.com\" url=\"http://bad.example.net/downloads/eicar.com\" quarantine=\"Yes\" quarantine_reason=\"Malware detected\""
+    expect:
+      "class_uid": 2004
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:36:00 timezone=\"UTC\" device_name=\"XGS2100\" log_id=017202618001 log_type=\"ATP\" log_component=\"Firewall\" log_subtype=\"Alert\" status=\"Alert\" priority=Critical user_name=\"frank\" src_ip=10.1.1.62 dst_ip=185.10.20.30 threatname=\"C2/Generic-A\" threattype=\"Botnet\" eventid=\"ATP-3311\" url=\"http://c2.example.org/gate.php\""
+    expect:
+      "class_uid": 2004
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:21:00 timezone=\"UTC\" device_name=\"XGS2100\" log_id=062516617003 log_type=\"Event\" log_component=\"Firewall Authentication\" log_subtype=\"Authentication\" status=\"Failed\" priority=Warning user_name=\"administrator\" auth_client=\"SSH\" auth_mechanism=\"Local\" reason=\"Invalid credentials\" src_ip=203.0.113.9"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:20:00 timezone=\"UTC\" device_name=\"XGS2100\" log_id=062516617002 log_type=\"Event\" log_component=\"Firewall Authentication\" log_subtype=\"Authentication\" status=\"Successful\" priority=Information user_name=\"bob\" usergroupname=\"Sales\" auth_client=\"Web Client\" auth_mechanism=\"Local\" reason=\"\" src_ip=10.1.1.77 name=\"bob\""
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "this line is not a sophos key=value record at all"
+    expect:
+      "class_uid": 0
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:30:00 timezone=\"UTC\" device_name=\"XGS2100\" log_id=016304616001 log_type=\"Content Filtering\" log_component=\"HTTP\" log_subtype=\"Denied\" status=\"403\" priority=Warning user_name=\"dave\" src_ip=10.1.1.60 dst_ip=151.101.1.69 src_port=52000 dst_port=443 protocol=\"TCP\" url=\"https://malware.example.com/payload/drop.exe?id=1\" domain=\"malware.example.com\" method=\"GET\" http_category=\"Malware\" http_category_type=\"Unproductive\" contenttype=\"application/octet-stream\" user_agent=\"Mozilla/5.0\" referer=\"https://mail.example.com/\" httpresponsecode=403 sent_bytes=512 recv_bytes=0 exceptions=\"\" override_token=\"\" activityname=\"Web Browsing\" reason=\"Category Blocked\""
+    expect:
+      "class_uid": 4002
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:15:00 timezone=\"UTC\" device_name=\"XGS2100\" device_id=C0100ABCDEF log_id=010101600001 log_type=\"Firewall\" log_component=\"Firewall Rule\" log_subtype=\"Allowed\" status=\"Allow\" priority=Information duration=12 fw_rule_id=4 nat_rule_id=0 policy_type=1 user_name=\"alice\" user_gp=\"Sales\" iap=2 ips_policy_id=0 appfilter_policy_id=0 application=\"HTTPS\" app_category=\"General Internet\" in_interface=\"Port1\" out_interface=\"Port2\" src_mac=00:1a:2b:3c:4d:5e dst_mac=00:1a:2b:3c:4d:5f src_ip=10.1.1.50 src_country_code=R1 dst_ip=93.184.216.34 dst_country_code=USA protocol=\"TCP\" src_port=51500 dst_port=443 sent_pkts=12 recv_pkts=14 sent_bytes=1840 recv_bytes=9210 tran_src_ip=203.0.113.1 tran_src_port=51500 tran_dst_ip= tran_dst_port=0 srczonetype=\"LAN\" dstzonetype=\"WAN\" connid=\"1234567\" vconnid=\"\" hb_health=\"No Heartbeat\""
+    expect:
+      "class_uid": 4001
+      "activity_id": 6
+      "metadata.version": "1.9.0"
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:16:00 timezone=\"UTC\" device_name=\"XGS2100\" device_id=C0100ABCDEF log_id=010101600002 log_type=\"Firewall\" log_component=\"Firewall Rule\" log_subtype=\"Denied\" status=\"Deny\" priority=Warning fw_rule_id=0 src_ip=203.0.113.9 src_country_code=RUS dst_ip=10.1.1.50 dst_country_code=R1 protocol=\"TCP\" src_port=44100 dst_port=3389 sent_pkts=0 recv_pkts=1 sent_bytes=0 recv_bytes=60 srczonetype=\"WAN\" dstzonetype=\"LAN\" connid=\"7654321\""
+    expect:
+      "class_uid": 4001
+      "activity_id": 5
+      "metadata.version": "1.9.0"
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:37:00 timezone=\"UTC\" device_name=\"XGS2100\" log_id=014001617001 log_type=\"IDP\" log_component=\"Anomaly\" log_subtype=\"Detect\" status=\"Detect\" priority=Warning signature_id=\"2019401\" signature_msg=\"ET EXPLOIT Possible CVE-2021-44228 Attempt\" classification=\"Attempted Administrator Privilege Gain\" rule=\"ET-Open\" ips_policy=\"LAN TO WAN\" gid=\"1\" sid=\"2019401\" rev=\"3\" reference=\"cve,2021-44228\" src_ip=203.0.113.44 dst_ip=10.1.1.20 src_port=41000 dst_port=8080 protocol=\"TCP\""
+    expect:
+      "class_uid": 2004
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:25:00 timezone=\"UTC\" device_name=\"XGS2100\" log_id=018202618001 log_type=\"Event\" log_component=\"IPSec\" log_subtype=\"System\" status=\"Successful\" priority=Information connectionname=\"HQ-to-Branch\" connectiontype=\"Site-to-Site\" localinterfaceip=198.51.100.10 localgateway=198.51.100.1 localnetwork=10.1.0.0/16 remoteinterfaceip=203.0.113.77 remotenetwork=10.2.0.0/16 user_name=\"\""
+    expect:
+      "class_uid": 4014
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "2026-08-18T11:01:00+00:00 xgs2100 device=\"SFW\" date=2026-08-18 time=11:01:00 timezone=\"UTC\" device_name=\"XGS2100\" log_id=010101600004 log_type=\"Firewall\" log_component=\"Firewall Rule\" log_subtype=\"Denied\" status=\"Drop\" priority=Warning src_ip=198.51.100.66 dst_ip=10.1.1.52 protocol=\"ICMP\" src_port=0 dst_port=0"
+    expect:
+      "class_uid": 4001
+      "activity_id": 5
+      "metadata.version": "1.9.0"
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:38:00 timezone=\"UTC\" device_name=\"XGS2100\" log_id=017904618001 log_type=\"Sandstorm\" log_component=\"Sandstorm\" log_subtype=\"Denied\" status=\"Blocked\" priority=Critical user_name=\"gina\" src_ip=10.1.1.63 threatname=\"Troj/Agent-BFPX\" filename=\"invoice.doc\" filehash=\"AB12CD34EF56\" reason=\"Malicious behaviour in sandbox\""
+    expect:
+      "class_uid": 2004
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:26:00 timezone=\"UTC\" device_name=\"XGS2100\" log_id=018302618002 log_type=\"Event\" log_component=\"SSL VPN\" log_subtype=\"System\" status=\"Successful\" priority=Information connectionname=\"RemoteUsers\" connectiontype=\"Remote Access\" user_name=\"carol\" tunnelip=10.81.234.6 src_ip=203.0.113.55 reason=\"\""
+    expect:
+      "class_uid": 4014
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "Aug 18 11:00:00 xgs2100 device=\"SFW\" date=2026-08-18 time=11:00:00 timezone=\"UTC\" device_name=\"XGS2100\" log_id=010101600003 log_type=\"Firewall\" log_component=\"Firewall Rule\" log_subtype=\"Allowed\" status=\"Allow\" priority=Information src_ip=10.1.1.51 dst_ip=8.8.8.8 protocol=\"UDP\" src_port=53000 dst_port=53 sent_bytes=64 recv_bytes=128"
+    expect:
+      "class_uid": 4001
+      "activity_id": 6
+      "metadata.version": "1.9.0"
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:45:00 timezone=\"UTC\" device_name=\"XGS2100\" log_id=062516617100 log_type=\"Event\" log_component=\"System\" log_subtype=\"System\" status=\"\" priority=Notice message=\"Interface Port2 link is up\" reason=\"\""
+    expect:
+      "class_uid": 0
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:55:00 timezone=\"UTC\" device_name=\"XGS2100\" log_id=020101620001 log_type=\"System Health\" log_component=\"Usage\" log_subtype=\"Usage\" priority=Information cpu=17 mem=62 disk=44 live_users=128"
+    expect:
+      "class_uid": 0
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:31:00 timezone=\"UTC\" device_name=\"XGS2100\" log_id=017505617001 log_type=\"WAF\" log_component=\"Web Application Firewall\" status=\"Blocked\" priority=Warning src_ip=203.0.113.200 dst_ip=10.1.1.9 url=\"https://shop.example.com/cart?id=1%27+OR+1%3D1\" domain=\"shop.example.com\" method=\"POST\" reason=\"SQL Injection\" extra=\"rule 942100\" httpresponsecode=403"
+    expect:
+      "class_uid": 4002
+      "activity_id": 6
+      "metadata.version": "1.9.0"
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:50:00 timezone=\"UTC\" device_name=\"XGS2100\" log_id=019101619001 log_type=\"Wireless\" log_component=\"AP\" log_subtype=\"Info\" status=\"\" priority=Information ssid=\"CorpWiFi\" ap=\"AP-Floor2\" client_mac=aa:bb:cc:dd:ee:ff"
+    expect:
+      "class_uid": 0
+      "activity_id": 99
+      "metadata.version": "1.9.0"

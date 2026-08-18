@@ -1,0 +1,337 @@
+name: duo_ocsf
+display_name: Duo Security (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Duo Security Admin API logs (authentication, administrator and
+  telephony streams) into complete OCSF 1.9.0 records:
+    eventtype=authentication            -> Authentication 3002
+    administrator action=admin_login    -> Authentication 3002
+    administrator action=user_*         -> User Management 3007
+    administrator action=group_*        -> Group Management 3006
+    all other administrator + telephony -> API Activity 6003
+  Account Change 3001 / User Access Management 3005 are DEPRECATED in OCSF 1.9
+  and are not emitted. On administrator events the Duo admin is `actor.user`
+  and the account named in `object` is the subject (`user` / `group`).
+match_values:
+  - duo
+category: security
+vendor: "Cisco"
+product: "Duo Security"
+parser_vrl: |
+  # Duo Admin API JSON -> OCSF 1.9.0.
+  raw_log = string!(.message)
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      # Unparseable input is emitted as an OCSF Base Event (class_uid 0)
+      # rather than being guessed into a security class: it stays valid, and
+      # therefore visible, without fabricating a user or an outcome.
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_name": "Duo Admin API",
+              "log_provider": "Duo Security",
+              "product": { "name": "Duo Security", "vendor_name": "Cisco" }
+          },
+          "unmapped": { "parse_error": "not a JSON object" }
+      }
+  } else {
+      p = object!(parsed)
+      access_device = object(p.access_device) ?? {}
+      auth_device = object(p.auth_device) ?? {}
+      application = object(p.application) ?? {}
+      duo_user = object(p.user) ?? {}
+
+      event_type = string(p.eventtype) ?? string(p.event_type) ?? ""
+
+      # ---- time: isotimestamp, else epoch seconds ----
+      time_ms = 0
+      iso = string(p.isotimestamp) ?? ""
+      if iso != "" {
+          t, terr = parse_timestamp(iso, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+      if time_ms == 0 {
+          epoch = to_int(p.timestamp) ?? 0
+          if epoch > 0 { time_ms = epoch * 1000 }
+      }
+
+      # ---- principal ----
+      uname = string(p.username) ?? ""
+      email = string(p.email) ?? ""
+      if uname == "" { uname = string(duo_user.name) ?? "" }
+      principal = { "name": downcase(uname) }
+      if uname == "" { principal = { "name": "unknown" } }
+      ukey = string(duo_user.key) ?? ""
+      if ukey != "" { principal = set!(principal, ["uid"], ukey) }
+      if match(email, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') {
+          principal = set!(principal, ["email_addr"], downcase(email))
+      } else if match(uname, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') {
+          principal = set!(principal, ["email_addr"], downcase(uname))
+      }
+
+      action = string(p.action) ?? ""
+      target_obj = string(p.object) ?? ""
+
+      # ---- class routing ----
+      class_uid = 6003
+      if event_type == "authentication" {
+          class_uid = 3002
+      } else if event_type == "administrator" {
+          if action == "admin_login" || action == "admin_login_error" {
+              class_uid = 3002
+          } else if starts_with(action, "user_") || starts_with(action, "admin_create") || starts_with(action, "admin_delete") || starts_with(action, "admin_update") {
+              class_uid = 3007
+          } else if starts_with(action, "group_") {
+              class_uid = 3006
+          }
+      }
+
+      # ---- outcome ----
+      status_id = 1
+      status_str = "Success"
+      severity_id = 1
+      severity = "Informational"
+      result = downcase(string(p.result) ?? "")
+      if result != "" {
+          if result == "success" || result == "allow" {
+              status_id = 1; status_str = "Success"
+          } else if result == "denied" || result == "failure" {
+              status_id = 2; status_str = "Failure"; severity_id = 2; severity = "Low"
+          } else if result == "fraud" {
+              status_id = 2; status_str = "Failure"; severity_id = 4; severity = "High"
+          } else {
+              status_id = 99; status_str = "Other"
+          }
+      }
+      if action == "admin_login_error" { status_id = 2; status_str = "Failure"; severity_id = 2; severity = "Low" }
+
+      ocsf = {}
+
+      if class_uid == 3002 {
+          ocsf.class_uid = 3002
+          ocsf.class_name = "Authentication"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = 1
+          ocsf.activity_name = "Logon"
+          # Authentication 3002 carries the authenticating principal in `user`.
+          ocsf.user = principal
+
+          # 3002 constraint at_least_one(service, dst_endpoint): the protected
+          # application Duo was gating, otherwise Duo itself.
+          svc_name = string(application.name) ?? ""
+          if svc_name == "" { svc_name = string(p.integration) ?? "" }
+          if svc_name == "" { svc_name = "Duo Security" }
+          svc = { "name": svc_name }
+          app_key = string(application.key) ?? ""
+          if app_key != "" { svc = set!(svc, ["uid"], app_key) }
+          ocsf.service = svc
+
+          txid = string(p.txid) ?? ""
+          if txid != "" { ocsf.session = { "uid": txid } }
+
+          # Duo IS the second factor: every authentication record is an MFA
+          # decision, so is_mfa is true even when the factor is a bypass code.
+          factor = string(p.factor) ?? ""
+          ocsf.is_mfa = event_type == "authentication"
+          if factor != "" {
+              ocsf.auth_protocol_id = 99
+              ocsf.auth_protocol = factor
+          }
+          ocsf.is_remote = true
+      } else if class_uid == 3007 {
+          activity_id = 2
+          activity_name = "Update"
+          if contains(action, "create") { activity_id = 1; activity_name = "Create" }
+          if contains(action, "delete") { activity_id = 3; activity_name = "Delete" }
+          if contains(action, "enable") || contains(action, "activate") { activity_id = 4; activity_name = "Enable" }
+          if contains(action, "disable") { activity_id = 5; activity_name = "Disable" }
+          if contains(action, "lock") { activity_id = 6; activity_name = "Lock" }
+          if contains(action, "unlock") { activity_id = 7; activity_name = "Unlock" }
+
+          ocsf.class_uid = 3007
+          ocsf.class_name = "User Management"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          # SUBJECT = the account named in `object`; ACTOR = the Duo admin in
+          # `username`. Reversing these inverts every "who changed whom" hunt.
+          subject_name = target_obj
+          if subject_name == "" { subject_name = "unknown" }
+          ocsf.user = { "name": downcase(subject_name) }
+          ocsf.actor = { "user": principal }
+      } else if class_uid == 3006 {
+          activity_id = 99
+          activity_name = "Other"
+          if contains(action, "create") { activity_id = 6; activity_name = "Create" }
+          if contains(action, "delete") { activity_id = 5; activity_name = "Delete" }
+          if contains(action, "update") { activity_id = 9; activity_name = "Update" }
+
+          ocsf.class_uid = 3006
+          ocsf.class_name = "Group Management"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          gname = target_obj
+          if gname == "" { gname = "unknown" }
+          ocsf.group = { "name": gname }
+          ocsf.actor = { "user": principal }
+      } else {
+          ocsf.class_uid = 6003
+          ocsf.class_name = "API Activity"
+          ocsf.category_uid = 6
+          ocsf.category_name = "Application Activity"
+          activity_id = 99
+          activity_name = "Other"
+          if contains(action, "create") { activity_id = 1; activity_name = "Create" }
+          if contains(action, "update") { activity_id = 3; activity_name = "Update" }
+          if contains(action, "delete") { activity_id = 4; activity_name = "Delete" }
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          operation = action
+          if operation == "" { operation = event_type }
+          if operation == "" { operation = "unknown" }
+          ocsf.api = { "operation": operation, "service": { "name": "Duo Admin API" } }
+          ocsf.actor = { "user": principal }
+          if target_obj != "" {
+              ocsf.resources = [{ "name": target_obj, "type": event_type }]
+          }
+      }
+
+      # ---- source endpoint ----
+      src_ip = string(access_device.ip) ?? string(p.ip) ?? string(p.ip_address) ?? ""
+      src_ep = {}
+      if src_ip != "" { src_ep = set!(src_ep, ["ip"], downcase(src_ip)) }
+      acc_host = string(access_device.hostname) ?? ""
+      if acc_host != "" { src_ep = set!(src_ep, ["hostname"], downcase(acc_host)) }
+      if length(src_ep) == 0 { src_ep = { "hostname": "unknown" } }
+      ocsf.src_endpoint = src_ep
+
+      # ---- common envelope ----
+      ocsf.status_id = status_id
+      ocsf.status = status_str
+      reason = string(p.reason) ?? ""
+      if reason != "" { ocsf.status_detail = reason }
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.type_uid = to_int(ocsf.class_uid) * 100 + to_int(ocsf.activity_id)
+      ocsf.time = time_ms
+      msg = string(p.description) ?? ""
+      if msg == "" { msg = action }
+      if msg == "" { msg = event_type }
+      ocsf.message = msg
+      ocsf.raw_data = raw_log
+
+      evt_uid = string(p.txid) ?? ""
+      if evt_uid == "" { evt_uid = uuid_v4() }
+      event_code = action
+      if event_code == "" { event_code = event_type }
+      ocsf.metadata = {
+          "version": "1.9.0",
+          "uid": evt_uid,
+          "original_event_uid": evt_uid,
+          "event_code": event_code,
+          "log_name": "Duo Admin API",
+          "log_provider": "Duo Security",
+          "product": { "name": "Duo Security", "vendor_name": "Cisco" }
+      }
+
+      cand = {
+          "duo_eventtype": event_type,
+          "factor": string(p.factor) ?? "",
+          "integration": string(p.integration) ?? "",
+          "object": target_obj,
+          "auth_device_name": string(auth_device.name) ?? "",
+          "auth_device_ip": string(auth_device.ip) ?? "",
+          "auth_device_country": string(auth_device.location.country) ?? "",
+          "access_device_os": string(access_device.os) ?? "",
+          "access_device_os_version": string(access_device.os_version) ?? "",
+          "access_device_browser": string(access_device.browser) ?? "",
+          "access_device_browser_version": string(access_device.browser_version) ?? "",
+          "geo_city": string(access_device.location.city) ?? "",
+          "geo_state": string(access_device.location.state) ?? "",
+          "geo_country": string(access_device.location.country) ?? "",
+          "telephony_type": string(p.type) ?? "",
+          "telephony_context": string(p.context) ?? "",
+          "phone": string(p.phone) ?? ""
+      }
+      unmapped = {}
+      for_each(cand) -> |k, v| {
+          if v != "" { unmapped = set!(unmapped, [k], v) }
+      }
+      if is_boolean(p.new_enrollment) { unmapped = set!(unmapped, ["new_enrollment"], bool!(p.new_enrollment)) }
+      groups = array(duo_user.groups) ?? []
+      if length(groups) > 0 { unmapped = set!(unmapped, ["user_groups"], encode_json(groups)) }
+      if length(unmapped) > 0 { ocsf.unmapped = unmapped }
+
+      . = ocsf
+  }
+samples:
+  # admin_group_delete.json
+  - raw: "{\"action\":\"group_delete\",\"description\":\"{\\\"name\\\": \\\"Contractors\\\"}\",\"eventtype\":\"administrator\",\"isotimestamp\":\"2026-08-18T16:20:10.000000+00:00\",\"object\":\"Contractors\",\"timestamp\":1787070010,\"username\":\"Ops Admin\",\"ip_address\":\"192.0.2.77\"}"
+    expect:
+      "class_uid": 3006
+      "activity_id": 5
+      "metadata.version": "1.9.0"
+  # admin_integration_create.json
+  - raw: "{\"action\":\"integration_create\",\"description\":\"{\\\"name\\\": \\\"New RADIUS\\\", \\\"type\\\": \\\"radius\\\"}\",\"eventtype\":\"administrator\",\"isotimestamp\":\"2026-08-18T16:31:02.000000+00:00\",\"object\":\"New RADIUS\",\"timestamp\":1787070662,\"username\":\"Ops Admin\",\"ip_address\":\"192.0.2.77\"}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # admin_login.json
+  - raw: "{\"action\":\"admin_login\",\"description\":\"{\\\"ip_address\\\": \\\"192.0.2.77\\\", \\\"factor\\\": \\\"push\\\", \\\"primary_auth_method\\\": \\\"Password\\\"}\",\"eventtype\":\"administrator\",\"isotimestamp\":\"2026-08-18T16:00:00.000000+00:00\",\"object\":null,\"timestamp\":1787068800,\"username\":\"Ops Admin\"}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # admin_user_create.json
+  - raw: "{\"action\":\"user_create\",\"description\":\"{\\\"notes\\\": \\\"\\\", \\\"realname\\\": \\\"Bob Smith\\\", \\\"status\\\": \\\"active\\\", \\\"username\\\": \\\"bob.smith@example.com\\\"}\",\"eventtype\":\"administrator\",\"isotimestamp\":\"2026-08-18T16:12:44.000000+00:00\",\"object\":\"bob.smith@example.com\",\"timestamp\":1787069564,\"username\":\"Ops Admin\",\"ip_address\":\"192.0.2.77\"}"
+    expect:
+      "class_uid": 3007
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # auth_denied_fraud.json
+  - raw: "{\"access_device\":{\"browser\":\"Unknown\",\"hostname\":null,\"ip\":\"198.51.100.201\",\"location\":{\"city\":\"Amsterdam\",\"country\":\"Netherlands\",\"state\":\"North Holland\"},\"os\":\"Unknown\"},\"application\":{\"key\":\"DIY8ZQOFZBLMBHXYZ123\",\"name\":\"Corporate VPN\"},\"auth_device\":{\"ip\":null,\"location\":{},\"name\":\"iPhone (555-0142)\"},\"email\":\"jane.doe@example.com\",\"eventtype\":\"authentication\",\"factor\":\"duo_push\",\"isotimestamp\":\"2026-08-18T14:09:41.000000+00:00\",\"reason\":\"user_marked_fraud\",\"result\":\"fraud\",\"timestamp\":1787062181,\"txid\":\"b2c3d4e5-f6a7-4b6c-9dae-1f2a3b4c5d6e\",\"user\":{\"groups\":[\"VPN Users\"],\"key\":\"DUXYZ123ABC456DEF789\",\"name\":\"jane.doe@example.com\"},\"username\":\"jane.doe@example.com\"}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # auth_success_push.json
+  - raw: "{\"access_device\":{\"browser\":\"Chrome\",\"browser_version\":\"126.0.0.0\",\"flash_version\":\"uninstalled\",\"hostname\":\"laptop-jdoe.corp.example.com\",\"ip\":\"203.0.113.55\",\"is_encryption_enabled\":true,\"is_firewall_enabled\":true,\"is_password_set\":true,\"java_version\":\"uninstalled\",\"location\":{\"city\":\"Boston\",\"country\":\"United States\",\"state\":\"Massachusetts\"},\"os\":\"Mac OS X\",\"os_version\":\"14.5.0\"},\"application\":{\"key\":\"DIY8ZQOFZBLMBHXYZ123\",\"name\":\"Corporate VPN\"},\"auth_device\":{\"ip\":\"198.51.100.9\",\"location\":{\"city\":\"Boston\",\"country\":\"United States\",\"state\":\"Massachusetts\"},\"name\":\"iPhone (555-0142)\"},\"email\":\"jane.doe@example.com\",\"event_type\":\"authentication\",\"eventtype\":\"authentication\",\"factor\":\"duo_push\",\"isotimestamp\":\"2026-08-18T14:03:02.000000+00:00\",\"reason\":\"user_approved\",\"result\":\"success\",\"timestamp\":1787061782,\"txid\":\"a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d\",\"user\":{\"groups\":[\"VPN Users\",\"Engineering\"],\"key\":\"DUXYZ123ABC456DEF789\",\"name\":\"jane.doe@example.com\"},\"username\":\"jane.doe@example.com\"}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # malformed.txt
+  - raw: "duo plain text, not json"
+    expect:
+      "class_uid": 0
+      "activity_id": 0
+      "metadata.version": "1.9.0"
+  # telephony.json
+  - raw: "{\"context\":\"authentication\",\"credits\":1,\"eventtype\":\"telephony\",\"isotimestamp\":\"2026-08-18T14:05:12.000000+00:00\",\"phone\":\"+15555550142\",\"timestamp\":1787061912,\"type\":\"sms\"}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 99
+      "metadata.version": "1.9.0"

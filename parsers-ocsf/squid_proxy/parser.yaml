@@ -1,0 +1,254 @@
+name: squid_proxy_ocsf
+display_name: Squid Proxy (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Squid native/extended access logs into OCSF 1.9.0 "HTTP Activity"
+  (class_uid 4002). Squid's result code (TCP_HIT / TCP_MISS / TCP_DENIED /
+  TCP_TUNNEL …) drives the security-control action/disposition and is kept
+  verbatim in `unmapped.cache_status`; the HTTP status rides in
+  http_response.code as a NUMBER so `http_response.code>=500` works. Lines
+  that are too short to be an access record become Base Event (class_uid 0).
+  Mirrors the UDM squid_proxy parser
+  (../parsers/parsers/squid_proxy/parser.yaml).
+match_values:
+  - squid_proxy
+category: network
+vendor: "Squid Project"
+product: "Squid Proxy"
+parser_vrl: |
+  # Squid access.log -> OCSF 1.9.0 HTTP Activity (4002) / Base Event (0)
+  # Format: time elapsed remotehost code/status bytes method URL rfc931
+  #         peerstatus/peerhost type ["referrer"]
+
+  raw_log = strip_whitespace(string!(.message))
+  raw_log = replace(raw_log, r'\s+', " ")
+
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
+
+  parts = split(raw_log, " ")
+
+  if length(parts) >= 10 {
+      # ---- 0: epoch seconds with milliseconds ----
+      ts_float = to_float(string(parts[0]) ?? "0") ?? 0.0
+      time_ms = to_int(round(ts_float * 1000.0))
+
+      # ---- 1: elapsed (ms) ----
+      duration_ms = to_int(string(parts[1]) ?? "0") ?? 0
+
+      # ---- 2: client address ----
+      client = string(parts[2]) ?? ""
+
+      # ---- 3: squidResult/httpStatus ----
+      squid_result = ""
+      code = 0
+      rs = split(string(parts[3]) ?? "", "/")
+      if length(rs) >= 1 { squid_result = upcase(string(rs[0]) ?? "") }
+      if length(rs) >= 2 { code = to_int(string(rs[1]) ?? "0") ?? 0 }
+
+      # ---- 4: reply size ----
+      resp_bytes = to_int(string(parts[4]) ?? "0") ?? 0
+
+      # ---- 5: method ----
+      method = upcase(string(parts[5]) ?? "")
+
+      # ---- 6: request URL ----
+      request_url = string(parts[6]) ?? ""
+
+      # ---- 7: identd / proxy-auth user ----
+      user_name = string(parts[7]) ?? ""
+      if user_name == "-" { user_name = "" }
+
+      # ---- 8: hierarchy/peer ----
+      hierarchy_code = ""
+      peer_host = ""
+      hp = split(string(parts[8]) ?? "", "/")
+      if length(hp) >= 1 { hierarchy_code = string(hp[0]) ?? "" }
+      if length(hp) >= 2 { peer_host = string(hp[1]) ?? "" }
+      if peer_host == "-" { peer_host = "" }
+
+      # ---- 9: content type ----
+      content_type = string(parts[9]) ?? ""
+      if content_type == "-" { content_type = "" }
+
+      # ---- optional trailing quoted referrer ----
+      referrer = ""
+      rm = parse_regex(raw_log, r'"(?P<referrer>[^"]*)"$') ?? {}
+      rv = string(rm.referrer) ?? ""
+      if rv != "" && rv != "-" { referrer = rv }
+
+      # ---- decompose the URL --------------------------------------------
+      url_obj = {}
+      dst_host = ""
+      dst_ip = ""
+      dst_port = 0
+      if method == "CONNECT" {
+          # CONNECT targets are "host:port", never a URL.
+          cm = parse_regex(request_url, r'^(?P<host>[^:]+):(?P<port>\d+)$') ?? {}
+          ch = string(cm.host) ?? ""
+          if ch != "" {
+              if match(ch, ip_re) { dst_ip = ch } else { dst_host = ch }
+              url_obj.hostname = downcase(ch)
+          }
+          cp = to_int(string(cm.port) ?? "0") ?? 0
+          if cp != 0 { dst_port = cp; url_obj.port = cp }
+          url_obj.scheme = "https"
+          url_obj.path = "/"
+      } else {
+          um = parse_regex(request_url, r'^(?:(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*)://)?(?P<host>[^:/]+)(?::(?P<port>\d+))?(?P<path>/[^?]*)?(?:\?(?P<query>.*))?$') ?? {}
+          uh = string(um.host) ?? ""
+          if uh != "" {
+              if match(uh, ip_re) { dst_ip = uh } else { dst_host = uh }
+              url_obj.hostname = downcase(uh)
+          }
+          us = downcase(string(um.scheme) ?? "")
+          if us != "" { url_obj.scheme = us }
+          up = to_int(string(um.port) ?? "0") ?? 0
+          if up != 0 { dst_port = up; url_obj.port = up }
+          upath = string(um.path) ?? ""
+          if upath != "" { url_obj.path = upath }
+          uq = string(um.query) ?? ""
+          if uq != "" { url_obj.query_string = uq }
+          if request_url != "" && us != "" { url_obj.url_string = request_url }
+      }
+      if !exists(url_obj.path) && !exists(url_obj.url_string) { url_obj.path = "/" }
+
+      # ---- method -> activity_id ----
+      activity_id = 99
+      activity_name = "Other"
+      if method == "CONNECT" { activity_id = 1; activity_name = "Connect" }
+      if method == "DELETE"  { activity_id = 2; activity_name = "Delete" }
+      if method == "GET"     { activity_id = 3; activity_name = "Get" }
+      if method == "HEAD"    { activity_id = 4; activity_name = "Head" }
+      if method == "OPTIONS" { activity_id = 5; activity_name = "Options" }
+      if method == "POST"    { activity_id = 6; activity_name = "Post" }
+      if method == "PUT"     { activity_id = 7; activity_name = "Put" }
+      if method == "TRACE"   { activity_id = 8; activity_name = "Trace" }
+      if method == "PATCH"   { activity_id = 9; activity_name = "Patch" }
+
+      status_id = 2
+      status_str = "Failure"
+      if code >= 200 && code < 400 { status_id = 1; status_str = "Success" }
+      if code == 0 { status_id = 0; status_str = "Unknown" }
+
+      # ---- squid result -> security-control action/disposition ----
+      action_id = 1
+      action_name = "Allowed"
+      disposition_id = 1
+      disposition_name = "Allowed"
+      severity_id = 1
+      severity = "Informational"
+      if contains(squid_result, "DENIED") {
+          action_id = 2
+          action_name = "Denied"
+          disposition_id = 2
+          disposition_name = "Blocked"
+          severity_id = 2
+          severity = "Low"
+      }
+
+      http_request = { "url": url_obj }
+      if method != "" { http_request.http_method = method }
+      if referrer != "" { http_request.referrer = referrer }
+
+      http_response = { "code": code, "status": status_str }
+      if resp_bytes != 0 { http_response.length = resp_bytes }
+      if content_type != "" { http_response.content_type = content_type }
+
+      unmapped = {}
+      if squid_result != "" { unmapped.cache_status = squid_result }
+      if hierarchy_code != "" { unmapped.hierarchy_code = hierarchy_code }
+      if peer_host != "" { unmapped.peer_host = peer_host }
+
+      . = {
+          "class_uid": 4002,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": 400200 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "action_id": action_id,
+          "action": action_name,
+          "disposition_id": disposition_id,
+          "disposition": disposition_name,
+          "time": time_ms,
+          "duration": duration_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "profiles": ["host", "security_control"],
+              "log_name": "squid-access",
+              "product": { "name": "Squid Proxy", "vendor_name": "Squid Project" }
+          },
+          "http_request": http_request,
+          "http_response": http_response,
+          "unmapped": unmapped
+      }
+      if resp_bytes != 0 { .traffic = { "bytes_out": resp_bytes } }
+      if match(client, ip_re) {
+          .src_endpoint = { "ip": client }
+      } else if client != "" && client != "-" {
+          .src_endpoint = { "hostname": downcase(client) }
+      }
+      dst_endpoint = {}
+      if dst_ip != "" { dst_endpoint.ip = dst_ip }
+      if dst_host != "" { dst_endpoint.hostname = downcase(dst_host) }
+      if dst_port != 0 { dst_endpoint.port = dst_port }
+      if exists(dst_endpoint.ip) || exists(dst_endpoint.hostname) { .dst_endpoint = dst_endpoint }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+  } else {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_name": "squid-access",
+              "product": { "name": "Squid Proxy", "vendor_name": "Squid Project" }
+          }
+      }
+  }
+
+  .
+
+# Runtime samples (NAN-2327): one per event shape this parser routes.
+# `class_uid` is asserted because class routing is the whole point of the
+# OCSF conversion — a silent reroute is the defect most likely to survive
+# a compile-only check.
+samples:
+  - raw: '1786000530.881 5012 10.20.1.56 TCP_TUNNEL/200 48210 CONNECT secure.example.org:443 - HIER_DIRECT/203.0.113.20 -'
+    expect:
+      class_uid: 4002
+      activity_id: 1
+  - raw: '1786000541.002 0 10.20.1.99 TCP_DENIED/403 3891 GET http://gambling.example.net/ - HIER_NONE/- text/html'
+    expect:
+      class_uid: 4002
+      activity_id: 3
+  - raw: '1786000522.345 231 10.20.1.55 TCP_MISS/200 32419 GET http://downloads.example.com/pkg/tool.tar.gz?v=3 jdoe DIRECT/93.184.216.34 application/octet-stream "http://intranet.example.com/tools"'
+    expect:
+      class_uid: 4002
+      activity_id: 3
+  - raw: '1786000541.002 0 10.20.1.99 TCP_DENIED/403'
+    expect:
+      class_uid: 0
+      activity_id: 99

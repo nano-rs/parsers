@@ -1,0 +1,441 @@
+name: juniper_srx_ocsf
+display_name: Juniper SRX (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Juniper SRX structured syslog ([junos@... key="value"]) into OCSF
+  1.9.0. RT_FLOW_SESSION_CREATE / _CLOSE / _DENY route to Network Activity
+  (4001) with activity Open / Close / Refuse; RT_IDP attack records route to
+  Detection Finding (2004); RT_UTM webfilter records route to HTTP Activity
+  (4002). Unlike the UDM parser this one never aborts on a non-RFC-5424 line —
+  it emits a Network Activity record with activity_id 99 and the raw line in
+  `message`.
+match_values:
+  - juniper_srx
+category: network
+vendor: "Juniper"
+product: "SRX"
+parser_vrl: |
+  # Juniper SRX -> OCSF 1.9.0
+
+  raw_log = string!(.message)
+
+  time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
+  dvc_host = ""
+  app_name_hdr = ""
+  msg_id = ""
+  rest = raw_log
+
+  hm, he = parse_regex(raw_log, r'^<(?P<pri>\d+)>\d*\s*(?P<ts>\S+)\s+(?P<host>\S+)\s+(?P<appname>\S+)\s+(?P<procid>\S+)\s+(?P<msgid>\S+)\s+(?P<rest>.*)$')
+  if he == null && hm != null {
+      dvc_host = string!(hm.host)
+      app_name_hdr = string!(hm.appname)
+      msg_id = string!(hm.msgid)
+      rest = string!(hm.rest)
+      tsv = string!(hm.ts)
+      ts, ts_err = parse_timestamp(tsv, "%Y-%m-%dT%H:%M:%S%.fZ")
+      if ts_err == null {
+          time_ms = to_int(to_unix_timestamp(ts, unit: "milliseconds"))
+      } else {
+          ts2, ts2_err = parse_timestamp(tsv, "%Y-%m-%dT%H:%M:%S%.f%z")
+          if ts2_err == null { time_ms = to_int(to_unix_timestamp(ts2, unit: "milliseconds")) }
+      }
+  }
+  # Some SRX deployments log the message id inline rather than in the MSGID slot.
+  if msg_id == "" || msg_id == "-" {
+      im, ie = parse_regex(raw_log, r'(?P<mid>RT_[A-Z0-9_]+)')
+      if ie == null && im != null { msg_id = string!(im.mid) }
+  }
+
+  kv = {}
+  sm, se = parse_regex(rest, r'\x5Bjunos@\S+\s+(?P<kvdata>[^\x5D]+)\x5D')
+  if se == null && sm != null {
+      kv = parse_key_value(string!(sm.kvdata), key_value_delimiter: "=", field_delimiter: " ") ?? {}
+  }
+
+  src_ip = to_string(kv."source-address") ?? ""
+  dst_ip = to_string(kv."destination-address") ?? ""
+  src_port = to_int(to_string(kv."source-port") ?? "") ?? 0
+  dst_port = to_int(to_string(kv."destination-port") ?? "") ?? 0
+  src_zone = to_string(kv."source-zone-name") ?? ""
+  dst_zone = to_string(kv."destination-zone-name") ?? ""
+  src_if = to_string(kv."packet-incoming-interface") ?? ""
+  if src_if == "" { src_if = to_string(kv."source-interface-name") ?? "" }
+  dst_if = to_string(kv."destination-interface-name") ?? ""
+
+  proto_num = to_int(to_string(kv."protocol-id") ?? "") ?? 0
+  proto = downcase(to_string(kv."protocol-name") ?? "")
+  if proto == "" {
+      if proto_num == 1 { proto = "icmp" }
+      if proto_num == 6 { proto = "tcp" }
+      if proto_num == 17 { proto = "udp" }
+      if proto_num == 47 { proto = "gre" }
+      if proto_num == 50 { proto = "esp" }
+      if proto_num == 58 { proto = "icmpv6" }
+  }
+  if proto_num == 0 {
+      if proto == "tcp" { proto_num = 6 }
+      if proto == "udp" { proto_num = 17 }
+      if proto == "icmp" { proto_num = 1 }
+  }
+
+  policy = to_string(kv."policy-name") ?? ""
+  session_id = to_string(kv."session-id-32") ?? ""
+  if session_id == "" { session_id = to_string(kv."session-id") ?? "" }
+  bytes_out = to_int(to_string(kv."bytes-from-client") ?? "") ?? 0
+  bytes_in = to_int(to_string(kv."bytes-from-server") ?? "") ?? 0
+  pkts_out = to_int(to_string(kv."packets-from-client") ?? "") ?? 0
+  pkts_in = to_int(to_string(kv."packets-from-server") ?? "") ?? 0
+  duration_s = to_int(to_string(kv."elapsed-time") ?? "") ?? 0
+  repeat_cnt = to_int(to_string(kv."repeat-count") ?? "") ?? 0
+
+  user_name = to_string(kv.username) ?? ""
+  if user_name == "N/A" { user_name = "" }
+  app = to_string(kv.application) ?? ""
+  if app == "" { app = to_string(kv."application-name") ?? "" }
+  if app == "UNKNOWN" { app = "" }
+  svc_name = to_string(kv."service-name") ?? ""
+  close_reason = to_string(kv.reason) ?? ""
+  srx_action = downcase(to_string(kv.action) ?? "")
+  attack_name = to_string(kv."attack-name") ?? ""
+  threat_sev = downcase(to_string(kv."threat-severity") ?? "")
+  idp_rule = to_string(kv."rule-name") ?? ""
+  rulebase = to_string(kv."rulebase-name") ?? ""
+
+  nat_src = to_string(kv."nat-source-address") ?? ""
+  nat_dst = to_string(kv."nat-destination-address") ?? ""
+  nat_sport = to_string(kv."nat-source-port") ?? ""
+  nat_dport = to_string(kv."nat-destination-port") ?? ""
+
+  # ---- severity ----
+  severity_id = 1
+  severity = "Informational"
+  if threat_sev == "low" || threat_sev == "info" { severity_id = 2; severity = "Low" }
+  if threat_sev == "medium" { severity_id = 3; severity = "Medium" }
+  if threat_sev == "high" { severity_id = 4; severity = "High" }
+  if threat_sev == "critical" { severity_id = 5; severity = "Critical" }
+
+  # ---- routing ----
+  # Route on MSGID *and* APP-NAME: SRX puts RT_FLOW / RT_IDP / RT_UTM in the
+  # APP-NAME slot and the specific event (IDP_ATTACK_LOG_EVENT,
+  # WEBFILTER_URL_BLOCKED, ...) in MSGID.
+  mid = downcase(msg_id) + " " + downcase(app_name_hdr)
+  route = "network"
+  activity_id = 99
+  activity_name = "Other"
+  action_id = 3
+  action = "Observed"
+  disposition_id = 17
+  disposition = "Logged"
+  status_id = 1
+  status_str = "Success"
+
+  if contains(mid, "rt_flow_session_create") {
+      activity_id = 1
+      activity_name = "Open"
+      action_id = 1
+      action = "Allowed"
+      disposition_id = 1
+      disposition = "Allowed"
+  } else if contains(mid, "rt_flow_session_close") {
+      activity_id = 2
+      activity_name = "Close"
+      action_id = 1
+      action = "Allowed"
+      disposition_id = 1
+      disposition = "Allowed"
+  } else if contains(mid, "rt_flow_session_deny") {
+      activity_id = 5
+      activity_name = "Refuse"
+      action_id = 2
+      action = "Denied"
+      disposition_id = 2
+      disposition = "Blocked"
+      status_id = 2
+      status_str = "Failure"
+      severity_id = 2
+      severity = "Low"
+  } else if contains(mid, "rt_idp") || contains(mid, "idp_attack") {
+      route = "finding"
+      activity_id = 1
+      activity_name = "Create"
+      action_id = 3
+      action = "Observed"
+      disposition_id = 15
+      disposition = "Detected"
+      if severity_id < 2 { severity_id = 2; severity = "Low" }
+      if srx_action == "drop" || srx_action == "drop-packet" || srx_action == "close" || srx_action == "block" {
+          action_id = 2
+          action = "Denied"
+          disposition_id = 2
+          disposition = "Blocked"
+      }
+  } else if contains(mid, "webfilter") || contains(mid, "url_") || (contains(mid, "rt_utm") && contains(mid, "web")) {
+      route = "http"
+      if srx_action == "block" || srx_action == "blocked" {
+          action_id = 2
+          action = "Denied"
+          disposition_id = 2
+          disposition = "Blocked"
+          status_id = 2
+          status_str = "Failure"
+      } else {
+          action_id = 1
+          action = "Allowed"
+          disposition_id = 1
+          disposition = "Allowed"
+      }
+  }
+
+  # ---- objects ----
+  src = {}
+  if src_ip != "" && src_ip != "0.0.0.0" { src.ip = downcase(src_ip) }
+  if src_port > 0 { src.port = src_port }
+  if src_zone != "" { src.zone = src_zone }
+  if src_if != "" { src.interface_name = src_if }
+
+  dst = {}
+  if dst_ip != "" && dst_ip != "0.0.0.0" { dst.ip = downcase(dst_ip) }
+  if dst_port > 0 { dst.port = dst_port }
+  if dst_zone != "" { dst.zone = dst_zone }
+  if dst_if != "" { dst.interface_name = dst_if }
+  if svc_name != "" && svc_name != "None" { dst.svc_name = svc_name }
+
+  traffic = {}
+  if bytes_in > 0 { traffic.bytes_in = bytes_in }
+  if bytes_out > 0 { traffic.bytes_out = bytes_out }
+  if pkts_in > 0 { traffic.packets_in = pkts_in }
+  if pkts_out > 0 { traffic.packets_out = pkts_out }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": uuid_v4(),
+      "log_source": "juniper_srx",
+      "log_provider": "JUNOS",
+      "profiles": ["host", "security_control"],
+      "product": {
+          "name": "SRX",
+          "vendor_name": "Juniper",
+          "feature": { "name": "firewall" }
+      }
+  }
+  if msg_id != "" && msg_id != "-" { metadata.event_code = msg_id }
+  if app_name_hdr != "" && app_name_hdr != "-" { metadata.log_name = app_name_hdr }
+
+  device = { "type_id": 9, "type": "Firewall" }
+  has_device = false
+  if dvc_host != "" { device.hostname = dvc_host; has_device = true }
+
+  fw_rule = {}
+  if policy != "" { fw_rule.name = policy; fw_rule.uid = policy }
+  if idp_rule != "" && policy == "" { fw_rule.name = idp_rule; fw_rule.uid = idp_rule }
+  if rulebase != "" { fw_rule.category = rulebase }
+
+  unmapped = {}
+  if session_id != "" { unmapped.session_id = session_id }
+  if close_reason != "" { unmapped.close_reason = close_reason }
+  if srx_action != "" { unmapped.srx_action = srx_action }
+  if nat_src != "" && nat_src != "0.0.0.0" { unmapped.nat_src_ip = nat_src }
+  if nat_dst != "" && nat_dst != "0.0.0.0" { unmapped.nat_dst_ip = nat_dst }
+  if nat_sport != "" && nat_sport != "0" { unmapped.nat_src_port = nat_sport }
+  if nat_dport != "" && nat_dport != "0" { unmapped.nat_dst_port = nat_dport }
+  if idp_rule != "" { unmapped.idp_rule_name = idp_rule }
+  if length(kv) == 0 { unmapped.parse_status = "no_junos_structured_data" }
+
+  obs = []
+  if src_ip != "" && src_ip != "0.0.0.0" { obs = push(obs, { "name": "src_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(src_ip) }) }
+  if dst_ip != "" && dst_ip != "0.0.0.0" { obs = push(obs, { "name": "dst_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(dst_ip) }) }
+  if user_name != "" { obs = push(obs, { "name": "user.name", "type": "User Name", "type_id": 4, "value": user_name }) }
+
+  # ============================================================
+  # Assemble
+  # ============================================================
+  if route == "finding" {
+      class_uid = 2004
+      title = attack_name
+      if title == "" { title = "Juniper IDP detection" }
+      evidence = {}
+      if length(src) > 0 { evidence.src_endpoint = src }
+      if length(dst) > 0 { evidence.dst_endpoint = dst }
+      if proto_num > 0 { evidence.connection_info = { "direction_id": 0, "protocol_num": proto_num } }
+      if user_name != "" { evidence.user = { "name": user_name } }
+      evidence.name = "IDP attack"
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Detection Finding",
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": 1,
+          "activity_name": "Create",
+          "type_uid": class_uid * 100 + 1,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "is_alert": true,
+          "metadata": metadata,
+          "finding_info": {
+              "uid": title,
+              "title": title,
+              "data_sources": ["juniper_srx"],
+              "analytic": { "name": title, "uid": title, "type_id": 1, "type": "Rule" }
+          },
+          "evidences": [evidence]
+      }
+      if length(fw_rule) > 0 { .firewall_rule = fw_rule }
+      if has_device { .device = device }
+      if repeat_cnt > 1 { .count = repeat_cnt }
+
+  } else if route == "http" {
+      class_uid = 4002
+      url_str = to_string(kv.url) ?? ""
+      obj_name = to_string(kv."object-name") ?? ""
+      if url_str == "" { url_str = obj_name }
+      category = to_string(kv.category) ?? ""
+      url = {}
+      if url_str != "" {
+          if starts_with(url_str, "http://") || starts_with(url_str, "https://") {
+              url.url_string = url_str
+          } else {
+              url.url_string = "http://" + url_str
+          }
+          dm, de = parse_regex(url_str, r'^(?:https?://)?(?P<domain>[^/:\s]+)')
+          if de == null && dm != null { url.hostname = string!(dm.domain) }
+          pm4, pe4 = parse_regex(url_str, r'^(?:https?://)?[^/]+(?P<path>/[^\s]*)$')
+          if pe4 == null && pm4 != null { url.path = string!(pm4.path) }
+      }
+      if category != "" { url.categories = [category] }
+      req = {}
+      if length(url) > 0 { req.url = url }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": class_uid * 100 + 99,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "http_request": req,
+          "connection_info": { "direction_id": 0, "protocol_num": proto_num }
+      }
+      if proto != "" { .connection_info.protocol_name = proto }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if length(src) == 0 && length(dst) == 0 { .dst_endpoint = { "svc_name": "http" } }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if app != "" { .app_name = app }
+      if has_device { .device = device }
+
+  } else {
+      class_uid = 4001
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Network Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": { "direction_id": 0, "protocol_num": proto_num }
+      }
+      if proto != "" { .connection_info.protocol_name = proto }
+      if session_id != "" { .connection_info.uid = session_id }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if length(src) == 0 && length(dst) == 0 {
+          fb = {}
+          if dvc_host != "" { fb.hostname = dvc_host }
+          if length(fb) == 0 { fb.hostname = "unknown" }
+          .src_endpoint = fb
+      }
+      if length(traffic) > 0 { .traffic = traffic }
+      if duration_s > 0 { .duration = duration_s }
+      if repeat_cnt > 1 { .count = repeat_cnt }
+      if length(fw_rule) > 0 { .firewall_rule = fw_rule }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if app != "" { .app_name = app }
+      if close_reason != "" { .status_detail = close_reason }
+      if has_device { .device = device }
+  }
+
+  if length(unmapped) > 0 { .unmapped = unmapped }
+  if length(obs) > 0 { .observables = obs }
+
+  .
+samples:
+- raw: <14>1 2024-10-30T09:47:12.123Z srx-edge-01 RT_FLOW - RT_FLOW_SESSION_CLOSE [junos@2636.1.1.1.2.26 reason="TCP FIN" source-address="10.10.1.55" source-port="51422" destination-address="93.184.216.34" destination-port="443" service-name="junos-https" protocol-id="6" policy-name="trust-to-untrust" source-zone-name="trust" destination-zone-name="untrust" session-id-32="84732" packets-from-client="14" bytes-from-client="4210" packets-from-server="10" bytes-from-server="11111" elapsed-time="60" username="jsmith" application="HTTPS"]
+  expect:
+    class_uid: 4001
+    activity_id: 2
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 93.184.216.34
+    actor.user.name: jsmith
+    disposition_id: 1
+- raw: <14>1 2024-10-30T09:46:12.123Z srx-edge-01 RT_FLOW - RT_FLOW_SESSION_CREATE [junos@2636.1.1.1.2.26 source-address="10.10.1.55" source-port="51422" destination-address="93.184.216.34" destination-port="443" service-name="junos-https" nat-source-address="198.51.100.7" nat-source-port="32100" nat-destination-address="93.184.216.34" nat-destination-port="443" src-nat-rule-name="snat-1" dst-nat-rule-name="N/A" protocol-id="6" policy-name="trust-to-untrust" source-zone-name="trust" destination-zone-name="untrust" session-id-32="84732" username="jsmith" roles="N/A" packet-incoming-interface="ge-0/0/1" application="HTTPS" nested-application="UNKNOWN" encrypted="UNKNOWN"]
+  expect:
+    class_uid: 4001
+    activity_id: 1
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 93.184.216.34
+    actor.user.name: jsmith
+    disposition_id: 1
+- raw: <14>1 2024-10-30T09:48:12.123Z srx-edge-01 RT_FLOW - RT_FLOW_SESSION_DENY [junos@2636.1.1.1.2.26 source-address="203.0.113.44" source-port="44112" destination-address="10.10.1.20" destination-port="3389" service-name="junos-ms-rdp" protocol-id="6" icmp-type="0" policy-name="deny-all" source-zone-name="untrust" application="UNKNOWN" nested-application="UNKNOWN" username="N/A" reason="policy deny"]
+  expect:
+    class_uid: 4001
+    activity_id: 5
+    src_endpoint.ip: 203.0.113.44
+    dst_endpoint.ip: 10.10.1.20
+    disposition_id: 2
+- raw: <14>1 2024-10-30T09:49:12.123Z srx-edge-01 RT_IDP - IDP_ATTACK_LOG_EVENT [junos@2636.1.1.1.2.40 epoch-time="1730281752" message-type="SIG" source-address="203.0.113.9" source-port="44001" destination-address="10.10.1.7" destination-port="445" protocol-name="TCP" service-name="SERVICE_SMB" application-name="NONE" rule-name="1" rulebase-name="IPS" policy-name="Recommended" export-id="12345" repeat-count="3" action="DROP" threat-severity="CRITICAL" attack-name="SMB:EXPLOIT:MS17-010" nat-source-address="0.0.0.0" nat-source-port="0"]
+  expect:
+    class_uid: 2004
+    activity_id: 1
+    finding_info.uid: SMB:EXPLOIT:MS17-010
+    disposition_id: 2
+- raw: Oct 30 09:52:12 srx-edge-01 not a structured srx line
+  expect:
+    class_uid: 4001
+    activity_id: 99
+    disposition_id: 17
+- raw: <14>1 2024-10-30T09:51:12.123Z srx-edge-01 mgd 1234 UI_COMMIT_COMPLETED [junos@2636.1.1.1.2.1 message="commit complete"]
+  expect:
+    class_uid: 4001
+    activity_id: 99
+    disposition_id: 17
+- raw: <14>1 2024-10-30T09:50:12.123Z srx-edge-01 RT_UTM - WEBFILTER_URL_BLOCKED [junos@2636.1.1.1.2.36 source-address="10.10.1.55" source-port="51424" destination-address="93.184.216.34" destination-port="80" protocol-id="6" profile-name="url-profile" url="malware.example.com/payload.exe" obj="/payload.exe" username="jsmith" roles="N/A" category="Enhanced_Malicious_Web_Sites" reason="BY_PRE_DEFINED" action="BLOCK"]
+  expect:
+    class_uid: 4002
+    activity_id: 99
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 93.184.216.34
+    actor.user.name: jsmith
+    http_request.url.path: /payload.exe
+    disposition_id: 2

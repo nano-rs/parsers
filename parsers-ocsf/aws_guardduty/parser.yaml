@@ -1,0 +1,364 @@
+name: aws_guardduty_ocsf
+display_name: AWS GuardDuty (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses AWS GuardDuty findings into complete OCSF 1.9.0 "Detection Finding"
+  (class_uid 2004) records carrying the cloud and security_control profiles.
+  Handles all four GuardDuty action shapes (AWS_API_CALL, NETWORK_CONNECTION,
+  DNS_REQUEST, PORT_PROBE) and the AccessKey / Instance / S3Bucket resource
+  shapes. The whole OCSF object is emitted on the root so it lands in
+  ocsf_logs.event and the promoted columns materialize. Mirrors the UDM
+  aws_guardduty parser but targets OCSF instead of `.udm.*`.
+match_values:
+  - aws_guardduty
+category: cloud
+vendor: "Amazon"
+product: "GuardDuty"
+parser_vrl: |
+  # AWS GuardDuty finding -> OCSF 1.9.0 Detection Finding (class_uid 2004)
+  raw_log = to_string(.message) ?? ""
+  class_uid = 2004
+
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Detection Finding",
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": class_uid * 100 + 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud", "security_control"],
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_name": "GuardDuty",
+              "product": { "name": "AWS GuardDuty", "vendor_name": "Amazon" }
+          },
+          "cloud": { "provider": "AWS" },
+          "finding_info": { "uid": "unknown", "title": "Unparsable GuardDuty finding" }
+      }
+  } else {
+      p = object!(parsed)
+      resource = object(p.resource) ?? {}
+      service = object(p.service) ?? {}
+      action = object(service.action) ?? {}
+
+      finding_type = to_string(p.type) ?? ""
+      finding_id = to_string(p.id) ?? ""
+      if finding_id == "" { finding_id = uuid_v4() }
+
+      # ---- severity: GuardDuty 0.1-10 -> OCSF severity_id ----
+      raw_sev = to_float(p.severity) ?? 0.0
+      severity_id = 1
+      severity = "Informational"
+      if raw_sev >= 1.0 { severity_id = 2; severity = "Low" }
+      if raw_sev >= 4.0 { severity_id = 3; severity = "Medium" }
+      if raw_sev >= 7.0 { severity_id = 4; severity = "High" }
+      if raw_sev >= 9.0 { severity_id = 5; severity = "Critical" }
+      risk_score = to_int(round(raw_sev * 10.0))
+
+      # ---- times ----
+      created_ms = 0
+      created_str = to_string(p.createdAt) ?? ""
+      if created_str != "" {
+          ct, cterr = parse_timestamp(created_str, "%+")
+          if cterr == null { created_ms = to_unix_timestamp(ct, unit: "milliseconds") }
+      }
+      updated_ms = 0
+      updated_str = to_string(p.updatedAt) ?? ""
+      if updated_str != "" {
+          ut, uterr = parse_timestamp(updated_str, "%+")
+          if uterr == null { updated_ms = to_unix_timestamp(ut, unit: "milliseconds") }
+      }
+      # A finding whose updatedAt has moved on is an update, not a first sighting.
+      activity_id = 1
+      activity_name = "Create"
+      if updated_ms > created_ms { activity_id = 2; activity_name = "Update" }
+      time_ms = created_ms
+      if updated_ms > 0 { time_ms = updated_ms }
+
+      first_seen_ms = 0
+      fs_str = to_string(service.eventFirstSeen) ?? ""
+      if fs_str != "" {
+          ft, fterr = parse_timestamp(fs_str, "%+")
+          if fterr == null { first_seen_ms = to_unix_timestamp(ft, unit: "milliseconds") }
+      }
+      last_seen_ms = 0
+      ls_str = to_string(service.eventLastSeen) ?? ""
+      if ls_str != "" {
+          lt, lterr = parse_timestamp(ls_str, "%+")
+          if lterr == null { last_seen_ms = to_unix_timestamp(lt, unit: "milliseconds") }
+      }
+
+      # ---- finding_info ----
+      finding_info = {
+          "uid": finding_id,
+          "title": to_string(p.title) ?? finding_type,
+          "types": [finding_type],
+          "analytic": {
+              "name": "AWS GuardDuty",
+              "type_id": 2,
+              "type": "Behavioral",
+              "uid": to_string(service.detectorId) ?? "guardduty"
+          },
+          "data_sources": ["AWS GuardDuty"],
+          "product": { "name": "AWS GuardDuty", "vendor_name": "Amazon" }
+      }
+      desc = to_string(p.description) ?? ""
+      if desc != "" { finding_info.desc = desc }
+      if created_ms > 0 { finding_info.created_time = created_ms }
+      if updated_ms > 0 { finding_info.modified_time = updated_ms }
+      if first_seen_ms > 0 { finding_info.first_seen_time = first_seen_ms }
+      if last_seen_ms > 0 { finding_info.last_seen_time = last_seen_ms }
+      arn = to_string(p.arn) ?? ""
+      if arn != "" { finding_info.uid_alt = arn }
+
+      # ---- cloud ----
+      cloud = { "provider": "AWS" }
+      region = to_string(p.region) ?? ""
+      if region != "" { cloud.region = region }
+      acct = to_string(p.accountId) ?? ""
+      if acct != "" { cloud.account = { "uid": acct } }
+      partition = to_string(p.partition) ?? ""
+      if partition != "" { cloud.cloud_partition = partition }
+
+      unmapped = {}
+      resources = []
+      actor = {}
+      src_endpoint = {}
+      dst_endpoint = {}
+      api_obj = {}
+
+      # ---- resource: IAM access key ----
+      ak = object(resource.accessKeyDetails) ?? {}
+      if length(keys(ak)) > 0 {
+          user = {}
+          uname = to_string(ak.userName) ?? ""
+          if uname != "" { user.name = uname }
+          pid = to_string(ak.principalId) ?? ""
+          if pid != "" { user.uid = pid }
+          utype = to_string(ak.userType) ?? ""
+          if utype != "" { user.type = utype }
+          if length(keys(user)) > 0 { actor.user = user }
+          akid = to_string(ak.accessKeyId) ?? ""
+          if akid != "" { unmapped.access_key_id = akid }
+          resources = push(resources, { "type": "AWS::IAM::AccessKey", "uid": akid, "name": uname })
+      }
+
+      # ---- resource: EC2 instance ----
+      inst = object(resource.instanceDetails) ?? {}
+      if length(keys(inst)) > 0 {
+          iid = to_string(inst.instanceId) ?? ""
+          resources = push(resources, { "type": "AWS::EC2::Instance", "uid": iid, "name": iid })
+          if iid != "" { unmapped.instance_id = iid }
+          itype = to_string(inst.instanceType) ?? ""
+          if itype != "" { unmapped.instance_type = itype }
+          img = to_string(inst.imageId) ?? ""
+          if img != "" { unmapped.image_id = img }
+          az = to_string(inst.availabilityZone) ?? ""
+          if az != "" { cloud.zone = az }
+          ifaces = array(inst.networkInterfaces) ?? []
+          first_iface = get(ifaces, [0]) ?? null
+          if first_iface != null {
+              priv = to_string(get(first_iface, ["privateIpAddress"]) ?? "") ?? ""
+              if priv != "" { dst_endpoint.ip = downcase(priv) }
+              pdns = to_string(get(first_iface, ["privateDnsName"]) ?? "") ?? ""
+              if pdns != "" { dst_endpoint.hostname = pdns }
+              if iid != "" { dst_endpoint.instance_uid = iid }
+              vpc = to_string(get(first_iface, ["vpcId"]) ?? "") ?? ""
+              if vpc != "" { dst_endpoint.vpc_uid = vpc }
+              sub = to_string(get(first_iface, ["subnetId"]) ?? "") ?? ""
+              if sub != "" { dst_endpoint.subnet_uid = sub }
+              eni = to_string(get(first_iface, ["networkInterfaceId"]) ?? "") ?? ""
+              if eni != "" { dst_endpoint.interface_uid = eni }
+              pub = to_string(get(first_iface, ["publicIp"]) ?? "") ?? ""
+              if pub != "" { unmapped.instance_public_ip = pub }
+          }
+      }
+
+      # ---- resource: S3 buckets ----
+      buckets = array(resource.s3BucketDetails) ?? []
+      for_each(buckets) -> |_i, b| {
+          bname = to_string(get(b, ["name"]) ?? "") ?? ""
+          barn = to_string(get(b, ["arn"]) ?? "") ?? ""
+          resources = push(resources, { "type": "AWS::S3::Bucket", "uid": barn, "name": bname })
+      }
+
+      # ---- service.action: four shapes ----
+      action_type = to_string(action.actionType) ?? ""
+      if action_type != "" { unmapped.action_type = action_type }
+
+      api_call = object(action.awsApiCallAction) ?? {}
+      if length(keys(api_call)) > 0 {
+          api_name = to_string(api_call.api) ?? ""
+          api_svc = to_string(api_call.serviceName) ?? ""
+          svc_short = api_svc
+          sm, smerr = parse_regex(api_svc, r'^(?P<s>[^.]+)')
+          if smerr == null { svc_short = to_string(sm.s) }
+          api_obj = { "operation": api_name, "service": { "name": svc_short } }
+          caller_type = to_string(api_call.callerType) ?? ""
+          if caller_type != "" { unmapped.caller_type = caller_type }
+          dom = to_string(get(api_call, ["domainDetails", "domain"]) ?? "") ?? ""
+          if dom != "" { unmapped.caller_domain = dom }
+          rid = object(api_call.remoteIpDetails) ?? {}
+          if length(keys(rid)) > 0 {
+              rip = to_string(rid.ipAddressV4) ?? ""
+              if rip != "" { src_endpoint.ip = downcase(rip) }
+              country = to_string(get(rid, ["country", "countryName"]) ?? "") ?? ""
+              city = to_string(get(rid, ["city", "cityName"]) ?? "") ?? ""
+              loc = {}
+              if country != "" { loc.country = country }
+              if city != "" { loc.city = city }
+              if length(keys(loc)) > 0 { src_endpoint.location = loc }
+              asn = to_int(get(rid, ["organization", "asn"]) ?? 0) ?? 0
+              asn_org = to_string(get(rid, ["organization", "org"]) ?? "") ?? ""
+              as_obj = {}
+              if asn > 0 { as_obj.number = asn }
+              if asn_org != "" { as_obj.name = asn_org }
+              if length(keys(as_obj)) > 0 { src_endpoint.autonomous_system = as_obj }
+              isp = to_string(get(rid, ["organization", "isp"]) ?? "") ?? ""
+              if isp != "" { src_endpoint.isp = isp }
+          }
+      }
+
+      net_action = object(action.networkConnectionAction) ?? {}
+      if length(keys(net_action)) > 0 {
+          direction = to_string(net_action.connectionDirection) ?? ""
+          if direction != "" { unmapped.connection_direction = direction }
+          proto = to_string(net_action.protocol) ?? ""
+          if proto != "" { unmapped.protocol = downcase(proto) }
+          blocked = to_bool(net_action.blocked) ?? false
+          unmapped.blocked = blocked
+          lport = to_int(get(net_action, ["localPortDetails", "port"]) ?? 0) ?? 0
+          if lport > 0 { dst_endpoint.port = lport }
+          lip = to_string(get(net_action, ["localIpDetails", "ipAddressV4"]) ?? "") ?? ""
+          if lip != "" && !exists(dst_endpoint.ip) { dst_endpoint.ip = downcase(lip) }
+          rport = to_int(get(net_action, ["remotePortDetails", "port"]) ?? 0) ?? 0
+          if rport > 0 { src_endpoint.port = rport }
+          rid2 = object(net_action.remoteIpDetails) ?? {}
+          if length(keys(rid2)) > 0 {
+              rip2 = to_string(rid2.ipAddressV4) ?? ""
+              if rip2 != "" { src_endpoint.ip = downcase(rip2) }
+              country2 = to_string(get(rid2, ["country", "countryName"]) ?? "") ?? ""
+              if country2 != "" { src_endpoint.location = { "country": country2 } }
+              asn2 = to_int(get(rid2, ["organization", "asn"]) ?? 0) ?? 0
+              org2 = to_string(get(rid2, ["organization", "org"]) ?? "") ?? ""
+              as2 = {}
+              if asn2 > 0 { as2.number = asn2 }
+              if org2 != "" { as2.name = org2 }
+              if length(keys(as2)) > 0 { src_endpoint.autonomous_system = as2 }
+          }
+      }
+
+      dns_action = object(action.dnsRequestAction) ?? {}
+      if length(keys(dns_action)) > 0 {
+          dns_domain = to_string(dns_action.domain) ?? ""
+          if dns_domain != "" {
+              unmapped.dns_domain = dns_domain
+              dst_endpoint.domain = dns_domain
+          }
+          dns_blocked = to_bool(dns_action.blocked) ?? false
+          unmapped.blocked = dns_blocked
+          dns_proto = to_string(dns_action.protocol) ?? ""
+          if dns_proto != "" { unmapped.protocol = downcase(dns_proto) }
+      }
+
+      probe = object(action.portProbeAction) ?? {}
+      if length(keys(probe)) > 0 {
+          unmapped.blocked = to_bool(probe.blocked) ?? false
+          details = array(probe.portProbeDetails) ?? []
+          first_probe = get(details, [0]) ?? null
+          if first_probe != null {
+              pport = to_int(get(first_probe, ["localPortDetails", "port"]) ?? 0) ?? 0
+              if pport > 0 { dst_endpoint.port = pport }
+              prip = to_string(get(first_probe, ["remoteIpDetails", "ipAddressV4"]) ?? "") ?? ""
+              if prip != "" { src_endpoint.ip = downcase(prip) }
+              pcountry = to_string(get(first_probe, ["remoteIpDetails", "country", "countryName"]) ?? "") ?? ""
+              if pcountry != "" { src_endpoint.location = { "country": pcountry } }
+          }
+      }
+
+      # ---- threat intel evidence ----
+      evidence = object(service.evidence) ?? {}
+      tid = array(evidence.threatIntelligenceDetails) ?? []
+      first_ti = get(tid, [0]) ?? null
+      if first_ti != null {
+          tl = to_string(get(first_ti, ["threatListName"]) ?? "") ?? ""
+          if tl != "" { unmapped.threat_list_name = tl }
+          tnames = array(get(first_ti, ["threatNames"]) ?? []) ?? []
+          first_tn = get(tnames, [0]) ?? null
+          if first_tn != null { unmapped.threat_name = to_string(first_tn) ?? "" }
+      }
+
+      ocsf = {
+          "class_uid": class_uid,
+          "class_name": "Detection Finding",
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": 1,
+          "status": "New",
+          "is_alert": true,
+          "risk_score": risk_score,
+          "time": time_ms,
+          "message": to_string(p.title) ?? finding_type,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud", "security_control"],
+              "uid": finding_id,
+              "log_name": "GuardDuty",
+              "log_provider": "AWS GuardDuty",
+              "product": { "name": "AWS GuardDuty", "vendor_name": "Amazon" }
+          },
+          "cloud": cloud,
+          "finding_info": finding_info
+      }
+      schema_ver = to_string(p.schemaVersion) ?? ""
+      if schema_ver != "" { unmapped.guardduty_schema_version = schema_ver }
+      cnt = to_int(service.count) ?? 0
+      if cnt > 0 { ocsf.count = cnt }
+      det = to_string(service.detectorId) ?? ""
+      if det != "" { unmapped.detector_id = det }
+      sample = to_bool(get(service, ["additionalInfo", "sample"]) ?? false) ?? false
+      unmapped.is_sample = sample
+
+      # `actor` on Detection Finding comes from the host profile, so declaring
+      # the profile is what makes the attribute legal.
+      if length(keys(actor)) > 0 {
+          ocsf.actor = actor
+          ocsf.metadata.profiles = ["cloud", "security_control", "host"]
+      }
+      if length(keys(api_obj)) > 0 { ocsf.api = api_obj }
+      if length(resources) > 0 { ocsf.resources = resources }
+      if length(keys(unmapped)) > 0 { ocsf.unmapped = unmapped }
+
+      # Detection Finding has no src_endpoint/dst_endpoint of its own; the
+      # network context rides in evidences[], which is the OCSF-sanctioned home.
+      ev = {}
+      if length(keys(src_endpoint)) > 0 { ev.src_endpoint = src_endpoint }
+      if length(keys(dst_endpoint)) > 0 { ev.dst_endpoint = dst_endpoint }
+      if length(keys(actor)) > 0 { ev.actor = actor }
+      if length(keys(api_obj)) > 0 { ev.api = api_obj }
+      if length(keys(ev)) > 0 {
+          ev.name = finding_type
+          ocsf.evidences = [ev]
+      }
+
+      . = ocsf
+  }

@@ -1,31 +1,50 @@
 name: conduit_proxy_ocsf
 display_name: Conduit MITM Proxy (OCSF)
-version: "1.3.0"
+version: "2.0.0"
+ocsf_version: "1.9.0"
 description: >
-  Parses Conduit MITM proxy access logs into a complete OCSF 1.8.0
+  Parses Conduit MITM proxy access logs into a complete OCSF 1.9.0
   "HTTP Activity" (class_uid 4002) record. The whole OCSF object is emitted on
   the root so it lands in the ocsf_logs `event` column and the promoted columns
   materialize. Mirrors the UDM conduit_proxy parser
   (../parsers/parsers/conduit_proxy/parser.yaml) but targets OCSF instead of
-  `.udm.*`. Proxy-specific signals that have no OCSF home (threat scoring, DLP
-  category/action, cache status) are preserved under the standard OCSF
-  `unmapped` object so nothing is lost.
+  `.udm.*`. Threat detector results become OCSF `enrichments`; the three
+  proxy facts with no OCSF home (cache result, proxy auth method, TLS
+  interception) stay in `unmapped`.
+
+  v2.0.0 — OCSF 1.8.0 -> 1.9.0 upgrade:
+    * metadata.version is now "1.9.0".
+    * metadata.profiles declares BOTH "host" (for `actor`) and
+      "security_control" (for action/disposition/risk_*/is_alert/
+      firewall_rule). Declaring only one of them makes the other family of
+      attributes fail as "not defined for this OCSF class/profile".
+    * The top-level `user` object was REMOVED. `user` is not an attribute of
+      HTTP Activity in OCSF 1.9 at all — the authenticated proxy user is
+      `actor.user.name` and nothing else.
+    * src_endpoint/dst_endpoint are now only emitted when they carry an
+      identifying attribute, and `ip` only when the value really is an IP:
+      network_endpoint has an at-least-one constraint and `ip` is regex-checked
+      as ip_t, so the old unconditional `{"ip": ""}` was invalid.
+    * The non-access/parse-failure fallback emits Base Event (class_uid 0)
+      instead of a 4002 with neither http_request nor http_response.
 match_values:
   - conduit_proxy
 category: network
 vendor: "Conduit"
 product: "Conduit Proxy"
 parser_vrl: |
-  # Conduit proxy JSON access log -> OCSF 1.8.0 HTTP Activity (class_uid 4002).
+  # Conduit proxy JSON access log -> OCSF 1.9.0 HTTP Activity (class_uid 4002).
   # Emits the COMPLETE OCSF record on the root.
 
   raw_log = string!(.message)
   parsed, err = parse_json(raw_log)
 
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
+
   if err == null && is_object(parsed) {
       p = object!(parsed)
 
-      # ---- method -> activity_id (OCSF HTTP Activity enum, 1.8.0) ----
+      # ---- method -> activity_id (OCSF HTTP Activity enum, 1.9.0) ----
       method = upcase(string(p.method) ?? "")
       activity_id = 99
       activity_name = "Other"
@@ -69,8 +88,12 @@ parser_vrl: |
       upstream = string(p.upstream_addr) ?? ""
       if upstream != "" {
           ua = split(upstream, ":")
-          if length(ua) >= 1 { dst_endpoint.ip = downcase(string(ua[0]) ?? "") }
-          if length(ua) >= 2 { dst_endpoint.port = to_int(ua[1]) ?? 0 }
+          cand = downcase(string(ua[0]) ?? "")
+          if match(cand, ip_re) { dst_endpoint.ip = cand }
+          if length(ua) >= 2 {
+              uport = to_int(ua[1]) ?? 0
+              if uport != 0 { dst_endpoint.port = uport }
+          }
       }
       if !exists(dst_endpoint.port) {
           dport = to_int(p.port) ?? 0
@@ -89,63 +112,90 @@ parser_vrl: |
       cat_val = string(p.category) ?? ""
       if cat_val != "" { url_categories = [cat_val] }
 
-      http_request = {
-          "http_method": method,
-          "url": {
-              "path": req_path,
-              "url_string": full_url,
-              "hostname": downcase(host),
-              "categories": url_categories
-          }
-      }
+      url_obj = {}
+      if req_path != "" { url_obj.path = req_path }
+      if full_url != "" { url_obj.url_string = full_url }
+      if host != "" { url_obj.hostname = downcase(host) }
+      scheme = downcase(string(p.scheme) ?? "")
+      if scheme != "" { url_obj.scheme = scheme }
+      if length(url_categories) > 0 { url_obj.categories = url_categories }
+      # url has an at-least-one [url_string, path] constraint.
+      if !exists(url_obj.path) && !exists(url_obj.url_string) { url_obj.path = "/" }
+
+      http_request = { "url": url_obj }
+      if method != "" { http_request.http_method = method }
 
       http_response = {
           "code": code,
           "length": to_int(p.response_bytes) ?? 0,
           "status": status_str
       }
+      ctype = string(p.content_type) ?? ""
+      if ctype != "" { http_response.content_type = ctype }
 
-      # threat_signals arrives as an array of {name, score, tier} objects, which
-      # is awkward to query (positional indices) and renders as a JSON blob in
-      # the record view. Reshape it into a name-keyed map so each detector is a
-      # first-class queryable JSON subcolumn under `unmapped`
-      # (e.g. unmapped.threat_signals.dga_entropy.score > 0.5) and flattens to
-      # leaf rows in the inspector. Detection rules ride the same nPL->SQL path,
-      # so signals are usable in rules directly. The raw array is preserved in
-      # the OCSF `message` (raw log), so nothing is lost.
-      threat_signals = {}
+      # Security-control profile outcome. The normalized action/disposition are
+      # intentionally separate from the source's raw value, which is retained
+      # when it cannot be mapped.
+      action_raw = downcase(string(p.action) ?? "")
+      action_id = 0
+      action_name = "Unknown"
+      disposition_id = 0
+      disposition_name = "Unknown"
+      if action_raw == "allow" || action_raw == "allowed" {
+          action_id = 1
+          action_name = "Allowed"
+          disposition_id = 1
+          disposition_name = "Allowed"
+      } else if action_raw == "deny" || action_raw == "denied" || action_raw == "block" || action_raw == "blocked" || blocked {
+          action_id = 2
+          action_name = "Denied"
+          disposition_id = 2
+          disposition_name = "Blocked"
+      } else if action_raw != "" {
+          action_id = 99
+          action_name = action_raw
+      }
+
+      threat_tier = downcase(string(p.threat_tier) ?? "")
+      risk_level_id = 99
+      risk_level = threat_tier
+      if threat_tier == "tier0" { risk_level_id = 0; risk_level = "Info" }
+      if threat_tier == "tier1" { risk_level_id = 1; risk_level = "Low" }
+      if threat_tier == "tier2" { risk_level_id = 2; risk_level = "Medium" }
+      if threat_tier == "tier3" { risk_level_id = 3; risk_level = "High" }
+      if threat_tier == "tier4" { risk_level_id = 4; risk_level = "Critical" }
+      if threat_tier == "" { risk_level = "Unknown" }
+
+      # Every detector result is an OCSF enrichment of the requested host. The
+      # detector-specific score and tier stay lossless in `data`.
+      enrichments = []
       raw_signals = array(p.threat_signals) ?? []
       for_each(raw_signals) -> |_i, sig| {
           s = object(sig) ?? {}
           sig_name = string(s.name) ?? ""
           if sig_name != "" {
-              threat_signals = set(threat_signals, [sig_name], {
-                  "score": s.score,
-                  "tier": s.tier
-              }) ?? threat_signals
+              enrichments = push(enrichments, {
+                  "name": "http_request.url.hostname",
+                  "value": downcase(host),
+                  "type": "threat_signal",
+                  "provider": "Conduit Proxy",
+                  "data": {
+                      "detector": sig_name,
+                      "score": s.score,
+                      "tier": s.tier
+                  }
+              })
           }
       }
 
-      # Proxy-specific signals with no PROMOTED OCSF column -> standard
-      # `unmapped` (the OCSF extended-fields spill). NAN-1443 lean storage keeps
-      # only promoted columns + this object + raw `message`, so anything not
-      # promoted must land here to stay a queryable field rather than
-      # message-only. `scheme`/`auth_method` were previously dropped to
-      # message-only (NAN-1462); `url.scheme` is not a promoted column, so
-      # `scheme` belongs here, not at a non-promoted spec path.
-      unmapped = {
-          "action": string(p.action) ?? null,
-          "scheme": string(p.scheme) ?? null,
-          "auth_method": string(p.auth_method) ?? null,
-          "cache_status": string(p.cache_status) ?? null,
-          "content_type": string(p.content_type) ?? null,
-          "tls_intercepted": p.tls_intercepted,
-          "threat_score": p.threat_score,
-          "threat_tier": string(p.threat_tier) ?? null,
-          "threat_blocked": p.threat_blocked,
-          "threat_signals": threat_signals,
-          "rule_id": p.rule_id
-      }
+      # OCSF 1.9 has no cache-result, proxy-auth-method, or TLS-interception
+      # attribute. Keep only those three source facts in `unmapped`.
+      unmapped = {}
+      am = string(p.auth_method) ?? ""
+      if am != "" { unmapped.auth_method = am }
+      cs = string(p.cache_status) ?? ""
+      if cs != "" { unmapped.cache_status = cs }
+      if is_boolean(p.tls_intercepted) { unmapped.tls_intercepted = p.tls_intercepted }
 
       . = {
           "class_uid": class_uid,
@@ -157,14 +207,26 @@ parser_vrl: |
           "type_uid": class_uid * 100 + activity_id,
           "severity_id": severity_id,
           "severity": severity,
+          "action_id": action_id,
+          "action": action_name,
+          "disposition_id": disposition_id,
+          "disposition": disposition_name,
+          "is_alert": blocked,
+          "risk_score": to_int((to_float(p.threat_score) ?? 0.0) * 100.0),
+          "risk_level_id": risk_level_id,
+          "risk_level": risk_level,
           "status_id": status_id,
           "status": status_str,
           "time": time_ms,
           # NAN-1465: base-event duration (ms) -> promoted `duration` column.
           "duration": to_int(p.duration_ms) ?? 0,
           "message": raw_log,
+          "raw_data": raw_log,
           "metadata": {
-              "version": "1.8.0",
+              "version": "1.9.0",
+              # "host" unlocks `actor`; "security_control" unlocks
+              # action/disposition/risk_*/is_alert/firewall_rule.
+              "profiles": ["host", "security_control"],
               "uid": string(p.id) ?? uuid_v4(),
               "log_name": "conduit-proxy",
               "product": {
@@ -172,43 +234,54 @@ parser_vrl: |
                   "vendor_name": "Conduit"
               }
           },
-          "src_endpoint": {
-              "ip": downcase(string(p.client_ip) ?? "")
-          },
-          "dst_endpoint": dst_endpoint,
           "http_request": http_request,
           "http_response": http_response,
           # OCSF: bytes_in = source(client)->destination, bytes_out = destination->source.
           "traffic": {
               "bytes_in": to_int(p.request_bytes) ?? 0,
               "bytes_out": to_int(p.response_bytes) ?? 0
-          },
-          "unmapped": unmapped
+          }
       }
 
-      # authenticated proxy user -> actor.user.name (+ top-level user.name),
-      # omit when absent/null.
+      client_ip = downcase(string(p.client_ip) ?? "")
+      if match(client_ip, ip_re) { .src_endpoint = { "ip": client_ip } }
+      if exists(dst_endpoint.ip) || exists(dst_endpoint.hostname) { .dst_endpoint = dst_endpoint }
+      if length(enrichments) > 0 { .enrichments = enrichments }
+      if length(unmapped) > 0 { .unmapped = unmapped }
+
+      rule_id = to_string(p.rule_id) ?? ""
+      if rule_id != "" { .firewall_rule = { "uid": rule_id } }
+
+      # Authenticated proxy user -> actor.user.name ONLY. OCSF 1.9 HTTP
+      # Activity has no top-level `user`; emitting one is rejected outright.
       auth_user = string(p.username) ?? ""
       if auth_user != "" {
           .actor = { "user": { "name": downcase(auth_user) } }
-          .user = { "name": downcase(auth_user) }
       }
   } else {
       # Non-access (internal/error) lines or parse failure: land a minimal,
-      # debuggable record rather than dropping the row.
+      # debuggable Base Event rather than dropping the row or emitting a 4002
+      # that carries neither http_request nor http_response.
       . = {
-          "class_uid": 4002,
-          "category_uid": 4,
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
           "activity_id": 99,
-          "type_uid": 400299,
+          "activity_name": "Other",
+          "type_uid": 99,
           "severity_id": 1,
+          "severity": "Informational",
           "status_id": 0,
+          "status": "Unknown",
           "time": 0,
           "message": raw_log,
+          "raw_data": raw_log,
           "metadata": {
-              "version": "1.8.0",
+              "version": "1.9.0",
               "uid": uuid_v4(),
               "log_level": "error",
+              "log_name": "conduit-proxy",
               "product": {
                   "name": "Conduit Proxy",
                   "vendor_name": "Conduit"
@@ -216,3 +289,23 @@ parser_vrl: |
           }
       }
   }
+
+  .
+
+# Runtime samples (NAN-2327): one per event shape this parser routes.
+# `class_uid` is asserted because class routing is the whole point of the
+# OCSF conversion — a silent reroute is the defect most likely to survive
+# a compile-only check.
+samples:
+  - raw: '{"id":"01J8ZR","timestamp":"2026-08-12T09:15:25.000000000Z","client_ip":"10.10.4.32","method":"CONNECT","scheme":"https","host":"api.github.com","port":443,"path":"/","full_url":"https://api.github.com/","status_code":200,"request_bytes":420,"response_bytes":15320,"duration_ms":88,"action":"allow","threat_score":0.02,"threat_tier":"tier0","threat_blocked":false,"threat_signals":[]}'
+    expect:
+      class_uid: 4002
+      activity_id: 1
+  - raw: '{"id":"01J8ZQ","timestamp":"2026-08-12T09:15:22.123456789Z","client_ip":"10.10.4.31","username":"bsmith","method":"GET","scheme":"https","host":"malware-cdn.example","port":443,"path":"/payload.bin","full_url":"https://malware-cdn.example/payload.bin","status_code":403,"request_bytes":812,"response_bytes":0,"duration_ms":14,"upstream_addr":"198.51.100.77:443","content_type":"application/octet-stream","cache_status":"MISS","auth_method":"ntlm","tls_intercepted":true,"action":"block","category":"malware","threat_score":0.93,"threat_tier":"tier4","threat_blocked":true,"rule_id":"RULE-118","threat_signals":[{"name":"dga_entropy","score":0.81,"tier":"tier3"},{"name":"newly_seen_domain","score":0.95,"tier":"tier4"}]}'
+    expect:
+      class_uid: 4002
+      activity_id: 3
+  - raw: '2026-08-12T09:15:30Z conduit-proxy INFO reload complete, 4 workers'
+    expect:
+      class_uid: 0
+      activity_id: 99

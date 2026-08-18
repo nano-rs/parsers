@@ -1,0 +1,364 @@
+name: f5_waf_ocsf
+display_name: F5 BIG-IP ASM (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses F5 BIG-IP ASM / Advanced WAF logs (syslog-wrapped or bare
+  comma-separated key=value) into OCSF 1.9.0 HTTP Activity (class_uid 4002).
+  The HTTP request/response is the event; the WAF verdict rides on
+  action_id / disposition_id, the ASM policy on firewall_rule, and the
+  violation detail (attack_type, violations, signature set, bot class,
+  support id) on unmapped.*. Lines that yield no recognisable ASM keys still
+  emit a well-formed 4002 record with activity_id 99 and the raw line in
+  `message`.
+match_values:
+  - f5_waf
+category: security
+vendor: "F5"
+product: "BIG-IP ASM"
+parser_vrl: |
+  # F5 BIG-IP ASM -> OCSF 1.9.0 HTTP Activity (class_uid 4002)
+
+  raw_log = string!(.message)
+
+  time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
+  dvc_host = null
+  body = raw_log
+
+  syslog_match, syslog_err = parse_regex(raw_log, r'^(?:<(?P<pri>\d+)>)?(?P<ts>[A-Z][a-z]{2}\s+\d+\s+\d+:\d+:\d+)\s+(?P<host>\S+)\s+(?P<component>[^:\x5B]+)(?:\x5B\d+\x5D)?:\s+(?P<body>.*)$')
+  if syslog_err == null && syslog_match != null {
+      body = string!(syslog_match.body)
+      hv = to_string(syslog_match.host)
+      if hv != "" { dvc_host = hv }
+      ts_str = to_string(syslog_match.ts)
+      if ts_str != "" {
+          full_ts = ts_str + " " + format_timestamp!(now(), "%Y")
+          ts, ts_err = parse_timestamp(full_ts, "%b %d %H:%M:%S %Y")
+          if ts_err == null { time_ms = to_int(to_unix_timestamp(ts, unit: "milliseconds")) }
+      }
+  }
+
+  kv = parse_key_value(body, key_value_delimiter: "=", field_delimiter: ",") ?? {}
+
+  # helper: first non-empty of a set of keys
+  pick = null
+
+  # ---- HTTP method -> activity_id ----
+  method = ""
+  mv = to_string(kv.method) ?? ""
+  if mv == "" { mv = to_string(kv.http_method) ?? "" }
+  if mv != "" { method = upcase(mv) }
+
+  activity_id = 99
+  activity_name = "Other"
+  if method == "CONNECT" { activity_id = 1;  activity_name = "Connect" }
+  if method == "DELETE"  { activity_id = 2;  activity_name = "Delete" }
+  if method == "GET"     { activity_id = 3;  activity_name = "Get" }
+  if method == "HEAD"    { activity_id = 4;  activity_name = "Head" }
+  if method == "OPTIONS" { activity_id = 5;  activity_name = "Options" }
+  if method == "POST"    { activity_id = 6;  activity_name = "Post" }
+  if method == "PUT"     { activity_id = 7;  activity_name = "Put" }
+  if method == "TRACE"   { activity_id = 8;  activity_name = "Trace" }
+  if method == "PATCH"   { activity_id = 9;  activity_name = "Patch" }
+
+  # ---- WAF verdict ----
+  waf_action = to_string(kv.action) ?? ""
+  if waf_action == "" { waf_action = to_string(kv.request_status) ?? "" }
+  la = downcase(waf_action)
+  action_id = 3
+  action = "Observed"
+  disposition_id = 17
+  disposition = "Logged"
+  if contains(la, "block") || contains(la, "reject") || contains(la, "drop") {
+      action_id = 2
+      action = "Denied"
+      disposition_id = 2
+      disposition = "Blocked"
+  }
+  if contains(la, "allow") || contains(la, "pass") {
+      action_id = 1
+      action = "Allowed"
+      disposition_id = 1
+      disposition = "Allowed"
+  }
+  if contains(la, "alert") {
+      action_id = 3
+      action = "Observed"
+      disposition_id = 19
+      disposition = "Alert"
+  }
+
+  # ---- severity ----
+  sev_raw = downcase(to_string(kv.severity) ?? "")
+  severity_id = 1
+  severity = "Informational"
+  if sev_raw == "informational" || sev_raw == "info" { severity_id = 1; severity = "Informational" }
+  if sev_raw == "warning" || sev_raw == "notice" || sev_raw == "low" { severity_id = 2; severity = "Low" }
+  if sev_raw == "error" || sev_raw == "medium" { severity_id = 3; severity = "Medium" }
+  if sev_raw == "critical" || sev_raw == "high" { severity_id = 4; severity = "High" }
+  if sev_raw == "emergency" || sev_raw == "alert" { severity_id = 5; severity = "Critical" }
+
+  attack_type = to_string(kv.attack_type) ?? ""
+  violations = to_string(kv.violations) ?? ""
+  is_alert = attack_type != "" || violations != ""
+  if is_alert && severity_id < 2 { severity_id = 2; severity = "Low" }
+
+  # ---- response code -> status ----
+  code = 0
+  cv = to_string(kv.response_code) ?? ""
+  if cv == "" { cv = to_string(kv.status_code) ?? "" }
+  if cv != "" { code = to_int(cv) ?? 0 }
+  has_code = code > 0
+
+  status_id = 0
+  status_str = "Unknown"
+  if has_code && code < 400 { status_id = 1; status_str = "Success" }
+  if has_code && code >= 400 { status_id = 2; status_str = "Failure" }
+
+  class_uid = 4002
+
+  . = {
+      "class_uid": class_uid,
+      "class_name": "HTTP Activity",
+      "category_uid": 4,
+      "category_name": "Network Activity",
+      "activity_id": activity_id,
+      "activity_name": activity_name,
+      "type_uid": class_uid * 100 + activity_id,
+      "severity_id": severity_id,
+      "severity": severity,
+      "status_id": status_id,
+      "status": status_str,
+      "time": time_ms,
+      "message": raw_log,
+      "action_id": action_id,
+      "action": action,
+      "disposition_id": disposition_id,
+      "disposition": disposition,
+      "is_alert": is_alert,
+      "metadata": {
+          "version": "1.9.0",
+          "uid": uuid_v4(),
+          "log_source": "f5_waf",
+          "log_provider": "ASM",
+          "profiles": ["host", "security_control"],
+          "product": {
+              "name": "BIG-IP ASM",
+              "vendor_name": "F5",
+              "feature": { "name": "waf" }
+          }
+      }
+  }
+
+  support_id = to_string(kv.support_id) ?? ""
+  if support_id != "" { .metadata.original_event_uid = support_id }
+
+  # ---- endpoints ----
+  src_ip = to_string(kv.src_ip) ?? ""
+  if src_ip == "" { src_ip = to_string(kv.client_ip) ?? "" }
+  if src_ip == "" { src_ip = to_string(kv.source_ip) ?? "" }
+  src = {}
+  if src_ip != "" { src.ip = downcase(src_ip) }
+  xff = to_string(kv.x_forwarded_for) ?? ""
+  country = to_string(kv.country) ?? ""
+  if country == "" { country = to_string(kv.geo_location) ?? "" }
+  if country != "" { src.location = { "country": country } }
+  src_port = to_string(kv.src_port) ?? ""
+  if src_port != "" {
+      sp = to_int(src_port) ?? 0
+      if sp > 0 { src.port = sp }
+  }
+  if length(src) > 0 { .src_endpoint = src }
+
+  dst_ip = to_string(kv.dest_ip) ?? ""
+  if dst_ip == "" { dst_ip = to_string(kv.server_ip) ?? "" }
+  if dst_ip == "" { dst_ip = to_string(kv.dst_ip) ?? "" }
+  dst = {}
+  if dst_ip != "" { dst.ip = downcase(dst_ip) }
+  dport = to_string(kv.dest_port) ?? ""
+  if dport == "" { dport = to_string(kv.dst_port) ?? "" }
+  if dport != "" {
+      dp = to_int(dport) ?? 0
+      if dp > 0 { dst.port = dp }
+  }
+  vs = to_string(kv.virtual_server) ?? ""
+  if vs != "" { dst.svc_name = vs }
+  if length(dst) > 0 { .dst_endpoint = dst }
+
+  # 4002 constrains "at least one of [dst_endpoint, src_endpoint]"
+  if !exists(.src_endpoint) && !exists(.dst_endpoint) {
+      .dst_endpoint = { "svc_name": "http" }
+  }
+
+  if dvc_host != null {
+      .device = { "hostname": dvc_host, "type_id": 15, "type": "Load Balancer" }
+  }
+
+  # ---- http_request / http_response ----
+  uri = to_string(kv.uri) ?? ""
+  if uri == "" { uri = to_string(kv.url) ?? "" }
+  host_hdr = to_string(kv.host) ?? ""
+  ua = to_string(kv.user_agent) ?? ""
+  if ua == "" { ua = to_string(kv.useragent) ?? "" }
+  referrer = to_string(kv.referer) ?? ""
+  if referrer == "" { referrer = to_string(kv.referrer) ?? "" }
+
+  req = {}
+  if method != "" { req.http_method = method }
+  if ua != "" { req.user_agent = ua }
+  if referrer != "" { req.referrer = referrer }
+  if xff != "" { req.x_forwarded_for = [xff] }
+  url = {}
+  if uri != "" {
+      if starts_with(uri, "http://") || starts_with(uri, "https://") {
+          url.url_string = uri
+          pu, pue = parse_url(uri)
+          if pue == null && pu != null {
+              url.hostname = to_string(pu.host)
+              url.path = to_string(pu.path)
+              url.scheme = to_string(pu.scheme)
+          }
+      } else {
+          qsplit = split(uri, "?", limit: 2)
+          url.path = qsplit[0]
+          if length(qsplit) > 1 { url.query_string = qsplit[1] }
+      }
+  }
+  if host_hdr != "" && !exists(url.hostname) { url.hostname = host_hdr }
+  if length(url) > 0 { req.url = url }
+  # 4002 constrains "at least one of [http_request, http_response]" — emit the
+  # request object unconditionally so an unrecognised ASM line still validates.
+  .http_request = req
+
+  resp = {}
+  if has_code { resp.code = code; resp.status = status_str }
+  ctype = to_string(kv.response_content_type) ?? ""
+  if ctype != "" { resp.content_type = ctype }
+  if length(resp) > 0 { .http_response = resp }
+
+  # ---- volumes / duration ----
+  traffic = {}
+  bin = to_string(kv.bytes_in) ?? ""
+  if bin != "" { traffic.bytes_in = to_int(bin) ?? 0 }
+  bout = to_string(kv.bytes_out) ?? ""
+  if bout != "" { traffic.bytes_out = to_int(bout) ?? 0 }
+  if length(traffic) > 0 { .traffic = traffic }
+
+  dur = to_string(kv.duration) ?? ""
+  if dur != "" { .duration = to_int(dur) ?? 0 }
+
+  # ---- ASM policy -> firewall_rule (security_control profile) ----
+  policy = to_string(kv.policy_name) ?? ""
+  if policy != "" { .firewall_rule = { "name": policy, "uid": policy, "type": "WAF Policy" } }
+
+  # ---- authenticated user ----
+  uname = to_string(kv.username) ?? ""
+  if uname == "" { uname = to_string(kv.user) ?? "" }
+  if uname != "" && uname != "N/A" { .actor = { "user": { "name": uname } } }
+
+  # ---- violation rating -> risk_level ----
+  vr = to_string(kv.violation_rating) ?? ""
+  if vr != "" {
+      vrn = to_int(vr) ?? 0
+      .risk_score = vrn
+      rl = 0
+      rlname = "Info"
+      if vrn >= 1 { rl = 1; rlname = "Low" }
+      if vrn >= 3 { rl = 2; rlname = "Medium" }
+      if vrn >= 4 { rl = 3; rlname = "High" }
+      if vrn >= 5 { rl = 4; rlname = "Critical" }
+      .risk_level_id = rl
+      .risk_level = rlname
+  }
+
+  # ---- everything ASM-specific that OCSF has no home for ----
+  unmapped = {}
+  if attack_type != "" { unmapped.attack_type = attack_type }
+  if violations != "" { unmapped.violations = violations }
+  if waf_action != "" { unmapped.waf_action = waf_action }
+  if support_id != "" { unmapped.support_id = support_id }
+  sid = to_string(kv.session_id) ?? ""
+  if sid != "" { unmapped.session_id = sid }
+  sigset = to_string(kv.sig_set_names) ?? ""
+  if sigset == "" { sigset = to_string(kv.signature_set) ?? "" }
+  if sigset != "" { unmapped.signature_set = sigset }
+  tc = to_string(kv.threat_campaign_names) ?? ""
+  if tc == "" { tc = to_string(kv.threat_campaign) ?? "" }
+  if tc != "" { unmapped.threat_campaign = tc }
+  bc = to_string(kv.bot_class) ?? ""
+  if bc != "" { unmapped.bot_class = bc }
+  bn = to_string(kv.bot_name) ?? ""
+  if bn != "" { unmapped.bot_name = bn }
+  pn = to_string(kv.param_name) ?? ""
+  if pn != "" { unmapped.param_name = pn }
+  pv = to_string(kv.param_value) ?? ""
+  if pv != "" { unmapped.param_value = pv }
+  ss = to_string(kv.staged_sig) ?? ""
+  if ss != "" { unmapped.staged_signature = ss }
+  vd = to_string(kv.violation_details) ?? ""
+  if vd != "" { unmapped.violation_details = vd }
+  rs = to_string(kv.request_status) ?? ""
+  if rs != "" { unmapped.request_status = rs }
+  if length(kv) == 0 { unmapped.parse_status = "no_key_value_pairs" }
+  if length(unmapped) > 0 { .unmapped = unmapped }
+
+  obs = []
+  if src_ip != "" { obs = push(obs, { "name": "src_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(src_ip) }) }
+  if dst_ip != "" { obs = push(obs, { "name": "dst_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(dst_ip) }) }
+  if uri != "" { obs = push(obs, { "name": "http_request.url.path", "type": "Uniform Resource Locator", "type_id": 23, "value": uri }) }
+  if ua != "" { obs = push(obs, { "name": "http_request.user_agent", "type": "HTTP User-Agent", "type_id": 16, "value": ua }) }
+  if length(obs) > 0 { .observables = obs }
+
+  .
+samples:
+- raw: Jan 15 14:34:00 bigip1.corp.local ASM:policy_name="/Common/prod_policy",src_ip="192.0.2.77",dest_ip="10.10.5.21",dest_port="443",method="GET",uri="/health",action="passed",response_code="200",request_status="passed",user_agent="kube-probe/1.29",username="svc_probe",session_id="abc123",duration="12"
+  expect:
+    class_uid: 4002
+    activity_id: 3
+    src_endpoint.ip: 192.0.2.77
+    dst_endpoint.ip: 10.10.5.21
+    actor.user.name: svc_probe
+    http_request.url.path: /health
+    disposition_id: 1
+- raw: Jan 15 14:35:00 bigip1.corp.local ASM:attack_type="Malicious Bot",bot_class="Malicious Bot",bot_name="Scrapy",policy_name="/Common/bot_policy",src_ip="203.0.113.55",dest_ip="10.10.5.20",method="HEAD",uri="http://shop.corp.local/cart",action="blocked",response_code="403",country="RU",x_forwarded_for="10.0.0.9"
+  expect:
+    class_uid: 4002
+    activity_id: 4
+    src_endpoint.ip: 203.0.113.55
+    dst_endpoint.ip: 10.10.5.20
+    http_request.url.path: /cart
+    disposition_id: 2
+- raw: 'Jan 15 14:40:00 bigip1.corp.local ASM: this is a free-form ASM notice with no key value pairs'
+  expect:
+    class_uid: 4002
+    activity_id: 99
+    disposition_id: 17
+- raw: attack_type="Path Traversal",src_ip="203.0.113.5",dest_ip="10.10.5.20",method="PUT",uri="/../../etc/passwd",action="blocked",response_code="403",severity="Warning"
+  expect:
+    class_uid: 4002
+    activity_id: 7
+    src_endpoint.ip: 203.0.113.5
+    dst_endpoint.ip: 10.10.5.20
+    http_request.url.path: /../../etc/passwd
+    disposition_id: 2
+- raw: totally unstructured garbage from a misrouted feed
+  expect:
+    class_uid: 4002
+    activity_id: 99
+    disposition_id: 17
+- raw: Jan 15 14:32:01 bigip1.corp.local ASM:unit_hostname="bigip1",attack_type="SQL-Injection",policy_name="/Common/prod_policy",src_ip="203.0.113.9",dest_ip="10.10.5.20",dest_port="443",method="POST",uri="/login.php?next=/admin",violations="Attack signature detected",severity="Critical",action="blocked",response_code="403",user_agent="sqlmap/1.5",support_id="4023498273",violation_rating="5",sig_set_names="{SQL Injection Signatures}",bytes_in="512",bytes_out="128"
+  expect:
+    class_uid: 4002
+    activity_id: 6
+    src_endpoint.ip: 203.0.113.9
+    dst_endpoint.ip: 10.10.5.20
+    http_request.url.path: /login.php
+    disposition_id: 2
+- raw: Jan 15 14:33:11 bigip1.corp.local ASM:attack_type="Cross Site Scripting (XSS)",policy_name="/Common/prod_policy",src_ip="198.51.100.4",dest_ip="10.10.5.20",dest_port="80",method="GET",uri="/search?q=<script>",violations="XSS signature",severity="Error",action="alerted",response_code="200",user_agent="Mozilla/5.0",support_id="4023498274",violation_rating="3"
+  expect:
+    class_uid: 4002
+    activity_id: 3
+    src_endpoint.ip: 198.51.100.4
+    dst_endpoint.ip: 10.10.5.20
+    http_request.url.path: /search
+    disposition_id: 19

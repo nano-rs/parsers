@@ -1,0 +1,418 @@
+name: proofpoint_ocsf
+display_name: Proofpoint Email Security (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Proofpoint Email Protection and TAP records into complete OCSF 1.9.0
+  Email Activity (class_uid 4009) records:
+    type=message     -> activity Receive / Send from filter.routeDirection,
+                        disposition from filter.disposition, spam scores in
+                        risk_score
+    type=tap_message -> activity Scan; attachments in email.files[], threat
+                        URLs in email.urls[], is_alert true
+    type=tap_click   -> activity Other; the clicked link in email.urls[] with
+                        the click source in src_endpoint and the click's
+                        user-agent in http_request
+  OCSF 1.9 DEPRECATES Email File Activity (4011) and Email URL Activity (4012)
+  and directs implementers to Email Activity with `email.files[]` /
+  `email.urls[]`, which is why a TAP click stays on 4009 rather than becoming
+  HTTP Activity — it keeps sender, recipient and subject queryable alongside
+  the clicked URL, which is what a phish investigation needs.
+  Carries metadata.profiles ["security_control"] because `disposition_id`,
+  `risk_score` and `is_alert` are bound to that profile in OCSF 1.9.
+match_values:
+  - proofpoint
+category: security
+vendor: "Proofpoint"
+product: "Email Protection"
+parser_vrl: |
+  # Proofpoint message log / TAP JSON -> OCSF 1.9.0 Email Activity (4009).
+  raw_log = string!(.message)
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      # Unparseable input is emitted as an OCSF Base Event (class_uid 0)
+      # rather than being guessed into a security class: it stays valid, and
+      # therefore visible, without fabricating a user or an outcome.
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_name": "Proofpoint Email Protection",
+              "log_provider": "Proofpoint",
+              "product": { "name": "Email Protection", "vendor_name": "Proofpoint" }
+          },
+          "unmapped": { "parse_error": "not a JSON object" }
+      }
+  } else {
+      p = object!(parsed)
+      conn = object(p.connection) ?? {}
+      envelope = object(p.envelope) ?? {}
+      msg_o = object(p.msg) ?? {}
+      filter_o = object(p.filter) ?? {}
+      modules = object(filter_o.modules) ?? {}
+      spam = object(modules.spam) ?? {}
+      scores = object(spam.scores) ?? {}
+
+      event_type = string(p.type) ?? "unknown"
+      profiles = ["security_control"]
+
+      severity_id = 1
+      severity = "Informational"
+      status_id = 1
+      status_str = "Success"
+      is_alert = false
+      direction_id = 0
+      src_ip = ""
+      src_host = ""
+      src_country = ""
+
+      email_obj = {}
+      ocsf = {
+          "class_uid": 4009,
+          "class_name": "Email Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity"
+      }
+
+      time_ms = 0
+
+      if event_type == "message" {
+          ts_str = string(p.ts) ?? ""
+          if ts_str != "" {
+              t, terr = parse_timestamp(ts_str, "%+")
+              if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+          }
+
+          route = downcase(string(filter_o.routeDirection) ?? "")
+          if route == "inbound" { direction_id = 1 }
+          if route == "outbound" { direction_id = 2 }
+          if route == "internal" { direction_id = 3 }
+
+          activity_id = 99
+          activity_name = "Other"
+          if direction_id == 1 { activity_id = 2; activity_name = "Receive" }
+          if direction_id == 2 || direction_id == 3 { activity_id = 1; activity_name = "Send" }
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+
+          sender = string(envelope.from) ?? ""
+          if match(sender, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["from"], downcase(sender)) }
+          rcpts = []
+          for_each(array(envelope.rcpts) ?? []) -> |_i, rv| {
+              r = to_string(rv) ?? ""
+              if match(r, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { rcpts = push(rcpts, downcase(r)) }
+          }
+          if length(rcpts) > 0 { email_obj = set!(email_obj, ["to"], rcpts) }
+
+          subj_arr = array(msg_o.normalizedHeader.subject) ?? []
+          if length(subj_arr) > 0 {
+              sv = to_string(subj_arr[0]) ?? ""
+              if sv != "" { email_obj = set!(email_obj, ["subject"], sv) }
+          }
+          mid_arr = array(msg_o.header."message-id") ?? []
+          if length(mid_arr) > 0 {
+              mv = to_string(mid_arr[0]) ?? ""
+              if mv != "" { email_obj = set!(email_obj, ["message_uid"], mv) }
+          }
+          msize = to_int(msg_o.sizeBytes) ?? 0
+          if msize > 0 { email_obj = set!(email_obj, ["size"], msize) }
+          guid = string(p.guid) ?? ""
+          if guid != "" { email_obj = set!(email_obj, ["uid"], guid) }
+
+          disposition = downcase(string(spam.disposition) ?? string(filter_o.disposition) ?? "")
+          disp_id = 0
+          disp = "Unknown"
+          if disposition == "delivered" || disposition == "accept" { disp_id = 1; disp = "Allowed" }
+          if disposition == "rejected" || disposition == "reject" { disp_id = 2; disp = "Blocked" }
+          if disposition == "quarantined" || disposition == "quarantine" { disp_id = 3; disp = "Quarantined" }
+          if disposition == "discarded" || disposition == "discard" { disp_id = 6; disp = "Dropped" }
+          if disposition != "" && disp_id == 0 { disp_id = 99; disp = "Other" }
+          if disp_id != 0 {
+              ocsf.disposition_id = disp_id
+              ocsf.disposition = disp
+          }
+          if disp_id == 2 || disp_id == 3 || disp_id == 6 {
+              status_id = 2; status_str = "Failure"; severity_id = 2; severity = "Low"
+          }
+
+          overall = to_int(scores.overall) ?? 0
+          if overall > 0 { ocsf.risk_score = overall }
+
+          src_ip = string(conn.ip) ?? ""
+          src_host = string(conn.host) ?? ""
+          src_country = string(conn.country) ?? ""
+      } else if event_type == "tap_message" {
+          ts_str = string(p.messageTime) ?? ""
+          if ts_str != "" {
+              t, terr = parse_timestamp(ts_str, "%+")
+              if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+          }
+
+          # TAP message events are threat verdicts on inbound mail.
+          direction_id = 1
+          ocsf.activity_id = 3
+          ocsf.activity_name = "Scan"
+          is_alert = true
+          severity_id = 3
+          severity = "Medium"
+
+          sender = string(p.sender) ?? ""
+          if match(sender, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["from"], downcase(sender)) }
+          rcpts = []
+          for_each(array(p.recipient) ?? []) -> |_i, rv| {
+              r = to_string(rv) ?? ""
+              if match(r, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { rcpts = push(rcpts, downcase(r)) }
+          }
+          if length(rcpts) > 0 { email_obj = set!(email_obj, ["to"], rcpts) }
+          subj = string(p.subject) ?? ""
+          if subj != "" { email_obj = set!(email_obj, ["subject"], subj) }
+          mid = string(p.messageID) ?? ""
+          if mid != "" { email_obj = set!(email_obj, ["message_uid"], mid) }
+          msize = to_int(p.messageSize) ?? 0
+          if msize > 0 { email_obj = set!(email_obj, ["size"], msize) }
+          hfrom = string(p.headerFrom) ?? ""
+          if match(hfrom, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["sender"], downcase(hfrom)) }
+
+          # Attachments -> email.files[] (OCSF 1.9 replacement for 4011).
+          files = []
+          for_each(array(p.messageParts) ?? []) -> |_i, mp| {
+              part = object(mp) ?? {}
+              fn = string(part.filename) ?? ""
+              if fn != "" {
+                  fobj = { "name": fn, "type_id": 1 }
+                  hashes = []
+                  sha = string(part.sha256) ?? ""
+                  if sha != "" { hashes = push(hashes, { "value": downcase(sha), "algorithm_id": 3, "algorithm": "SHA-256" }) }
+                  md5v = string(part.md5) ?? ""
+                  if md5v != "" { hashes = push(hashes, { "value": downcase(md5v), "algorithm_id": 1, "algorithm": "MD5" }) }
+                  if length(hashes) > 0 { fobj = set!(fobj, ["hashes"], hashes) }
+                  ctype = string(part.contentType) ?? ""
+                  if ctype != "" { fobj = set!(fobj, ["mime_type"], ctype) }
+                  files = push(files, fobj)
+              }
+          }
+          if length(files) > 0 { email_obj = set!(email_obj, ["files"], files) }
+
+          # Threat URLs -> email.urls[] (OCSF 1.9 replacement for 4012).
+          urls = []
+          for_each(array(p.threatsInfoMap) ?? []) -> |_i, tv| {
+              th = object(tv) ?? {}
+              tu = string(th.threatUrl) ?? ""
+              tt = downcase(string(th.threatType) ?? "")
+              if tu != "" && tt == "url" { urls = push(urls, { "url_string": tu }) }
+          }
+          if length(urls) > 0 { email_obj = set!(email_obj, ["urls"], urls) }
+
+          # The worst of the TAP classifier scores drives risk_score.
+          risk = to_int(p.malwareScore) ?? 0
+          phish = to_int(p.phishScore) ?? 0
+          if phish > risk { risk = phish }
+          spam_s = to_int(p.spamScore) ?? 0
+          if spam_s > risk { risk = spam_s }
+          imp = to_int(p.impostorScore) ?? 0
+          if imp > risk { risk = imp }
+          if risk > 0 { ocsf.risk_score = risk }
+          if risk >= 80 { severity_id = 4; severity = "High" }
+
+          qfolder = string(p.quarantineFolder) ?? ""
+          if qfolder != "" {
+              ocsf.disposition_id = 3
+              ocsf.disposition = "Quarantined"
+              status_id = 2
+              status_str = "Failure"
+          } else {
+              ocsf.disposition_id = 1
+              ocsf.disposition = "Allowed"
+          }
+
+          src_ip = string(p.senderIP) ?? ""
+      } else if event_type == "tap_click" {
+          ts_str = string(p.clickTime) ?? ""
+          if ts_str != "" {
+              t, terr = parse_timestamp(ts_str, "%+")
+              if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+          }
+
+          direction_id = 1
+          # A click is not Send / Receive / Scan / Trace / MTA Relay; OCSF has no
+          # activity for it, so it is Other with the click detail preserved.
+          ocsf.activity_id = 99
+          ocsf.activity_name = "Other"
+          is_alert = true
+          severity_id = 4
+          severity = "High"
+
+          sender = string(p.sender) ?? ""
+          if match(sender, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["from"], downcase(sender)) }
+          rcpt = string(p.recipient) ?? ""
+          if match(rcpt, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["to"], [downcase(rcpt)]) }
+          mid = string(p.messageID) ?? ""
+          if mid != "" { email_obj = set!(email_obj, ["message_uid"], mid) }
+          clicked = string(p.url) ?? ""
+          threat_url = string(p.threatURL) ?? ""
+          urls = []
+          if clicked != "" { urls = push(urls, { "url_string": clicked }) }
+          if threat_url != "" && threat_url != clicked { urls = push(urls, { "url_string": threat_url }) }
+          if length(urls) > 0 { email_obj = set!(email_obj, ["urls"], urls) }
+
+          threat_status = downcase(string(p.threatStatus) ?? "")
+          if threat_status == "blocked" {
+              ocsf.disposition_id = 2
+              ocsf.disposition = "Blocked"
+          } else {
+              ocsf.disposition_id = 1
+              ocsf.disposition = "Allowed"
+              status_id = 2
+              status_str = "Failure"
+          }
+
+          # Email Activity 4009 defines no http_request, so the click's
+          # user-agent has no canonical home and is kept in unmapped.
+          # For a click the source is the CLICKING endpoint, not the sending MTA;
+          # the sender IP is kept in unmapped so the two are never confused.
+          src_ip = string(p.clickIP) ?? ""
+      } else {
+          ocsf.activity_id = 99
+          ocsf.activity_name = "Other"
+          sender = string(p.sender) ?? ""
+          if match(sender, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["from"], downcase(sender)) }
+      }
+
+      # `email` is REQUIRED on 4009 and needs at_least_one(from, to).
+      if !exists(email_obj.from) && !exists(email_obj.to) {
+          email_obj = set!(email_obj, ["from"], "unknown@invalid.local")
+      }
+      ocsf.email = email_obj
+      ocsf.direction_id = direction_id
+
+      src_ep = {}
+      if src_ip != "" { src_ep = set!(src_ep, ["ip"], downcase(src_ip)) }
+      if src_host != "" { src_ep = set!(src_ep, ["hostname"], downcase(src_host)) }
+      if src_country != "" { src_ep = set!(src_ep, ["location"], { "country": src_country }) }
+      if length(src_ep) > 0 { ocsf.src_endpoint = src_ep }
+
+      ocsf.is_alert = is_alert
+      ocsf.status_id = status_id
+      ocsf.status = status_str
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.type_uid = to_int(ocsf.class_uid) * 100 + to_int(ocsf.activity_id)
+      ocsf.time = time_ms
+      msg = event_type
+      subj_msg = string(p.subject) ?? ""
+      if subj_msg != "" { msg = subj_msg }
+      ocsf.message = msg
+      ocsf.raw_data = raw_log
+
+      evt_uid = string(p.guid) ?? string(p.messageID) ?? ""
+      if evt_uid == "" { evt_uid = uuid_v4() }
+      ocsf.metadata = {
+          "version": "1.9.0",
+          "profiles": profiles,
+          "uid": evt_uid,
+          "original_event_uid": evt_uid,
+          "event_code": event_type,
+          "log_name": "Proofpoint Email Protection",
+          "log_provider": "Proofpoint",
+          "product": { "name": "Email Protection", "vendor_name": "Proofpoint" }
+      }
+
+      cand = {
+          "proofpoint_type": event_type,
+          "guid": string(p.guid) ?? "",
+          "filter_disposition": string(filter_o.disposition) ?? "",
+          "route_direction": string(filter_o.routeDirection) ?? "",
+          "spam_verdict": string(spam.verdict) ?? "",
+          "connection_protocol": string(conn.protocol) ?? "",
+          "connection_helo": string(conn.helo) ?? "",
+          "connection_country": src_country,
+          "sender_ip": string(p.senderIP) ?? "",
+          "click_ip": string(p.clickIP) ?? "",
+          "classification": string(p.classification) ?? "",
+          "threat_status": string(p.threatStatus) ?? "",
+          "threat_id": string(p.threatID) ?? "",
+          "threat_url": string(p.threatURL) ?? "",
+          "campaign_id": string(p.campaignId) ?? "",
+          "quarantine_folder": string(p.quarantineFolder) ?? "",
+          "quarantine_rule": string(p.quarantineRule) ?? "",
+          "header_from": string(p.headerFrom) ?? "",
+          "click_user_agent": string(p.userAgent) ?? ""
+      }
+      unmapped = {}
+      for_each(cand) -> |k, v| {
+          if v != "" { unmapped = set!(unmapped, [k], v) }
+      }
+      spam_overall = to_int(scores.overall) ?? 0
+      if spam_overall > 0 { unmapped = set!(unmapped, ["spam_score_overall"], spam_overall) }
+      phish_c = to_int(scores.classifiers.phish) ?? 0
+      if phish_c > 0 { unmapped = set!(unmapped, ["phish_score"], phish_c) }
+      malware_c = to_int(scores.classifiers.malware) ?? 0
+      if malware_c > 0 { unmapped = set!(unmapped, ["malware_score"], malware_c) }
+      rewritten = to_int(modules.urldefense.counts.rewritten) ?? 0
+      if rewritten > 0 { unmapped = set!(unmapped, ["urls_rewritten"], rewritten) }
+      if exists(p.threatsInfoMap) { unmapped = set!(unmapped, ["threats_info"], encode_json(p.threatsInfoMap)) }
+      if exists(p.messageParts) { unmapped = set!(unmapped, ["message_parts"], encode_json(p.messageParts)) }
+      if exists(p.modulesRun) { unmapped = set!(unmapped, ["modules_run"], encode_json(p.modulesRun)) }
+      if length(unmapped) > 0 { ocsf.unmapped = unmapped }
+
+      . = ocsf
+  }
+samples:
+  # malformed.txt
+  - raw: "proofpoint not json"
+    expect:
+      "class_uid": 0
+      "activity_id": 0
+      "metadata.version": "1.9.0"
+  # message_inbound_quarantine.json
+  - raw: "{\"type\":\"message\",\"ts\":\"2026-08-18T12:40:02.000000+0000\",\"guid\":\"a1B2c3D4e5F6g7H8i9J0kL\",\"connection\":{\"ip\":\"198.51.100.201\",\"host\":\"mail.evil.example\",\"protocol\":\"esmtps\",\"country\":\"nl\",\"helo\":\"mail.evil.example\"},\"envelope\":{\"from\":\"attacker@evil.example\",\"rcpts\":[\"bob.smith@example.com\",\"finance@example.com\"]},\"msg\":{\"normalizedHeader\":{\"subject\":[\"Payroll update\"],\"from\":[\"attacker@evil.example\"]},\"header\":{\"message-id\":[\"<CA+evil999@mail.evil.example>\"]},\"sizeBytes\":120043},\"filter\":{\"disposition\":\"discard\",\"routeDirection\":\"inbound\",\"modules\":{\"spam\":{\"verdict\":\"spam\",\"disposition\":\"discard\",\"scores\":{\"overall\":92,\"classifiers\":{\"phish\":88,\"malware\":10,\"spam\":92}}},\"urldefense\":{\"counts\":{\"rewritten\":3}}},\"modulesRun\":[\"spam\",\"urldefense\",\"dmarc\"]}}"
+    expect:
+      "class_uid": 4009
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  # message_outbound_delivered.json
+  - raw: "{\"type\":\"message\",\"ts\":\"2026-08-18T13:01:12.000000+0000\",\"guid\":\"z9Y8x7W6v5U4t3S2r1Q0pO\",\"connection\":{\"ip\":\"192.0.2.10\",\"host\":\"mta1.example.com\",\"protocol\":\"esmtps\",\"country\":\"us\"},\"envelope\":{\"from\":\"jane.doe@example.com\",\"rcpts\":[\"customer@client.example\"]},\"msg\":{\"normalizedHeader\":{\"subject\":[\"Re: contract\"]},\"header\":{\"message-id\":[\"<CA+out555@mail.example.com>\"]},\"sizeBytes\":9421},\"filter\":{\"disposition\":\"delivered\",\"routeDirection\":\"outbound\",\"modules\":{\"spam\":{\"verdict\":\"clean\",\"disposition\":\"delivered\",\"scores\":{\"overall\":3}}}}}"
+    expect:
+      "class_uid": 4009
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # tap_click.json
+  - raw: "{\"type\":\"tap_click\",\"clickTime\":\"2026-08-18T12:45:31.000Z\",\"threatTime\":\"2026-08-18T12:40:05.000Z\",\"campaignId\":\"c1a2b3c4-5555-6666-7777-888899990000\",\"classification\":\"phish\",\"clickIP\":\"203.0.113.55\",\"messageID\":\"<CA+phish777@mail.evil.example>\",\"recipient\":\"jane.doe@example.com\",\"sender\":\"attacker@evil.example\",\"senderIP\":\"198.51.100.201\",\"threatID\":\"1234567890abcdef\",\"threatStatus\":\"active\",\"threatURL\":\"https://threatinsight.proofpoint.com/threat/1234567890abcdef\",\"url\":\"https://login.microsoftonline.evil.example/verify?u=jane\",\"userAgent\":\"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\",\"GUID\":\"clk-1111-2222-3333\",\"id\":\"clk-1111-2222-3333\"}"
+    expect:
+      "class_uid": 4009
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  # tap_click_blocked.json
+  - raw: "{\"type\":\"tap_click\",\"clickTime\":\"2026-08-18T12:47:00.000Z\",\"classification\":\"malware\",\"clickIP\":\"192.0.2.77\",\"messageID\":\"<CA+evil999@mail.evil.example>\",\"recipient\":\"bob.smith@example.com\",\"sender\":\"attacker@evil.example\",\"senderIP\":\"198.51.100.201\",\"threatID\":\"abcdef1234567890\",\"threatStatus\":\"blocked\",\"threatURL\":\"https://threatinsight.proofpoint.com/threat/abcdef1234567890\",\"url\":\"https://payload.evil.example/dl/x.exe\",\"userAgent\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0.0.0\",\"id\":\"clk-4444-5555-6666\"}"
+    expect:
+      "class_uid": 4009
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  # tap_message.json
+  - raw: "{\"type\":\"tap_message\",\"messageTime\":\"2026-08-18T12:40:05.000Z\",\"sender\":\"attacker@evil.example\",\"recipient\":[\"bob.smith@example.com\"],\"headerFrom\":\"\\\"Payroll\\\" <payroll@example.com>\",\"subject\":\"Payroll update\",\"messageID\":\"<CA+evil999@mail.evil.example>\",\"senderIP\":\"198.51.100.201\",\"spamScore\":92,\"malwareScore\":100,\"phishScore\":88,\"impostorScore\":0,\"messageSize\":120043,\"quarantineFolder\":\"Attachment Defense Blocked\",\"quarantineRule\":\"module.sandbox.threat\",\"GUID\":\"a1B2c3D4e5F6g7H8i9J0kL\",\"messageParts\":[{\"disposition\":\"attached\",\"filename\":\"payroll.doc\",\"md5\":\"5d41402abc4b2a76b9719d911017c592\",\"sha256\":\"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\",\"contentType\":\"application/msword\",\"sandboxStatus\":\"threat\"}],\"threatsInfoMap\":[{\"campaignId\":\"c1a2b3c4-5555-6666-7777-888899990000\",\"classification\":\"malware\",\"threat\":\"payroll.doc\",\"threatId\":\"abcdef1234567890\",\"threatStatus\":\"active\",\"threatType\":\"attachment\",\"threatTime\":\"2026-08-18T12:40:05Z\"},{\"campaignId\":\"c1a2b3c4-5555-6666-7777-888899990000\",\"classification\":\"phish\",\"threat\":\"https://login.microsoftonline.evil.example\",\"threatId\":\"1234567890abcdef\",\"threatUrl\":\"https://threatinsight.proofpoint.com/threat/1234567890abcdef\",\"threatStatus\":\"active\",\"threatType\":\"url\",\"threatTime\":\"2026-08-18T12:40:05Z\"}],\"modulesRun\":[\"sandbox\",\"urldefense\",\"spam\"],\"policyRoutes\":[\"default_inbound\"]}"
+    expect:
+      "class_uid": 4009
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  # unknown_type.json
+  - raw: "{\"type\":\"dlp_incident\",\"ts\":\"2026-08-18T14:00:00.000000+0000\",\"sender\":\"jane.doe@example.com\",\"incidentId\":\"INC-4711\",\"policy\":\"US PII\"}"
+    expect:
+      "class_uid": 4009
+      "activity_id": 99
+      "metadata.version": "1.9.0"

@@ -1,0 +1,453 @@
+name: linux_journald_ocsf
+display_name: systemd-journald (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses systemd-journald entries (one JSON object per entry, as emitted by
+  `journalctl -o json`, systemd-journal-upload, Vector's journald source or
+  Fluent Bit's systemd input) into OCSF 1.9.0. Field names and trust semantics
+  follow systemd.journal-fields(7) — underscore-prefixed names are journald's
+  own trusted fields. Routing: sshd Accepted / Failed / Disconnected ->
+  Authentication (3002); sudo command and sudo authentication failure ->
+  Authentication (3002) activity 7 Account Switch, with the command on
+  actor.process.cmd_line; kernel netfilter LOG lines (SRC=/DST=) -> Network
+  Activity (4001). Every other journal entry emits a Base Event (class_uid 0)
+  carrying PRIORITY-derived severity, the systemd unit and the message —
+  rather than being guessed into a security class.
+match_values:
+  - linux_journald
+category: host
+vendor: "systemd"
+product: "journald"
+parser_vrl: |
+  # systemd-journald -> OCSF 1.9.0
+
+  raw_log = to_string(.message) ?? ""
+  entry = {}
+  decoded = false
+  if is_object(.message) {
+      entry = object!(.message)
+      decoded = true
+  } else {
+      parsed, perr = parse_json(raw_log)
+      if perr == null && is_object(parsed) {
+          entry = object!(parsed)
+          decoded = true
+      }
+  }
+
+  msg_text = to_string(entry.MESSAGE) ?? ""
+
+  # ---- PRIORITY 0 emerg .. 7 debug ----
+  priority_num = to_int(to_string(entry.PRIORITY) ?? "") ?? 6
+  severity_id = 1
+  severity = "Informational"
+  if priority_num <= 2 { severity_id = 5; severity = "Critical" }
+  if priority_num == 3 { severity_id = 4; severity = "High" }
+  if priority_num == 4 { severity_id = 3; severity = "Medium" }
+  if priority_num >= 5 { severity_id = 1; severity = "Informational" }
+
+  # ---- __REALTIME_TIMESTAMP is CLOCK_REALTIME in microseconds ----
+  time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
+  rt_us = to_int(to_string(entry.__REALTIME_TIMESTAMP) ?? "") ?? 0
+  if rt_us > 0 { time_ms = to_int(floor(rt_us / 1000)) }
+
+  hostname = to_string(entry._HOSTNAME) ?? ""
+  identifier = to_string(entry.SYSLOG_IDENTIFIER) ?? ""
+  if identifier == "" { identifier = to_string(entry._COMM) ?? "" }
+  ident_l = downcase(identifier)
+  comm = to_string(entry._COMM) ?? ""
+  exe = to_string(entry._EXE) ?? ""
+  cmdline = to_string(entry._CMDLINE) ?? ""
+  pid = to_int(to_string(entry._PID) ?? "") ?? 0
+  if pid == 0 { pid = to_int(to_string(entry.SYSLOG_PID) ?? "") ?? 0 }
+  uid = to_string(entry._UID) ?? ""
+  unit = to_string(entry._SYSTEMD_UNIT) ?? ""
+  transport = to_string(entry._TRANSPORT) ?? ""
+  boot_id = to_string(entry._BOOT_ID) ?? ""
+  machine_id = to_string(entry._MACHINE_ID) ?? ""
+  audit_session = to_string(entry._AUDIT_SESSION) ?? ""
+  message_id = to_string(entry.MESSAGE_ID) ?? ""
+
+  # ---- accumulators ----
+  route = "base"
+  activity_id = 99
+  activity_name = "Other"
+  action_id = 3
+  action = "Observed"
+  disposition_id = 17
+  disposition = "Logged"
+  status_id = 1
+  status_str = "Success"
+
+  user_name = ""
+  target_user = ""
+  src_ip = ""
+  src_port = 0
+  dst_ip = ""
+  dst_port = 0
+  proto = ""
+  auth_method = ""
+  sudo_command = ""
+  sudo_tty = ""
+  sudo_pwd = ""
+  fail_reason = ""
+
+  if ident_l == "sshd" && msg_text != "" {
+      am, ae = parse_regex(msg_text, r'^Accepted\s+(?P<method>\S+)\s+for\s+(?P<user>\S+)\s+from\s+(?P<ip>\S+)\s+port\s+(?P<port>\d+)')
+      if ae == null && am != null {
+          route = "auth"
+          user_name = string!(am.user)
+          src_ip = string!(am.ip)
+          src_port = to_int(am.port) ?? 0
+          auth_method = string!(am.method)
+          activity_id = 1
+          activity_name = "Logon"
+          action_id = 1
+          action = "Allowed"
+          disposition_id = 1
+          disposition = "Allowed"
+      } else {
+          fm, fe = parse_regex(msg_text, r'^Failed\s+(?P<method>\S+)\s+for\s+(?:invalid user\s+)?(?P<user>\S+)\s+from\s+(?P<ip>\S+)\s+port\s+(?P<port>\d+)')
+          if fe == null && fm != null {
+              route = "auth"
+              user_name = string!(fm.user)
+              src_ip = string!(fm.ip)
+              src_port = to_int(fm.port) ?? 0
+              auth_method = string!(fm.method)
+              activity_id = 1
+              activity_name = "Logon"
+              action_id = 2
+              action = "Denied"
+              disposition_id = 2
+              disposition = "Blocked"
+              status_id = 2
+              status_str = "Failure"
+              if severity_id < 2 { severity_id = 2; severity = "Low" }
+          } else {
+              dm, de = parse_regex(msg_text, r'^(?:Disconnected from|Connection closed by)\s+(?:authenticating user\s+(?P<user>\S+)\s+)?(?P<ip>[0-9a-fA-F:.]+)\s+port\s+(?P<port>\d+)')
+              if de == null && dm != null {
+                  route = "auth"
+                  src_ip = string!(dm.ip)
+                  src_port = to_int(dm.port) ?? 0
+                  user_name = to_string(dm.user)
+                  activity_id = 2
+                  activity_name = "Logoff"
+                  action_id = 1
+                  action = "Allowed"
+                  disposition_id = 1
+                  disposition = "Allowed"
+              }
+          }
+      }
+  } else if ident_l == "sudo" && msg_text != "" {
+      sm, se = parse_regex(msg_text, r'(?P<user>\S+)\s*:\s+TTY=(?P<tty>\S+)\s*;\s*PWD=(?P<pwd>\S+)\s*;\s*USER=(?P<target>\S+)\s*;\s*COMMAND=(?P<command>.*)')
+      if se == null && sm != null {
+          route = "auth"
+          user_name = string!(sm.user)
+          target_user = string!(sm.target)
+          sudo_command = string!(sm.command)
+          sudo_tty = string!(sm.tty)
+          sudo_pwd = string!(sm.pwd)
+          activity_id = 7
+          activity_name = "Account Switch"
+          action_id = 1
+          action = "Allowed"
+          disposition_id = 1
+          disposition = "Allowed"
+      } else {
+          sf, sfe = parse_regex(msg_text, r'(?P<user>\S+)\s*:\s+(?P<reason>authentication failure|user NOT in sudoers|command not allowed)')
+          if sfe == null && sf != null {
+              route = "auth"
+              user_name = string!(sf.user)
+              fail_reason = string!(sf.reason)
+              activity_id = 7
+              activity_name = "Account Switch"
+              action_id = 2
+              action = "Denied"
+              disposition_id = 2
+              disposition = "Blocked"
+              status_id = 2
+              status_str = "Failure"
+              if severity_id < 2 { severity_id = 2; severity = "Low" }
+          }
+      }
+  } else if ident_l == "kernel" && msg_text != "" {
+      nm, ne = parse_regex(msg_text, r'\bSRC=(?P<src>\S+)\s+DST=(?P<dst>\S+)')
+      if ne == null && nm != null {
+          route = "network"
+          src_ip = string!(nm.src)
+          dst_ip = string!(nm.dst)
+          activity_id = 6
+          activity_name = "Traffic"
+          pm2, pe2 = parse_regex(msg_text, r'\bSPT=(?P<spt>\d+)\s+DPT=(?P<dpt>\d+)')
+          if pe2 == null && pm2 != null {
+              src_port = to_int(pm2.spt) ?? 0
+              dst_port = to_int(pm2.dpt) ?? 0
+          }
+          pr, pre = parse_regex(msg_text, r'\bPROTO=(?P<proto>\S+)')
+          if pre == null && pr != null { proto = downcase(string!(pr.proto)) }
+          if contains(msg_text, "DROP") || contains(msg_text, "REJECT") || contains(msg_text, "BLOCK") {
+              activity_id = 5
+              activity_name = "Refuse"
+              action_id = 2
+              action = "Denied"
+              disposition_id = 6
+              disposition = "Dropped"
+          }
+      }
+  }
+
+  proto_num = 0
+  if proto == "tcp" { proto_num = 6 }
+  if proto == "udp" { proto_num = 17 }
+  if proto == "icmp" { proto_num = 1 }
+
+  src = {}
+  if src_ip != "" { src.ip = downcase(src_ip) }
+  if src_port > 0 { src.port = src_port }
+  dst = {}
+  if dst_ip != "" { dst.ip = downcase(dst_ip) }
+  if dst_port > 0 { dst.port = dst_port }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": uuid_v4(),
+      "log_source": "linux_journald",
+      "log_provider": "systemd-journald",
+      "profiles": ["host", "security_control"],
+      "product": {
+          "name": "journald",
+          "vendor_name": "systemd",
+          "feature": { "name": "journal" }
+      }
+  }
+  if identifier != "" { metadata.log_name = identifier }
+  if message_id != "" { metadata.event_code = message_id }
+  if transport != "" { metadata.source = transport }
+
+  device = { "type_id": 0, "type": "Unknown" }
+  has_device = false
+  if hostname != "" { device.hostname = hostname; has_device = true }
+  if machine_id != "" { device.uid = machine_id; has_device = true }
+
+  actor = {}
+  if user_name != "" { actor.user = { "name": user_name } }
+  if uid != "" && user_name != "" { actor.user.uid = uid }
+  aproc = {}
+  if identifier != "" { aproc.name = identifier }
+  if pid > 0 { aproc.pid = pid }
+  if sudo_command != "" {
+      aproc.cmd_line = sudo_command
+  } else {
+      if cmdline != "" { aproc.cmd_line = cmdline }
+  }
+  if exe != "" { aproc.file = { "path": exe, "name": identifier, "type_id": 1 } }
+  # process object constrains "at least one of [pid, uid, cpid]" — a journal
+  # entry without _PID (kernel transport) gets no actor.process at all.
+  if pid > 0 { actor.process = aproc }
+
+  unmapped = {}
+  if hostname != "" { unmapped.hostname = hostname }
+  if unit != "" { unmapped.systemd_unit = unit }
+  if transport != "" { unmapped.transport = transport }
+  if boot_id != "" { unmapped.boot_id = boot_id }
+  if machine_id != "" { unmapped.machine_id = machine_id }
+  if audit_session != "" { unmapped.audit_session = audit_session }
+  if comm != "" { unmapped.comm = comm }
+  if uid != "" { unmapped.uid = uid }
+  if sudo_tty != "" { unmapped.tty = sudo_tty }
+  if sudo_pwd != "" { unmapped.working_directory = sudo_pwd }
+  if fail_reason != "" { unmapped.failure_reason = fail_reason }
+  if !decoded { unmapped.parse_status = "not_json" }
+
+  obs = []
+  if src_ip != "" { obs = push(obs, { "name": "src_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(src_ip) }) }
+  if dst_ip != "" { obs = push(obs, { "name": "dst_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(dst_ip) }) }
+  if user_name != "" { obs = push(obs, { "name": "actor.user.name", "type": "User Name", "type_id": 4, "value": user_name }) }
+
+  emit_message = msg_text
+  if emit_message == "" { emit_message = raw_log }
+
+  # ============================================================
+  # Assemble
+  # ============================================================
+  if route == "auth" {
+      class_uid = 3002
+      subject = user_name
+      if target_user != "" { subject = target_user }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Authentication",
+          "category_uid": 3,
+          "category_name": "Identity & Access Management",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": emit_message,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "user": { "name": subject }
+      }
+      if length(actor) > 0 { .actor = actor }
+      if length(src) > 0 {
+          .src_endpoint = src
+          .is_remote = true
+      }
+      if ident_l == "sshd" {
+          .dst_endpoint = { "hostname": hostname, "svc_name": "ssh", "port": 22 }
+          .auth_protocol_id = 99
+          .auth_protocol = "SSH"
+          .logon_type = "Network"
+      } else {
+          .service = { "name": "sudo" }
+          .auth_protocol_id = 0
+          .auth_protocol = "Unknown"
+      }
+      if auth_method != "" { .status_detail = auth_method }
+      if fail_reason != "" { .status_detail = fail_reason }
+      if audit_session != "" { .session = { "uid": audit_session } }
+      if has_device { .device = device }
+
+  } else if route == "network" {
+      class_uid = 4001
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Network Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": emit_message,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": { "direction_id": 0, "protocol_num": proto_num }
+      }
+      if proto != "" { .connection_info.protocol_name = proto }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if length(src) == 0 && length(dst) == 0 {
+          fb = {}
+          if hostname != "" { fb.hostname = hostname }
+          if length(fb) == 0 { fb.hostname = "unknown" }
+          .src_endpoint = fb
+      }
+      if has_device { .device = device }
+
+  } else {
+      class_uid = 0
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": emit_message,
+          "metadata": metadata
+      }
+      if length(actor) > 0 { .actor = actor }
+      if unit != "" && !exists(.metadata.event_code) { .metadata.event_code = unit }
+  }
+
+  if length(unmapped) > 0 { .unmapped = unmapped }
+  if length(obs) > 0 { .observables = obs }
+
+  .
+samples:
+- raw: '{"__REALTIME_TIMESTAMP":"1785931500000000","PRIORITY":"4","SYSLOG_IDENTIFIER":"kernel","MESSAGE":"[UFW BLOCK] IN=eth0 OUT= MAC=00:16:3e:aa:bb:cc SRC=203.0.113.44 DST=10.0.0.5 LEN=60 TOS=0x00 PREC=0x00 TTL=52 ID=1234 DF PROTO=TCP SPT=44112 DPT=3389 WINDOW=1024 RES=0x00 SYN URGP=0","_HOSTNAME":"web01","_TRANSPORT":"kernel","_BOOT_ID":"aaaa"}
+
+    '
+  expect:
+    class_uid: 4001
+    activity_id: 5
+    src_endpoint.ip: 203.0.113.44
+    dst_endpoint.ip: 10.0.0.5
+    disposition_id: 6
+- raw: '{"__REALTIME_TIMESTAMP":"1785931700000000","PRIORITY":"3","SYSLOG_IDENTIFIER":"kernel","MESSAGE":"EXT4-fs error (device sda1): ext4_lookup:1602: inode #12: comm ls: deleted inode referenced","_HOSTNAME":"web01","_TRANSPORT":"kernel"}
+
+    '
+  expect:
+    class_uid: 0
+    activity_id: 99
+- raw: not json at all
+  expect:
+    class_uid: 0
+    activity_id: 99
+- raw: '{"__REALTIME_TIMESTAMP":"1785931200000000","PRIORITY":"6","SYSLOG_FACILITY":"4","SYSLOG_IDENTIFIER":"sshd","MESSAGE":"Accepted publickey for alice from 203.0.113.5 port 54321 ssh2","_PID":"1234","_UID":"0","_HOSTNAME":"web01","_COMM":"sshd","_EXE":"/usr/sbin/sshd","_SYSTEMD_UNIT":"ssh.service","_TRANSPORT":"syslog","_BOOT_ID":"aaaa","_MACHINE_ID":"bbbb","_AUDIT_SESSION":"42"}
+
+    '
+  expect:
+    class_uid: 3002
+    activity_id: 1
+    src_endpoint.ip: 203.0.113.5
+    user.name: alice
+    actor.user.name: alice
+    disposition_id: 1
+- raw: '{"__REALTIME_TIMESTAMP":"1785931300000000","PRIORITY":"6","SYSLOG_IDENTIFIER":"sshd","MESSAGE":"Disconnected from authenticating user alice 203.0.113.5 port 54321 [preauth]","_PID":"1236","_HOSTNAME":"web01","_SYSTEMD_UNIT":"ssh.service"}
+
+    '
+  expect:
+    class_uid: 3002
+    activity_id: 2
+    src_endpoint.ip: 203.0.113.5
+    user.name: alice
+    actor.user.name: alice
+    disposition_id: 1
+- raw: '{"__REALTIME_TIMESTAMP":"1785931260000000","PRIORITY":"4","SYSLOG_IDENTIFIER":"sshd","MESSAGE":"Failed password for invalid user root from 198.51.100.4 port 41122 ssh2","_PID":"1235","_HOSTNAME":"web01","_COMM":"sshd","_SYSTEMD_UNIT":"ssh.service","_TRANSPORT":"syslog"}
+
+    '
+  expect:
+    class_uid: 3002
+    activity_id: 1
+    src_endpoint.ip: 198.51.100.4
+    user.name: root
+    actor.user.name: root
+    disposition_id: 2
+- raw: '{"__REALTIME_TIMESTAMP":"1785931400000000","PRIORITY":"5","SYSLOG_IDENTIFIER":"sudo","MESSAGE":"  alice : TTY=pts/0 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/systemctl restart nginx","_PID":"2001","_UID":"1000","_HOSTNAME":"web01","_COMM":"sudo","_EXE":"/usr/bin/sudo","_SYSTEMD_UNIT":"session-3.scope"}
+
+    '
+  expect:
+    class_uid: 3002
+    activity_id: 7
+    user.name: root
+    actor.user.name: alice
+    disposition_id: 1
+- raw: '{"__REALTIME_TIMESTAMP":"1785931460000000","PRIORITY":"3","SYSLOG_IDENTIFIER":"sudo","MESSAGE":"bob : authentication failure ; TTY=pts/1 ; PWD=/home/bob ; USER=root","_PID":"2002","_UID":"1001","_HOSTNAME":"web01","_COMM":"sudo"}
+
+    '
+  expect:
+    class_uid: 3002
+    activity_id: 7
+    user.name: bob
+    actor.user.name: bob
+    disposition_id: 2
+- raw: '{"__REALTIME_TIMESTAMP":"1785931600000000","PRIORITY":"6","SYSLOG_IDENTIFIER":"systemd","MESSAGE":"Started Session 3 of user alice.","_PID":"1","_UID":"0","_HOSTNAME":"web01","_COMM":"systemd","_EXE":"/usr/lib/systemd/systemd","_SYSTEMD_UNIT":"session-3.scope","_TRANSPORT":"journal","MESSAGE_ID":"39f53479d3a045ac8e11786248231fbf"}
+
+    '
+  expect:
+    class_uid: 0
+    activity_id: 99

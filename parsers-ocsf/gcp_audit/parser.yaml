@@ -1,0 +1,270 @@
+name: gcp_audit_ocsf
+display_name: GCP Audit Log (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Google Cloud Audit Logs (cloudaudit.googleapis.com) into complete OCSF
+  1.9.0 "API Activity" (class_uid 6003) records carrying the cloud profile.
+  Admin Activity, Data Access and System Event entries all share the AuditLog
+  protoPayload, so the method lands on api.operation, the principal on
+  actor.user, the authorization decision on status, and the target on
+  resources[]. The whole OCSF object is emitted on the root so it lands in
+  ocsf_logs.event and the promoted columns materialize. Mirrors the UDM
+  gcp_audit parser but targets OCSF instead of `.udm.*`.
+match_values:
+  - gcp_audit
+category: cloud
+vendor: "Google"
+product: "Cloud Audit Logs"
+parser_vrl: |
+  # GCP Cloud Audit Log -> OCSF 1.9.0 API Activity (class_uid 6003)
+  raw_log = to_string(.message) ?? ""
+  class_uid = 6003
+
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      . = {
+          "class_uid": class_uid,
+          "class_name": "API Activity",
+          "category_uid": 6,
+          "category_name": "Application Activity",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": class_uid * 100 + 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud"],
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_name": "cloudaudit.googleapis.com",
+              "product": { "name": "Google Cloud Audit Logs", "vendor_name": "Google" }
+          },
+          "api": { "operation": "Unknown", "service": { "name": "unknown" } },
+          "cloud": { "provider": "GCP" },
+          "actor": { "user": { "name": "unknown" } },
+          "src_endpoint": { "ip": "0.0.0.0" }
+      }
+  } else {
+      p = object!(parsed)
+      payload = object(p.protoPayload) ?? {}
+      resource = object(p.resource) ?? {}
+      labels = object(resource.labels) ?? {}
+
+      # ---- time ----
+      time_ms = 0
+      ts_str = to_string(p.timestamp) ?? ""
+      if ts_str == "" { ts_str = to_string(p.receiveTimestamp) ?? "" }
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- method -> activity_id ----
+      method_name = to_string(payload.methodName) ?? ""
+      verb = ""
+      if method_name != "" {
+          mparts = split(method_name, ".")
+          mlast = length(mparts) - 1
+          mgot, mgerr = get(mparts, [mlast])
+          if mgerr == null { verb = downcase(to_string(mgot) ?? "") }
+      }
+      activity_id = 99
+      activity_name = "Other"
+      if starts_with(verb, "create") || starts_with(verb, "insert") { activity_id = 1; activity_name = "Create" }
+      if starts_with(verb, "get") || starts_with(verb, "list") || starts_with(verb, "read") || starts_with(verb, "describe") || starts_with(verb, "search") || starts_with(verb, "check") || starts_with(verb, "aggregated") { activity_id = 2; activity_name = "Read" }
+      if starts_with(verb, "update") || starts_with(verb, "patch") || starts_with(verb, "set") || starts_with(verb, "modify") || starts_with(verb, "enable") || starts_with(verb, "disable") || starts_with(verb, "start") || starts_with(verb, "stop") || starts_with(verb, "reset") || starts_with(verb, "resize") || starts_with(verb, "attach") || starts_with(verb, "detach") { activity_id = 3; activity_name = "Update" }
+      if starts_with(verb, "delete") || starts_with(verb, "remove") || starts_with(verb, "destroy") || starts_with(verb, "purge") { activity_id = 4; activity_name = "Delete" }
+
+      # ---- service ----
+      service_name = to_string(payload.serviceName) ?? ""
+      svc_short = service_name
+      if service_name != "" {
+          sparts = split(service_name, ".")
+          sgot, sgerr = get(sparts, [0])
+          if sgerr == null { svc_short = to_string(sgot) ?? service_name }
+      }
+      if svc_short == "" { svc_short = "unknown" }
+
+      # ---- project id: resource.labels first, then logName ----
+      project_id = to_string(labels.project_id) ?? ""
+      log_name = to_string(p.logName) ?? ""
+      if project_id == "" && log_name != "" {
+          lparts = split(log_name, "/")
+          lfirst, lferr = get(lparts, [0])
+          if lferr == null && (to_string(lfirst) ?? "") == "projects" {
+              lsecond, lserr = get(lparts, [1])
+              if lserr == null { project_id = to_string(lsecond) ?? "" }
+          }
+      }
+
+      cloud = { "provider": "GCP" }
+      if project_id != "" {
+          cloud.account = { "uid": project_id, "name": project_id }
+          cloud.project_uid = project_id
+      }
+      zone = to_string(labels.zone) ?? ""
+      if zone != "" { cloud.zone = zone; cloud.region = zone }
+
+      # ---- principal ----
+      auth_info = object(payload.authenticationInfo) ?? {}
+      principal = to_string(auth_info.principalEmail) ?? ""
+      user = { "name": "unknown" }
+      if principal != "" {
+          user = { "name": principal, "uid": principal }
+          if contains(principal, "@") {
+              user.email_addr = principal
+              pparts = split(principal, "@")
+              if length(pparts) == 2 { user.domain = to_string(pparts[1]) }
+          }
+          if ends_with(principal, ".gserviceaccount.com") {
+              user.type_id = 4
+              user.type = "Service"
+          } else {
+              user.type_id = 1
+              user.type = "User"
+          }
+      }
+      actor = { "user": user }
+
+      # ---- caller network context ----
+      req_meta = object(payload.requestMetadata) ?? {}
+      caller_ip = to_string(req_meta.callerIp) ?? ""
+      src_endpoint = { "ip": "0.0.0.0" }
+      if caller_ip != "" {
+          if is_ipv4(caller_ip) || is_ipv6(caller_ip) {
+              src_endpoint = { "ip": downcase(caller_ip) }
+          } else {
+              # GCP emits sentinels like "private" / "gce-internal-ip"
+              src_endpoint = { "ip": "0.0.0.0", "hostname": caller_ip }
+          }
+      }
+
+      # ---- outcome: status.code beats authorizationInfo.granted ----
+      status_obj = object(payload.status) ?? {}
+      status_code_num = to_int(status_obj.code) ?? -1
+      status_id = 1
+      status_str = "Success"
+      severity_id = 1
+      severity = "Informational"
+
+      auth_list = array(payload.authorizationInfo) ?? []
+      first_auth = get(auth_list, [0]) ?? null
+      permission = ""
+      if first_auth != null {
+          permission = to_string(get(first_auth, ["permission"]) ?? "") ?? ""
+          granted = to_bool(get(first_auth, ["granted"]) ?? false) ?? false
+          if !granted {
+              status_id = 2
+              status_str = "Failure"
+              severity_id = 2
+              severity = "Low"
+          }
+      }
+      if status_code_num > 0 {
+          status_id = 2
+          status_str = "Failure"
+          severity_id = 2
+          severity = "Low"
+      }
+
+      gcp_sev = upcase(to_string(p.severity) ?? "")
+      if gcp_sev == "WARNING" && severity_id < 3 { severity_id = 3; severity = "Medium" }
+      if (gcp_sev == "ERROR" || gcp_sev == "CRITICAL" || gcp_sev == "ALERT" || gcp_sev == "EMERGENCY") && severity_id < 4 { severity_id = 4; severity = "High" }
+
+      # ---- api ----
+      api_obj = { "operation": method_name, "service": { "name": svc_short } }
+      if method_name == "" { api_obj.operation = "Unknown" }
+      insert_id = to_string(p.insertId) ?? ""
+      if insert_id != "" { api_obj.request = { "uid": insert_id } }
+      status_msg = to_string(status_obj.message) ?? ""
+      if status_msg != "" { api_obj.response = { "message": status_msg } }
+
+      # ---- resources ----
+      resources = []
+      resource_name = to_string(payload.resourceName) ?? ""
+      if resource_name != "" {
+          res = { "uid": resource_name, "name": resource_name }
+          rtype = to_string(resource.type) ?? ""
+          if rtype != "" { res.type = rtype }
+          if project_id != "" { res.namespace = project_id }
+          if zone != "" { res.zone = zone }
+          resources = push(resources, res)
+      }
+
+      # ---- http_request: only the caller user-agent is available ----
+      http_request = {}
+      ua = to_string(req_meta.callerSuppliedUserAgent) ?? ""
+      if ua != "" { http_request.user_agent = ua }
+
+      ocsf = {
+          "class_uid": class_uid,
+          "class_name": "API Activity",
+          "category_uid": 6,
+          "category_name": "Application Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud"],
+              "uid": uuid_v4(),
+              "log_name": "cloudaudit.googleapis.com",
+              "log_provider": "Google Cloud Audit Logs",
+              "product": { "name": "Google Cloud Audit Logs", "vendor_name": "Google" }
+          },
+          "api": api_obj,
+          "cloud": cloud,
+          "actor": actor,
+          "src_endpoint": src_endpoint
+      }
+      if insert_id != "" { ocsf.metadata.uid = insert_id }
+      if log_name != "" { ocsf.metadata.log_name = log_name }
+      if status_code_num >= 0 { ocsf.status_code = to_string(status_code_num) }
+      if status_msg != "" { ocsf.status_detail = status_msg }
+      if length(resources) > 0 { ocsf.resources = resources }
+      if length(keys(http_request)) > 0 { ocsf.http_request = http_request }
+
+      unmapped = {}
+      if permission != "" { unmapped.permission = permission }
+      if length(auth_list) > 0 { unmapped.authorization_info = encode_json(auth_list) }
+      principal_subject = to_string(auth_info.principalSubject) ?? ""
+      if principal_subject != "" { unmapped.principal_subject = principal_subject }
+      oauth_client = to_string(get(auth_info, ["oauthInfo", "oauthClientId"]) ?? "") ?? ""
+      if oauth_client != "" { unmapped.oauth_client_id = oauth_client }
+      if gcp_sev != "" { unmapped.gcp_severity = gcp_sev }
+      rtype2 = to_string(resource.type) ?? ""
+      if rtype2 != "" { unmapped.gcp_resource_type = rtype2 }
+
+      # IAM policy deltas are the highest-signal part of an audit log; keep the
+      # full delta and mark the event as a permission change.
+      service_data = object(payload.serviceData) ?? {}
+      deltas = array(get(service_data, ["policyDelta", "bindingDeltas"]) ?? []) ?? []
+      if length(deltas) > 0 {
+          unmapped.iam_binding_deltas = encode_json(deltas)
+          unmapped.change_type = "permission_change"
+          ocsf.activity_id = 3
+          ocsf.activity_name = "Update"
+          ocsf.type_uid = class_uid * 100 + 3
+      }
+      request_obj = object(payload.request) ?? {}
+      if length(keys(request_obj)) > 0 { unmapped.request_details = encode_json(request_obj) }
+      response_obj = object(payload.response) ?? {}
+      if length(keys(response_obj)) > 0 { unmapped.response_details = encode_json(response_obj) }
+      if length(keys(unmapped)) > 0 { ocsf.unmapped = unmapped }
+
+      . = ocsf
+  }

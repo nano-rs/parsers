@@ -1,0 +1,679 @@
+name: defender_edr_ocsf
+display_name: Microsoft Defender for Endpoint (OCSF)
+version: "1.0.0"
+description: >
+  Parses Microsoft Defender for Endpoint (Advanced Hunting JSON) into
+  complete OCSF 1.9.0 records, routed by ActionType:
+    ProcessCreated                                   -> Process Activity 1007 (Launch)
+    ConnectionSuccess/Attempt/Request/InboundAccepted-> Network Activity 4001 (Open)
+    ConnectionFailed                                 -> Network Activity 4001 (Fail)
+    ListeningConnectionCreated                       -> Network Activity 4001 (Listen)
+    DnsQueryResponse / DnsQuery                      -> DNS Activity 4003 (Response/Query)
+    FileCreated/Modified/Renamed/Deleted             -> File System Activity 1001
+    RegistryKeyCreated/Deleted/Renamed               -> Registry Key Activity 201001 (win ext)
+    RegistryValueSet/Deleted                         -> Registry Value Activity 201002 (win ext)
+    LogonSuccess / LogonFailed / LogonAttempted      -> Authentication 3002 (Logon)
+    NetworkInfo (adapter inventory)                  -> Device Inventory Info 5001 (Collect)
+    AlertId present / AntivirusDetection             -> Detection Finding 2004 (Create)
+    anything else                                    -> Process Activity 1007 (Other)
+  InitiatingProcess* is always actor.process; on ProcessCreated the NEW process
+  is `process`. Carries metadata.profiles ["host"] (plus "security_control" on
+  findings, which is what disposition/action are bound to). The OCSF counterpart
+  of parsers/defender_edr - deploy one or the other, never both.
+ocsf_version: "1.9.0"
+match_values:
+  - defender_edr
+category: endpoint
+vendor: "Microsoft"
+product: "Microsoft Defender for Endpoint"
+parser_vrl: |
+  # Microsoft Defender for Endpoint (Advanced Hunting JSON) -> OCSF 1.9.0.
+  # Emits the COMPLETE OCSF record on the root, routed by ActionType:
+  #   ProcessCreated                                  -> Process Activity 1007 (Launch)
+  #   ConnectionSuccess/Attempt/Failed/InboundAccepted-> Network Activity 4001 (Open/Fail)
+  #   DnsQueryResponse                                -> DNS Activity 4003 (Response)
+  #   FileCreated/Modified/Renamed/Deleted            -> File System Activity 1001
+  #   RegistryKeyCreated/Deleted                      -> Registry Key Activity 201001 (win ext)
+  #   RegistryValueSet/Deleted                        -> Registry Value Activity 201002 (win ext)
+  #   LogonSuccess / LogonFailed                      -> Authentication 3002 (Logon)
+  #   NetworkInfo (adapter inventory)                 -> Device Inventory Info 5001 (Collect)
+  #   AlertId present / AntivirusDetection            -> Detection Finding 2004 (Create)
+  #   anything else                                   -> Process Activity 1007 (Other)
+  raw_log = string!(.message)
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      . = {
+          "class_uid": 1007,
+          "class_name": "Process Activity",
+          "category_uid": 1,
+          "category_name": "System Activity",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 100799,
+          "severity_id": 1,
+          "severity": "Informational",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          # 1007 requires actor/device/process even on the unparseable path.
+          "process": { "pid": 0 },
+          "actor": { "process": { "pid": 0 } },
+          "device": { "hostname": "", "type_id": 0 },
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["host"],
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_source": "defender_edr",
+              "product": { "name": "Microsoft Defender for Endpoint", "vendor_name": "Microsoft" }
+          }
+      }
+  } else {
+      p = object!(parsed)
+
+      action_type = to_string(p.ActionType) ?? ""
+      at = downcase(action_type)
+
+      # ---- time ---------------------------------------------------------
+      time_ms = 0
+      ts_str = to_string(p.Timestamp) ?? ""
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- device -------------------------------------------------------
+      device_hostname = downcase(to_string(p.DeviceName) ?? "")
+      device = { "hostname": device_hostname, "type_id": 0 }
+      device_id = to_string(p.DeviceId) ?? ""
+      if device_id != "" { device.uid = device_id }
+
+      # ---- the INITIATING process (the actor on every telemetry shape) ---
+      # NOTE: to_string(<missing>) yields "" and does not error, so every
+      # fallback below is an explicit empty check rather than `??` chaining.
+      init_name = to_string(p.InitiatingProcessFileName) ?? ""
+      init_folder = to_string(p.InitiatingProcessFolderPath) ?? ""
+      init_sha = downcase(to_string(p.InitiatingProcessSHA256) ?? "")
+      init_file = { "name": init_name, "path": init_folder, "type_id": 1 }
+      if init_sha != "" { init_file.hashes = [{ "algorithm_id": 3, "value": init_sha }] }
+      init_process = {
+          "name": init_name,
+          "cmd_line": to_string(p.InitiatingProcessCommandLine) ?? "",
+          "pid": to_int(p.InitiatingProcessId) ?? 0,
+          "file": init_file
+      }
+      init_user_name = downcase(to_string(p.InitiatingProcessAccountName) ?? "")
+      init_user = {
+          "name": init_user_name,
+          "domain": downcase(to_string(p.InitiatingProcessAccountDomain) ?? "")
+      }
+      init_user_sid = to_string(p.InitiatingProcessAccountSid) ?? ""
+      if init_user_sid != "" { init_user.uid = init_user_sid }
+
+      # ---- the subject account (Account* columns) -----------------------
+      acct_name = downcase(to_string(p.AccountName) ?? "")
+      acct_user = {
+          "name": acct_name,
+          "domain": downcase(to_string(p.AccountDomain) ?? "")
+      }
+      acct_sid = to_string(p.AccountSid) ?? ""
+      if acct_sid != "" { acct_user.uid = acct_sid }
+
+      # ---- file hashes on the subject file ------------------------------
+      sha256 = downcase(to_string(p.SHA256) ?? "")
+      sha1 = downcase(to_string(p.SHA1) ?? "")
+      md5 = downcase(to_string(p.MD5) ?? "")
+      hashes = []
+      if md5 != "" { hashes = push(hashes, { "algorithm_id": 1, "value": md5 }) }
+      if sha1 != "" { hashes = push(hashes, { "algorithm_id": 2, "value": sha1 }) }
+      if sha256 != "" { hashes = push(hashes, { "algorithm_id": 3, "value": sha256 }) }
+
+      subject_file_name = to_string(p.FileName) ?? ""
+      subject_folder = to_string(p.FolderPath) ?? ""
+      subject_file = { "name": subject_file_name, "path": subject_folder, "type_id": 1 }
+      if length(hashes) > 0 { subject_file.hashes = hashes }
+      file_size = to_int(p.FileSize) ?? 0
+      if file_size > 0 { subject_file.size = file_size }
+
+      is_alert_shape = (to_string(p.AlertId) ?? "") != "" || at == "antivirusdetection" || at == "antivirusreport"
+
+      # ---- defaults; overridden per branch below ------------------------
+      class_uid = 1007
+      class_name = "Process Activity"
+      category_uid = 1
+      category_name = "System Activity"
+      activity_id = 99
+      activity_name = "Other"
+      severity_id = 1
+      severity = "Informational"
+      profiles = ["host"]
+
+      ocsf = {}
+
+      if is_alert_shape {
+          # ---- Detection Finding 2004 -----------------------------------
+          # The detected/initiating process is the ACTOR — it is what tripped
+          # the detection — which also keeps actor.process.* queryable. The
+          # same artifacts are repeated in evidences[] for fidelity.
+          class_uid = 2004
+          class_name = "Detection Finding"
+          category_uid = 2
+          category_name = "Findings"
+          activity_id = 1
+          activity_name = "Create"
+          profiles = ["host", "security_control"]
+
+          # Defender AlertInfo.Severity is a word, not a number.
+          sev_raw = downcase(to_string(p.Severity) ?? "")
+          risk_level_id = 0
+          risk_level = "Info"
+          if sev_raw == "high" {
+              severity_id = 4; severity = "High"; risk_level_id = 3; risk_level = "High"
+          } else if sev_raw == "medium" {
+              severity_id = 3; severity = "Medium"; risk_level_id = 2; risk_level = "Medium"
+          } else if sev_raw == "low" {
+              severity_id = 2; severity = "Low"; risk_level_id = 1; risk_level = "Low"
+          } else if sev_raw == "informational" {
+              severity_id = 1; severity = "Informational"
+          }
+
+          finding_uid = to_string(p.AlertId) ?? ""
+          if finding_uid == "" { finding_uid = to_string(p.ReportId) ?? "" }
+          if finding_uid == "" { finding_uid = uuid_v4() }
+          title = to_string(p.Title) ?? ""
+          if title == "" { title = to_string(p.ThreatName) ?? "" }
+          if title == "" { title = action_type }
+
+          finding_info = {
+              "uid": finding_uid,
+              "title": title,
+              "types": [action_type],
+              "data_sources": ["defender_edr"]
+          }
+          detection_source = to_string(p.DetectionSource) ?? ""
+          category_str = to_string(p.Category) ?? ""
+          if detection_source != "" || category_str != "" {
+              # Defender detections come from behavioural analytics and ML
+              # engines rather than a customer-authored rule.
+              finding_info.analytic = {
+                  "name": detection_source,
+                  "uid": category_str,
+                  "type_id": 2,
+                  "type": "Behavioral"
+              }
+          }
+          ocsf.finding_info = finding_info
+          ocsf.is_alert = true
+          ocsf.risk_level_id = risk_level_id
+          ocsf.risk_level = risk_level
+          ocsf.actor = { "process": init_process, "user": init_user }
+          ocsf.device = device
+
+          evidence = { "actor": { "process": init_process } }
+          if subject_file_name != "" { evidence.file = subject_file }
+          if device_hostname != "" { evidence.device = device }
+          ocsf.evidences = [evidence]
+
+          # RemediationAction -> security_control disposition/action
+          remediation = downcase(to_string(p.RemediationAction) ?? "")
+          disposition_id = 15
+          disposition = "Detected"
+          action_id = 3
+          action = "Observed"
+          if remediation == "quarantine" || remediation == "quarantined" {
+              disposition_id = 3; disposition = "Quarantined"; action_id = 2; action = "Denied"
+          } else if remediation == "block" || remediation == "blocked" {
+              disposition_id = 2; disposition = "Blocked"; action_id = 2; action = "Denied"
+          } else if remediation == "remove" || remediation == "removed" {
+              disposition_id = 5; disposition = "Deleted"; action_id = 2; action = "Denied"
+          } else if remediation == "allow" || remediation == "allowed" {
+              disposition_id = 1; disposition = "Allowed"; action_id = 1; action = "Allowed"
+          }
+          ocsf.disposition_id = disposition_id
+          ocsf.disposition = disposition
+          ocsf.action_id = action_id
+          ocsf.action = action
+
+          # 2004 status_id is the FINDING lifecycle, not Success/Failure.
+          alert_state = downcase(to_string(p.AlertState) ?? "")
+          status_id = 1
+          status = "New"
+          if alert_state == "inprogress" || alert_state == "in progress" {
+              status_id = 2; status = "In Progress"
+          } else if alert_state == "resolved" {
+              status_id = 4; status = "Resolved"
+          } else if alert_state == "suppressed" || alert_state == "dismissed" {
+              status_id = 3; status = "Suppressed"
+          }
+          ocsf.status_id = status_id
+          ocsf.status = status
+
+          # AttackTechniques is a Defender JSON array column of T-numbers.
+          mitre_ids = []
+          techniques_raw = []
+          if is_array(p.AttackTechniques) { techniques_raw = array(p.AttackTechniques) ?? [] }
+          for_each(techniques_raw) -> |_i, tq| {
+              tq_str = to_string(tq) ?? ""
+              m, merr = parse_regex(tq_str, r'(?P<tid>[tT]\d{4}(?:\.\d{3})?)')
+              if merr == null { mitre_ids = push(mitre_ids, upcase(string(m.tid) ?? "")) }
+          }
+          mitre_ids = unique(mitre_ids)
+          if length(mitre_ids) > 0 {
+              attacks = []
+              for_each(mitre_ids) -> |_i, tid| {
+                  attacks = push(attacks, { "technique": { "uid": tid } })
+              }
+              ocsf.attacks = attacks
+          }
+
+          ocsf.unmapped = {
+              "action_type": action_type,
+              "device_id": device_id,
+              "report_id": to_string(p.ReportId) ?? null,
+              "detection_source": to_string(p.DetectionSource) ?? null,
+              "category": to_string(p.Category) ?? null,
+              "threat_family": to_string(p.ThreatFamilyName) ?? null,
+              "remediation_action": to_string(p.RemediationAction) ?? null,
+              "alert_state": to_string(p.AlertState) ?? null
+          }
+      } else if at == "processcreated" || at == "processcreatedusingwmiquery" {
+          # ---- Process Activity 1007 (Launch) ---------------------------
+          # The NEW process is `process`; its launcher (InitiatingProcess*) is
+          # `actor.process`.
+          activity_id = 1
+          activity_name = "Launch"
+          new_process = {
+              "name": subject_file_name,
+              "cmd_line": to_string(p.ProcessCommandLine) ?? "",
+              "pid": to_int(p.ProcessId) ?? 0,
+              "file": subject_file
+          }
+          if acct_name != "" { new_process.user = acct_user }
+          ocsf.process = new_process
+          ocsf.actor = { "process": init_process, "user": init_user }
+          ocsf.device = device
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+          ocsf.unmapped = {
+              "action_type": action_type,
+              "device_id": device_id,
+              "report_id": to_string(p.ReportId) ?? null,
+              "process_integrity_level": to_string(p.ProcessIntegrityLevel) ?? null,
+              "process_token_elevation": to_string(p.ProcessTokenElevation) ?? null,
+              "account_upn": to_string(p.AccountUpn) ?? null,
+              "logon_id": to_string(p.LogonId) ?? null
+          }
+      } else if at == "connectionsuccess" || at == "connectionfailed" || at == "connectionattempt" || at == "connectionrequest" || at == "inboundconnectionaccepted" || at == "listeningconnectioncreated" {
+          # ---- Network Activity 4001 ------------------------------------
+          class_uid = 4001
+          class_name = "Network Activity"
+          category_uid = 4
+          category_name = "Network Activity"
+          activity_id = 1
+          activity_name = "Open"
+          if at == "connectionfailed" { activity_id = 4; activity_name = "Fail" }
+          if at == "listeningconnectioncreated" { activity_id = 7; activity_name = "Listen" }
+
+          src_endpoint = {
+              "ip": downcase(to_string(p.LocalIP) ?? ""),
+              "port": to_int(p.LocalPort) ?? 0
+          }
+          if device_hostname != "" { src_endpoint.hostname = device_hostname }
+          dst_endpoint = {
+              "ip": downcase(to_string(p.RemoteIP) ?? ""),
+              "port": to_int(p.RemotePort) ?? 0
+          }
+          remote_url = to_string(p.RemoteUrl) ?? ""
+          if remote_url != "" { dst_endpoint.hostname = downcase(remote_url) }
+          ocsf.src_endpoint = src_endpoint
+          ocsf.dst_endpoint = dst_endpoint
+
+          # connection_info.direction_id: 0 Unknown, 1 Inbound, 2 Outbound.
+          proto = downcase(to_string(p.Protocol) ?? "")
+          direction_id = 2
+          if at == "inboundconnectionaccepted" { direction_id = 1 }
+          connection_info = { "direction_id": direction_id }
+          if proto == "tcp" { connection_info.protocol_num = 6 }
+          if proto == "udp" { connection_info.protocol_num = 17 }
+          if proto == "icmp" { connection_info.protocol_num = 1 }
+          ocsf.connection_info = connection_info
+
+          ocsf.actor = { "process": init_process, "user": init_user }
+          ocsf.device = device
+          ocsf.unmapped = {
+              "action_type": action_type,
+              "device_id": device_id,
+              "report_id": to_string(p.ReportId) ?? null,
+              "protocol": to_string(p.Protocol) ?? null,
+              "remote_url": to_string(p.RemoteUrl) ?? null
+          }
+      } else if at == "dnsqueryresponse" || at == "dnsquery" || at == "dnsconnectioninspected" {
+          # ---- DNS Activity 4003 ----------------------------------------
+          class_uid = 4003
+          class_name = "DNS Activity"
+          category_uid = 4
+          category_name = "Network Activity"
+          activity_id = 1
+          activity_name = "Query"
+          if at == "dnsqueryresponse" { activity_id = 2; activity_name = "Response" }
+
+          # 4003 needs at least one endpoint; the querying host is the source.
+          src_endpoint = {}
+          if device_hostname != "" { src_endpoint.hostname = device_hostname }
+          local_ip = downcase(to_string(p.LocalIP) ?? "")
+          if local_ip != "" { src_endpoint.ip = local_ip }
+          if !is_empty(src_endpoint) { ocsf.src_endpoint = src_endpoint }
+          remote_ip = downcase(to_string(p.RemoteIP) ?? "")
+          if remote_ip != "" { ocsf.dst_endpoint = { "ip": remote_ip, "port": to_int(p.RemotePort) ?? 0 } }
+          if is_empty(src_endpoint) && remote_ip == "" { ocsf.src_endpoint = { "hostname": "" } }
+
+          query_name = downcase(to_string(p.RemoteUrl) ?? "")
+          if query_name == "" { query_name = downcase(to_string(p.DnsQueryName) ?? "") }
+          ocsf.query = { "hostname": query_name }
+          answers_raw = to_string(p.DnsQueryResult) ?? ""
+          if answers_raw != "" { ocsf.answers = [{ "rdata": answers_raw }] }
+          ocsf.actor = { "process": init_process, "user": init_user }
+          ocsf.device = device
+          ocsf.unmapped = {
+              "action_type": action_type,
+              "device_id": device_id,
+              "report_id": to_string(p.ReportId) ?? null
+          }
+      } else if at == "filecreated" || at == "filemodified" || at == "filerenamed" || at == "filedeleted" {
+          # ---- File System Activity 1001 --------------------------------
+          class_uid = 1001
+          class_name = "File System Activity"
+          activity_id = 1
+          activity_name = "Create"
+          if at == "filemodified" { activity_id = 3; activity_name = "Update" }
+          if at == "filerenamed" { activity_id = 5; activity_name = "Rename" }
+          if at == "filedeleted" { activity_id = 4; activity_name = "Delete" }
+
+          # Defender puts the leaf name in FileName and the directory in
+          # FolderPath; build a file object with both.
+          file_obj = { "name": subject_file_name, "path": subject_folder, "type_id": 1 }
+          if length(hashes) > 0 { file_obj.hashes = hashes }
+          if file_size > 0 { file_obj.size = file_size }
+          ocsf.file = file_obj
+          ocsf.actor = { "process": init_process, "user": init_user }
+          ocsf.device = device
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+          ocsf.unmapped = {
+              "action_type": action_type,
+              "device_id": device_id,
+              "report_id": to_string(p.ReportId) ?? null
+          }
+      } else if at == "registrykeycreated" || at == "registrykeydeleted" || at == "registrykeyrenamed" {
+          # ---- Registry Key Activity 201001 (win extension) -------------
+          class_uid = 201001
+          class_name = "Registry Key Activity"
+          activity_id = 1
+          activity_name = "Create"
+          if at == "registrykeydeleted" { activity_id = 4; activity_name = "Delete" }
+          if at == "registrykeyrenamed" { activity_id = 3; activity_name = "Rename" }
+          ocsf.reg_key = { "path": to_string(p.RegistryKey) ?? "" }
+          ocsf.actor = { "process": init_process, "user": init_user }
+          ocsf.device = device
+          ocsf.unmapped = {
+              "action_type": action_type,
+              "device_id": device_id,
+              "report_id": to_string(p.ReportId) ?? null
+          }
+      } else if at == "registryvalueset" || at == "registryvaluedeleted" {
+          # ---- Registry Value Activity 201002 (win extension) -----------
+          class_uid = 201002
+          class_name = "Registry Value Activity"
+          activity_id = 2
+          activity_name = "Set"
+          if at == "registryvaluedeleted" { activity_id = 4; activity_name = "Delete" }
+          ocsf.reg_value = {
+              "name": to_string(p.RegistryValueName) ?? "",
+              "path": to_string(p.RegistryKey) ?? "",
+              "data": to_string(p.RegistryValueData) ?? ""
+          }
+          ocsf.actor = { "process": init_process, "user": init_user }
+          ocsf.device = device
+          ocsf.unmapped = {
+              "action_type": action_type,
+              "device_id": device_id,
+              "report_id": to_string(p.ReportId) ?? null,
+              "registry_value_type": to_string(p.RegistryValueType) ?? null
+          }
+      } else if at == "logonsuccess" || at == "logonfailed" || at == "logonattempted" {
+          # ---- Authentication 3002 --------------------------------------
+          class_uid = 3002
+          class_name = "Authentication"
+          category_uid = 3
+          category_name = "Identity & Access Management"
+          activity_id = 1
+          activity_name = "Logon"
+
+          status_id = 1
+          status = "Success"
+          if at == "logonfailed" {
+              status_id = 2; status = "Failure"; severity_id = 2; severity = "Low"
+          }
+          ocsf.status_id = status_id
+          ocsf.status = status
+
+          ocsf.user = acct_user
+          ocsf.actor = { "process": init_process, "user": init_user }
+          # 3002 needs one of [service, dst_endpoint]; the logon lands ON this
+          # device, so the device is the destination endpoint.
+          ocsf.dst_endpoint = { "hostname": device_hostname }
+          remote_ip = downcase(to_string(p.RemoteIP) ?? "")
+          remote_device = downcase(to_string(p.RemoteDeviceName) ?? "")
+          src_endpoint = {}
+          if remote_ip != "" { src_endpoint.ip = remote_ip }
+          if remote_device != "" { src_endpoint.hostname = remote_device }
+          if !is_empty(src_endpoint) { ocsf.src_endpoint = src_endpoint }
+          ocsf.device = device
+
+          # Defender LogonType is a word ("Interactive", "Network", ...).
+          logon_type_raw = to_string(p.LogonType) ?? ""
+          lt = downcase(logon_type_raw)
+          logon_type_id = 0
+          logon_type = "Unknown"
+          if lt == "interactive" { logon_type_id = 2; logon_type = "Interactive" }
+          if lt == "network" { logon_type_id = 3; logon_type = "Network" }
+          if lt == "batch" { logon_type_id = 4; logon_type = "Batch" }
+          if lt == "service" { logon_type_id = 5; logon_type = "OS Service" }
+          if lt == "unlock" { logon_type_id = 7; logon_type = "Unlock" }
+          if lt == "networkcleartext" { logon_type_id = 8; logon_type = "Network Cleartext" }
+          if lt == "newcredentials" { logon_type_id = 9; logon_type = "New Credentials" }
+          if lt == "remoteinteractive" { logon_type_id = 10; logon_type = "Remote Interactive" }
+          if lt == "cachedinteractive" { logon_type_id = 11; logon_type = "Cached Interactive" }
+          if logon_type_raw != "" && logon_type_id == 0 { logon_type_id = 99; logon_type = logon_type_raw }
+          if logon_type_raw != "" {
+              ocsf.logon_type_id = logon_type_id
+              ocsf.logon_type = logon_type
+              ocsf.is_remote = logon_type_id == 3 || logon_type_id == 8 || logon_type_id == 10
+              ocsf.is_cleartext = logon_type_id == 8
+          }
+          logon_id = to_string(p.LogonId) ?? ""
+          if logon_id != "" { ocsf.session = { "uid": logon_id } }
+
+          ocsf.unmapped = {
+              "action_type": action_type,
+              "device_id": device_id,
+              "report_id": to_string(p.ReportId) ?? null,
+              "is_local_admin": p.IsLocalAdmin,
+              "remote_device_name": to_string(p.RemoteDeviceName) ?? null,
+              "protocol": to_string(p.Protocol) ?? null
+          }
+      } else if at == "networkinfo" {
+          # ---- Device Inventory Info 5001 -------------------------------
+          # NetworkInfo is adapter inventory, not an activity: the adapters
+          # belong on device.network_interfaces.
+          class_uid = 5001
+          class_name = "Device Inventory Info"
+          category_uid = 5
+          category_name = "Discovery"
+          activity_id = 2
+          activity_name = "Collect"
+
+          mac = downcase(to_string(p.MacAddress) ?? "")
+          adapter_name = to_string(p.NetworkAdapterName) ?? ""
+          adapter_type = downcase(to_string(p.NetworkAdapterType) ?? "")
+          iface_type_id = 0
+          if adapter_type == "ethernet" { iface_type_id = 1 }
+          if adapter_type == "wireless" || adapter_type == "wireless80211" { iface_type_id = 2 }
+          if adapter_type == "tunnel" { iface_type_id = 4 }
+
+          # IPAddresses is a JSON array of objects or of plain strings
+          # depending on the Defender schema version; take the first address
+          # that stringifies to something non-empty.
+          first_ip = ""
+          ip_list = []
+          if is_array(p.IPAddresses) { ip_list = array(p.IPAddresses) ?? [] }
+          for_each(ip_list) -> |_i, entry| {
+              candidate = ""
+              if is_object(entry) {
+                  candidate = to_string(get(entry, ["IPAddress"]) ?? "") ?? ""
+              } else {
+                  candidate = to_string(entry) ?? ""
+              }
+              if first_ip == "" && candidate != "" { first_ip = downcase(candidate) }
+          }
+
+          iface = { "name": adapter_name, "type_id": iface_type_id }
+          if mac != "" { iface.mac = mac }
+          if first_ip != "" { iface.ip = first_ip }
+          if device_hostname != "" { iface.hostname = device_hostname }
+          inv_device = device
+          if mac != "" { inv_device.mac = mac }
+          if first_ip != "" { inv_device.ip = first_ip }
+          inv_device.network_interfaces = [iface]
+          ocsf.device = inv_device
+          ocsf.unmapped = {
+              "action_type": action_type,
+              "device_id": device_id,
+              "report_id": to_string(p.ReportId) ?? null,
+              "network_adapter_status": to_string(p.NetworkAdapterStatus) ?? null,
+              "connected_networks": to_string(p.ConnectedNetworks) ?? null,
+              "default_gateways": to_string(p.DefaultGateways) ?? null,
+              "dns_addresses": to_string(p.DnsAddresses) ?? null
+          }
+      } else {
+          # ---- unrouted ActionType -> Process Activity 1007 (Other) -----
+          # The only process such a record describes is the initiating one, so
+          # it is both the subject and (as the initiator) the actor.
+          ocsf.process = init_process
+          ocsf.actor = { "process": init_process, "user": init_user }
+          ocsf.device = device
+          ocsf.unmapped = {
+              "action_type": action_type,
+              "device_id": device_id,
+              "report_id": to_string(p.ReportId) ?? null
+          }
+      }
+
+      # ---- common envelope ---------------------------------------------
+      ocsf.class_uid = class_uid
+      ocsf.class_name = class_name
+      ocsf.category_uid = category_uid
+      ocsf.category_name = category_name
+      ocsf.activity_id = activity_id
+      ocsf.activity_name = activity_name
+      ocsf.type_uid = class_uid * 100 + activity_id
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.time = time_ms
+      ocsf.message = raw_log
+      ocsf.raw_data = raw_log
+
+      # ReportId is only unique within a device/timestamp stream, so compose it
+      # with both to keep a replay idempotent without risking a collision.
+      report_id = to_string(p.ReportId) ?? ""
+      record_uid = ""
+      if report_id != "" && device_id != "" && ts_str != "" {
+          record_uid = join!(["defender_edr", device_id, report_id, ts_str], "|")
+      }
+      if record_uid == "" { record_uid = to_string(p.AlertId) ?? "" }
+      if record_uid == "" { record_uid = uuid_v4() }
+
+      ocsf.metadata = {
+          "version": "1.9.0",
+          "profiles": profiles,
+          "uid": record_uid,
+          "original_event_uid": record_uid,
+          "event_code": action_type,
+          "log_source": "defender_edr",
+          "product": { "name": "Microsoft Defender for Endpoint", "vendor_name": "Microsoft" }
+      }
+
+      . = ocsf
+  }
+samples:
+  - raw: "{\"Timestamp\": \"2026-08-18T12:00:00.1234567Z\", \"DeviceId\": \"a1b2c3d4e5f6\", \"DeviceName\": \"wks-11.corp.local\", \"ReportId\": 88123, \"ActionType\": \"AntivirusDetection\", \"AlertId\": \"da637123456789\", \"Title\": \"Suspicious PowerShell command line\", \"Severity\": \"High\", \"Category\": \"Execution\", \"DetectionSource\": \"WindowsDefenderAv\", \"ThreatFamilyName\": \"Trojan:Win32/Emotet\", \"ThreatName\": \"Trojan:Win32/Emotet.A\", \"RemediationAction\": \"Quarantine\", \"AlertState\": \"New\", \"AttackTechniques\": [\"T1059.001 (PowerShell)\", \"T1204 (User Execution)\"], \"FileName\": \"payload.exe\", \"FolderPath\": \"C:\\\\Users\\\\alice\\\\Downloads\", \"SHA256\": \"DEADBEEF\", \"InitiatingProcessId\": 4321, \"InitiatingProcessFileName\": \"powershell.exe\", \"InitiatingProcessFolderPath\": \"C:\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\", \"InitiatingProcessCommandLine\": \"powershell.exe -enc SQBFAFgA\", \"InitiatingProcessAccountName\": \"alice\", \"InitiatingProcessAccountDomain\": \"CORP\"}"
+    expect:
+      "class_uid": 2004
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "2026-08-18 12:00:00 defender edr plain text line"
+    expect:
+      "class_uid": 1007
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "{\"Timestamp\": \"2026-08-18T12:00:00.1234567Z\", \"DeviceId\": \"a1b2c3d4e5f6\", \"DeviceName\": \"wks-11.corp.local\", \"ReportId\": 88123, \"ActionType\": \"ConnectionFailed\", \"RemoteIP\": \"203.0.113.9\", \"RemotePort\": 4444, \"LocalIP\": \"10.1.2.3\", \"LocalPort\": 51235, \"Protocol\": \"Tcp\", \"InitiatingProcessId\": 999, \"InitiatingProcessFileName\": \"rundll32.exe\", \"InitiatingProcessAccountName\": \"alice\"}"
+    expect:
+      "class_uid": 4001
+      "activity_id": 4
+      "metadata.version": "1.9.0"
+  - raw: "{\"Timestamp\": \"2026-08-18T12:00:00.1234567Z\", \"DeviceId\": \"a1b2c3d4e5f6\", \"DeviceName\": \"wks-11.corp.local\", \"ReportId\": 88123, \"ActionType\": \"ConnectionSuccess\", \"RemoteIP\": \"93.184.216.34\", \"RemotePort\": 443, \"RemoteUrl\": \"example.com\", \"LocalIP\": \"10.1.2.3\", \"LocalPort\": 51234, \"Protocol\": \"Tcp\", \"InitiatingProcessId\": 888, \"InitiatingProcessFileName\": \"curl.exe\", \"InitiatingProcessFolderPath\": \"C:\\\\Windows\\\\System32\\\\curl.exe\", \"InitiatingProcessCommandLine\": \"curl https://example.com\", \"InitiatingProcessCreationTime\": \"2026-08-18T11:59:00Z\", \"InitiatingProcessAccountDomain\": \"CORP\", \"InitiatingProcessAccountName\": \"alice\"}"
+    expect:
+      "class_uid": 4001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"Timestamp\": \"2026-08-18T12:00:00.1234567Z\", \"DeviceId\": \"a1b2c3d4e5f6\", \"DeviceName\": \"wks-11.corp.local\", \"ReportId\": 88123, \"ActionType\": \"DnsQueryResponse\", \"RemoteUrl\": \"evil.example.com\", \"RemoteIP\": \"10.0.0.53\", \"RemotePort\": 53, \"LocalIP\": \"10.1.2.3\", \"DnsQueryResult\": \"1.2.3.4\", \"InitiatingProcessId\": 1012, \"InitiatingProcessFileName\": \"svchost.exe\", \"InitiatingProcessAccountName\": \"system\"}"
+    expect:
+      "class_uid": 4003
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "{\"Timestamp\": \"2026-08-18T12:00:00.1234567Z\", \"DeviceId\": \"a1b2c3d4e5f6\", \"DeviceName\": \"wks-11.corp.local\", \"ReportId\": 88123, \"ActionType\": \"FileCreated\", \"FileName\": \"payload.exe\", \"FolderPath\": \"C:\\\\Users\\\\alice\\\\Downloads\", \"SHA256\": \"DEADBEEF\", \"SHA1\": \"CAFE01\", \"MD5\": \"BEEF02\", \"FileSize\": 204800, \"InitiatingProcessId\": 1010, \"InitiatingProcessFileName\": \"chrome.exe\", \"InitiatingProcessFolderPath\": \"C:\\\\Program Files\\\\Google\\\\Chrome\\\\chrome.exe\", \"InitiatingProcessCommandLine\": \"chrome.exe\", \"InitiatingProcessAccountDomain\": \"CORP\", \"InitiatingProcessAccountName\": \"alice\"}"
+    expect:
+      "class_uid": 1001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"Timestamp\": \"2026-08-18T12:00:00.1234567Z\", \"DeviceId\": \"a1b2c3d4e5f6\", \"DeviceName\": \"wks-11.corp.local\", \"ReportId\": 88123, \"ActionType\": \"FileDeleted\", \"FileName\": \"secret.docx\", \"FolderPath\": \"C:\\\\Users\\\\alice\\\\Documents\", \"InitiatingProcessId\": 1011, \"InitiatingProcessFileName\": \"cmd.exe\", \"InitiatingProcessAccountName\": \"alice\"}"
+    expect:
+      "class_uid": 1001
+      "activity_id": 4
+      "metadata.version": "1.9.0"
+  - raw: "{\"Timestamp\": \"2026-08-18T12:00:00.1234567Z\", \"DeviceId\": \"a1b2c3d4e5f6\", \"DeviceName\": \"wks-11.corp.local\", \"ReportId\": 88123, \"ActionType\": \"LogonFailed\", \"LogonType\": \"Network\", \"AccountDomain\": \"CORP\", \"AccountName\": \"admin\", \"RemoteIP\": \"203.0.113.9\", \"InitiatingProcessId\": 640, \"InitiatingProcessFileName\": \"lsass.exe\"}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"Timestamp\": \"2026-08-18T12:00:00.1234567Z\", \"DeviceId\": \"a1b2c3d4e5f6\", \"DeviceName\": \"wks-11.corp.local\", \"ReportId\": 88123, \"ActionType\": \"LogonSuccess\", \"LogonType\": \"RemoteInteractive\", \"AccountDomain\": \"CORP\", \"AccountName\": \"alice\", \"AccountSid\": \"S-1-5-21-1-2-3-1001\", \"LogonId\": 987654, \"RemoteIP\": \"10.9.9.9\", \"RemoteDeviceName\": \"WKS-09\", \"IsLocalAdmin\": true, \"Protocol\": \"Tcp\", \"InitiatingProcessId\": 640, \"InitiatingProcessFileName\": \"lsass.exe\", \"InitiatingProcessAccountName\": \"system\"}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"Timestamp\": \"2026-08-18T12:00:00.1234567Z\", \"DeviceId\": \"a1b2c3d4e5f6\", \"DeviceName\": \"wks-11.corp.local\", \"ReportId\": 88123, \"ActionType\": \"NetworkInfo\", \"NetworkAdapterName\": \"Ethernet 2\", \"MacAddress\": \"00-11-22-33-44-55\", \"NetworkAdapterType\": \"Ethernet\", \"NetworkAdapterStatus\": \"Up\", \"IPAddresses\": [{\"IPAddress\": \"10.1.2.3\", \"SubnetPrefix\": 24, \"AddressType\": \"Private\"}], \"DefaultGateways\": [\"10.1.2.1\"], \"DnsAddresses\": [\"10.1.2.53\"], \"ConnectedNetworks\": \"corp.local\"}"
+    expect:
+      "class_uid": 5001
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "{\"Timestamp\": \"2026-08-18T12:00:00.1234567Z\", \"DeviceId\": \"a1b2c3d4e5f6\", \"DeviceName\": \"wks-11.corp.local\", \"ReportId\": 88123, \"ActionType\": \"ScheduledTaskCreated\", \"InitiatingProcessId\": 770, \"InitiatingProcessFileName\": \"schtasks.exe\", \"InitiatingProcessAccountName\": \"alice\", \"InitiatingProcessAccountDomain\": \"CORP\"}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "{\"Timestamp\": \"2026-08-18T12:00:00.1234567Z\", \"DeviceId\": \"a1b2c3d4e5f6\", \"DeviceName\": \"wks-11.corp.local\", \"ReportId\": 88123, \"ActionType\": \"ProcessCreated\", \"FileName\": \"powershell.exe\", \"FolderPath\": \"C:\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\", \"SHA256\": \"9F914D42706FE215501044ACD85A32D58AAEF1419D404FDDFA5D3B48F66CCD9F\", \"SHA1\": \"AABBCC\", \"MD5\": \"DDEEFF\", \"ProcessId\": 4321, \"ProcessCommandLine\": \"powershell.exe -enc SQBFAFgA\", \"ProcessIntegrityLevel\": \"High\", \"ProcessTokenElevation\": \"TokenElevationTypeFull\", \"ProcessCreationTime\": \"2026-08-18T12:00:00Z\", \"AccountDomain\": \"CORP\", \"AccountName\": \"alice\", \"AccountSid\": \"S-1-5-21-1-2-3-1001\", \"AccountUpn\": \"alice@corp.local\", \"LogonId\": 1234567, \"InitiatingProcessId\": 1200, \"InitiatingProcessFileName\": \"explorer.exe\", \"InitiatingProcessFolderPath\": \"C:\\\\Windows\\\\explorer.exe\", \"InitiatingProcessCommandLine\": \"explorer.exe\", \"InitiatingProcessSHA256\": \"00112233\", \"InitiatingProcessAccountDomain\": \"CORP\", \"InitiatingProcessAccountName\": \"alice\"}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"Timestamp\": \"2026-08-18T12:00:00.1234567Z\", \"DeviceId\": \"a1b2c3d4e5f6\", \"DeviceName\": \"wks-11.corp.local\", \"ReportId\": 88123, \"ActionType\": \"RegistryKeyCreated\", \"RegistryKey\": \"HKEY_LOCAL_MACHINE\\\\SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run\", \"InitiatingProcessId\": 555, \"InitiatingProcessFileName\": \"reg.exe\", \"InitiatingProcessAccountName\": \"bob\"}"
+    expect:
+      "class_uid": 201001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"Timestamp\": \"2026-08-18T12:00:00.1234567Z\", \"DeviceId\": \"a1b2c3d4e5f6\", \"DeviceName\": \"wks-11.corp.local\", \"ReportId\": 88123, \"ActionType\": \"RegistryValueSet\", \"RegistryKey\": \"HKEY_LOCAL_MACHINE\\\\SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run\", \"RegistryValueName\": \"Updater\", \"RegistryValueData\": \"C:\\\\tmp\\\\bad.exe\", \"RegistryValueType\": \"String\", \"InitiatingProcessId\": 555, \"InitiatingProcessFileName\": \"reg.exe\", \"InitiatingProcessAccountName\": \"bob\"}"
+    expect:
+      "class_uid": 201002
+      "activity_id": 2
+      "metadata.version": "1.9.0"

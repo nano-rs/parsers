@@ -127,14 +127,122 @@ emit [OCSF](https://schema.ocsf.io) records instead, for deployments running
 Each is the counterpart of a UDM parser above and **claims the same source type**,
 because a source type names the log, not the schema it is mapped into. They are
 alternatives: deploy the UDM parser or the OCSF one for a given source, never both.
+The tree is the index — every directory under [`parsers-ocsf/`](parsers-ocsf) is
+one parser, named after its UDM counterpart in `parsers/`.
 
-| Parser | Source type | UDM counterpart |
-|--------|-------------|-----------------|
-| [Apache HTTP Server (OCSF)](parsers-ocsf/apache) | `apache_access` | [apache](parsers/apache) |
-| [AWS CloudTrail (OCSF)](parsers-ocsf/aws_cloudtrail) | `aws_cloudtrail` | [aws_cloudtrail](parsers/aws_cloudtrail) |
-| [Conduit MITM Proxy (OCSF)](parsers-ocsf/conduit_proxy) | `conduit_proxy` | [conduit_proxy](parsers/conduit_proxy) |
-| [Microsoft Sysmon (OCSF)](parsers-ocsf/windows_sysmon) | `windows_sysmon` | [windows_sysmon](parsers/windows_sysmon) |
-| [Windows Event Log (OCSF)](parsers-ocsf/windows_event) | `windows_event` | [windows_event](parsers/windows_event) |
+### Which OCSF version — the branch decides
+
+**The branch selects the OCSF version.**
+
+| Branch | OCSF version | For |
+|--------|--------------|-----|
+| `main` | 1.8 | tenants running OCSF on ClickHouse (non-lake) |
+| `ocsf-1.9` | 1.9 | tenants on the lake / OCSF 1.9 |
+
+Both the parser and rule repositories have a per-deployment `branch` setting, so a
+tenant moves to 1.9 by changing that one field — nothing else about the path or the
+import flow changes.
+
+Each parser **also** records the version in its own YAML:
+
+```yaml
+ocsf_version: "1.9.0"
+```
+
+so the version is self-evident in the file and machine-checkable. The validator
+asserts `metadata.version` against this key rather than a hardcoded constant,
+which is what lets the same script gate both branches.
+
+**Why the version is not in the folder name.** nano's repo sync resolves the OCSF
+tree as the hardcoded `parsers-ocsf/` sibling of the configured parsers path, so a
+`parsers-ocsf-1.9/` folder would simply never be found. A nested `parsers-ocsf/1.9/`
+does not work either: the tree walk is recursive, so every version directory would
+be imported alongside every other one, and an operator would be offered several
+copies of the same source. Branch for the version, key for the record.
+
+### Sample corpus
+
+Samples live **beside the parser** — this is the convention for the OCSF tree:
+
+```
+parsers-ocsf/<source>/
+├── parser.yaml
+└── samples/
+    ├── 4624_logon_success.json
+    ├── 4688_process_creation.json
+    └── malformed.json
+```
+
+- One file per branch of the parser, named after the branch it exercises
+  (each EventID, each CloudTrail shape, each log type) — plus one malformed line,
+  because a parser that aborts on garbage drops the whole batch.
+- A file is either the raw log line, or a `{"message": "<raw line>"}` wrapper.
+  Use the wrapper whenever the raw line is itself JSON containing a `message` key.
+- These are the inputs `scripts/validate-ocsf.sh` runs. A parser with no `samples/`
+  is reported as UNVALIDATED — it is unproven, not fine.
+
+UDM parsers use a different, inline convention (a `samples:` block inside
+`parser.yaml`, exercised by `scripts/validate-vrl.sh`). Both are live; OCSF
+parsers use the sidecar directory because their raw lines — Windows XML, nested
+cloud JSON — are far too large to read inline.
+
+### Validating the OCSF tree
+
+```bash
+# whole tree
+scripts/validate-ocsf.sh
+
+# one parser, or a file listing changed parser paths (same contract as validate-vrl.sh)
+scripts/validate-ocsf.sh parsers-ocsf/windows_event_xml/parser.yaml
+```
+
+Two gates per sample:
+
+1. **VRL** — `vector vrl` compiles *and runs* the program. `vector vrl` exits 0
+   even when a program aborts at runtime, so the signal is whether an object came
+   out at all. An abort is a hard failure: that parser drops every event it touches.
+2. **OCSF** — the *emitted* event (never a row read back from the lake, which has
+   been through column promotion and null-stripping) is checked against nano's OCSF
+   contract, plus these tree-wide consistency rules:
+   - `metadata.version` equals the parser's own `ocsf_version`
+   - `type_uid == class_uid * 100 + activity_id`
+   - the parser never writes `.udm.*` or `source_type` (`metadata.log_source`
+     carries the source type in OCSF)
+   - `class_uid` is a real, **non-deprecated** class — OCSF 1.9 deprecated
+     Account Change (3001) and User Access Management (3005) in favour of
+     User Management (3007) and Group Management (3006)
+   - every OCSF path written is either promoted (queryable) or under `unmapped.*`;
+     anything else is reported as silently unqueryable
+
+The contract check needs nano's `ocsf_event_validate` binary, which is a nano build
+artifact and is not vendored here. Point `OCSF_VALIDATOR` at it, or put it on
+`PATH`; without it that half reports SKIPPED and every rule above still runs.
+
+The reference data the script checks against lives next to it and is regenerated
+from `https://schema.ocsf.io/api/1.9.0/`:
+
+- `scripts/ocsf-1.9.0-classes.json` — every class uid, caption and `@deprecated` flag
+- `scripts/ocsf-1.9.0-promoted-fields.txt` — the OCSF field paths nano promotes to
+  queryable columns
+
+CI runs both `scripts/validate-vrl.sh` and `scripts/validate-ocsf.sh` over the whole
+repository on every PR (`.github/workflows/validate-parsers.yml`).
+
+### Writing an OCSF parser
+
+- Emit the **complete OCSF object on the root** (`. = ocsf`) so it lands in
+  `ocsf_logs.event` and the promoted columns materialize.
+- UDM names do not exist in OCSF. `src_ip` is `src_endpoint.ip`, `user` is
+  `actor.user.name` (the actor) or `user.name` (the subject, class-dependent),
+  `timestamp` is `time`, `id` is `metadata.uid`, `ext.foo` is `unmapped.foo`.
+- **Profile-bound attributes require declaring the profile.** `cloud`, `trace`,
+  `device` on the IAM classes and `security_control` are not base attributes of
+  every class. If the validator says an attribute "is not defined for this OCSF
+  class/profile" and the path is right, the missing piece is almost always
+  `metadata.profiles`, e.g. `"profiles": ["host"]`.
+- When nothing fits, **Base Event (`class_uid` 0) is the right answer.** It is the
+  spec's home for an event with no class; forcing an application log line into a
+  security class poisons every class-scoped hunt.
 
 ## Structure
 

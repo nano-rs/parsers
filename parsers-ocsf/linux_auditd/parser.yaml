@@ -1,0 +1,624 @@
+name: linux_auditd_ocsf
+display_name: Linux Audit Daemon (OCSF)
+version: "1.0.0"
+description: >
+  Parses Linux auditd text records into complete OCSF 1.9.0 records,
+  routed by audit record type:
+    SYSCALL / EXECVE / CWD / AVC  -> Process Activity 1007
+    PATH                          -> File System Activity 1001
+    USER_AUTH / USER_LOGIN / USER_LOGOUT / USER_START / USER_END /
+    CRED_ACQ / CRED_DISP          -> Authentication 3002
+    ADD_USER / DEL_USER / USER_MGMT / USER_ACCT / ROLE_ASSIGN / ROLE_REMOVE
+                                  -> User Management 3007 (3001/3005 deprecated in 1.9)
+    ADD_GROUP / DEL_GROUP / GRP_MGMT -> Group Management 3006
+    NETFILTER_PKT                 -> Network Activity 4001 (Traffic)
+  auditd splits one logical event across several records, so every emitted event
+  carries metadata.correlation_uid = "<epoch>.<ms>:<serial>" and companion records
+  with no pid of their own (EXECVE, CWD, PATH) use the process.pid 0 sentinel.
+  Also accepts the optional node=<host> prefix. Carries metadata.profiles ["host"]
+  (plus "security_control" on AVC, which is what disposition/action are bound to).
+  The OCSF counterpart of parsers/linux_auditd - deploy one or the other.
+ocsf_version: "1.9.0"
+match_values:
+  - linux_auditd
+category: endpoint
+vendor: "Linux"
+product: "auditd"
+parser_vrl: |
+  # Linux auditd (text key=value records) -> OCSF 1.9.0.
+  # Emits the COMPLETE OCSF record on the root, routed by audit record type:
+  #   SYSCALL                       -> Process Activity 1007 (Launch on execve, else Other)
+  #   EXECVE                        -> Process Activity 1007 (Launch)
+  #   CWD                           -> Process Activity 1007 (Other; carries working_directory)
+  #   AVC                           -> Process Activity 1007 (Other + SELinux disposition)
+  #   PATH                          -> File System Activity 1001 (by nametype)
+  #   USER_AUTH/USER_LOGIN/USER_LOGOUT/USER_START/USER_END/CRED_ACQ/CRED_DISP
+  #                                 -> Authentication 3002
+  #   ADD_USER/DEL_USER/USER_MGMT/USER_ACCT/ROLE_ASSIGN/ROLE_REMOVE
+  #                                 -> User Management 3007   (3001/3005 are deprecated in 1.9)
+  #   ADD_GROUP/DEL_GROUP/GRP_MGMT  -> Group Management 3006
+  #   NETFILTER_PKT                 -> Network Activity 4001 (Traffic)
+  #   anything else / unparsable    -> Process Activity 1007 (Other)
+  #
+  # auditd splits ONE logical event across several records (SYSCALL + EXECVE +
+  # CWD + PATH...) that share the audit id. nano ingests them one line at a time,
+  # so every emitted event carries metadata.correlation_uid = "<epoch>.<ms>:<serial>"
+  # and the sibling records can be re-joined on it. Companion records that carry
+  # no pid of their own (EXECVE, CWD, PATH) emit the process.pid 0 sentinel.
+  raw_log = string!(.message)
+
+  # Optional `node=<host>` prefix (auditd name_format=hostname), then the
+  # `type=X msg=audit(EPOCH.MS:SERIAL): <body>` header.
+  node_name = ""
+  node_match, node_err = parse_regex(raw_log, r'^node=(?P<n>\S+)\s+')
+  if node_err == null { node_name = downcase(string(node_match.n) ?? "") }
+
+  header_match, h_err = parse_regex(raw_log, r'type=(?P<audit_type>\w+)\s+msg=audit\((?P<epoch>\d+)\.(?P<ms>\d+):(?P<serial>\d+)\):\s*(?P<body>.*)')
+
+  if h_err != null {
+      . = {
+          "class_uid": 1007,
+          "class_name": "Process Activity",
+          "category_uid": 1,
+          "category_name": "System Activity",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 100799,
+          "severity_id": 1,
+          "severity": "Informational",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          # 1007 requires actor/device/process even on the unparseable path.
+          "process": { "pid": 0 },
+          "actor": { "process": { "pid": 0 } },
+          "device": { "hostname": node_name, "type_id": 0 },
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["host"],
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_source": "linux_auditd",
+              "product": { "name": "auditd", "vendor_name": "Linux" }
+          }
+      }
+  } else {
+      audit_type = upcase(string(header_match.audit_type) ?? "")
+      epoch_str = string(header_match.epoch) ?? "0"
+      ms_str = string(header_match.ms) ?? "0"
+      serial = string(header_match.serial) ?? ""
+      body = string(header_match.body) ?? ""
+
+      # ---- time: auditd stamps EPOCH.MILLIS ----
+      time_ms = ((to_int(epoch_str) ?? 0) * 1000) + (to_int(ms_str) ?? 0)
+      audit_id = epoch_str + "." + ms_str + ":" + serial
+
+      # ---- key=value body ----
+      kv = {}
+      kv_parsed, kv_err = parse_key_value(body, key_value_delimiter: "=", field_delimiter: " ")
+      if kv_err == null { kv = kv_parsed }
+
+      # ---- scalar helpers -------------------------------------------------
+      comm = replace(to_string(kv.comm) ?? "", "\"", "")
+      exe = replace(to_string(kv.exe) ?? "", "\"", "")
+      if exe == "" {
+          # exe="..." inside a PAM msg='...' blob is missed by parse_key_value
+          exm, exerr = parse_regex(body, r'exe="(?P<v>[^"]*)"')
+          if exerr == null { exe = string(exm.v) ?? "" }
+      }
+      exe_name = ""
+      enm, enmerr = parse_regex(exe, r'(?P<b>[^/]+)$')
+      if enmerr == null { exe_name = string(enm.b) ?? "" }
+
+      proc_name = comm
+      if proc_name == "" { proc_name = exe_name }
+
+      pid = to_int(kv.pid) ?? 0
+      ppid = to_int(kv.ppid) ?? 0
+      uid_num = to_string(kv.uid) ?? ""
+      auid_num = to_string(kv.auid) ?? ""
+      euid_num = to_string(kv.euid) ?? ""
+      gid_num = to_string(kv.gid) ?? ""
+      ses = to_string(kv.ses) ?? ""
+      tty = replace(to_string(kv.tty) ?? "", "\"", "")
+      syscall_num = to_string(kv.syscall) ?? ""
+      exit_str = to_string(kv.exit) ?? ""
+      success = downcase(to_string(kv.success) ?? "")
+      audit_key = replace(to_string(kv.key) ?? "", "\"", "")
+      if audit_key == "(null)" { audit_key = "" }
+
+      # acct="name" — the account a PAM/user-management record is about
+      acct = ""
+      acm, acerr = parse_regex(body, r'acct="?(?P<v>[^"\s]*)"?')
+      if acerr == null { acct = string(acm.v) ?? "" }
+      # res=success|failed
+      res = ""
+      rsm, rserr = parse_regex(body, r'\bres=(?P<v>\w+)')
+      if rserr == null { res = downcase(string(rsm.v) ?? "") }
+      # op=PAM:authentication / op=add-user ...
+      op = ""
+      opm, operr = parse_regex(body, r'\bop=(?P<v>\S+)')
+      if operr == null { op = replace(string(opm.v) ?? "", "\"", "") }
+      # hostname= / addr= / terminal= on PAM records ("?" means "not supplied")
+      remote_host = ""
+      hnm, hnerr = parse_regex(body, r'\bhostname=(?P<v>[^\s,]+)')
+      if hnerr == null { remote_host = string(hnm.v) ?? "" }
+      if remote_host == "?" { remote_host = "" }
+      remote_addr = ""
+      adm, aderr = parse_regex(body, r'\baddr=(?P<v>[^\s,]+)')
+      if aderr == null { remote_addr = downcase(string(adm.v) ?? "") }
+      if remote_addr == "?" { remote_addr = "" }
+      terminal = ""
+      tmm, tmerr = parse_regex(body, r'\bterminal=(?P<v>[^\s,]+)')
+      if tmerr == null { terminal = string(tmm.v) ?? "" }
+      if terminal == "?" { terminal = "" }
+
+      # ---- shared objects -------------------------------------------------
+      device = { "hostname": node_name, "type_id": 0 }
+
+      proc_file = { "name": exe_name, "path": exe, "type_id": 1 }
+      subject_process = { "name": proc_name, "pid": pid, "file": proc_file }
+      if uid_num != "" { subject_process.user = { "uid": uid_num } }
+
+      # auid is the LOGIN uid — the human behind the session — so it is the
+      # actor's identity, while uid/euid are the effective ids of the process.
+      actor_user = {}
+      if auid_num != "" && auid_num != "4294967295" { actor_user.uid = auid_num }
+      if acct != "" { actor_user.name = downcase(acct) }
+
+      # ---- defaults; overridden per branch below ----
+      class_uid = 1007
+      class_name = "Process Activity"
+      category_uid = 1
+      category_name = "System Activity"
+      activity_id = 99
+      activity_name = "Other"
+      severity_id = 1
+      severity = "Informational"
+      profiles = ["host"]
+
+      ocsf = {}
+
+      is_auth = audit_type == "USER_AUTH" || audit_type == "USER_LOGIN" || audit_type == "USER_LOGOUT" || audit_type == "USER_START" || audit_type == "USER_END" || audit_type == "CRED_ACQ" || audit_type == "CRED_DISP"
+      is_user_mgmt = audit_type == "ADD_USER" || audit_type == "DEL_USER" || audit_type == "USER_MGMT" || audit_type == "USER_ACCT" || audit_type == "ROLE_ASSIGN" || audit_type == "ROLE_REMOVE"
+      is_group_mgmt = audit_type == "ADD_GROUP" || audit_type == "DEL_GROUP" || audit_type == "GRP_MGMT"
+
+      if audit_type == "SYSCALL" || audit_type == "EXECVE" || audit_type == "CWD" || audit_type == "AVC" {
+          # ---- Process Activity 1007 ----------------------------------
+          class_uid = 1007; class_name = "Process Activity"
+          category_uid = 1; category_name = "System Activity"
+
+          proc = subject_process
+
+          if audit_type == "SYSCALL" {
+              # execve(59) / execveat(322) on x86_64, execve(221) on aarch64 —
+              # these are the syscalls that actually launch a process.
+              if syscall_num == "59" || syscall_num == "322" || syscall_num == "221" {
+                  activity_id = 1; activity_name = "Launch"
+              } else {
+                  activity_id = 99; activity_name = "Other"
+              }
+          } else if audit_type == "EXECVE" {
+              activity_id = 1; activity_name = "Launch"
+              # EXECVE carries no pid of its own — only the argv. Rebuild the
+              # command line from a0..a9 and lean on correlation_uid to rejoin
+              # it with the SYSCALL record that does carry the pid.
+              args = []
+              a0 = replace(to_string(kv.a0) ?? "", "\"", "")
+              a1 = replace(to_string(kv.a1) ?? "", "\"", "")
+              a2 = replace(to_string(kv.a2) ?? "", "\"", "")
+              a3 = replace(to_string(kv.a3) ?? "", "\"", "")
+              a4 = replace(to_string(kv.a4) ?? "", "\"", "")
+              a5 = replace(to_string(kv.a5) ?? "", "\"", "")
+              a6 = replace(to_string(kv.a6) ?? "", "\"", "")
+              a7 = replace(to_string(kv.a7) ?? "", "\"", "")
+              a8 = replace(to_string(kv.a8) ?? "", "\"", "")
+              a9 = replace(to_string(kv.a9) ?? "", "\"", "")
+              if a0 != "" { args = push(args, a0) }
+              if a1 != "" { args = push(args, a1) }
+              if a2 != "" { args = push(args, a2) }
+              if a3 != "" { args = push(args, a3) }
+              if a4 != "" { args = push(args, a4) }
+              if a5 != "" { args = push(args, a5) }
+              if a6 != "" { args = push(args, a6) }
+              if a7 != "" { args = push(args, a7) }
+              if a8 != "" { args = push(args, a8) }
+              if a9 != "" { args = push(args, a9) }
+              if length(args) > 0 {
+                  proc.cmd_line = join!(args, " ")
+                  argv0_name = ""
+                  a0m, a0merr = parse_regex(a0, r'(?P<b>[^/]+)$')
+                  if a0merr == null { argv0_name = string(a0m.b) ?? "" }
+                  if proc.name == "" { proc.name = argv0_name }
+              }
+          } else if audit_type == "CWD" {
+              activity_id = 99; activity_name = "Other"
+              cwd_val = replace(to_string(kv.cwd) ?? "", "\"", "")
+              if cwd_val != "" { proc.working_directory = cwd_val }
+          } else {
+              # AVC — an SELinux access-vector decision about a running process.
+              activity_id = 99; activity_name = "Other"
+              avc_decision = ""
+              avc_perm = ""
+              avm, avmerr = parse_regex(body, r'avc:\s+(?P<d>\w+)\s+\{\s*(?P<p>[^\x7D]+)\}')
+              if avmerr == null {
+                  avc_decision = downcase(string(avm.d) ?? "")
+                  avc_perm = strip_whitespace(string(avm.p) ?? "")
+              }
+              # SELinux is a security control making an allow/deny call, so the
+              # decision is a disposition (security_control profile), not a status.
+              profiles = ["host", "security_control"]
+              if avc_decision == "denied" {
+                  ocsf.disposition_id = 2; ocsf.disposition = "Blocked"
+                  ocsf.action_id = 2; ocsf.action = "Denied"
+                  severity_id = 3; severity = "Medium"
+              } else {
+                  ocsf.disposition_id = 1; ocsf.disposition = "Allowed"
+                  ocsf.action_id = 1; ocsf.action = "Allowed"
+              }
+              scontext = ""
+              scm, scerr = parse_regex(body, r'scontext=(?P<v>\S+)')
+              if scerr == null { scontext = string(scm.v) ?? "" }
+              tcontext = ""
+              tcm, tcerr = parse_regex(body, r'tcontext=(?P<v>\S+)')
+              if tcerr == null { tcontext = string(tcm.v) ?? "" }
+              tclass = ""
+              tlm, tlerr = parse_regex(body, r'tclass=(?P<v>\w+)')
+              if tlerr == null { tclass = string(tlm.v) ?? "" }
+              ocsf.unmapped = {
+                  "avc_decision": avc_decision,
+                  "avc_permission": avc_perm,
+                  "selinux_source_context": scontext,
+                  "selinux_target_context": tcontext,
+                  "selinux_target_class": tclass,
+                  "selinux_permissive": to_string(kv.permissive) ?? null,
+                  "target_name": replace(to_string(kv.name) ?? "", "\"", "")
+              }
+          }
+
+          if audit_type != "AVC" {
+              ocsf.unmapped = {
+                  "audit_record_type": audit_type,
+                  "syscall": syscall_num,
+                  "uid": uid_num,
+                  "euid": euid_num,
+                  "gid": gid_num,
+                  "tty": tty,
+                  "session_id": ses,
+                  "audit_key": audit_key
+              }
+          }
+
+          ocsf.process = proc
+          # The launching process is the ACTOR; auditd gives only its pid (ppid).
+          actor = { "process": { "pid": ppid } }
+          if actor_user != {} { actor.user = actor_user }
+          ocsf.actor = actor
+          ocsf.device = device
+          if exit_str != "" {
+              exit_int = to_int(exit_str) ?? 0
+              ocsf.exit_code = exit_int
+          }
+          if success != "" {
+              if success == "yes" {
+                  ocsf.status_id = 1; ocsf.status = "Success"
+              } else {
+                  ocsf.status_id = 2; ocsf.status = "Failure"
+                  severity_id = 2; severity = "Low"
+              }
+          }
+      } else if audit_type == "PATH" {
+          # ---- File System Activity 1001 ------------------------------
+          class_uid = 1001; class_name = "File System Activity"
+          category_uid = 1; category_name = "System Activity"
+          nametype = upcase(replace(to_string(kv.nametype) ?? "", "\"", ""))
+          if nametype == "CREATE" {
+              activity_id = 1; activity_name = "Create"
+          } else if nametype == "DELETE" {
+              activity_id = 4; activity_name = "Delete"
+          } else if nametype == "NORMAL" || nametype == "PARENT" {
+              activity_id = 14; activity_name = "Open"
+          } else {
+              activity_id = 99; activity_name = "Other"
+          }
+          fpath = replace(to_string(kv.name) ?? "", "\"", "")
+          fname = ""
+          fnm, fnmerr = parse_regex(fpath, r'(?P<b>[^/]+)$')
+          if fnmerr == null { fname = string(fnm.b) ?? "" }
+          ocsf.file = { "name": fname, "path": fpath, "type_id": 1 }
+          # PATH is a companion record: no pid, no comm of its own.
+          actor = { "process": { "pid": pid } }
+          if actor_user != {} { actor.user = actor_user }
+          ocsf.actor = actor
+          ocsf.device = device
+          ocsf.unmapped = {
+              "inode": to_string(kv.inode) ?? null,
+              "file_mode": to_string(kv.mode) ?? null,
+              "nametype": nametype,
+              "owner_uid": to_string(kv.ouid) ?? null,
+              "owner_gid": to_string(kv.ogid) ?? null
+          }
+      } else if is_auth {
+          # ---- Authentication 3002 ------------------------------------
+          class_uid = 3002; class_name = "Authentication"
+          category_uid = 3; category_name = "Identity & Access Management"
+          if audit_type == "USER_LOGIN" || audit_type == "USER_AUTH" || audit_type == "USER_START" {
+              activity_id = 1; activity_name = "Logon"
+          } else if audit_type == "USER_LOGOUT" || audit_type == "USER_END" {
+              activity_id = 2; activity_name = "Logoff"
+          } else {
+              # CRED_ACQ / CRED_DISP — PAM credential setup and teardown have no
+              # dedicated OCSF authentication activity.
+              activity_id = 99; activity_name = "Other"
+          }
+          user_obj = { "name": downcase(acct) }
+          if auid_num != "" && auid_num != "4294967295" { user_obj.uid = auid_num }
+          ocsf.user = user_obj
+          # 3002 requires user + one of [service, dst_endpoint]. The PAM stack
+          # doing the authenticating is the service; auditd never names the local
+          # host, so dst_endpoint is not available.
+          svc_name = exe_name
+          if svc_name == "" { svc_name = "pam" }
+          ocsf.service = { "name": svc_name }
+          if remote_addr != "" || remote_host != "" {
+              src = {}
+              if remote_addr != "" { src.ip = remote_addr }
+              if remote_host != "" { src.hostname = downcase(remote_host) }
+              ocsf.src_endpoint = src
+          }
+          if ses != "" && ses != "4294967295" { ocsf.session = { "uid": ses } }
+          if res == "success" {
+              ocsf.status_id = 1; ocsf.status = "Success"
+          } else if res != "" {
+              ocsf.status_id = 2; ocsf.status = "Failure"
+              severity_id = 2; severity = "Low"
+          }
+          if terminal != "" {
+              # Terminal-attached PAM sessions are local; a remote address means
+              # the login came over the network.
+              ocsf.is_remote = remote_addr != ""
+          }
+          ocsf.device = device
+          ocsf.unmapped = {
+              "audit_record_type": audit_type,
+              "pam_operation": op,
+              "terminal": terminal,
+              "exe": exe,
+              "pid": to_string(pid)
+          }
+      } else if is_user_mgmt {
+          # ---- User Management 3007 (3001/3005 deprecated in 1.9) -----
+          class_uid = 3007; class_name = "User Management"
+          category_uid = 3; category_name = "Identity & Access Management"
+          if audit_type == "ADD_USER" {
+              activity_id = 1; activity_name = "Create"
+          } else if audit_type == "DEL_USER" {
+              activity_id = 3; activity_name = "Delete"
+          } else if audit_type == "USER_MGMT" {
+              activity_id = 2; activity_name = "Update"
+          } else if audit_type == "ROLE_ASSIGN" {
+              activity_id = 16; activity_name = "Assign Roles"
+          } else if audit_type == "ROLE_REMOVE" {
+              activity_id = 17; activity_name = "Remove Roles"
+          } else {
+              # USER_ACCT — PAM account-validity check
+              activity_id = 99; activity_name = "Other"
+          }
+          user_obj = { "name": downcase(acct) }
+          acct_id = to_string(kv.id) ?? ""
+          if acct_id != "" { user_obj.uid = acct_id }
+          ocsf.user = user_obj
+          actor = {}
+          if actor_user != {} { actor.user = actor_user }
+          if pid != 0 { actor.process = { "pid": pid, "name": proc_name, "file": proc_file } }
+          if actor != {} { ocsf.actor = actor }
+          ocsf.device = device
+          if res == "success" {
+              ocsf.status_id = 1; ocsf.status = "Success"
+          } else if res != "" {
+              ocsf.status_id = 2; ocsf.status = "Failure"
+              severity_id = 2; severity = "Low"
+          }
+          ocsf.unmapped = { "audit_record_type": audit_type, "operation": op, "exe": exe }
+      } else if is_group_mgmt {
+          # ---- Group Management 3006 ----------------------------------
+          class_uid = 3006; class_name = "Group Management"
+          category_uid = 3; category_name = "Identity & Access Management"
+          if audit_type == "ADD_GROUP" {
+              activity_id = 6; activity_name = "Create"
+          } else if audit_type == "DEL_GROUP" {
+              activity_id = 5; activity_name = "Delete"
+          } else {
+              activity_id = 9; activity_name = "Update"
+          }
+          grp = ""
+          gm, gmerr = parse_regex(body, r'\bgrp="?(?P<v>[^"\s]+)"?')
+          if gmerr == null { grp = string(gm.v) ?? "" }
+          if grp == "" { grp = acct }
+          group_obj = { "name": downcase(grp) }
+          grp_id = to_string(kv.id) ?? ""
+          if grp_id != "" { group_obj.uid = grp_id }
+          ocsf.group = group_obj
+          if acct != "" && acct != grp { ocsf.user = { "name": downcase(acct) } }
+          actor = {}
+          if actor_user != {} { actor.user = actor_user }
+          if pid != 0 { actor.process = { "pid": pid, "name": proc_name, "file": proc_file } }
+          if actor != {} { ocsf.actor = actor }
+          ocsf.device = device
+          if res == "success" {
+              ocsf.status_id = 1; ocsf.status = "Success"
+          } else if res != "" {
+              ocsf.status_id = 2; ocsf.status = "Failure"
+              severity_id = 2; severity = "Low"
+          }
+          ocsf.unmapped = { "audit_record_type": audit_type, "operation": op, "exe": exe }
+      } else if audit_type == "NETFILTER_PKT" {
+          # ---- Network Activity 4001 ----------------------------------
+          class_uid = 4001; class_name = "Network Activity"
+          category_uid = 4; category_name = "Network Activity"
+          activity_id = 6; activity_name = "Traffic"
+          saddr = downcase(replace(to_string(kv.saddr) ?? "", "\"", ""))
+          daddr = downcase(replace(to_string(kv.daddr) ?? "", "\"", ""))
+          src = {}
+          if saddr != "" { src.ip = saddr }
+          sport = to_int(kv.sport) ?? 0
+          if sport != 0 { src.port = sport }
+          dst = {}
+          if daddr != "" { dst.ip = daddr }
+          dport = to_int(kv.dport) ?? 0
+          if dport != 0 { dst.port = dport }
+          ocsf.src_endpoint = src
+          ocsf.dst_endpoint = dst
+          # connection_info.direction_id is required whenever connection_info is
+          # present; a NETFILTER_PKT record does not state the direction.
+          conn = { "direction_id": 0 }
+          proto_num = to_int(kv.proto) ?? 0
+          if proto_num != 0 { conn.protocol_num = proto_num }
+          ocsf.connection_info = conn
+          ocsf.device = device
+          ocsf.unmapped = { "audit_record_type": audit_type, "mark": to_string(kv.mark) ?? null }
+      } else {
+          # ---- unknown record type -> Process Activity / Other --------
+          class_uid = 1007; class_name = "Process Activity"
+          category_uid = 1; category_name = "System Activity"
+          activity_id = 99; activity_name = "Other"
+          ocsf.process = subject_process
+          actor = { "process": { "pid": ppid } }
+          if actor_user != {} { actor.user = actor_user }
+          ocsf.actor = actor
+          ocsf.device = device
+          ocsf.unmapped = { "audit_record_type": audit_type }
+      }
+
+      # ---- common envelope ---------------------------------------------
+      ocsf.class_uid = class_uid
+      ocsf.class_name = class_name
+      ocsf.category_uid = category_uid
+      ocsf.category_name = category_name
+      ocsf.activity_id = activity_id
+      ocsf.activity_name = activity_name
+      ocsf.type_uid = class_uid * 100 + activity_id
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.time = time_ms
+      ocsf.message = raw_log
+      ocsf.raw_data = raw_log
+      ocsf.metadata = {
+          "version": "1.9.0",
+          "profiles": profiles,
+          "uid": audit_id,
+          "original_event_uid": audit_id,
+          # Every record of one logical auditd event shares this id.
+          "correlation_uid": audit_id,
+          "event_code": audit_type,
+          "log_source": "linux_auditd",
+          "log_provider": "auditd",
+          "product": { "name": "auditd", "vendor_name": "Linux" }
+      }
+      if audit_key != "" {
+          ocsf.metadata.event_code = audit_type + ":" + audit_key
+      }
+
+      . = ocsf
+  }
+samples:
+  - raw: "type=ADD_GROUP msg=audit(1787043802.600:4652): pid=3302 uid=0 auid=1000 ses=5 msg='op=adding-group grp=\"docker\" acct=\"alice\" id=999 exe=\"/usr/sbin/groupadd\" hostname=? addr=? terminal=pts/2 res=success'"
+    expect:
+      "class_uid": 3006
+      "activity_id": 6
+      "metadata.version": "1.9.0"
+  - raw: "type=ADD_USER msg=audit(1787043800.500:4650): pid=3300 uid=0 auid=1000 ses=5 msg='op=adding-user id=1500 exe=\"/usr/sbin/useradd\" hostname=? addr=? terminal=pts/2 res=success'"
+    expect:
+      "class_uid": 3007
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "type=AVC msg=audit(1787043805.777:4660): avc:  denied  { execute } for  pid=3400 comm=\"httpd\" name=\"payload.sh\" dev=\"dm-0\" ino=778812 scontext=system_u:system_r:httpd_t:s0 tcontext=unconfined_u:object_r:user_tmp_t:s0 tclass=file permissive=0"
+    expect:
+      "class_uid": 1007
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "Aug 18 10:15:00 web-01 kernel: something entirely unrelated"
+    expect:
+      "class_uid": 1007
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "type=CONFIG_CHANGE msg=audit(1787043808.100:4690): auid=1000 ses=5 op=add_rule key=\"exec_watch\" list=4 res=1"
+    expect:
+      "class_uid": 1007
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "type=CRED_ACQ msg=audit(1787043702.001:4602): pid=3212 uid=0 auid=1000 ses=5 msg='op=PAM:setcred grantors=pam_unix acct=\"alice\" exe=\"/usr/sbin/sshd\" hostname=jump.corp.local addr=10.4.5.6 terminal=ssh res=success'"
+    expect:
+      "class_uid": 3002
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "type=CWD msg=audit(1787043600.123:4521): cwd=\"/home/alice/work\""
+    expect:
+      "class_uid": 1007
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "type=DEL_USER msg=audit(1787043801.500:4651): pid=3301 uid=0 auid=1000 ses=5 msg='op=deleting-user acct=\"tempsvc\" id=1500 exe=\"/usr/sbin/userdel\" hostname=? addr=? terminal=pts/2 res=success'"
+    expect:
+      "class_uid": 3007
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  - raw: "type=EXECVE msg=audit(1787043600.123:4521): argc=3 a0=\"/usr/bin/curl\" a1=\"-fsSL\" a2=\"http://198.51.100.9/p.sh\""
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "type=NETFILTER_PKT msg=audit(1787043806.900:4670): mark=0 saddr=10.4.5.6 daddr=198.51.100.9 proto=6 sport=51234 dport=443"
+    expect:
+      "class_uid": 4001
+      "activity_id": 6
+      "metadata.version": "1.9.0"
+  - raw: "node=web-01.corp.local type=SYSCALL msg=audit(1787043807.001:4680): arch=c000003e syscall=59 success=yes exit=0 ppid=1 pid=4001 auid=4294967295 uid=0 gid=0 euid=0 tty=(none) ses=4294967295 comm=\"nginx\" exe=\"/usr/sbin/nginx\" key=(null)"
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "type=PATH msg=audit(1787043602.005:4530): item=0 name=\"/tmp/.hidden/payload\" inode=99 dev=fd:01 mode=0100755 ouid=1000 ogid=1000 nametype=CREATE"
+    expect:
+      "class_uid": 1001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "type=PATH msg=audit(1787043600.123:4521): item=1 name=\"/etc/shadow\" inode=1573 dev=fd:01 mode=0100640 ouid=0 ogid=42 rdev=00:00 nametype=NORMAL cap_fp=0 cap_fi=0"
+    expect:
+      "class_uid": 1001
+      "activity_id": 14
+      "metadata.version": "1.9.0"
+  - raw: "type=ROLE_ASSIGN msg=audit(1787043804.100:4655): pid=3305 uid=0 auid=1000 ses=5 msg='op=add-role acct=\"alice\" exe=\"/usr/sbin/semanage\" hostname=? addr=? terminal=pts/2 res=success'"
+    expect:
+      "class_uid": 3007
+      "activity_id": 16
+      "metadata.version": "1.9.0"
+  - raw: "type=SYSCALL msg=audit(1787043601.200:4522): arch=c000003e syscall=257 success=no exit=-13 items=1 ppid=3092 pid=3105 auid=1000 uid=1000 gid=1000 euid=0 tty=pts0 ses=3 comm=\"cat\" exe=\"/usr/bin/cat\" key=\"shadow_access\""
+    expect:
+      "class_uid": 1007
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "type=SYSCALL msg=audit(1787043600.123:4521): arch=c000003e syscall=59 success=yes exit=0 a0=55d1f2a3b400 a1=55d1f2a3b4c0 a2=55d1f2a3b500 a3=8 items=2 ppid=2841 pid=3092 auid=1000 uid=1000 gid=1000 euid=1000 suid=1000 fsuid=1000 egid=1000 sgid=1000 fsgid=1000 tty=pts0 ses=3 comm=\"curl\" exe=\"/usr/bin/curl\" subj=unconfined key=\"exec_watch\""
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "type=USER_ACCT msg=audit(1787043703.220:4603): pid=3211 uid=0 auid=1000 ses=5 msg='op=PAM:accounting grantors=pam_unix acct=\"alice\" exe=\"/usr/sbin/sshd\" hostname=jump.corp.local addr=10.4.5.6 terminal=ssh res=success'"
+    expect:
+      "class_uid": 3007
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "type=USER_AUTH msg=audit(1787043701.112:4601): pid=3211 uid=0 auid=4294967295 ses=4294967295 msg='op=PAM:authentication grantors=? acct=\"root\" exe=\"/usr/sbin/sshd\" hostname=203.0.113.44 addr=203.0.113.44 terminal=ssh res=failed'"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "type=USER_LOGIN msg=audit(1787043700.881:4600): pid=3210 uid=0 auid=1000 ses=5 msg='op=login id=1000 exe=\"/usr/sbin/sshd\" hostname=jump.corp.local addr=10.4.5.6 terminal=/dev/pts/2 res=success'"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "type=USER_LOGOUT msg=audit(1787043900.010:4700): pid=3210 uid=0 auid=1000 ses=5 msg='op=login id=1000 exe=\"/usr/sbin/sshd\" hostname=jump.corp.local addr=10.4.5.6 terminal=/dev/pts/2 res=success'"
+    expect:
+      "class_uid": 3002
+      "activity_id": 2
+      "metadata.version": "1.9.0"

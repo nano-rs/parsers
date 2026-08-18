@@ -18,7 +18,14 @@ UNSAMPLED_NAMES=""
 # fed to jq. Used to tell "ran to completion" from "aborted": a program that
 # finishes emits a JSON object, one that aborts emits "aborted" or a bare error.
 normalize_vector_output() {
-    printf '%s' "$1" | grep -v "INFO vector" | perl -pe "s/t'([^']*)'/\"\$1\"/g"
+    # `vector vrl` emits raw control characters (a literal tab or newline
+    # preserved from the source log) INSIDE JSON strings. That is well-formed as
+    # far as the event goes, but jq rejects it, and the caller then reports the
+    # parser as having aborted at runtime — a false failure that hits any source
+    # whose raw log contains a tab (rendered Windows event text, auditd
+    # PROCTITLE). Escape them so jq sees legal JSON; content is unchanged.
+    printf '%s' "$1" | grep -v "INFO vector" | perl -pe "s/t'([^']*)'/\"\$1\"/g" \
+        | perl -pe 's/([\x00-\x08\x0b\x0c\x0e-\x1f])/sprintf("\\\\u%04x", ord($1))/ge; s/\t/\\\\t/g'
 }
 
 # Minimal test events — just enough structure for VRL to compile + run against.
@@ -100,11 +107,11 @@ EOF
     fi
 
     # Write VRL to temp file (vector vrl reads from file)
-    vrl_file=$(mktemp /tmp/vrl_XXXXXX.vrl)
+    vrl_file=$(mktemp "${TMPDIR:-/tmp}/nano_vrl.XXXXXX")
     echo "$vrl_program" > "$vrl_file"
 
     # Write test event to temp file
-    event_file=$(mktemp /tmp/event_XXXXXX.json)
+    event_file=$(mktemp "${TMPDIR:-/tmp}/nano_event.XXXXXX")
     echo "$event_json" > "$event_file"
 
     # Run Vector VRL validation
@@ -170,7 +177,7 @@ EOF
         idx=0
         while [ "$idx" -lt "$sample_count" ]; do
             raw=$(yq ".samples[$idx].raw" "$parser_file")
-            sample_event=$(mktemp /tmp/sample_XXXXXX.json)
+            sample_event=$(mktemp "${TMPDIR:-/tmp}/nano_sample.XXXXXX")
             jq -nc --arg m "$raw" '{message: $m}' > "$sample_event"
 
             s_out=$(vector vrl --input "$sample_event" --program "$vrl_file" --print-object 2>&1)

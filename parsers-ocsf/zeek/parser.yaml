@@ -1,0 +1,1016 @@
+name: zeek_ocsf
+display_name: Zeek Network Monitor (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Zeek (Bro) JSON logs into OCSF 1.9.0, routed per log type via `_path`:
+  conn/ssl/x509/files/pe/dpd/sip/snmp/dce_rpc -> Network Activity (4001);
+  dns -> DNS Activity (4003); http -> HTTP Activity (4002); dhcp -> DHCP
+  Activity (4004); ssh -> SSH Activity (4007); rdp -> RDP Activity (4005);
+  smb_mapping/smb_files -> SMB Activity (4006); ftp -> FTP Activity (4008);
+  smtp -> Email Activity (4009); tunnel -> Tunnel Activity (4014);
+  kerberos/ntlm -> Authentication (3002); notice/intel/weird -> Detection
+  Finding (2004). An unrecognised `_path`, or a line that is not JSON, emits a
+  Base Event (class_uid 0) with activity_id 99, `metadata.event_code` set to
+  the Zeek log type, and the raw line preserved in `message` — rather than
+  being guessed into a security class.
+match_values:
+  - zeek
+category: network
+vendor: "Zeek Project"
+product: "Zeek"
+parser_vrl: |
+  # Zeek -> OCSF 1.9.0 (per-log-type class routing)
+
+  raw_log = string!(.message)
+  parsed, perr = parse_json(raw_log)
+  ev = {}
+  if perr == null && is_object(parsed) { ev = object!(parsed) }
+
+  log_type = downcase(to_string(ev._path) ?? "")
+  if log_type == "" { log_type = downcase(to_string(ev."@path") ?? "") }
+
+  # ---- time: Zeek ts is epoch seconds with fractional part ----
+  time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
+  tsf = to_float(to_string(ev.ts) ?? "") ?? 0.0
+  if tsf > 0.0 { time_ms = to_int(floor(tsf * 1000.0)) }
+
+  # ---- connection 5-tuple ----
+  src_ip = to_string(ev."id.orig_h") ?? ""
+  dst_ip = to_string(ev."id.resp_h") ?? ""
+  src_port = to_int(to_string(ev."id.orig_p") ?? "") ?? 0
+  dst_port = to_int(to_string(ev."id.resp_p") ?? "") ?? 0
+  proto = downcase(to_string(ev.proto) ?? "")
+  uid = to_string(ev.uid) ?? ""
+  community_id = to_string(ev.community_id) ?? ""
+  sensor = to_string(ev.node) ?? ""
+  if sensor == "" { sensor = to_string(ev."_system_name") ?? "" }
+  service = downcase(to_string(ev.service) ?? "")
+
+  proto_num = 0
+  if proto == "tcp" { proto_num = 6 }
+  if proto == "udp" { proto_num = 17 }
+  if proto == "icmp" { proto_num = 1 }
+
+  # Zeek counts orig_* as the connection originator == OCSF src_endpoint
+  bytes_out = to_int(to_string(ev.orig_bytes) ?? "") ?? 0
+  bytes_in = to_int(to_string(ev.resp_bytes) ?? "") ?? 0
+  pkts_out = to_int(to_string(ev.orig_pkts) ?? "") ?? 0
+  pkts_in = to_int(to_string(ev.resp_pkts) ?? "") ?? 0
+  dur_f = to_float(to_string(ev.duration) ?? "") ?? 0.0
+  duration_s = to_int(floor(dur_f))
+  conn_state = to_string(ev.conn_state) ?? ""
+
+  severity_id = 1
+  severity = "Informational"
+  status_id = 1
+  status_str = "Success"
+  action_id = 3
+  action = "Observed"
+  disposition_id = 17
+  disposition = "Logged"
+
+  src = {}
+  if src_ip != "" { src.ip = downcase(src_ip) }
+  if src_port > 0 { src.port = src_port }
+  dst = {}
+  if dst_ip != "" { dst.ip = downcase(dst_ip) }
+  if dst_port > 0 { dst.port = dst_port }
+  if service != "" && service != "-" { dst.svc_name = service }
+
+  traffic = {}
+  if bytes_in > 0 { traffic.bytes_in = bytes_in }
+  if bytes_out > 0 { traffic.bytes_out = bytes_out }
+  if pkts_in > 0 { traffic.packets_in = pkts_in }
+  if pkts_out > 0 { traffic.packets_out = pkts_out }
+
+  conn_info = { "direction_id": 0, "protocol_num": proto_num }
+  if proto != "" { conn_info.protocol_name = proto }
+  if uid != "" { conn_info.uid = uid }
+  if community_id != "" { conn_info.community_uid = community_id }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": uuid_v4(),
+      "log_source": "zeek",
+      "log_provider": "Zeek",
+      "profiles": ["host", "security_control"],
+      "product": {
+          "name": "Zeek",
+          "vendor_name": "Zeek Project",
+          "feature": { "name": "network_monitor" }
+      }
+  }
+  if log_type != "" { metadata.log_name = log_type; metadata.event_code = log_type }
+  if uid != "" { metadata.correlation_uid = uid }
+
+  device = { "type_id": 13, "type": "IDS" }
+  has_device = false
+  if sensor != "" { device.hostname = sensor; has_device = true }
+
+  unmapped = {}
+  if uid != "" { unmapped.zeek_uid = uid }
+  if log_type != "" { unmapped.zeek_path = log_type }
+  if conn_state != "" { unmapped.conn_state = conn_state }
+  if community_id != "" { unmapped.community_id = community_id }
+  if perr != null { unmapped.parse_status = "not_json" }
+
+  obs = []
+  if src_ip != "" { obs = push(obs, { "name": "src_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(src_ip) }) }
+  if dst_ip != "" { obs = push(obs, { "name": "dst_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(dst_ip) }) }
+
+  # endpoints fallback shared by every class that constrains on them
+  src_fb = src
+  dst_fb = dst
+  if length(src_fb) == 0 && length(dst_fb) == 0 {
+      if sensor != "" {
+          src_fb = { "hostname": sensor }
+      } else {
+          src_fb = { "hostname": "unknown" }
+      }
+  }
+
+  # ============================================================
+  # conn / ssl / x509 / files / pe / dpd / sip / snmp / dce_rpc
+  # ============================================================
+  if log_type == "conn" || log_type == "ssl" || log_type == "x509" || log_type == "files" || log_type == "pe" || log_type == "dpd" || log_type == "sip" || log_type == "snmp" || log_type == "dce_rpc" || log_type == "radius" || log_type == "modbus" || log_type == "irc" || log_type == "mysql" {
+      activity_id = 6
+      activity_name = "Traffic"
+      if log_type == "conn" {
+          if conn_state == "S0" || conn_state == "REJ" {
+              activity_id = 5
+              activity_name = "Refuse"
+              action_id = 2
+              action = "Denied"
+              disposition_id = 2
+              disposition = "Blocked"
+          }
+          if conn_state == "SF" || conn_state == "RSTO" || conn_state == "RSTR" {
+              activity_id = 2
+              activity_name = "Close"
+              action_id = 1
+              action = "Allowed"
+              disposition_id = 1
+              disposition = "Allowed"
+          }
+      }
+      class_uid = 4001
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Network Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": conn_info,
+          "src_endpoint": src_fb
+      }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if length(traffic) > 0 { .traffic = traffic }
+      if duration_s > 0 { .duration = duration_s }
+      if service != "" && service != "-" { .app_protocol_name = service }
+      if has_device { .device = device }
+      # TLS / certificate detail
+      sni = to_string(ev.server_name) ?? ""
+      if sni != "" { unmapped.tls_sni = sni }
+      tlsv = to_string(ev.version) ?? ""
+      if tlsv != "" && log_type == "ssl" { unmapped.tls_version = tlsv }
+      ja3 = to_string(ev.ja3) ?? ""
+      if ja3 != "" { unmapped.ja3 = ja3 }
+      subj = to_string(ev."certificate.subject") ?? ""
+      if subj != "" { unmapped.cert_subject = subj }
+      # file detail (files / pe) — 4001 defines no `file` attribute
+      fname = to_string(ev.filename) ?? ""
+      if fname != "" { unmapped.file_name = fname }
+      fsha = to_string(ev.sha256) ?? ""
+      if fsha != "" {
+          unmapped.file_sha256 = fsha
+          obs = push(obs, { "name": "file.hashes.value", "type": "Fingerprint", "type_id": 30, "value": fsha })
+      }
+      fmime = to_string(ev.mime_type) ?? ""
+      if fmime != "" { unmapped.file_mime_type = fmime }
+
+  # ============================================================
+  # dns
+  # ============================================================
+  } else if log_type == "dns" {
+      class_uid = 4003
+      qname = to_string(ev.query) ?? ""
+      qtype = to_string(ev.qtype_name) ?? ""
+      qclass = to_string(ev.qclass_name) ?? ""
+      rcode_name = to_string(ev.rcode_name) ?? ""
+      txid = to_int(to_string(ev.trans_id) ?? "") ?? 0
+      dns_activity = 1
+      dns_activity_name = "Query"
+      if rcode_name != "" || is_array(ev.answers) { dns_activity = 2; dns_activity_name = "Response" }
+      if rcode_name != "" && rcode_name != "NOERROR" {
+          status_id = 2
+          status_str = "Failure"
+      }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "DNS Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": dns_activity,
+          "activity_name": dns_activity_name,
+          "type_uid": class_uid * 100 + dns_activity,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": conn_info,
+          "src_endpoint": src_fb
+      }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      q = {}
+      if qname != "" { q.hostname = qname }
+      if qtype != "" { q.type = qtype }
+      if qclass != "" { q.class = qclass }
+      if length(q) > 0 { .query = q }
+      if rcode_name != "" { .rcode = rcode_name }
+      if txid > 0 { .transaction_id = txid }
+      if is_array(ev.answers) {
+          answers = []
+          ttls = []
+          if is_array(ev.TTLs) { ttls = array!(ev.TTLs) }
+          for_each(array!(ev.answers)) -> |i, a| {
+              rd = to_string(a) ?? ""
+              if rd != "" {
+                  ans = { "rdata": rd }
+                  tt2 = to_int(to_string(get(ttls, [i]) ?? "") ?? "") ?? 0
+                  if tt2 > 0 { ans.ttl = tt2 }
+                  answers = push(answers, ans)
+              }
+          }
+          if length(answers) > 0 { .answers = answers }
+      }
+      if has_device { .device = device }
+      if qname != "" { obs = push(obs, { "name": "query.hostname", "type": "Hostname", "type_id": 1, "value": qname }) }
+
+  # ============================================================
+  # http
+  # ============================================================
+  } else if log_type == "http" {
+      class_uid = 4002
+      method = upcase(to_string(ev.method) ?? "")
+      http_activity = 99
+      http_activity_name = "Other"
+      if method == "CONNECT" { http_activity = 1;  http_activity_name = "Connect" }
+      if method == "DELETE"  { http_activity = 2;  http_activity_name = "Delete" }
+      if method == "GET"     { http_activity = 3;  http_activity_name = "Get" }
+      if method == "HEAD"    { http_activity = 4;  http_activity_name = "Head" }
+      if method == "OPTIONS" { http_activity = 5;  http_activity_name = "Options" }
+      if method == "POST"    { http_activity = 6;  http_activity_name = "Post" }
+      if method == "PUT"     { http_activity = 7;  http_activity_name = "Put" }
+      if method == "TRACE"   { http_activity = 8;  http_activity_name = "Trace" }
+      if method == "PATCH"   { http_activity = 9;  http_activity_name = "Patch" }
+      hostname = to_string(ev.host) ?? ""
+      uri = to_string(ev.uri) ?? ""
+      code = to_int(to_string(ev.status_code) ?? "") ?? 0
+      hstatus = "Unknown"
+      if code > 0 && code < 400 { status_id = 1; status_str = "Success"; hstatus = "Success" }
+      if code >= 400 { status_id = 2; status_str = "Failure"; hstatus = "Failure" }
+      url = {}
+      if hostname != "" { url.hostname = hostname }
+      if uri != "" { url.path = uri }
+      if hostname != "" && uri != "" { url.url_string = "http://" + hostname + uri }
+      req = {}
+      if http_activity != 99 { req.http_method = method }
+      ua = to_string(ev.user_agent) ?? ""
+      if ua != "" { req.user_agent = ua }
+      rf = to_string(ev.referrer) ?? ""
+      if rf != "" { req.referrer = rf }
+      if length(url) > 0 { req.url = url }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": http_activity,
+          "activity_name": http_activity_name,
+          "type_uid": class_uid * 100 + http_activity,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": conn_info,
+          "http_request": req,
+          "src_endpoint": src_fb
+      }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if code > 0 {
+          resp = { "code": code, "status": hstatus }
+          rl = to_int(to_string(ev.response_body_len) ?? "") ?? 0
+          if rl > 0 { resp.length = rl }
+          ct = to_string(ev.resp_mime_types) ?? ""
+          if ct != "" { resp.content_type = ct }
+          .http_response = resp
+      }
+      rb = to_int(to_string(ev.response_body_len) ?? "") ?? 0
+      qb = to_int(to_string(ev.request_body_len) ?? "") ?? 0
+      t2 = {}
+      if rb > 0 { t2.bytes_in = rb }
+      if qb > 0 { t2.bytes_out = qb }
+      if length(t2) > 0 { .traffic = t2 }
+      zuser = to_string(ev.username) ?? ""
+      if zuser != "" { .actor = { "user": { "name": zuser } } }
+      if has_device { .device = device }
+      if ua != "" { obs = push(obs, { "name": "http_request.user_agent", "type": "HTTP User-Agent", "type_id": 16, "value": ua }) }
+
+  # ============================================================
+  # dhcp
+  # ============================================================
+  } else if log_type == "dhcp" {
+      class_uid = 4004
+      msg_types = ""
+      if is_array(ev.msg_types) {
+          mt = array!(ev.msg_types)
+          msg_types = downcase(to_string(mt[0]) ?? "")
+      }
+      if msg_types == "" { msg_types = downcase(to_string(ev.msg_types) ?? "") }
+      dhcp_activity = 99
+      dhcp_activity_name = "Other"
+      if contains(msg_types, "discover") { dhcp_activity = 1; dhcp_activity_name = "Discover" }
+      if contains(msg_types, "offer")    { dhcp_activity = 2; dhcp_activity_name = "Offer" }
+      if contains(msg_types, "request")  { dhcp_activity = 3; dhcp_activity_name = "Request" }
+      if contains(msg_types, "decline")  { dhcp_activity = 4; dhcp_activity_name = "Decline" }
+      if contains(msg_types, "ack")      { dhcp_activity = 5; dhcp_activity_name = "Ack" }
+      if contains(msg_types, "nak")      { dhcp_activity = 6; dhcp_activity_name = "Nak" }
+      if contains(msg_types, "release")  { dhcp_activity = 7; dhcp_activity_name = "Release" }
+      if contains(msg_types, "inform")   { dhcp_activity = 8; dhcp_activity_name = "Inform" }
+      csrc = src
+      cmac = to_string(ev.mac) ?? ""
+      if cmac != "" { csrc.mac = downcase(cmac) }
+      chost = to_string(ev.host_name) ?? ""
+      if chost != "" { csrc.hostname = chost }
+      aip = to_string(ev.assigned_addr) ?? ""
+      if aip != "" { csrc.ip = downcase(aip) }
+      if length(csrc) == 0 { csrc = src_fb }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "DHCP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": dhcp_activity,
+          "activity_name": dhcp_activity_name,
+          "type_uid": class_uid * 100 + dhcp_activity,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": conn_info,
+          "src_endpoint": csrc
+      }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      lt_f = to_float(to_string(ev.lease_time) ?? "") ?? 0.0
+      lt = to_int(floor(lt_f))
+      if lt > 0 { .lease_dur = lt }
+      if has_device { .device = device }
+
+  # ============================================================
+  # ssh -> 4007 SSH Activity
+  # ============================================================
+  } else if log_type == "ssh" {
+      class_uid = 4007
+      ssh_activity = 1
+      ssh_activity_name = "Open"
+      auth_success = to_string(ev.auth_success) ?? ""
+      if auth_success == "false" {
+          ssh_activity = 4
+          ssh_activity_name = "Fail"
+          status_id = 2
+          status_str = "Failure"
+          severity_id = 2
+          severity = "Low"
+      }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "SSH Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": ssh_activity,
+          "activity_name": ssh_activity_name,
+          "type_uid": class_uid * 100 + ssh_activity,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": conn_info,
+          "src_endpoint": src_fb
+      }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if length(traffic) > 0 { .traffic = traffic }
+      pv = to_string(ev.version) ?? ""
+      if pv != "" { .protocol_ver = pv }
+      cli = to_string(ev.client) ?? ""
+      if cli != "" { unmapped.ssh_client = cli }
+      srv = to_string(ev.server) ?? ""
+      if srv != "" { unmapped.ssh_server = srv }
+      hka = to_string(ev.host_key_alg) ?? ""
+      if hka != "" { unmapped.ssh_host_key_alg = hka }
+      hk = to_string(ev.host_key) ?? ""
+      if hk != "" { unmapped.ssh_host_key = hk }
+      if has_device { .device = device }
+
+  # ============================================================
+  # rdp -> 4005 RDP Activity
+  # ============================================================
+  } else if log_type == "rdp" {
+      class_uid = 4005
+      . = {
+          "class_uid": class_uid,
+          "class_name": "RDP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": 6,
+          "activity_name": "Traffic",
+          "type_uid": class_uid * 100 + 6,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": conn_info,
+          "src_endpoint": src_fb
+      }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if length(traffic) > 0 { .traffic = traffic }
+      ck = to_string(ev.cookie) ?? ""
+      if ck != "" { .identifier_cookie = ck }
+      dw = to_int(to_string(ev."desktop_width") ?? "") ?? 0
+      dh = to_int(to_string(ev."desktop_height") ?? "") ?? 0
+      if dw > 0 && dh > 0 { .remote_display = { "physical_width": dw, "physical_height": dh } }
+      rs = to_string(ev.result) ?? ""
+      if rs != "" { .status_detail = rs }
+      kb = to_string(ev.keyboard_layout) ?? ""
+      if kb != "" { unmapped.rdp_keyboard_layout = kb }
+      if has_device { .device = device }
+
+  # ============================================================
+  # smb_mapping / smb_files -> 4006 SMB Activity
+  # ============================================================
+  } else if log_type == "smb_mapping" || log_type == "smb_files" {
+      class_uid = 4006
+      smb_activity = 99
+      smb_activity_name = "Other"
+      zaction = downcase(to_string(ev.action) ?? "")
+      if contains(zaction, "open") { smb_activity = 2; smb_activity_name = "File Open" }
+      if contains(zaction, "create") { smb_activity = 3; smb_activity_name = "File Create" }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "SMB Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": smb_activity,
+          "activity_name": smb_activity_name,
+          "type_uid": class_uid * 100 + smb_activity,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": conn_info,
+          "src_endpoint": src_fb
+      }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      share = to_string(ev.path) ?? ""
+      if share != "" { .share = share }
+      st = to_string(ev.share_type) ?? ""
+      if st != "" { .share_type = st }
+      fname = to_string(ev.name) ?? ""
+      if fname != "" { .file = { "name": fname, "path": fname, "type_id": 1 } }
+      if zaction != "" { unmapped.smb_action = zaction }
+      if has_device { .device = device }
+
+  # ============================================================
+  # ftp -> 4008 FTP Activity
+  # ============================================================
+  } else if log_type == "ftp" {
+      class_uid = 4008
+      cmd = upcase(to_string(ev.command) ?? "")
+      ftp_activity = 99
+      ftp_activity_name = "Other"
+      if cmd == "STOR" || cmd == "APPE" { ftp_activity = 1; ftp_activity_name = "Put" }
+      if cmd == "RETR" { ftp_activity = 2; ftp_activity_name = "Get" }
+      if cmd == "DELE" { ftp_activity = 4; ftp_activity_name = "Delete" }
+      if cmd == "RNTO" || cmd == "RNFR" { ftp_activity = 5; ftp_activity_name = "Rename" }
+      if cmd == "LIST" || cmd == "NLST" || cmd == "MLSD" { ftp_activity = 6; ftp_activity_name = "List" }
+      rcode = to_int(to_string(ev.reply_code) ?? "") ?? 0
+      if rcode >= 400 { status_id = 2; status_str = "Failure" }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "FTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": ftp_activity,
+          "activity_name": ftp_activity_name,
+          "type_uid": class_uid * 100 + ftp_activity,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": conn_info,
+          "src_endpoint": src_fb
+      }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if cmd != "" { .command = cmd }
+      if rcode > 0 { .codes = [rcode] }
+      arg = to_string(ev.arg) ?? ""
+      if arg != "" { .file = { "name": arg, "path": arg, "type_id": 1 } }
+      zuser = to_string(ev.user) ?? ""
+      if zuser != "" { .actor = { "user": { "name": zuser } } }
+      rmsg = to_string(ev.reply_msg) ?? ""
+      if rmsg != "" { .status_detail = rmsg }
+      if has_device { .device = device }
+
+  # ============================================================
+  # smtp -> 4009 Email Activity
+  # ============================================================
+  } else if log_type == "smtp" {
+      class_uid = 4009
+      email = {}
+      efrom = to_string(ev.from) ?? ""
+      if efrom == "" { efrom = to_string(ev.mailfrom) ?? "" }
+      if efrom != "" { email.from = efrom }
+      if is_array(ev.rcptto) {
+          tos = []
+          for_each(array!(ev.rcptto)) -> |_i, t| {
+              tv3 = to_string(t) ?? ""
+              if tv3 != "" { tos = push(tos, tv3) }
+          }
+          if length(tos) > 0 { email.to = tos }
+      }
+      eto = to_string(ev.to) ?? ""
+      if eto != "" && !exists(email.to) { email.to = [eto] }
+      subj = to_string(ev.subject) ?? ""
+      if subj != "" { email.subject = subj }
+      mid = to_string(ev.msg_id) ?? ""
+      if mid != "" { email.message_uid = mid }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Email Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": 1,
+          "activity_name": "Send",
+          "type_uid": class_uid * 100 + 1,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "direction_id": 0,
+          "direction": "Unknown",
+          "email": email,
+          "src_endpoint": src_fb
+      }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      helo = to_string(ev.helo) ?? ""
+      if helo != "" { unmapped.smtp_helo = helo }
+      if has_device { .device = device }
+
+  # ============================================================
+  # tunnel -> 4014 Tunnel Activity
+  # ============================================================
+  } else if log_type == "tunnel" {
+      class_uid = 4014
+      zaction = downcase(to_string(ev.action) ?? "")
+      tun_activity = 99
+      tun_activity_name = "Other"
+      if contains(zaction, "discover") || contains(zaction, "open") { tun_activity = 1; tun_activity_name = "Open" }
+      if contains(zaction, "close") || contains(zaction, "expire") { tun_activity = 2; tun_activity_name = "Close" }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Tunnel Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": tun_activity,
+          "activity_name": tun_activity_name,
+          "type_uid": class_uid * 100 + tun_activity,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": conn_info,
+          "src_endpoint": src_fb
+      }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      tt = to_string(ev.tunnel_type) ?? ""
+      if tt != "" { unmapped.tunnel_type_raw = tt }
+      if uid != "" { .session = { "uid": uid } }
+      if has_device { .device = device }
+
+  # ============================================================
+  # kerberos / ntlm -> 3002 Authentication
+  # ============================================================
+  } else if log_type == "kerberos" || log_type == "ntlm" {
+      class_uid = 3002
+      zuser = to_string(ev.client) ?? ""
+      if log_type == "ntlm" { zuser = to_string(ev.username) ?? "" }
+      udomain = to_string(ev.domainname) ?? ""
+      svc = to_string(ev.service) ?? ""
+      success = to_string(ev.success) ?? ""
+      auth_activity = 1
+      auth_activity_name = "Logon"
+      if log_type == "kerberos" {
+          req_type = upcase(to_string(ev.request_type) ?? "")
+          if req_type == "TGS" { auth_activity = 4; auth_activity_name = "Service Ticket Request" }
+          if req_type == "AS" { auth_activity = 3; auth_activity_name = "Authentication Ticket" }
+      }
+      if success == "false" {
+          status_id = 2
+          status_str = "Failure"
+          action_id = 2
+          action = "Denied"
+          disposition_id = 2
+          disposition = "Blocked"
+          severity_id = 2
+          severity = "Low"
+      } else {
+          action_id = 1
+          action = "Allowed"
+          disposition_id = 1
+          disposition = "Allowed"
+      }
+      user_obj = { "name": zuser }
+      if udomain != "" { user_obj.domain = udomain }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Authentication",
+          "category_uid": 3,
+          "category_name": "Identity & Access Management",
+          "activity_id": auth_activity,
+          "activity_name": auth_activity_name,
+          "type_uid": class_uid * 100 + auth_activity,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "user": user_obj,
+          "src_endpoint": src_fb
+      }
+      if length(dst) > 0 {
+          .dst_endpoint = dst
+      } else {
+          .service = { "name": "Zeek " + log_type }
+      }
+      if log_type == "kerberos" { .auth_protocol_id = 2; .auth_protocol = "Kerberos" }
+      if log_type == "ntlm" { .auth_protocol_id = 1; .auth_protocol = "NTLM" }
+      if svc != "" { unmapped.kerberos_service = svc }
+      ct = to_string(ev.cipher) ?? ""
+      if ct != "" { unmapped.kerberos_cipher = ct }
+      if zuser != "" { obs = push(obs, { "name": "user.name", "type": "User Name", "type_id": 4, "value": zuser }) }
+      if has_device { .device = device }
+
+  # ============================================================
+  # notice / intel / weird -> 2004 Detection Finding
+  # ============================================================
+  } else if log_type == "notice" || log_type == "intel" || log_type == "weird" {
+      class_uid = 2004
+      title = to_string(ev.note) ?? ""
+      if title == "" { title = to_string(ev.name) ?? "" }
+      if title == "" { title = "Zeek " + log_type }
+      desc = to_string(ev.msg) ?? ""
+      severity_id = 3
+      severity = "Medium"
+      if log_type == "weird" { severity_id = 2; severity = "Low" }
+      if log_type == "intel" { severity_id = 4; severity = "High" }
+      evidence = {}
+      if length(src) > 0 { evidence.src_endpoint = src }
+      if length(dst) > 0 { evidence.dst_endpoint = dst }
+      if proto_num > 0 { evidence.connection_info = { "direction_id": 0, "protocol_num": proto_num } }
+      evidence.name = "Zeek " + log_type
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Detection Finding",
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": 1,
+          "activity_name": "Create",
+          "type_uid": class_uid * 100 + 1,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": 15,
+          "disposition": "Detected",
+          "is_alert": true,
+          "metadata": metadata,
+          "finding_info": {
+              "uid": title,
+              "title": title,
+              "types": [log_type],
+              "data_sources": ["zeek"],
+              "analytic": { "name": title, "uid": title, "type_id": 1, "type": "Rule" }
+          },
+          "evidences": [evidence]
+      }
+      if desc != "" { .finding_info.desc = desc; .status_detail = desc }
+      iv = to_string(ev."seen.indicator") ?? ""
+      if iv != "" {
+          unmapped.intel_indicator = iv
+          obs = push(obs, { "name": "finding_info.uid", "type": "Hostname", "type_id": 1, "value": iv })
+      }
+      isrc = to_string(ev.sources) ?? ""
+      if isrc != "" { unmapped.intel_sources = isrc }
+      if has_device { .device = device }
+
+  # ============================================================
+  # unknown Zeek log type -> Base Event (0), nothing guessed
+  # ============================================================
+  } else {
+      class_uid = 0
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "metadata": metadata
+      }
+      if log_type == "" { .metadata.event_code = "unknown" }
+  }
+
+  if length(unmapped) > 0 {
+      if exists(.unmapped) {
+          .unmapped = merge(object!(.unmapped), unmapped)
+      } else {
+          .unmapped = unmapped
+      }
+  }
+  if length(obs) > 0 { .observables = obs }
+
+  .
+samples:
+- raw: '{"_path":"conn","ts":1730281572.123456,"uid":"CxT1234abcd","id.orig_h":"10.10.1.55","id.orig_p":51422,"id.resp_h":"93.184.216.34","id.resp_p":443,"proto":"tcp","service":"ssl","duration":60.25,"orig_bytes":4210,"resp_bytes":11111,"conn_state":"SF","local_orig":true,"local_resp":false,"missed_bytes":0,"history":"ShADadFf","orig_pkts":14,"orig_ip_bytes":4770,"resp_pkts":10,"resp_ip_bytes":11511,"community_id":"1:abcd=","node":"zeek-sensor-1"}
+
+    '
+  expect:
+    class_uid: 4001
+    activity_id: 2
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 93.184.216.34
+    disposition_id: 1
+- raw: '{"_path":"conn","ts":1730281600.0,"uid":"CxT9999","id.orig_h":"203.0.113.44","id.orig_p":44112,"id.resp_h":"10.10.1.20","id.resp_p":3389,"proto":"tcp","conn_state":"REJ","orig_pkts":1,"resp_pkts":1,"node":"zeek-sensor-1"}
+
+    '
+  expect:
+    class_uid: 4001
+    activity_id: 5
+    src_endpoint.ip: 203.0.113.44
+    dst_endpoint.ip: 10.10.1.20
+    disposition_id: 2
+- raw: '{"_path":"dhcp","ts":1730281610.0,"uids":["CxDh666"],"client_addr":"10.10.1.99","server_addr":"10.10.1.1","mac":"00:0c:29:3a:1b:5f","host_name":"LAPTOP-7","domain":"corp.local","assigned_addr":"10.10.1.99","lease_time":86400.0,"msg_types":["REQUEST","ACK"],"duration":0.05,"node":"zeek-sensor-1"}
+
+    '
+  expect:
+    class_uid: 4004
+    activity_id: 3
+    src_endpoint.ip: 10.10.1.99
+    disposition_id: 17
+- raw: '{"_path":"dns","ts":1730281580.5,"uid":"CxD111","id.orig_h":"10.10.1.55","id.orig_p":51000,"id.resp_h":"8.8.8.8","id.resp_p":53,"proto":"udp","trans_id":42513,"query":"example.com","qclass":1,"qclass_name":"C_INTERNET","qtype":1,"qtype_name":"A","rcode":0,"rcode_name":"NOERROR","AA":false,"TC":false,"RD":true,"RA":true,"Z":0,"answers":["93.184.216.34"],"TTLs":[300.0],"rejected":false,"node":"zeek-sensor-1"}
+
+    '
+  expect:
+    class_uid: 4003
+    activity_id: 2
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 8.8.8.8
+    query.hostname: example.com
+    disposition_id: 17
+- raw: '{"_path":"files","ts":1730281594.0,"fuid":"FxAbc","tx_hosts":["93.184.216.34"],"rx_hosts":["10.10.1.55"],"conn_uids":["CxH222"],"source":"HTTP","depth":0,"analyzers":["SHA256","MD5"],"mime_type":"application/x-dosexec","filename":"payload.exe","duration":0.1,"is_orig":false,"seen_bytes":10240,"total_bytes":10240,"md5":"d41d8cd98f00b204e9800998ecf8427e","sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","node":"zeek-sensor-1"}
+
+    '
+  expect:
+    class_uid: 4001
+    activity_id: 6
+    disposition_id: 17
+- raw: '{"_path":"ftp","ts":1730281602.0,"uid":"CxF888","id.orig_h":"10.10.1.55","id.orig_p":51602,"id.resp_h":"198.51.100.20","id.resp_p":21,"user":"anonymous","password":"anon@","command":"RETR","arg":"ftp://198.51.100.20/pub/tool.zip","file_size":204800,"reply_code":226,"reply_msg":"Transfer complete","node":"zeek-sensor-1"}
+
+    '
+  expect:
+    class_uid: 4008
+    activity_id: 2
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 198.51.100.20
+    actor.user.name: anonymous
+    disposition_id: 17
+- raw: '{"_path":"http","ts":1730281590.0,"uid":"CxH222","id.orig_h":"10.10.1.55","id.orig_p":51423,"id.resp_h":"93.184.216.34","id.resp_p":80,"trans_depth":1,"method":"GET","host":"malware.example.com","uri":"/payload.exe","referrer":"http://example.com/","version":"1.1","user_agent":"curl/8.1.0","request_body_len":0,"response_body_len":10240,"status_code":200,"status_msg":"OK","resp_mime_types":["application/octet-stream"],"node":"zeek-sensor-1"}
+
+    '
+  expect:
+    class_uid: 4002
+    activity_id: 3
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 93.184.216.34
+    http_request.url.path: /payload.exe
+    disposition_id: 17
+- raw: '{"_path":"intel","ts":1730281608.0,"uid":"CxI444","id.orig_h":"10.10.1.55","id.orig_p":51608,"id.resp_h":"185.220.101.1","id.resp_p":443,"seen.indicator":"185.220.101.1","seen.indicator_type":"Intel::ADDR","seen.where":"Conn::IN_RESP","matched":["Intel::ADDR"],"sources":["tor-exit-nodes"],"node":"zeek-sensor-1"}
+
+    '
+  expect:
+    class_uid: 2004
+    activity_id: 1
+    finding_info.uid: Zeek intel
+    disposition_id: 15
+- raw: '{"_path":"kerberos","ts":1730281605.0,"uid":"CxK111","id.orig_h":"10.10.1.55","id.orig_p":51605,"id.resp_h":"10.10.1.5","id.resp_p":88,"request_type":"TGS","client":"jsmith/CORP.LOCAL","service":"cifs/filesrv.corp.local","success":true,"cipher":"aes256-cts-hmac-sha1-96","node":"zeek-sensor-1"}
+
+    '
+  expect:
+    class_uid: 3002
+    activity_id: 4
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 10.10.1.5
+    user.name: jsmith/CORP.LOCAL
+    disposition_id: 1
+- raw: '{"_path":"notice","ts":1730281607.0,"uid":"CxNo333","id.orig_h":"203.0.113.9","id.orig_p":44001,"id.resp_h":"10.10.1.7","id.resp_p":445,"proto":"tcp","note":"Scan::Port_Scan","msg":"203.0.113.9 scanned at least 15 unique ports","sub":"remote","src":"203.0.113.9","dst":"10.10.1.7","peer_descr":"zeek-sensor-1","actions":["Notice::ACTION_LOG"],"suppress_for":3600.0,"node":"zeek-sensor-1"}
+
+    '
+  expect:
+    class_uid: 2004
+    activity_id: 1
+    finding_info.uid: Scan::Port_Scan
+    disposition_id: 15
+- raw: '{"_path":"ntlm","ts":1730281606.0,"uid":"CxN222","id.orig_h":"10.10.1.55","id.orig_p":51606,"id.resp_h":"10.10.1.7","id.resp_p":445,"username":"jsmith","hostname":"LAPTOP-7","domainname":"CORP","success":false,"node":"zeek-sensor-1"}
+
+    '
+  expect:
+    class_uid: 3002
+    activity_id: 1
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 10.10.1.7
+    user.name: jsmith
+    disposition_id: 2
+- raw: not zeek json
+  expect:
+    class_uid: 0
+    activity_id: 99
+- raw: '{"_path":"rdp","ts":1730281598.0,"uid":"CxR555","id.orig_h":"203.0.113.44","id.orig_p":44112,"id.resp_h":"10.10.1.20","id.resp_p":3389,"cookie":"administrator","result":"encrypted","security_protocol":"HYBRID","desktop_width":1920,"desktop_height":1080,"keyboard_layout":"English - United States","node":"zeek-sensor-1"}
+
+    '
+  expect:
+    class_uid: 4005
+    activity_id: 6
+    src_endpoint.ip: 203.0.113.44
+    dst_endpoint.ip: 10.10.1.20
+    disposition_id: 17
+- raw: '{"_path":"smb_files","ts":1730281601.0,"uid":"CxSmb777","id.orig_h":"10.10.1.55","id.orig_p":51601,"id.resp_h":"10.10.1.7","id.resp_p":445,"action":"SMB::FILE_OPEN","path":"\\\\FILESRV\\Finance","name":"payroll.xlsx","size":40960,"node":"zeek-sensor-1"}
+
+    '
+  expect:
+    class_uid: 4006
+    activity_id: 2
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 10.10.1.7
+    disposition_id: 17
+- raw: '{"_path":"smb_mapping","ts":1730281599.0,"uid":"CxSmb666","id.orig_h":"10.10.1.55","id.orig_p":51600,"id.resp_h":"10.10.1.7","id.resp_p":445,"path":"\\\\FILESRV\\Finance","share_type":"DISK","node":"zeek-sensor-1"}
+
+    '
+  expect:
+    class_uid: 4006
+    activity_id: 99
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 10.10.1.7
+    disposition_id: 17
+- raw: '{"_path":"smtp","ts":1730281603.0,"uid":"CxE999","id.orig_h":"10.10.1.55","id.orig_p":51603,"id.resp_h":"198.51.100.25","id.resp_p":25,"trans_depth":1,"helo":"mail.corp.local","mailfrom":"jsmith@corp.local","rcptto":["partner@example.com"],"from":"jsmith@corp.local","to":["partner@example.com"],"subject":"Q4 numbers","msg_id":"<abc@corp.local>","node":"zeek-sensor-1"}
+
+    '
+  expect:
+    class_uid: 4009
+    activity_id: 1
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 198.51.100.25
+    disposition_id: 17
+- raw: '{"_path":"ssh","ts":1730281596.0,"uid":"CxSsh444","id.orig_h":"203.0.113.9","id.orig_p":51500,"id.resp_h":"10.10.1.7","id.resp_p":22,"version":2,"auth_success":false,"auth_attempts":3,"client":"SSH-2.0-OpenSSH_9.0","server":"SSH-2.0-OpenSSH_8.9p1","cipher_alg":"chacha20-poly1305@openssh.com","host_key_alg":"ssh-ed25519","host_key":"aa:bb:cc","node":"zeek-sensor-1"}
+
+    '
+  expect:
+    class_uid: 4007
+    activity_id: 4
+    src_endpoint.ip: 203.0.113.9
+    dst_endpoint.ip: 10.10.1.7
+    disposition_id: 17
+- raw: '{"_path":"ssl","ts":1730281592.0,"uid":"CxS333","id.orig_h":"10.10.1.55","id.orig_p":51424,"id.resp_h":"93.184.216.34","id.resp_p":443,"version":"TLSv13","cipher":"TLS_AES_256_GCM_SHA384","server_name":"example.com","resumed":false,"established":true,"ja3":"e7d705a3286e19ea42f587b344ee6865","node":"zeek-sensor-1"}
+
+    '
+  expect:
+    class_uid: 4001
+    activity_id: 6
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 93.184.216.34
+    disposition_id: 17
+- raw: '{"_path":"tunnel","ts":1730281604.0,"uid":"CxT000","id.orig_h":"10.10.1.55","id.orig_p":0,"id.resp_h":"198.51.100.30","id.resp_p":0,"tunnel_type":"Tunnel::GRE","action":"Tunnel::DISCOVER","node":"zeek-sensor-1"}
+
+    '
+  expect:
+    class_uid: 4014
+    activity_id: 1
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 198.51.100.30
+    disposition_id: 17
+- raw: '{"_path":"radius_wonky_custom","ts":1730281611.0,"uid":"CxU777","id.orig_h":"10.10.1.55","id.resp_h":"10.10.1.5","some_field":"value"}
+
+    '
+  expect:
+    class_uid: 0
+    activity_id: 99
+- raw: '{"_path":"weird","ts":1730281609.0,"uid":"CxW555","id.orig_h":"10.10.1.55","id.orig_p":51609,"id.resp_h":"93.184.216.34","id.resp_p":80,"name":"bad_HTTP_request","notice":false,"peer":"zeek-sensor-1","node":"zeek-sensor-1"}
+
+    '
+  expect:
+    class_uid: 2004
+    activity_id: 1
+    finding_info.uid: bad_HTTP_request
+    disposition_id: 15

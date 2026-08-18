@@ -1,0 +1,317 @@
+name: github_audit_ocsf
+display_name: GitHub Audit Log (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses GitHub organization / enterprise audit log events into complete OCSF
+  1.9.0 records, routed by the `action` prefix:
+    user.login / user.failed_login / user.logout      -> Authentication 3002
+    org.{add,remove,invite,update}_member,
+    org.*_outside_collaborator, user.*,
+    two_factor_authentication.*                       -> User Management 3007
+    team.*                                            -> Group Management 3006
+    repo.*, hook.*, integration.*, protected_branch.*,
+    oauth_application.*, everything else               -> API Activity 6003
+  Account Change 3001 and User Access Management 3005 are DEPRECATED in OCSF
+  1.9 and are not emitted. `actor` is the GitHub login that performed the
+  action (`actor.user`); `user` — GitHub's field for the account the action was
+  performed ON — is the subject (`user`). Reversing them inverts every
+  "who added whom to the org" hunt.
+match_values:
+  - github_audit
+category: cloud
+vendor: "GitHub"
+product: "GitHub"
+parser_vrl: |
+  # GitHub audit log JSON -> OCSF 1.9.0.
+  raw_log = string!(.message)
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      # Unparseable input is emitted as an OCSF Base Event (class_uid 0)
+      # rather than being guessed into a security class: it stays valid, and
+      # therefore visible, without fabricating a user or an outcome.
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_name": "GitHub Audit Log",
+              "log_provider": "GitHub",
+              "product": { "name": "GitHub", "vendor_name": "GitHub" }
+          },
+          "unmapped": { "parse_error": "not a JSON object" }
+      }
+  } else {
+      p = object!(parsed)
+      actor_loc = object(p.actor_location) ?? {}
+
+      action = string(p.action) ?? ""
+
+      # ---- time: epoch millis in @timestamp, else created_at ----
+      time_ms = to_int(p."@timestamp") ?? 0
+      if time_ms == 0 { time_ms = to_int(p.created_at) ?? 0 }
+
+      # ---- identities ----
+      actor_login = string(p.actor) ?? ""
+      actor_user = { "name": downcase(actor_login) }
+      if actor_login == "" { actor_user = { "name": "unknown" } }
+      actor_id = to_string(p.actor_id) ?? ""
+      if actor_id != "" { actor_user = set!(actor_user, ["uid"], actor_id) }
+
+      target_login = string(p.user) ?? ""
+      subject = { "name": downcase(target_login) }
+      target_id = to_string(p.user_id) ?? ""
+      if target_id != "" { subject = set!(subject, ["uid"], target_id) }
+      have_subject = target_login != ""
+
+      # ---- outcome: GitHub audit records completed actions ----
+      status_id = 1
+      status_str = "Success"
+      severity_id = 1
+      severity = "Informational"
+      if action == "user.failed_login" || action == "org.oauth_app_access_denied" {
+          status_id = 2; status_str = "Failure"; severity_id = 2; severity = "Low"
+      }
+
+      # ---- class routing ----
+      is_auth = action == "user.login" || action == "user.failed_login" || action == "user.logout"
+      is_usermgmt = starts_with(action, "two_factor_authentication.") ||
+                    starts_with(action, "org.add_member") || starts_with(action, "org.remove_member") ||
+                    starts_with(action, "org.invite_member") || starts_with(action, "org.update_member") ||
+                    starts_with(action, "org.cancel_invitation") ||
+                    starts_with(action, "org.add_outside_collaborator") ||
+                    starts_with(action, "org.remove_outside_collaborator") ||
+                    (starts_with(action, "user.") && !is_auth)
+      is_groupmgmt = starts_with(action, "team.")
+
+      class_uid = 6003
+      if is_auth { class_uid = 3002 } else if is_usermgmt { class_uid = 3007 } else if is_groupmgmt { class_uid = 3006 }
+
+      ocsf = {}
+
+      if class_uid == 3002 {
+          activity_id = 1
+          activity_name = "Logon"
+          if action == "user.logout" { activity_id = 2; activity_name = "Logoff" }
+          ocsf.class_uid = 3002
+          ocsf.class_name = "Authentication"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          # Authentication 3002 carries the authenticating principal in `user`.
+          ocsf.user = actor_user
+          ocsf.service = { "name": "GitHub" }
+          ocsf.is_remote = true
+      } else if class_uid == 3007 {
+          activity_id = 2
+          activity_name = "Update"
+          if starts_with(action, "org.add_member") || starts_with(action, "org.invite_member") || starts_with(action, "org.add_outside_collaborator") || action == "user.create" { activity_id = 1; activity_name = "Create" }
+          if starts_with(action, "org.remove_member") || starts_with(action, "org.remove_outside_collaborator") || starts_with(action, "org.cancel_invitation") || action == "user.destroy" || action == "user.delete" { activity_id = 3; activity_name = "Delete" }
+          if action == "user.unsuspend" { activity_id = 4; activity_name = "Enable" }
+          if action == "user.suspend" { activity_id = 5; activity_name = "Disable" }
+          if action == "user.lock" { activity_id = 6; activity_name = "Lock" }
+          if action == "user.unlock" { activity_id = 7; activity_name = "Unlock" }
+          if action == "user.change_password" { activity_id = 8; activity_name = "Password Change" }
+          if action == "user.forgot_password" || action == "user.password_reset" { activity_id = 9; activity_name = "Password Reset" }
+          if action == "two_factor_authentication.enabled" { activity_id = 12; activity_name = "Enable MFA Factors" }
+          if action == "two_factor_authentication.disabled" { activity_id = 13; activity_name = "Disable MFA Factors" }
+          if action == "user.add_email" || action == "user.remove_email" { activity_id = 2; activity_name = "Update" }
+          if action == "org.update_member" { activity_id = 2; activity_name = "Update" }
+          if starts_with(action, "personal_access_token.") { activity_id = 18; activity_name = "Add Programmatic Credentials" }
+
+          ocsf.class_uid = 3007
+          ocsf.class_name = "User Management"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          # SUBJECT = GitHub's `user` (the account operated on); falls back to
+          # the actor for self-service actions (2FA enable, password change).
+          if have_subject { ocsf.user = subject } else { ocsf.user = actor_user }
+          ocsf.actor = { "user": actor_user }
+          perm = string(p.permission) ?? ""
+          if perm != "" { ocsf.privileges = [perm] }
+      } else if class_uid == 3006 {
+          activity_id = 99
+          activity_name = "Other"
+          if action == "team.create" { activity_id = 6; activity_name = "Create" }
+          if action == "team.destroy" || action == "team.delete" { activity_id = 5; activity_name = "Delete" }
+          if action == "team.add_member" { activity_id = 3; activity_name = "Add User" }
+          if action == "team.remove_member" { activity_id = 4; activity_name = "Remove User" }
+          if action == "team.add_repository" || action == "team.remove_repository" || action == "team.change_parent_team" { activity_id = 9; activity_name = "Update" }
+          if action == "team.promote_maintainer" { activity_id = 1; activity_name = "Assign Privileges" }
+          if action == "team.demote_maintainer" { activity_id = 2; activity_name = "Revoke Privileges" }
+
+          ocsf.class_uid = 3006
+          ocsf.class_name = "Group Management"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          team_name = string(p.team) ?? ""
+          if team_name == "" { team_name = "unknown" }
+          ocsf.group = { "name": team_name, "type": "GitHub Team" }
+          if have_subject { ocsf.user = subject }
+          ocsf.actor = { "user": actor_user }
+      } else {
+          activity_id = 99
+          activity_name = "Other"
+          op_type = downcase(string(p.operation_type) ?? "")
+          if op_type == "create" { activity_id = 1; activity_name = "Create" }
+          if op_type == "access" { activity_id = 2; activity_name = "Read" }
+          if op_type == "modify" || op_type == "transfer" { activity_id = 3; activity_name = "Update" }
+          if op_type == "remove" { activity_id = 4; activity_name = "Delete" }
+          if activity_id == 99 {
+              if contains(action, ".create") || contains(action, ".add") { activity_id = 1; activity_name = "Create" }
+              if contains(action, ".access") || contains(action, ".read") { activity_id = 2; activity_name = "Read" }
+              if contains(action, ".update") || contains(action, ".rename") || contains(action, ".transfer") { activity_id = 3; activity_name = "Update" }
+              if contains(action, ".destroy") || contains(action, ".remove") || contains(action, ".delete") { activity_id = 4; activity_name = "Delete" }
+          }
+          ocsf.class_uid = 6003
+          ocsf.class_name = "API Activity"
+          ocsf.category_uid = 6
+          ocsf.category_name = "Application Activity"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          op = action
+          if op == "" { op = "unknown" }
+          ocsf.api = { "operation": op, "service": { "name": "GitHub" } }
+          ocsf.actor = { "user": actor_user }
+      }
+
+      # ---- resources: repository / organization / enterprise ----
+      resources = []
+      repo_name = string(p.repository) ?? string(p.repo) ?? ""
+      if repo_name != "" { resources = push(resources, { "name": repo_name, "type": "Repository" }) }
+      org_name = string(p.org) ?? ""
+      if org_name != "" {
+          org_res = { "name": org_name, "type": "Organization" }
+          org_id = to_string(p.org_id) ?? ""
+          if org_id != "" { org_res = set!(org_res, ["uid"], org_id) }
+          resources = push(resources, org_res)
+      }
+      business = string(p.business) ?? ""
+      if business != "" { resources = push(resources, { "name": business, "type": "Enterprise" }) }
+      # `resources` is not an attribute of Authentication 3002 — only of
+      # 3006 / 3007 / 6003 — so it is attached conditionally.
+      if length(resources) > 0 && to_int(ocsf.class_uid) != 3002 { ocsf.resources = resources }
+
+      # ---- source endpoint ----
+      src_ip = string(p.actor_ip) ?? ""
+      src_ep = {}
+      if src_ip != "" { src_ep = set!(src_ep, ["ip"], downcase(src_ip)) }
+      cc = string(actor_loc.country_code) ?? ""
+      if cc != "" { src_ep = set!(src_ep, ["location"], { "country": cc }) }
+      if length(src_ep) == 0 { src_ep = { "hostname": "unknown" } }
+      ocsf.src_endpoint = src_ep
+
+      # ---- common envelope ----
+      ocsf.status_id = status_id
+      ocsf.status = status_str
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.type_uid = to_int(ocsf.class_uid) * 100 + to_int(ocsf.activity_id)
+      ocsf.time = time_ms
+      msg = action
+      if msg == "" { msg = "github_audit_event" }
+      ocsf.message = msg
+      ocsf.raw_data = raw_log
+
+      evt_uid = string(p._document_id) ?? ""
+      if evt_uid == "" { evt_uid = uuid_v4() }
+      ocsf.metadata = {
+          "version": "1.9.0",
+          "uid": evt_uid,
+          "original_event_uid": evt_uid,
+          "event_code": action,
+          "log_name": "GitHub Audit Log",
+          "log_provider": "GitHub",
+          "product": { "name": "GitHub", "vendor_name": "GitHub" }
+      }
+
+      cand = {
+          "operation_type": string(p.operation_type) ?? "",
+          "permission": string(p.permission) ?? "",
+          "team": string(p.team) ?? "",
+          "org": org_name,
+          "enterprise": business,
+          "repository": repo_name,
+          "target_login": target_login,
+          "programmatic_access_type": string(p.programmatic_access_type) ?? "",
+          "oauth_application_id": to_string(p.oauth_application_id) ?? "",
+          "geo_country": cc
+      }
+      unmapped = {}
+      for_each(cand) -> |k, v| {
+          if v != "" { unmapped = set!(unmapped, [k], v) }
+      }
+      if is_boolean(p.repository_public) { unmapped = set!(unmapped, ["repository_public"], bool!(p.repository_public)) }
+      if length(unmapped) > 0 { ocsf.unmapped = unmapped }
+
+      . = ocsf
+  }
+samples:
+  # malformed.txt
+  - raw: "github not json"
+    expect:
+      "class_uid": 0
+      "activity_id": 0
+      "metadata.version": "1.9.0"
+  # oauth_app_create.json
+  - raw: "{\"@timestamp\":1787064000000,\"_document_id\":\"gHiJ-7890KlMn1234OpQr\",\"action\":\"oauth_application.create\",\"actor\":\"ops-admin\",\"actor_id\":1234567,\"actor_ip\":\"192.0.2.77\",\"actor_location\":{\"country_code\":\"US\"},\"created_at\":1787064000000,\"operation_type\":\"create\",\"org\":\"example-org\",\"org_id\":98765,\"oauth_application_id\":5566778899,\"name\":\"CI Deploy App\"}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # org_add_member.json
+  - raw: "{\"@timestamp\":1787062182000,\"_document_id\":\"aBcD-1234EfGh5678IjKl\",\"action\":\"org.add_member\",\"actor\":\"ops-admin\",\"actor_id\":1234567,\"actor_ip\":\"192.0.2.77\",\"actor_location\":{\"country_code\":\"US\"},\"business\":\"example-inc\",\"created_at\":1787062182000,\"operation_type\":\"create\",\"org\":\"example-org\",\"org_id\":98765,\"permission\":\"admin\",\"user\":\"bob-smith\",\"user_id\":7654321}"
+    expect:
+      "class_uid": 3007
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # repo_destroy.json
+  - raw: "{\"@timestamp\":1787063400000,\"_document_id\":\"eFgH-5678IjKl9012MnOp\",\"action\":\"repo.destroy\",\"actor\":\"ops-admin\",\"actor_id\":1234567,\"actor_ip\":\"192.0.2.77\",\"actor_location\":{\"country_code\":\"US\"},\"created_at\":1787063400000,\"operation_type\":\"remove\",\"org\":\"example-org\",\"org_id\":98765,\"repo\":\"example-org/legacy-service\",\"repository\":\"example-org/legacy-service\",\"repository_public\":false,\"visibility\":\"private\"}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 4
+      "metadata.version": "1.9.0"
+  # team_add_member.json
+  - raw: "{\"@timestamp\":1787063000000,\"_document_id\":\"dEfG-4567HiJk8901LmNo\",\"action\":\"team.add_member\",\"actor\":\"ops-admin\",\"actor_id\":1234567,\"actor_ip\":\"192.0.2.77\",\"actor_location\":{\"country_code\":\"US\"},\"created_at\":1787063000000,\"operation_type\":\"modify\",\"org\":\"example-org\",\"org_id\":98765,\"team\":\"example-org/platform-admins\",\"user\":\"bob-smith\",\"user_id\":7654321}"
+    expect:
+      "class_uid": 3006
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  # two_factor_disabled.json
+  - raw: "{\"@timestamp\":1787063800000,\"_document_id\":\"fGhI-6789JkLm0123NoPq\",\"action\":\"two_factor_authentication.disabled\",\"actor\":\"jane-doe\",\"actor_id\":222333,\"actor_ip\":\"203.0.113.55\",\"actor_location\":{\"country_code\":\"US\"},\"created_at\":1787063800000,\"operation_type\":\"modify\",\"user\":\"jane-doe\",\"user_id\":222333}"
+    expect:
+      "class_uid": 3007
+      "activity_id": 13
+      "metadata.version": "1.9.0"
+  # user_failed_login.json
+  - raw: "{\"@timestamp\":1787062244000,\"_document_id\":\"bCdE-2345FgHi6789JkLm\",\"action\":\"user.failed_login\",\"actor\":\"jane-doe\",\"actor_id\":222333,\"actor_ip\":\"198.51.100.201\",\"actor_location\":{\"country_code\":\"NL\"},\"created_at\":1787062244000,\"operation_type\":\"authentication\",\"org\":\"example-org\",\"org_id\":98765,\"user\":\"jane-doe\",\"user_id\":222333}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # user_login.json
+  - raw: "{\"@timestamp\":1787062100000,\"_document_id\":\"cDeF-3456GhIj7890KlMn\",\"action\":\"user.login\",\"actor\":\"jane-doe\",\"actor_id\":222333,\"actor_ip\":\"203.0.113.55\",\"actor_location\":{\"country_code\":\"US\"},\"created_at\":1787062100000,\"operation_type\":\"authentication\",\"user\":\"jane-doe\",\"user_id\":222333}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"

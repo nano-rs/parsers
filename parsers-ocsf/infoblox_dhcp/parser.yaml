@@ -1,0 +1,269 @@
+name: infoblox_dhcp_ocsf
+display_name: Infoblox DHCP (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Infoblox NIOS dhcpd syslog (DHCPDISCOVER / OFFER / REQUEST / ACK /
+  NAK / DECLINE / RELEASE / INFORM / EXPIRE) into OCSF 1.9.0 DHCP Activity
+  (class_uid 4004). The client is modelled as src_endpoint (leased IP, MAC,
+  hostname), the appliance as dst_endpoint / device. Unrecognised dhcpd lines
+  still emit a well-formed 4004 record with activity_id 99 and the raw line
+  preserved in `message`.
+match_values:
+  - infoblox_dhcp
+category: network
+vendor: "Infoblox"
+product: "DHCP"
+parser_vrl: |
+  # Infoblox DHCP -> OCSF 1.9.0 DHCP Activity (class_uid 4004)
+
+  raw_log = string!(.message)
+
+  time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
+  server_host = null
+  body = raw_log
+
+  syslog_match, syslog_err = parse_regex(raw_log, r'^(?:<(?P<pri>\d+)>)?(?P<ts>[A-Z][a-z]{2}\s+\d+\s+\d+:\d+:\d+)\s+(?P<host>\S+)\s+(?P<proc>[^:\x5B]+)(?:\[\d+\])?:\s+(?P<body>.*)$')
+  if syslog_err == null && syslog_match != null {
+      body = string!(syslog_match.body)
+      hv = to_string(syslog_match.host)
+      if hv != "" { server_host = hv }
+      ts_str = to_string(syslog_match.ts)
+      if ts_str != "" {
+          full_ts = ts_str + " " + format_timestamp!(now(), "%Y")
+          ts, ts_err = parse_timestamp(full_ts, "%b %d %H:%M:%S %Y")
+          if ts_err == null { time_ms = to_int(to_unix_timestamp(ts, unit: "milliseconds")) }
+      }
+  }
+
+  # ---- DHCP message type -> activity_id ----
+  dhcp_type = ""
+  type_match, type_err = parse_regex(body, r'^(?P<type>DHCP[A-Z]+)')
+  if type_err == null && type_match != null { dhcp_type = string!(type_match.type) }
+
+  activity_id = 99
+  activity_name = "Other"
+  if dhcp_type == "DHCPDISCOVER" { activity_id = 1; activity_name = "Discover" }
+  if dhcp_type == "DHCPOFFER"    { activity_id = 2; activity_name = "Offer" }
+  if dhcp_type == "DHCPREQUEST"  { activity_id = 3; activity_name = "Request" }
+  if dhcp_type == "DHCPDECLINE"  { activity_id = 4; activity_name = "Decline" }
+  if dhcp_type == "DHCPACK"      { activity_id = 5; activity_name = "Ack" }
+  if dhcp_type == "DHCPNAK"      { activity_id = 6; activity_name = "Nak" }
+  if dhcp_type == "DHCPRELEASE"  { activity_id = 7; activity_name = "Release" }
+  if dhcp_type == "DHCPINFORM"   { activity_id = 8; activity_name = "Inform" }
+  if dhcp_type == "DHCPEXPIRE"   { activity_id = 9; activity_name = "Expire" }
+
+  # ---- client identity: IP / MAC / hostname / relay interface ----
+  client_ip = null
+  client_mac = null
+  client_host = null
+  iface = null
+
+  # "on 10.1.2.3 to aa:bb:.. (host) via eth1"  (OFFER / ACK / NAK)
+  m, e = parse_regex(body, r'\bon\s+(?P<ip>\d+\.\d+\.\d+\.\d+)\s+to\s+(?P<mac>[0-9a-fA-F:]{17})(?:\s+\((?P<host>[^\x29]*)\))?')
+  if e == null && m != null {
+      client_ip = string!(m.ip)
+      client_mac = downcase(string!(m.mac))
+      hh = to_string(m.host)
+      if hh != "" { client_host = hh }
+  }
+
+  # "for 10.1.2.3 from aa:bb:.. (host)"  (REQUEST)
+  if client_ip == null {
+      m2, e2 = parse_regex(body, r'\bfor\s+(?P<ip>\d+\.\d+\.\d+\.\d+)\s+from\s+(?P<mac>[0-9a-fA-F:]{17})(?:\s+\((?P<host>[^\x29]*)\))?')
+      if e2 == null && m2 != null {
+          client_ip = string!(m2.ip)
+          client_mac = downcase(string!(m2.mac))
+          hh2 = to_string(m2.host)
+          if hh2 != "" { client_host = hh2 }
+      }
+  }
+
+  # "of 10.1.2.3 from aa:bb:.. (host)"  (RELEASE / DECLINE)
+  if client_ip == null {
+      m3, e3 = parse_regex(body, r'\bof\s+(?P<ip>\d+\.\d+\.\d+\.\d+)\s+from\s+(?P<mac>[0-9a-fA-F:]{17})(?:\s+\((?P<host>[^\x29]*)\))?')
+      if e3 == null && m3 != null {
+          client_ip = string!(m3.ip)
+          client_mac = downcase(string!(m3.mac))
+          hh3 = to_string(m3.host)
+          if hh3 != "" { client_host = hh3 }
+      }
+  }
+
+  # "from aa:bb:.." with no lease IP (DISCOVER)
+  if client_mac == null {
+      m4, e4 = parse_regex(body, r'\bfrom\s+(?P<mac>[0-9a-fA-F:]{17})')
+      if e4 == null && m4 != null { client_mac = downcase(string!(m4.mac)) }
+  }
+
+  # "from 10.1.2.3 via eth1" (INFORM)
+  if client_ip == null {
+      m5, e5 = parse_regex(body, r'\bfrom\s+(?P<ip>\d+\.\d+\.\d+\.\d+)')
+      if e5 == null && m5 != null { client_ip = string!(m5.ip) }
+  }
+
+  mi, mie = parse_regex(body, r'\bvia\s+(?P<iface>\S+)')
+  if mie == null && mi != null { iface = string!(mi.iface) }
+
+  # "(hostname)" as a standalone trailing token, when not captured above
+  if client_host == null {
+      mh, mhe = parse_regex(body, r'\((?P<host>[^\x29]{1,253})\)\s+via\b')
+      if mhe == null && mh != null { client_host = string!(mh.host) }
+  }
+
+  # lease duration, when dhcpd emits it
+  lease_dur = null
+  ml, mle = parse_regex(body, r'\blease-duration\s+(?P<d>\d+)|\blease\s+time\s+(?P<d2>\d+)')
+  if mle == null && ml != null {
+      d = to_string(ml.d)
+      if d == "" { d = to_string(ml.d2) }
+      if d != "" { lease_dur = to_int(d) ?? null }
+  }
+
+  # NAK is the one failure disposition dhcpd expresses inline
+  status_id = 1
+  status_str = "Success"
+  disposition_id = 1
+  disposition = "Allowed"
+  action_id = 1
+  action = "Allowed"
+  severity_id = 1
+  severity = "Informational"
+  if activity_id == 6 || activity_id == 4 {
+      status_id = 2
+      status_str = "Failure"
+      disposition_id = 2
+      disposition = "Blocked"
+      action_id = 2
+      action = "Denied"
+      severity_id = 2
+      severity = "Low"
+  }
+  is_renewal = activity_id == 3 && client_ip != null
+
+  class_uid = 4004
+
+  . = {
+      "class_uid": class_uid,
+      "class_name": "DHCP Activity",
+      "category_uid": 4,
+      "category_name": "Network Activity",
+      "activity_id": activity_id,
+      "activity_name": activity_name,
+      "type_uid": class_uid * 100 + activity_id,
+      "severity_id": severity_id,
+      "severity": severity,
+      "status_id": status_id,
+      "status": status_str,
+      "time": time_ms,
+      "message": raw_log,
+      "action_id": action_id,
+      "action": action,
+      "disposition_id": disposition_id,
+      "disposition": disposition,
+      "is_renewal": is_renewal,
+      "metadata": {
+          "version": "1.9.0",
+          "uid": uuid_v4(),
+          "log_source": "infoblox_dhcp",
+          "log_provider": "dhcpd",
+          "profiles": ["host", "security_control"],
+          "product": {
+              "name": "NIOS DHCP",
+              "vendor_name": "Infoblox",
+              "feature": { "name": "dhcp" }
+          }
+      }
+  }
+
+  if dhcp_type != "" { .metadata.event_code = dhcp_type }
+
+  src = {}
+  if client_ip != null { src.ip = client_ip }
+  if client_mac != null { src.mac = client_mac }
+  if client_host != null { src.hostname = client_host }
+  if iface != null { src.interface_name = iface }
+  if length(src) > 0 { .src_endpoint = src }
+
+  # 4004 constrains "at least one of [dst_endpoint, src_endpoint]", so the DHCP
+  # server side is emitted unconditionally — even for lines we could not parse.
+  dst = { "svc_name": "dhcp", "port": 67 }
+  if server_host != null {
+      dst.hostname = server_host
+      .device = { "hostname": server_host, "type_id": 0, "type": "Unknown" }
+  }
+  .dst_endpoint = dst
+
+  if lease_dur != null { .lease_dur = lease_dur }
+
+  unmapped = {}
+  if iface != null { unmapped.server_interface = iface }
+  if dhcp_type == "" { unmapped.parse_status = "unrecognized_dhcpd_line" }
+  if length(unmapped) > 0 { .unmapped = unmapped }
+
+  obs = []
+  if client_ip != null { obs = push(obs, { "name": "src_endpoint.ip", "type": "IP Address", "type_id": 2, "value": client_ip }) }
+  if client_mac != null { obs = push(obs, { "name": "src_endpoint.mac", "type": "MAC Address", "type_id": 3, "value": client_mac }) }
+  if client_host != null { obs = push(obs, { "name": "src_endpoint.hostname", "type": "Hostname", "type_id": 1, "value": client_host }) }
+  if length(obs) > 0 { .observables = obs }
+
+  # emit the assembled OCSF record
+  .
+samples:
+- raw: 'Jan 25 13:13:13 infoblox02 dhcpd[1236]: DHCPACK on 10.20.30.44 to 00:0c:29:3a:1b:5f (LAPTOP-7) via eth1 lease-duration 86400'
+  expect:
+    class_uid: 4004
+    activity_id: 5
+    src_endpoint.ip: 10.20.30.44
+    disposition_id: 1
+- raw: 'Jan 25 13:21:00 infoblox02 dhcpd[1236]: DHCPDECLINE of 10.20.30.44 from 00:0c:29:3a:1b:5f via eth1'
+  expect:
+    class_uid: 4004
+    activity_id: 4
+    src_endpoint.ip: 10.20.30.44
+    disposition_id: 2
+- raw: 'Jan 25 13:13:12 infoblox02 dhcpd[1236]: DHCPDISCOVER from 00:0c:29:3a:1b:5f via eth1'
+  expect:
+    class_uid: 4004
+    activity_id: 1
+    disposition_id: 1
+- raw: 'Jan 25 13:22:00 infoblox02 dhcpd[1236]: DHCPINFORM from 10.20.30.99 via eth1'
+  expect:
+    class_uid: 4004
+    activity_id: 8
+    src_endpoint.ip: 10.20.30.99
+    disposition_id: 1
+- raw: 'Jan 25 13:14:01 infoblox02 dhcpd[1236]: DHCPNAK on 10.20.30.44 to 00:0c:29:3a:1b:5f via eth1'
+  expect:
+    class_uid: 4004
+    activity_id: 6
+    src_endpoint.ip: 10.20.30.44
+    disposition_id: 2
+- raw: 'Jan 25 13:13:12 infoblox02 dhcpd[1236]: DHCPOFFER on 10.20.30.44 to 00:0c:29:3a:1b:5f via eth1'
+  expect:
+    class_uid: 4004
+    activity_id: 2
+    src_endpoint.ip: 10.20.30.44
+    disposition_id: 1
+- raw: '<30>Jan 25 13:25:00 infoblox02 dhcpd[1236]: Wrote 0 deleted host decls to leases file.'
+  expect:
+    class_uid: 4004
+    activity_id: 99
+    disposition_id: 1
+- raw: garbage line with no syslog header at all
+  expect:
+    class_uid: 4004
+    activity_id: 99
+    disposition_id: 1
+- raw: 'Jan 25 13:20:41 infoblox02 dhcpd[1236]: DHCPRELEASE of 10.20.30.44 from 00:0c:29:3a:1b:5f (LAPTOP-7) via eth1 (found)'
+  expect:
+    class_uid: 4004
+    activity_id: 7
+    src_endpoint.ip: 10.20.30.44
+    disposition_id: 1
+- raw: 'Jan 25 13:13:13 infoblox02 dhcpd[1236]: DHCPREQUEST for 10.20.30.44 from 00:0c:29:3a:1b:5f (LAPTOP-7) via eth1'
+  expect:
+    class_uid: 4004
+    activity_id: 3
+    src_endpoint.ip: 10.20.30.44
+    disposition_id: 1

@@ -1,0 +1,567 @@
+name: routeros_ocsf
+display_name: MikroTik RouterOS (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses MikroTik RouterOS remote syslog into OCSF 1.9.0. The envelope matrix
+  is handled the same way as the UDM parser — PRI, timestamp (bsd-syslog or
+  iso8601), hostname and the comma-separated topic prefix are each independently
+  optional, because remote-log-format and syslog-time-format vary per device.
+  Message families route as: DNS query / answer / NXDOMAIN / NODATA -> DNS
+  Activity (4003); user logged in / out and login failure -> Authentication
+  (3002); firewall connection tracking -> Network Activity (4001); DHCP
+  assigned / deassigned -> DHCP Activity (4004). Anything else — including the
+  deliberately unparsed ssh transport detail and web proxy lines — emits a Base
+  Event (class_uid 0) with activity_id 99 and the raw line in `message`, rather
+  than being guessed into a security class.
+match_values:
+  - routeros
+category: network
+vendor: "MikroTik"
+product: "RouterOS"
+parser_vrl: |
+  # MikroTik RouterOS -> OCSF 1.9.0
+
+  raw_log = string!(.message)
+  body = raw_log
+
+  severity_id = 1
+  severity = "Informational"
+
+  # ---- optional PRI ----
+  pm, pe = parse_regex(body, r'^<(?P<pri>\d+)>(?P<rest>.*)$')
+  if pe == null && pm != null {
+      body = string!(pm.rest)
+      pri_val = to_int(pm.pri) ?? 30
+      sev_num = mod(pri_val, 8)
+      if sev_num <= 2 { severity_id = 5; severity = "Critical" }
+      if sev_num == 3 { severity_id = 4; severity = "High" }
+      if sev_num == 4 { severity_id = 3; severity = "Medium" }
+      if sev_num >= 5 { severity_id = 1; severity = "Informational" }
+  }
+
+  # ---- optional timestamp: iso8601 or bsd-syslog ----
+  time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
+  im, ie = parse_regex(body, r'^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s+(?P<rest>.*)$')
+  if ie == null && im != null {
+      body = string!(im.rest)
+      ts, ts_err = parse_timestamp(string!(im.ts), "%Y-%m-%dT%H:%M:%S%.fZ")
+      if ts_err == null {
+          time_ms = to_int(to_unix_timestamp(ts, unit: "milliseconds"))
+      } else {
+          ts2, ts2_err = parse_timestamp(string!(im.ts), "%Y-%m-%dT%H:%M:%S%.f%z")
+          if ts2_err == null { time_ms = to_int(to_unix_timestamp(ts2, unit: "milliseconds")) }
+      }
+  } else {
+      bm, be = parse_regex(body, r'^(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(?P<rest>.*)$')
+      if be == null && bm != null {
+          body = string!(bm.rest)
+          full = string!(bm.ts) + " " + format_timestamp!(now(), "%Y")
+          ts3, ts3_err = parse_timestamp(full, "%b %d %H:%M:%S %Y")
+          if ts3_err == null { time_ms = to_int(to_unix_timestamp(ts3, unit: "milliseconds")) }
+      }
+  }
+
+  # ---- optional hostname, consumed only when what follows still looks like a
+  # topic list or a known message family ----
+  dvc_host = ""
+  hm, he = parse_regex(body, r'^(?P<host>[A-Za-z0-9][A-Za-z0-9._-]*)\s+(?P<rest>(?:[a-z]+(?:,[a-z]+)*\s+)?(?:query |done query|local query|user |login failure|forward:|input:|output:|prerouting:|postrouting:|dhcp).*)$')
+  if he == null && hm != null {
+      dvc_host = string!(hm.host)
+      body = string!(hm.rest)
+  }
+
+  # ---- optional topic prefix ----
+  topics = ""
+  tm, te = parse_regex(body, r'^(?P<topics>[a-z]+(?:,[a-z]+)+|dns|dhcp|firewall|system|account|ssh)\s+(?P<rest>.*)$')
+  if te == null && tm != null {
+      topics = string!(tm.topics)
+      body = string!(tm.rest)
+      if contains(topics, "critical") { severity_id = 5; severity = "Critical" }
+      if contains(topics, "error") { severity_id = 4; severity = "High" }
+      if contains(topics, "warning") { severity_id = 3; severity = "Medium" }
+  }
+
+  # ---- accumulators ----
+  route = "base"
+  activity_id = 99
+  activity_name = "Other"
+  action_id = 3
+  action = "Observed"
+  disposition_id = 17
+  disposition = "Logged"
+  status_id = 1
+  status_str = "Success"
+
+  src_ip = ""
+  dst_ip = ""
+  src_port = 0
+  dst_port = 0
+  src_mac = ""
+  proto = ""
+  in_if = ""
+  out_if = ""
+  chain = ""
+  pkt_len = 0
+  user_name = ""
+  auth_via = ""
+  qname = ""
+  qtype = ""
+  qid = ""
+  answer = ""
+  rcode = ""
+  dhcp_server = ""
+  dhcp_ip = ""
+  dhcp_mac = ""
+
+  matched = false
+
+  # ---- DNS query: "query from 192.168.1.100: #12345 google.com. A" ----
+  dq, dqe = parse_regex(body, r'query from (?P<src_ip>[^:\s]+):\s+#(?P<qid>\d+)\s+(?P<qname>\S+?)\.?\s+(?P<qtype>[A-Z]+)\b')
+  if dqe == null && dq != null {
+      src_ip = string!(dq.src_ip)
+      qid = string!(dq.qid)
+      qname = string!(dq.qname)
+      qtype = string!(dq.qtype)
+      route = "dns"
+      activity_id = 1
+      activity_name = "Query"
+      matched = true
+  }
+
+  if !matched {
+      dl, dle = parse_regex(body, r'local query:\s+#(?P<qid>\d+)\s+(?P<qname>\S+?)\.?\s+(?P<qtype>[A-Z]+)\b')
+      if dle == null && dl != null {
+          qid = string!(dl.qid)
+          qname = string!(dl.qname)
+          qtype = string!(dl.qtype)
+          route = "dns"
+          activity_id = 1
+          activity_name = "Query"
+          matched = true
+      }
+  }
+
+  if !matched {
+      nx, nxe = parse_regex(body, r'done query:\s+#(?P<qid>\d+)\s+dns name does not exist')
+      if nxe == null && nx != null {
+          qid = string!(nx.qid)
+          rcode = "NXDomain"
+          route = "dns"
+          activity_id = 2
+          activity_name = "Response"
+          status_id = 2
+          status_str = "Failure"
+          matched = true
+      }
+  }
+
+  if !matched {
+      nd, nde = parse_regex(body, r'done query:\s+#(?P<qid>\d+)\s+dns name exists, but no appropriate record')
+      if nde == null && nd != null {
+          qid = string!(nd.qid)
+          rcode = "NoError"
+          route = "dns"
+          activity_id = 2
+          activity_name = "Response"
+          status_id = 2
+          status_str = "Failure"
+          matched = true
+      }
+  }
+
+  if !matched {
+      da, dae = parse_regex(body, r'done query:\s+#(?P<qid>\d+)\s+(?P<qname>\S+?)\.?\s+(?P<answer>[0-9]{1,3}(?:\.[0-9]{1,3}){3}|[0-9a-fA-F:]{3,})\s*$')
+      if dae == null && da != null {
+          qid = string!(da.qid)
+          qname = string!(da.qname)
+          answer = string!(da.answer)
+          rcode = "NoError"
+          route = "dns"
+          activity_id = 2
+          activity_name = "Response"
+          matched = true
+      }
+  }
+
+  # ---- login / logout ----
+  if !matched {
+      lm, le = parse_regex(body, r'user\s+(?P<user>\S+)\s+logged\s+(?P<dir>in|out)\s+from\s+(?P<src_ip>\S+)(?:\s+via\s+(?P<via>\S+))?')
+      if le == null && lm != null {
+          user_name = string!(lm.user)
+          src_ip = string!(lm.src_ip)
+          auth_via = to_string(lm.via)
+          route = "auth"
+          activity_id = 1
+          activity_name = "Logon"
+          if string!(lm.dir) == "out" { activity_id = 2; activity_name = "Logoff" }
+          action_id = 1
+          action = "Allowed"
+          disposition_id = 1
+          disposition = "Allowed"
+          matched = true
+      }
+  }
+
+  if !matched {
+      lf, lfe = parse_regex(body, r'login failure for user\s+(?P<user>\S+)\s+from\s+(?P<src_ip>\S+)(?:\s+via\s+(?P<via>\S+))?')
+      if lfe == null && lf != null {
+          user_name = string!(lf.user)
+          src_ip = string!(lf.src_ip)
+          auth_via = to_string(lf.via)
+          route = "auth"
+          activity_id = 1
+          activity_name = "Logon"
+          action_id = 2
+          action = "Denied"
+          disposition_id = 2
+          disposition = "Blocked"
+          status_id = 2
+          status_str = "Failure"
+          if severity_id < 2 { severity_id = 2; severity = "Low" }
+          matched = true
+      }
+  }
+
+  # ---- firewall connection tracking ----
+  if !matched {
+      fm, fe = parse_regex(body, r'(?P<src_ip>[0-9]{1,3}(?:\.[0-9]{1,3}){3}):(?P<src_port>\d+)->(?P<dst_ip>[0-9]{1,3}(?:\.[0-9]{1,3}){3}):(?P<dst_port>\d+)')
+      if fe == null && fm != null {
+          src_ip = string!(fm.src_ip)
+          dst_ip = string!(fm.dst_ip)
+          src_port = to_int(fm.src_port) ?? 0
+          dst_port = to_int(fm.dst_port) ?? 0
+          route = "network"
+          activity_id = 6
+          activity_name = "Traffic"
+          matched = true
+
+          cm, ce = parse_regex(body, r'(?P<chain>input|output|forward|prerouting|postrouting):')
+          if ce == null && cm != null { chain = string!(cm.chain) }
+          fim, fie = parse_regex(body, r'in:(?P<in_if>\S*)\s+out:(?P<out_if>\S*?),')
+          if fie == null && fim != null {
+              in_if = to_string(fim.in_if)
+              out_if = to_string(fim.out_if)
+          }
+          mm, me = parse_regex(body, r'src-mac\s+(?P<mac>[0-9a-fA-F:]{11,17})')
+          if me == null && mm != null { src_mac = downcase(string!(mm.mac)) }
+          pm2, pe2 = parse_regex(body, r'proto\s+(?P<proto>[A-Za-z0-9-]+)')
+          if pe2 == null && pm2 != null { proto = downcase(string!(pm2.proto)) }
+          lm2, le2 = parse_regex(body, r'\blen\s+(?P<len>\d+)')
+          if le2 == null && lm2 != null { pkt_len = to_int(lm2.len) ?? 0 }
+      }
+  }
+
+  # ---- DHCP ----
+  if !matched {
+      dm, dme = parse_regex(body, r'(?P<server>\S+)\s+(?P<action>assigned|deassigned)\s+(?P<ip>[0-9]{1,3}(?:\.[0-9]{1,3}){3})\s+(?:to|from)\s+(?P<mac>[0-9a-fA-F:]{11,17})')
+      if dme == null && dm != null {
+          dhcp_server = string!(dm.server)
+          dhcp_ip = string!(dm.ip)
+          dhcp_mac = downcase(string!(dm.mac))
+          route = "dhcp"
+          if string!(dm.action) == "assigned" {
+              activity_id = 5
+              activity_name = "Ack"
+          } else {
+              activity_id = 7
+              activity_name = "Release"
+          }
+          action_id = 1
+          action = "Allowed"
+          disposition_id = 1
+          disposition = "Allowed"
+          matched = true
+      }
+  }
+
+  proto_num = 0
+  if proto == "tcp" { proto_num = 6 }
+  if proto == "udp" { proto_num = 17 }
+  if proto == "icmp" { proto_num = 1 }
+
+  src = {}
+  if src_ip != "" { src.ip = downcase(src_ip) }
+  if src_port > 0 { src.port = src_port }
+  if src_mac != "" { src.mac = src_mac }
+  if in_if != "" { src.interface_name = in_if }
+  dst = {}
+  if dst_ip != "" { dst.ip = downcase(dst_ip) }
+  if dst_port > 0 { dst.port = dst_port }
+  if out_if != "" { dst.interface_name = out_if }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": uuid_v4(),
+      "log_source": "routeros",
+      "log_provider": "RouterOS",
+      "profiles": ["host", "security_control"],
+      "product": {
+          "name": "RouterOS",
+          "vendor_name": "MikroTik",
+          "feature": { "name": "router" }
+      }
+  }
+  if topics != "" { metadata.log_name = topics }
+
+  device = { "type_id": 12, "type": "Router" }
+  has_device = false
+  if dvc_host != "" { device.hostname = dvc_host; has_device = true }
+
+  unmapped = {}
+  if topics != "" { unmapped.topics = topics }
+  if chain != "" { unmapped.chain = chain }
+  if in_if != "" { unmapped.interface_in = in_if }
+  if out_if != "" { unmapped.interface_out = out_if }
+  if qid != "" { unmapped.dns_query_id = qid }
+  if dhcp_server != "" { unmapped.dhcp_server = dhcp_server }
+  if auth_via != "" { unmapped.auth_via = auth_via }
+  if !matched { unmapped.unparsed = "true" }
+
+  obs = []
+  if src_ip != "" { obs = push(obs, { "name": "src_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(src_ip) }) }
+  if dst_ip != "" { obs = push(obs, { "name": "dst_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(dst_ip) }) }
+  if user_name != "" { obs = push(obs, { "name": "user.name", "type": "User Name", "type_id": 4, "value": user_name }) }
+  if qname != "" { obs = push(obs, { "name": "query.hostname", "type": "Hostname", "type_id": 1, "value": qname }) }
+
+  # ============================================================
+  # Assemble
+  # ============================================================
+  if route == "dns" {
+      class_uid = 4003
+      . = {
+          "class_uid": class_uid,
+          "class_name": "DNS Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": { "direction_id": 0, "protocol_num": 17, "protocol_name": "udp" }
+      }
+      q = {}
+      if qname != "" { q.hostname = qname }
+      if qtype != "" { q.type = qtype }
+      if length(q) > 0 { .query = q }
+      if answer != "" { .answers = [{ "rdata": answer }] }
+      if rcode != "" { .rcode = rcode }
+      qidn = to_int(qid) ?? 0
+      if qidn > 0 { .transaction_id = qidn }
+      if length(src) > 0 { .src_endpoint = src }
+      dstd = dst
+      if length(dstd) == 0 { dstd = { "svc_name": "dns", "port": 53 } }
+      if dvc_host != "" { dstd.hostname = dvc_host }
+      .dst_endpoint = dstd
+      if has_device { .device = device }
+
+  } else if route == "auth" {
+      class_uid = 3002
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Authentication",
+          "category_uid": 3,
+          "category_name": "Identity & Access Management",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "user": { "name": user_name },
+          "is_remote": true
+      }
+      if length(src) > 0 { .src_endpoint = src }
+      if dvc_host != "" {
+          .dst_endpoint = { "hostname": dvc_host }
+      } else {
+          .service = { "name": "RouterOS management" }
+      }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if auth_via != "" { .logon_type = auth_via }
+      if has_device { .device = device }
+
+  } else if route == "dhcp" {
+      class_uid = 4004
+      csrc = { "ip": downcase(dhcp_ip), "mac": dhcp_mac }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "DHCP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "src_endpoint": csrc
+      }
+      dstd2 = { "svc_name": "dhcp", "port": 67 }
+      if dvc_host != "" { dstd2.hostname = dvc_host }
+      .dst_endpoint = dstd2
+      if has_device { .device = device }
+      obs = push(obs, { "name": "src_endpoint.mac", "type": "MAC Address", "type_id": 3, "value": dhcp_mac })
+
+  } else if route == "network" {
+      class_uid = 4001
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Network Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": { "direction_id": 0, "protocol_num": proto_num }
+      }
+      if proto != "" { .connection_info.protocol_name = proto }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if pkt_len > 0 { .traffic = { "bytes_out": pkt_len } }
+      if chain != "" { .firewall_rule = { "name": chain, "uid": chain } }
+      if has_device { .device = device }
+
+  } else {
+      class_uid = 0
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "metadata": metadata
+      }
+      if topics != "" { .metadata.event_code = topics }
+  }
+
+  if length(unmapped) > 0 { .unmapped = unmapped }
+  if length(obs) > 0 { .observables = obs }
+
+  .
+samples:
+- raw: <30>Aug  5 12:00:00 edge-rtr dhcp,info dhcp1 assigned 10.20.0.9 to 00:16:3E:AA:BB:CC
+  expect:
+    class_uid: 4004
+    activity_id: 5
+    src_endpoint.ip: 10.20.0.9
+    disposition_id: 1
+- raw: <30>Aug  5 12:00:00 edge-rtr dhcp,info dhcp1 deassigned 10.20.0.9 from 00:16:3E:AA:BB:CC
+  expect:
+    class_uid: 4004
+    activity_id: 7
+    src_endpoint.ip: 10.20.0.9
+    disposition_id: 1
+- raw: '<30>Aug  5 12:00:00 edge-rtr done query: #1001 example.com. 192.0.2.10'
+  expect:
+    class_uid: 4003
+    activity_id: 2
+    query.hostname: example.com
+    disposition_id: 17
+- raw: '<30>Aug  5 12:00:00 edge-rtr done query: #1005 dns name exists, but no appropriate record'
+  expect:
+    class_uid: 4003
+    activity_id: 2
+    disposition_id: 17
+- raw: '<30>Aug  5 12:00:00 edge-rtr done query: #1004 dns name does not exist'
+  expect:
+    class_uid: 4003
+    activity_id: 2
+    disposition_id: 17
+- raw: '<30>Aug  5 12:00:00 edge-rtr query from 10.20.0.5: #1001 example.com. A'
+  expect:
+    class_uid: 4003
+    activity_id: 1
+    src_endpoint.ip: 10.20.0.5
+    query.hostname: example.com
+    disposition_id: 17
+- raw: '<30>2026-08-05T12:00:00Z edge-rtr query from 10.20.0.7: #1003 example.org. A'
+  expect:
+    class_uid: 4003
+    activity_id: 1
+    src_endpoint.ip: 10.20.0.7
+    query.hostname: example.org
+    disposition_id: 17
+- raw: '<30>Aug  5 12:00:00 edge-rtr dns,packet query from 10.20.0.6: #1002 example.net. AAAA'
+  expect:
+    class_uid: 4003
+    activity_id: 1
+    src_endpoint.ip: 10.20.0.6
+    query.hostname: example.net
+    disposition_id: 17
+- raw: '<30>Aug  5 12:00:00 edge-rtr firewall,info forward: in:ether1 out:ether2, src-mac 00:16:3e:aa:bb:cc, proto TCP (SYN), 10.20.0.8:51000->192.0.2.20:443, len 60'
+  expect:
+    class_uid: 4001
+    activity_id: 6
+    src_endpoint.ip: 10.20.0.8
+    dst_endpoint.ip: 192.0.2.20
+    disposition_id: 17
+- raw: <30>Aug  5 12:00:00 edge-rtr system,info,account user admin logged in from 203.0.113.9 via ssh
+  expect:
+    class_uid: 3002
+    activity_id: 1
+    src_endpoint.ip: 203.0.113.9
+    user.name: admin
+    actor.user.name: admin
+    disposition_id: 1
+- raw: <38>Aug  5 12:00:00 edge-rtr system,error,critical login failure for user root from 198.51.100.4 via ssh
+  expect:
+    class_uid: 3002
+    activity_id: 1
+    src_endpoint.ip: 198.51.100.4
+    user.name: root
+    actor.user.name: root
+    disposition_id: 2
+- raw: plain line with no envelope at all
+  expect:
+    class_uid: 0
+    activity_id: 99
+- raw: '<30>Aug  5 12:00:00 edge-rtr ssh,debug auth req: admin ssh-connection publickey'
+  expect:
+    class_uid: 0
+    activity_id: 99

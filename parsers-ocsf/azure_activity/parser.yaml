@@ -1,0 +1,239 @@
+name: azure_activity_ocsf
+display_name: Azure Activity Log (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Azure Monitor Activity Logs into complete OCSF 1.9.0 "API Activity"
+  (class_uid 6003) records carrying the cloud profile. Azure Activity Logs are
+  ARM control-plane calls, so the operation lands on api.operation /
+  api.service.name, the caller on actor.user, and the target ARM resource on
+  resources[]. The whole OCSF object is emitted on the root so it lands in
+  ocsf_logs.event and the promoted columns materialize. Mirrors the UDM
+  azure_activity parser but targets OCSF instead of `.udm.*`.
+match_values:
+  - azure_activity
+category: cloud
+vendor: "Microsoft"
+product: "Azure"
+parser_vrl: |
+  # Azure Monitor Activity Log -> OCSF 1.9.0 API Activity (class_uid 6003)
+  raw_log = to_string(.message) ?? ""
+  class_uid = 6003
+
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      . = {
+          "class_uid": class_uid,
+          "class_name": "API Activity",
+          "category_uid": 6,
+          "category_name": "Application Activity",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": class_uid * 100 + 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud"],
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_name": "AzureActivity",
+              "product": { "name": "Azure Activity Log", "vendor_name": "Microsoft" }
+          },
+          "api": { "operation": "Unknown", "service": { "name": "unknown" } },
+          "cloud": { "provider": "Azure" },
+          "actor": { "user": { "name": "unknown" } },
+          "src_endpoint": { "ip": "0.0.0.0" }
+      }
+  } else {
+      p = object!(parsed)
+      props = object(p.properties) ?? {}
+      claims = object(p.claims) ?? {}
+      http_req = object(p.httpRequest) ?? {}
+
+      # ---- time ----
+      time_ms = 0
+      ts_str = to_string(p.eventTimestamp) ?? to_string(p.time) ?? ""
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- operation ----
+      operation = to_string(get(p, ["operationName", "value"]) ?? "") ?? ""
+      if operation == "" { operation = to_string(get(p, ["eventName", "value"]) ?? "") ?? "" }
+      if operation == "" { operation = "Unknown" }
+
+      # ---- activity_id: explicit changeType wins, else the ARM verb ----
+      change = downcase(to_string(p.changeType) ?? "")
+      op_parts = split(downcase(operation), "/")
+      verb = ""
+      if length(op_parts) > 0 {
+          last_idx = length(op_parts) - 1
+          got, gerr = get(op_parts, [last_idx])
+          if gerr == null { verb = to_string(got) ?? "" }
+      }
+      activity_id = 99
+      activity_name = "Other"
+      if verb == "read" || verb == "list" || verb == "listkeys" { activity_id = 2; activity_name = "Read" }
+      if verb == "write" { activity_id = 3; activity_name = "Update" }
+      if verb == "delete" { activity_id = 4; activity_name = "Delete" }
+      if change == "create" { activity_id = 1; activity_name = "Create" }
+      if change == "update" { activity_id = 3; activity_name = "Update" }
+      if change == "delete" { activity_id = 4; activity_name = "Delete" }
+      if change == "read" { activity_id = 2; activity_name = "Read" }
+
+      # ---- status ----
+      status_raw = to_string(get(p, ["status", "value"]) ?? "") ?? ""
+      if status_raw == "" { status_raw = to_string(p.resultType) ?? "" }
+      status_id = 0
+      status_str = "Unknown"
+      sl = downcase(status_raw)
+      if sl == "succeeded" || sl == "success" || sl == "accepted" || sl == "started" { status_id = 1; status_str = "Success" }
+      if sl == "failed" || sl == "failure" { status_id = 2; status_str = "Failure" }
+
+      # ---- severity from Azure `level` ----
+      level = downcase(to_string(p.level) ?? "")
+      severity_id = 1
+      severity = "Informational"
+      if level == "warning" { severity_id = 3; severity = "Medium" }
+      if level == "error" { severity_id = 4; severity = "High" }
+      if level == "critical" { severity_id = 5; severity = "Critical" }
+
+      # ---- caller identity ----
+      caller = to_string(p.caller) ?? ""
+      if caller == "" { caller = to_string(get(claims, ["http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn"]) ?? "") ?? "" }
+      if caller == "" { caller = to_string(get(claims, ["http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name"]) ?? "") ?? "" }
+      user = { "name": "unknown" }
+      if caller != "" {
+          user = { "name": caller, "uid": caller }
+          if contains(caller, "@") { user.email_addr = caller }
+      }
+      caller_type = to_string(p.callerType) ?? ""
+      if caller_type != "" { user.type = caller_type }
+      actor = { "user": user }
+      appid = to_string(claims.appid) ?? ""
+      if appid != "" { actor.app_uid = appid }
+
+      # ---- source endpoint ----
+      client_ip = to_string(http_req.clientIpAddress) ?? ""
+      if client_ip == "" { client_ip = to_string(claims.ipaddr) ?? "" }
+      src_endpoint = { "ip": "0.0.0.0" }
+      if client_ip != "" { src_endpoint = { "ip": downcase(client_ip) } }
+
+      # ---- cloud ----
+      cloud = { "provider": "Azure" }
+      sub_id = to_string(p.subscriptionId) ?? ""
+      sub_name = to_string(p.subscriptionName) ?? ""
+      account = {}
+      if sub_id != "" { account.uid = sub_id }
+      if sub_name != "" { account.name = sub_name }
+      if length(keys(account)) > 0 { cloud.account = account }
+      loc = to_string(p.resourceLocation) ?? ""
+      if loc != "" { cloud.region = loc }
+      tenant_id = to_string(p.tenantId) ?? ""
+      if tenant_id != "" { cloud.org = { "uid": tenant_id } }
+
+      # ---- api ----
+      provider = to_string(get(p, ["resourceProviderName", "value"]) ?? "") ?? ""
+      if provider == "" && length(op_parts) > 0 {
+          first, ferr = get(op_parts, [0])
+          if ferr == null { provider = to_string(first) ?? "" }
+      }
+      api_obj = { "operation": operation, "service": { "name": provider } }
+      op_id = to_string(p.operationId) ?? ""
+      if op_id != "" { api_obj.request = { "uid": op_id } }
+      status_code = to_string(props.statusCode) ?? ""
+      if status_code != "" { api_obj.response = { "error": status_code } }
+
+      # ---- resources ----
+      resources = []
+      res_id = to_string(p.resourceId) ?? ""
+      if res_id != "" {
+          res = { "uid": res_id, "type": to_string(get(p, ["resourceType", "value"]) ?? "") ?? "" }
+          res_name = to_string(p.resourceName) ?? ""
+          if res_name == "" {
+              rid_parts = split(res_id, "/")
+              rlast = length(rid_parts) - 1
+              rgot, rgerr = get(rid_parts, [rlast])
+              if rgerr == null { res_name = to_string(rgot) ?? "" }
+          }
+          if res_name != "" { res.name = res_name }
+          rg = to_string(p.resourceGroupName) ?? ""
+          if rg != "" { res.group = { "name": rg } }
+          if loc != "" { res.region = loc }
+          if sub_id != "" { res.namespace = sub_id }
+          resources = push(resources, res)
+      }
+
+      # ---- http_request ----
+      http_request = {}
+      method = upcase(to_string(http_req.method) ?? "")
+      if method != "" { http_request.http_method = method }
+      uri = to_string(http_req.uri) ?? ""
+      if uri != "" { http_request.url = { "url_string": uri } }
+      crid = to_string(http_req.clientRequestId) ?? ""
+      if crid != "" { http_request.uid = crid }
+
+      ocsf = {
+          "class_uid": class_uid,
+          "class_name": "API Activity",
+          "category_uid": 6,
+          "category_name": "Application Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud"],
+              "uid": uuid_v4(),
+              "log_name": "AzureActivity",
+              "log_provider": "Azure Monitor",
+              "product": { "name": "Azure Activity Log", "vendor_name": "Microsoft" }
+          },
+          "api": api_obj,
+          "cloud": cloud,
+          "actor": actor,
+          "src_endpoint": src_endpoint
+      }
+      corr = to_string(p.correlationId) ?? ""
+      if corr != "" { ocsf.metadata.correlation_uid = corr }
+      if status_code != "" { ocsf.status_code = status_code }
+      status_msg = to_string(props.statusMessage) ?? ""
+      if status_msg != "" { ocsf.status_detail = status_msg }
+      if length(resources) > 0 { ocsf.resources = resources }
+      if length(keys(http_request)) > 0 { ocsf.http_request = http_request }
+
+      unmapped = {}
+      cat = to_string(get(p, ["category", "value"]) ?? "") ?? ""
+      if cat != "" { unmapped.azure_category = cat }
+      if status_raw != "" { unmapped.azure_status = status_raw }
+      sub_status = to_string(get(p, ["subStatus", "value"]) ?? "") ?? ""
+      if sub_status != "" { unmapped.sub_status = sub_status }
+      if tenant_id != "" { unmapped.tenant_id = tenant_id }
+      rg2 = to_string(p.resourceGroupName) ?? ""
+      if rg2 != "" { unmapped.resource_group = rg2 }
+      iss = to_string(claims.iss) ?? ""
+      if iss != "" { unmapped.issuer = iss }
+      srid = to_string(props.serviceRequestId) ?? ""
+      if srid != "" { unmapped.service_request_id = srid }
+      drid = to_string(props.deletedResourceId) ?? ""
+      if drid != "" { unmapped.deleted_resource_id = drid }
+      ev_name = to_string(get(p, ["eventName", "value"]) ?? "") ?? ""
+      if ev_name != "" { unmapped.event_name = ev_name }
+      if length(keys(unmapped)) > 0 { ocsf.unmapped = unmapped }
+
+      . = ocsf
+  }

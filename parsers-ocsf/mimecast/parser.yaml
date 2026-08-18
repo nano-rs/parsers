@@ -1,0 +1,384 @@
+name: mimecast_ocsf
+display_name: Mimecast (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Mimecast Email Security logs into complete OCSF 1.9.0 Email Activity
+  (class_uid 4009) records:
+    type=receipt            -> activity Receive / Send by Dir, disposition from Act
+    type=url_protect        -> activity Scan, the clicked/scanned link in email.urls[]
+    type=attachment_protect -> activity Scan, the attachment in email.files[]
+  OCSF 1.9 DEPRECATES Email File Activity (4011) and Email URL Activity (4012);
+  its own guidance is to use Email Activity with the `email.files[]` and
+  `email.urls[]` arrays, which is what this parser does.
+  Carries metadata.profiles ["security_control"] because `disposition_id`,
+  `risk_score` and `is_alert` are bound to that profile in OCSF 1.9.
+match_values:
+  - mimecast
+category: security
+vendor: "Mimecast"
+product: "Email Security"
+parser_vrl: |
+  # Mimecast receipt / URL-protect / attachment-protect JSON -> OCSF 1.9.0 4009.
+  raw_log = string!(.message)
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      # Unparseable input is emitted as an OCSF Base Event (class_uid 0)
+      # rather than being guessed into a security class: it stays valid, and
+      # therefore visible, without fabricating a user or an outcome.
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_name": "Mimecast Email Security",
+              "log_provider": "Mimecast",
+              "product": { "name": "Email Security", "vendor_name": "Mimecast" }
+          },
+          "unmapped": { "parse_error": "not a JSON object" }
+      }
+  } else {
+      p = object!(parsed)
+      spd = object(p.SpamProcessingDetail) ?? {}
+
+      event_type = string(p.type) ?? "unknown"
+      profiles = ["security_control"]
+
+      # ---- time ----
+      time_ms = 0
+      ts_str = string(p.datetime) ?? ""
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- direction ----
+      dir_raw = downcase(string(p.Dir) ?? string(p.route) ?? "")
+      direction_id = 0
+      if dir_raw == "inbound" || dir_raw == "in" { direction_id = 1 }
+      if dir_raw == "outbound" || dir_raw == "out" { direction_id = 2 }
+      if dir_raw == "internal" || dir_raw == "int" { direction_id = 3 }
+
+      severity_id = 1
+      severity = "Informational"
+      status_id = 1
+      status_str = "Success"
+      is_alert = false
+
+      ocsf = {
+          "class_uid": 4009,
+          "class_name": "Email Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity"
+      }
+
+      email_obj = {}
+      src_ip = ""
+
+      if event_type == "receipt" {
+          activity_id = 99
+          activity_name = "Other"
+          if direction_id == 1 { activity_id = 2; activity_name = "Receive" }
+          if direction_id == 2 || direction_id == 3 { activity_id = 1; activity_name = "Send" }
+
+          sender = string(p.Sender) ?? ""
+          rcpt = string(p.Rcpt) ?? ""
+          if match(sender, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["from"], downcase(sender)) }
+          if match(rcpt, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["to"], [downcase(rcpt)]) }
+          subj = string(p.Subject) ?? ""
+          if subj != "" { email_obj = set!(email_obj, ["subject"], subj) }
+          mid = string(p.MsgId) ?? ""
+          if mid != "" { email_obj = set!(email_obj, ["message_uid"], mid) }
+          msz = to_int(p.MsgSz) ?? 0
+          if msz > 0 { email_obj = set!(email_obj, ["size"], msz) }
+
+          # Attachment names arrive as a single delimited string.
+          att_names = string(p.AttNames) ?? ""
+          if att_names != "" {
+              files = []
+              for_each(split(att_names, ",")) -> |_i, fn| {
+                  nm = strip_whitespace(to_string(fn))
+                  if nm != "" { files = push(files, { "name": nm, "type_id": 1 }) }
+              }
+              if length(files) > 0 { email_obj = set!(email_obj, ["files"], files) }
+          }
+
+          # Mimecast delivery verdict -> OCSF disposition.
+          act = downcase(string(p.Act) ?? "")
+          disp_id = 0
+          disp = "Unknown"
+          if act == "acc" || act == "accept" { disp_id = 1; disp = "Allowed" }
+          if act == "rej" || act == "reject" { disp_id = 2; disp = "Blocked" }
+          if act == "hld" || act == "hold" { disp_id = 3; disp = "Quarantined" }
+          if act == "bnc" || act == "bounce" { disp_id = 6; disp = "Dropped" }
+          if act != "" && disp_id == 0 { disp_id = 99; disp = "Other" }
+          if disp_id != 0 {
+              ocsf.disposition_id = disp_id
+              ocsf.disposition = disp
+          }
+          if disp_id == 2 || disp_id == 3 || disp_id == 6 {
+              status_id = 2
+              status_str = "Failure"
+              severity_id = 2
+              severity = "Low"
+          }
+
+          spam_score = to_int(p.SpamScore) ?? 0
+          if spam_score > 0 { ocsf.risk_score = spam_score }
+
+          virus = string(p.VirusFound) ?? ""
+          if virus != "" {
+              is_alert = true
+              severity_id = 4
+              severity = "High"
+              ocsf.malware = [{ "name": virus, "classification_ids": [0] }]
+          }
+
+          auth = {}
+          spf = to_string(spd.spf.allow) ?? ""
+          if spf != "" { auth = set!(auth, ["spf"], spf) }
+          dkim = to_string(spd.dkim.allow) ?? ""
+          if dkim != "" { auth = set!(auth, ["dkim"], dkim) }
+          dmarc = to_string(spd.dmarc.allow) ?? ""
+          if dmarc != "" { auth = set!(auth, ["dmarc"], dmarc) }
+          if length(auth) > 0 { ocsf.email_auth = auth }
+
+          src_ip = string(p.IP) ?? ""
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+      } else if event_type == "url_protect" {
+          # A rewritten link scanned / clicked. OCSF 1.9 deprecates 4012 in
+          # favour of email.urls[] on Email Activity.
+          ocsf.activity_id = 3
+          ocsf.activity_name = "Scan"
+
+          sender = string(p.fromUserEmailAddress) ?? ""
+          rcpt = string(p.userEmailAddress) ?? ""
+          if match(sender, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["from"], downcase(sender)) }
+          if match(rcpt, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["to"], [downcase(rcpt)]) }
+          subj = string(p.Subject) ?? string(p.subject) ?? ""
+          if subj != "" { email_obj = set!(email_obj, ["subject"], subj) }
+          mid = string(p.messageId) ?? ""
+          if mid != "" { email_obj = set!(email_obj, ["message_uid"], mid) }
+          url_str = string(p.url) ?? ""
+          if url_str != "" {
+              url_obj = { "url_string": url_str }
+              cat = string(p.category) ?? ""
+              if cat != "" { url_obj = set!(url_obj, ["categories"], [cat]) }
+              email_obj = set!(email_obj, ["urls"], [url_obj])
+          }
+
+          action = downcase(string(p.action) ?? "")
+          disp_id = 0
+          disp = "Unknown"
+          if action == "allow" || action == "permit" { disp_id = 1; disp = "Allowed" }
+          if action == "block" || action == "blocked" { disp_id = 2; disp = "Blocked" }
+          if action == "warn" { disp_id = 23; disp = "Challenge" }
+          if action != "" && disp_id == 0 { disp_id = 99; disp = "Other" }
+          if disp_id != 0 {
+              ocsf.disposition_id = disp_id
+              ocsf.disposition = disp
+          }
+
+          scan_result = downcase(string(p.scanResult) ?? "")
+          if scan_result == "malicious" || disp_id == 2 {
+              is_alert = true
+              severity_id = 4
+              severity = "High"
+          }
+          src_ip = string(p.sendingIp) ?? ""
+      } else if event_type == "attachment_protect" {
+          ocsf.activity_id = 3
+          ocsf.activity_name = "Scan"
+
+          sender = string(p.senderAddress) ?? ""
+          rcpt = string(p.recipientAddress) ?? ""
+          if match(sender, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["from"], downcase(sender)) }
+          if match(rcpt, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["to"], [downcase(rcpt)]) }
+          subj = string(p.subject) ?? ""
+          if subj != "" { email_obj = set!(email_obj, ["subject"], subj) }
+          mid = string(p.messageId) ?? ""
+          if mid != "" { email_obj = set!(email_obj, ["message_uid"], mid) }
+
+          fname = string(p.fileName) ?? ""
+          fhash = string(p.fileHash) ?? ""
+          if fname != "" || fhash != "" {
+              nm = fname
+              if nm == "" { nm = "unknown" }
+              fobj = { "name": nm, "type_id": 1 }
+              if fhash != "" {
+                  # Pick the hash algorithm from the digest length.
+                  alg_id = 99
+                  alg = "Other"
+                  hl = length(fhash)
+                  if hl == 32 { alg_id = 1; alg = "MD5" }
+                  if hl == 40 { alg_id = 2; alg = "SHA-1" }
+                  if hl == 64 { alg_id = 3; alg = "SHA-256" }
+                  fobj = set!(fobj, ["hashes"], [{ "value": downcase(fhash), "algorithm_id": alg_id, "algorithm": alg }])
+              }
+              email_obj = set!(email_obj, ["files"], [fobj])
+          }
+
+          result = downcase(string(p.result) ?? "")
+          action_triggered = downcase(string(p.actionTriggered) ?? "")
+          disp_id = 0
+          disp = "Unknown"
+          if result == "safe" || result == "clean" { disp_id = 1; disp = "Allowed" }
+          if result == "malicious" || result == "unsafe" { disp_id = 2; disp = "Blocked" }
+          if contains(action_triggered, "hold") || contains(action_triggered, "quarantine") { disp_id = 3; disp = "Quarantined" }
+          if contains(action_triggered, "sandbox") || contains(action_triggered, "safefile") { disp_id = 4; disp = "Isolated" }
+          if disp_id != 0 {
+              ocsf.disposition_id = disp_id
+              ocsf.disposition = disp
+          }
+          if result == "malicious" || result == "unsafe" {
+              is_alert = true
+              severity_id = 4
+              severity = "High"
+              status_id = 2
+              status_str = "Failure"
+          }
+      } else {
+          ocsf.activity_id = 99
+          ocsf.activity_name = "Other"
+          sender = string(p.Sender) ?? string(p.senderAddress) ?? ""
+          rcpt = string(p.Rcpt) ?? string(p.recipientAddress) ?? ""
+          if match(sender, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["from"], downcase(sender)) }
+          if match(rcpt, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["to"], [downcase(rcpt)]) }
+      }
+
+      # `email` is REQUIRED on 4009 and needs at_least_one(from, to).
+      if length(email_obj) == 0 { email_obj = { "from": "unknown@invalid.local" } }
+      if !exists(email_obj.from) && !exists(email_obj.to) {
+          email_obj = set!(email_obj, ["from"], "unknown@invalid.local")
+      }
+      ocsf.email = email_obj
+      ocsf.direction_id = direction_id
+
+      if src_ip != "" { ocsf.src_endpoint = { "ip": downcase(src_ip) } }
+
+      ocsf.is_alert = is_alert
+      ocsf.status_id = status_id
+      ocsf.status = status_str
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.type_uid = to_int(ocsf.class_uid) * 100 + to_int(ocsf.activity_id)
+      ocsf.time = time_ms
+      msg = event_type
+      subj_msg = string(p.Subject) ?? string(p.subject) ?? ""
+      if subj_msg != "" { msg = subj_msg }
+      ocsf.message = msg
+      ocsf.raw_data = raw_log
+
+      evt_uid = string(p.MsgId) ?? string(p.messageId) ?? ""
+      if evt_uid == "" { evt_uid = uuid_v4() }
+      ocsf.metadata = {
+          "version": "1.9.0",
+          "profiles": profiles,
+          "uid": evt_uid,
+          "original_event_uid": evt_uid,
+          "event_code": event_type,
+          "log_name": "Mimecast Email Security",
+          "log_provider": "Mimecast",
+          "product": { "name": "Email Security", "vendor_name": "Mimecast" }
+      }
+
+      cand = {
+          "mimecast_type": event_type,
+          "account": string(p.acc) ?? "",
+          "act": string(p.Act) ?? "",
+          "direction_raw": dir_raw,
+          "spam_info": string(p.SpamInfo) ?? "",
+          "spam_limit": to_string(p.SpamLimit) ?? "",
+          "spam_score": to_string(p.SpamScore) ?? "",
+          "attachment_count": to_string(p.AttCnt) ?? "",
+          "tls_version": string(p.TlsVer) ?? "",
+          "cipher": string(p.Cphr) ?? "",
+          "virus_found": string(p.VirusFound) ?? "",
+          "scan_result": string(p.scanResult) ?? "",
+          "url_category": string(p.category) ?? "",
+          "url_action": string(p.action) ?? "",
+          "file_extension": string(p.fileExt) ?? "",
+          "attachment_result": string(p.result) ?? "",
+          "action_triggered": string(p.actionTriggered) ?? "",
+          "policy_definition": string(p.definition) ?? "",
+          "details": string(p.details) ?? ""
+      }
+      unmapped = {}
+      for_each(cand) -> |k, v| {
+          if v != "" { unmapped = set!(unmapped, [k], v) }
+      }
+      if length(unmapped) > 0 { ocsf.unmapped = unmapped }
+
+      . = ocsf
+  }
+samples:
+  # attachment_protect_malicious.json
+  - raw: "{\"type\":\"attachment_protect\",\"datetime\":\"2026-08-18T12:41:19+0000\",\"acc\":\"C1A2B3\",\"fileName\":\"payroll.doc\",\"fileHash\":\"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\",\"fileExt\":\"doc\",\"result\":\"malicious\",\"actionTriggered\":\"Hold for review\",\"details\":\"Macro detected: AutoOpen\",\"definition\":\"Default Attachment Protect\",\"senderAddress\":\"attacker@evil.example\",\"recipientAddress\":\"bob.smith@example.com\",\"subject\":\"Payroll update\",\"messageId\":\"<CA+evil999@mail.evil.example>\",\"route\":\"inbound\"}"
+    expect:
+      "class_uid": 4009
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  # attachment_protect_safe.json
+  - raw: "{\"type\":\"attachment_protect\",\"datetime\":\"2026-08-18T12:34:02+0000\",\"acc\":\"C1A2B3\",\"fileName\":\"invoice_aug.pdf\",\"fileHash\":\"5d41402abc4b2a76b9719d911017c592\",\"fileExt\":\"pdf\",\"result\":\"safe\",\"actionTriggered\":\"Safe file delivered\",\"definition\":\"Default Attachment Protect\",\"senderAddress\":\"partner@supplier.example\",\"recipientAddress\":\"jane.doe@example.com\",\"subject\":\"August invoice\",\"messageId\":\"<CA+abc123@mail.supplier.example>\",\"route\":\"inbound\"}"
+    expect:
+      "class_uid": 4009
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  # malformed.txt
+  - raw: "mimecast not json"
+    expect:
+      "class_uid": 0
+      "activity_id": 0
+      "metadata.version": "1.9.0"
+  # receipt_accepted.json
+  - raw: "{\"type\":\"receipt\",\"datetime\":\"2026-08-18T12:33:44+0000\",\"aCode\":\"abc123\",\"acc\":\"C1A2B3\",\"Sender\":\"partner@supplier.example\",\"Rcpt\":\"jane.doe@example.com\",\"Subject\":\"August invoice\",\"MsgId\":\"<CA+abc123@mail.supplier.example>\",\"IP\":\"198.51.100.77\",\"Act\":\"Acc\",\"Dir\":\"Inbound\",\"SpamScore\":\"2\",\"SpamInfo\":\"[]\",\"SpamLimit\":\"5\",\"AttNames\":\"invoice_aug.pdf\",\"AttCnt\":\"1\",\"MsgSz\":\"84213\",\"TlsVer\":\"TLSv1.3\",\"Cphr\":\"TLS_AES_256_GCM_SHA384\",\"VirusFound\":\"\",\"SpamProcessingDetail\":{\"spf\":{\"allow\":\"true\",\"info\":\"Pass\"},\"dkim\":{\"allow\":\"true\",\"info\":\"Pass\"},\"dmarc\":{\"allow\":\"true\",\"info\":\"Pass\"}}}"
+    expect:
+      "class_uid": 4009
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  # receipt_held_virus.json
+  - raw: "{\"type\":\"receipt\",\"datetime\":\"2026-08-18T12:40:02+0000\",\"acc\":\"C1A2B3\",\"Sender\":\"attacker@evil.example\",\"Rcpt\":\"bob.smith@example.com\",\"Subject\":\"Payroll update\",\"MsgId\":\"<CA+evil999@mail.evil.example>\",\"IP\":\"198.51.100.201\",\"Act\":\"Hld\",\"Dir\":\"Inbound\",\"SpamScore\":\"9\",\"SpamInfo\":\"[Spam]\",\"SpamLimit\":\"5\",\"AttNames\":\"payroll.doc,readme.txt\",\"AttCnt\":\"2\",\"MsgSz\":\"120043\",\"VirusFound\":\"Trojan.Generic.KDZ\",\"SpamProcessingDetail\":{\"spf\":{\"allow\":\"false\",\"info\":\"Fail\"},\"dkim\":{\"allow\":\"false\",\"info\":\"None\"},\"dmarc\":{\"allow\":\"false\",\"info\":\"Fail\"}}}"
+    expect:
+      "class_uid": 4009
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  # receipt_outbound.json
+  - raw: "{\"type\":\"receipt\",\"datetime\":\"2026-08-18T13:01:12+0000\",\"acc\":\"C1A2B3\",\"Sender\":\"jane.doe@example.com\",\"Rcpt\":\"customer@client.example\",\"Subject\":\"Re: contract\",\"MsgId\":\"<CA+out555@mail.example.com>\",\"IP\":\"192.0.2.10\",\"Act\":\"Acc\",\"Dir\":\"Outbound\",\"MsgSz\":\"9421\",\"TlsVer\":\"TLSv1.2\"}"
+    expect:
+      "class_uid": 4009
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # unknown_type.json
+  - raw: "{\"type\":\"impersonation_protect\",\"datetime\":\"2026-08-18T13:20:00+0000\",\"acc\":\"C1A2B3\",\"senderAddress\":\"ceo@example.co\",\"recipientAddress\":\"finance@example.com\",\"subject\":\"Urgent wire transfer\",\"messageId\":\"<CA+imp001@mail.example.co>\",\"definition\":\"Impersonation Protect\",\"hits\":\"3\"}"
+    expect:
+      "class_uid": 4009
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  # url_protect_allow.json
+  - raw: "{\"type\":\"url_protect\",\"datetime\":\"2026-08-18T12:50:00+0000\",\"acc\":\"C1A2B3\",\"url\":\"https://docs.supplier.example/invoice/8812\",\"category\":\"Business\",\"scanResult\":\"clean\",\"action\":\"allow\",\"sendingIp\":\"198.51.100.77\",\"userEmailAddress\":\"jane.doe@example.com\",\"fromUserEmailAddress\":\"partner@supplier.example\",\"Subject\":\"August invoice\",\"messageId\":\"<CA+abc123@mail.supplier.example>\",\"route\":\"inbound\"}"
+    expect:
+      "class_uid": 4009
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  # url_protect_block.json
+  - raw: "{\"type\":\"url_protect\",\"datetime\":\"2026-08-18T12:45:31+0000\",\"acc\":\"C1A2B3\",\"url\":\"https://login.microsoftonline.evil.example/verify?u=jane\",\"category\":\"Phishing & Fraud\",\"scanResult\":\"malicious\",\"action\":\"block\",\"sendingIp\":\"198.51.100.201\",\"userEmailAddress\":\"jane.doe@example.com\",\"fromUserEmailAddress\":\"attacker@evil.example\",\"Subject\":\"Action required: verify your account\",\"messageId\":\"<CA+phish777@mail.evil.example>\",\"route\":\"inbound\",\"actions\":\"block\",\"adminOverride\":\"N/A\",\"userOverride\":\"None\"}"
+    expect:
+      "class_uid": 4009
+      "activity_id": 3
+      "metadata.version": "1.9.0"

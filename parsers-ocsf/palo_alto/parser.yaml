@@ -1,0 +1,788 @@
+name: palo_alto_ocsf
+display_name: Palo Alto Networks PAN-OS (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Palo Alto Networks PAN-OS CSV syslog into OCSF 1.9.0, routed by log
+  type: TRAFFIC -> Network Activity (4001); THREAT/url -> HTTP Activity (4002);
+  every other THREAT subtype (vulnerability, spyware, virus, wildfire, file,
+  data) -> Detection Finding (2004); AUTHENTICATION, GLOBALPROTECT and USERID
+  -> Authentication (3002); CONFIG -> API Activity (6003). SYSTEM, HIPMATCH and
+  any unrecognised log type still emit a Network Activity record with
+  activity_id 99 and the raw line preserved in `message`.
+match_values:
+  - palo_alto
+category: network
+vendor: "Palo Alto Networks"
+product: "PAN-OS"
+parser_vrl: |
+  # Palo Alto PAN-OS -> OCSF 1.9.0
+  # 4001 Network Activity / 4002 HTTP Activity / 2004 Detection Finding /
+  # 3002 Authentication / 6003 API Activity
+
+  raw_log = string!(.message)
+  working = raw_log
+
+  # ---- strip syslog header ----
+  hm, he = parse_regex(working, r'^(?:<\d+>)?(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d+\s+\d+:\d+:\d+\s+(?:(?P<host>\S+)\s+)?(?P<payload>\d.*|,.*|.*)$')
+  dvc_host = ""
+  if he == null && hm != null {
+      working = string!(hm.payload)
+      dvc_host = to_string(hm.host)
+  }
+
+  fields = parse_csv(working) ?? []
+  n = length(fields)
+
+  serial = to_string(fields[2])
+  log_type = upcase(to_string(fields[3]))
+  subtype = downcase(to_string(fields[4]))
+
+  # ---- receive_time (pos 1) ----
+  time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
+  ts_str = to_string(fields[1])
+  if ts_str != "" {
+      ts, ts_err = parse_timestamp(ts_str, "%Y/%m/%d %H:%M:%S")
+      if ts_err == null { time_ms = to_int(to_unix_timestamp(ts, unit: "milliseconds")) }
+  }
+
+  # ---- shared accumulators ----
+  route = "network"
+  activity_id = 99
+  activity_name = "Other"
+  action_id = 3
+  action = "Observed"
+  disposition_id = 17
+  disposition = "Logged"
+  status_id = 1
+  status_str = "Success"
+  severity_id = 1
+  severity = "Informational"
+
+  src_ip = ""
+  dst_ip = ""
+  src_port = 0
+  dst_port = 0
+  src_zone = ""
+  dst_zone = ""
+  src_if = ""
+  dst_if = ""
+  src_country = ""
+  dst_country = ""
+  nat_src_ip = ""
+  nat_dst_ip = ""
+  nat_src_port = 0
+  nat_dst_port = 0
+  proto = ""
+  app_name = ""
+  rule_name = ""
+  session_id = ""
+  user_name = ""
+  dst_user = ""
+  bytes_out = 0
+  bytes_in = 0
+  pkts_out = 0
+  pkts_in = 0
+  duration_s = 0
+  repeat_cnt = 0
+  pan_action = ""
+  end_reason = ""
+  url_raw = ""
+  file_name = ""
+  file_hash = ""
+  threat_raw = ""
+  threat_id = ""
+  threat_name = ""
+  url_category = ""
+  content_type = ""
+  user_agent = ""
+  referrer = ""
+  http_method = ""
+  sys_desc = ""
+  cfg_cmd = ""
+  cfg_path = ""
+  cfg_result = ""
+  gp_stage = ""
+  gp_status = ""
+  gp_reason = ""
+  gp_auth_method = ""
+  gp_private_ip = ""
+  gp_host = ""
+  hip_name = ""
+
+  # helper values shared by TRAFFIC and THREAT (identical positions 7..30)
+  if log_type == "TRAFFIC" || log_type == "THREAT" {
+      v7 = to_string(fields[7]);  if v7 != "" && v7 != "0.0.0.0" { src_ip = v7 }
+      v8 = to_string(fields[8]);  if v8 != "" && v8 != "0.0.0.0" { dst_ip = v8 }
+      v9 = to_string(fields[9]);  if v9 != "" && v9 != "0.0.0.0" { nat_src_ip = v9 }
+      v10 = to_string(fields[10]); if v10 != "" && v10 != "0.0.0.0" { nat_dst_ip = v10 }
+      rule_name = to_string(fields[11])
+      user_name = to_string(fields[12])
+      dst_user = to_string(fields[13])
+      app_name = to_string(fields[14])
+      src_zone = to_string(fields[16])
+      dst_zone = to_string(fields[17])
+      src_if = to_string(fields[18])
+      dst_if = to_string(fields[19])
+      session_id = to_string(fields[22])
+      repeat_cnt = to_int(to_string(fields[23])) ?? 0
+      src_port = to_int(to_string(fields[24])) ?? 0
+      dst_port = to_int(to_string(fields[25])) ?? 0
+      nat_src_port = to_int(to_string(fields[26])) ?? 0
+      nat_dst_port = to_int(to_string(fields[27])) ?? 0
+      proto = downcase(to_string(fields[29]))
+      pan_action = downcase(to_string(fields[30]))
+  }
+
+  # ============================================================
+  # TRAFFIC
+  # ============================================================
+  if log_type == "TRAFFIC" {
+      route = "network"
+      bytes_out = to_int(to_string(fields[32])) ?? 0
+      bytes_in = to_int(to_string(fields[33])) ?? 0
+      duration_s = to_int(to_string(fields[36])) ?? 0
+      url_category = to_string(fields[37])
+      src_country = to_string(fields[41])
+      dst_country = to_string(fields[42])
+      pkts_out = to_int(to_string(fields[44])) ?? 0
+      pkts_in = to_int(to_string(fields[45])) ?? 0
+      end_reason = to_string(fields[46])
+
+      activity_id = 6
+      activity_name = "Traffic"
+      if subtype == "start" { activity_id = 1; activity_name = "Open" }
+      if subtype == "end"   { activity_id = 2; activity_name = "Close" }
+      if subtype == "drop" || subtype == "deny" { activity_id = 5; activity_name = "Refuse" }
+
+  # ============================================================
+  # THREAT
+  # ============================================================
+  } else if log_type == "THREAT" {
+      url_raw = to_string(fields[31])
+      threat_raw = to_string(fields[32])
+      url_category = to_string(fields[33])
+      content_type = to_string(fields[41])
+      file_hash = to_string(fields[43])
+      user_agent = to_string(fields[46])
+      referrer = to_string(fields[49])
+      http_method = upcase(to_string(fields[62]))
+
+      if threat_raw != "" {
+          tm, te = parse_regex(threat_raw, r'^(?P<name>.+?)\x28(?P<id>\d+)\x29\s*$')
+          if te == null && tm != null {
+              threat_name = string!(tm.name)
+              threat_id = string!(tm.id)
+          } else {
+              threat_name = threat_raw
+          }
+      }
+      if subtype == "file" || subtype == "virus" || subtype == "wildfire" || subtype == "data" {
+          file_name = url_raw
+      }
+
+      pan_sev = downcase(to_string(fields[34]))
+      severity_id = 3
+      severity = "Medium"
+      if pan_sev == "informational" || pan_sev == "info" { severity_id = 1; severity = "Informational" }
+      if pan_sev == "low" { severity_id = 2; severity = "Low" }
+      if pan_sev == "medium" { severity_id = 3; severity = "Medium" }
+      if pan_sev == "high" { severity_id = 4; severity = "High" }
+      if pan_sev == "critical" { severity_id = 5; severity = "Critical" }
+
+      if subtype == "url" {
+          route = "http"
+          activity_id = 99
+          activity_name = "Other"
+          if http_method == "CONNECT" { activity_id = 1;  activity_name = "Connect" }
+          if http_method == "DELETE"  { activity_id = 2;  activity_name = "Delete" }
+          if http_method == "GET"     { activity_id = 3;  activity_name = "Get" }
+          if http_method == "HEAD"    { activity_id = 4;  activity_name = "Head" }
+          if http_method == "OPTIONS" { activity_id = 5;  activity_name = "Options" }
+          if http_method == "POST"    { activity_id = 6;  activity_name = "Post" }
+          if http_method == "PUT"     { activity_id = 7;  activity_name = "Put" }
+          if http_method == "TRACE"   { activity_id = 8;  activity_name = "Trace" }
+          if http_method == "PATCH"   { activity_id = 9;  activity_name = "Patch" }
+      } else {
+          route = "finding"
+          activity_id = 1
+          activity_name = "Create"
+      }
+
+  # ============================================================
+  # AUTHENTICATION
+  # ============================================================
+  } else if log_type == "AUTHENTICATION" {
+      route = "auth"
+      activity_id = 1
+      activity_name = "Logon"
+      src_ip = to_string(fields[8])
+      user_name = to_string(fields[9])
+      rule_name = to_string(fields[12])
+      sys_desc = to_string(fields[18])
+      auth_evt = downcase(to_string(fields[20]))
+      if subtype == "authentication-failed" || auth_evt == "failure" || subtype == "failed" {
+          status_id = 2
+          status_str = "Failure"
+          action_id = 2
+          action = "Denied"
+          disposition_id = 2
+          disposition = "Blocked"
+          severity_id = 2
+          severity = "Low"
+      } else {
+          action_id = 1
+          action = "Allowed"
+          disposition_id = 1
+          disposition = "Allowed"
+      }
+
+  # ============================================================
+  # GLOBALPROTECT
+  # ============================================================
+  } else if log_type == "GLOBALPROTECT" {
+      route = "auth"
+      gp_stage = to_string(fields[9])
+      gp_auth_method = to_string(fields[10])
+      user_name = to_string(fields[12])
+      gp_host = to_string(fields[14])
+      src_ip = to_string(fields[15])
+      gp_private_ip = to_string(fields[17])
+      gp_reason = to_string(fields[25])
+      gp_status = downcase(to_string(fields[28]))
+      duration_s = to_int(to_string(fields[30])) ?? 0
+
+      activity_id = 1
+      activity_name = "Logon"
+      if contains(subtype, "logout") || contains(downcase(gp_stage), "logout") {
+          activity_id = 2
+          activity_name = "Logoff"
+      }
+      if gp_status == "failure" || gp_status == "failed" || gp_status == "error" {
+          status_id = 2
+          status_str = "Failure"
+          action_id = 2
+          action = "Denied"
+          disposition_id = 2
+          disposition = "Blocked"
+          severity_id = 2
+          severity = "Low"
+      } else {
+          action_id = 1
+          action = "Allowed"
+          disposition_id = 1
+          disposition = "Allowed"
+      }
+
+  # ============================================================
+  # USERID (user -> IP mapping)
+  # ============================================================
+  } else if log_type == "USERID" {
+      route = "auth"
+      src_ip = to_string(fields[8])
+      user_name = to_string(fields[9])
+      src_port = to_int(to_string(fields[14])) ?? 0
+      dst_port = to_int(to_string(fields[15])) ?? 0
+      activity_id = 1
+      activity_name = "Logon"
+      if contains(subtype, "logout") { activity_id = 2; activity_name = "Logoff" }
+      action_id = 1
+      action = "Allowed"
+      disposition_id = 1
+      disposition = "Allowed"
+
+  # ============================================================
+  # CONFIG (administrative change)
+  # ============================================================
+  } else if log_type == "CONFIG" {
+      route = "api"
+      src_ip = to_string(fields[7])
+      cfg_cmd = downcase(to_string(fields[9]))
+      user_name = to_string(fields[10])
+      cfg_result = downcase(to_string(fields[12]))
+      cfg_path = to_string(fields[13])
+
+      activity_id = 3
+      activity_name = "Update"
+      if cfg_cmd == "add" || cfg_cmd == "create" || cfg_cmd == "clone" { activity_id = 1; activity_name = "Create" }
+      if cfg_cmd == "delete" { activity_id = 4; activity_name = "Delete" }
+      if cfg_cmd == "get" || cfg_cmd == "show" { activity_id = 2; activity_name = "Read" }
+      if cfg_result == "failed" || cfg_result == "failure" {
+          status_id = 2
+          status_str = "Failure"
+          severity_id = 2
+          severity = "Low"
+      }
+      action_id = 1
+      action = "Allowed"
+      disposition_id = 1
+      disposition = "Allowed"
+
+  # ============================================================
+  # HIPMATCH
+  # ============================================================
+  } else if log_type == "HIPMATCH" {
+      route = "network"
+      user_name = to_string(fields[7])
+      gp_host = to_string(fields[9])
+      src_ip = to_string(fields[11])
+      hip_name = to_string(fields[12])
+      rule_name = hip_name
+      activity_id = 99
+      activity_name = "Other"
+
+  # ============================================================
+  # SYSTEM and anything else
+  # ============================================================
+  } else {
+      route = "network"
+      activity_id = 99
+      activity_name = "Other"
+      if log_type == "SYSTEM" {
+          sys_desc = to_string(fields[14])
+          pan_sev2 = downcase(to_string(fields[13]))
+          if pan_sev2 == "low" { severity_id = 2; severity = "Low" }
+          if pan_sev2 == "medium" { severity_id = 3; severity = "Medium" }
+          if pan_sev2 == "high" { severity_id = 4; severity = "High" }
+          if pan_sev2 == "critical" { severity_id = 5; severity = "Critical" }
+      }
+  }
+
+  # ---- PAN action -> OCSF action / disposition (TRAFFIC + THREAT) ----
+  if pan_action != "" {
+      if pan_action == "allow" {
+          action_id = 1
+          action = "Allowed"
+          disposition_id = 1
+          disposition = "Allowed"
+      } else if pan_action == "drop" || starts_with(pan_action, "drop-") || pan_action == "random-drop" {
+          action_id = 2
+          action = "Denied"
+          disposition_id = 6
+          disposition = "Dropped"
+          status_id = 2
+          status_str = "Failure"
+      } else if starts_with(pan_action, "reset") {
+          action_id = 2
+          action = "Denied"
+          disposition_id = 21
+          disposition = "Reset"
+          status_id = 2
+          status_str = "Failure"
+          if route == "network" { activity_id = 3; activity_name = "Reset" }
+      } else if pan_action == "alert" {
+          action_id = 3
+          action = "Observed"
+          disposition_id = 19
+          disposition = "Alert"
+      } else if pan_action == "sinkhole" {
+          action_id = 4
+          action = "Modified"
+          disposition_id = 7
+          disposition = "Custom Action"
+      } else {
+          # deny, block-url, block-ip, block-continue, ...
+          action_id = 2
+          action = "Denied"
+          disposition_id = 2
+          disposition = "Blocked"
+          status_id = 2
+          status_str = "Failure"
+      }
+  }
+
+  # ---- protocol number ----
+  proto_num = 0
+  if proto == "tcp" { proto_num = 6 }
+  if proto == "udp" { proto_num = 17 }
+  if proto == "icmp" { proto_num = 1 }
+  if proto == "gre" { proto_num = 47 }
+  if proto == "esp" { proto_num = 50 }
+
+  # ---- endpoints ----
+  src = {}
+  if src_ip != "" && src_ip != "0.0.0.0" { src.ip = downcase(src_ip) }
+  if src_port > 0 { src.port = src_port }
+  if src_zone != "" { src.zone = src_zone }
+  if src_if != "" { src.interface_name = src_if }
+  if src_country != "" { src.location = { "country": src_country } }
+  if gp_host != "" { src.hostname = gp_host }
+
+  dst = {}
+  if dst_ip != "" && dst_ip != "0.0.0.0" { dst.ip = downcase(dst_ip) }
+  if dst_port > 0 { dst.port = dst_port }
+  if dst_zone != "" { dst.zone = dst_zone }
+  if dst_if != "" { dst.interface_name = dst_if }
+  if dst_country != "" { dst.location = { "country": dst_country } }
+  if app_name != "" { dst.svc_name = app_name }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": uuid_v4(),
+      "log_source": "palo_alto",
+      "log_provider": "PAN-OS",
+      "profiles": ["host", "security_control"],
+      "product": {
+          "name": "PAN-OS",
+          "vendor_name": "Palo Alto Networks",
+          "feature": { "name": "firewall" }
+      }
+  }
+  if log_type != "" { metadata.log_name = log_type }
+  if subtype != "" { metadata.event_code = log_type + ":" + subtype }
+
+  device = { "type_id": 9, "type": "Firewall" }
+  has_device = false
+  if serial != "" { device.uid = serial; has_device = true }
+  if dvc_host != "" { device.hostname = dvc_host; has_device = true }
+
+  unmapped = {}
+  if session_id != "" { unmapped.session_id = session_id }
+  if nat_src_ip != "" { unmapped.nat_src_ip = nat_src_ip }
+  if nat_dst_ip != "" { unmapped.nat_dst_ip = nat_dst_ip }
+  if nat_src_port > 0 { unmapped.nat_src_port = nat_src_port }
+  if nat_dst_port > 0 { unmapped.nat_dst_port = nat_dst_port }
+  if pan_action != "" { unmapped.pan_action = pan_action }
+  if end_reason != "" { unmapped.session_end_reason = end_reason }
+  if dst_user != "" { unmapped.dest_user = dst_user }
+  if subtype != "" { unmapped.log_subtype = subtype }
+  if sys_desc != "" { unmapped.description = sys_desc }
+  if gp_stage != "" { unmapped.gp_stage = gp_stage }
+  if gp_reason != "" { unmapped.gp_reason = gp_reason }
+  if gp_private_ip != "" && gp_private_ip != "0.0.0.0" { unmapped.gp_private_ip = gp_private_ip }
+  if hip_name != "" { unmapped.hip_match_name = hip_name }
+  if cfg_path != "" { unmapped.config_path = cfg_path }
+  if log_type == "" { unmapped.parse_status = "no_panos_log_type" }
+
+  obs = []
+  if src_ip != "" && src_ip != "0.0.0.0" { obs = push(obs, { "name": "src_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(src_ip) }) }
+  if dst_ip != "" && dst_ip != "0.0.0.0" { obs = push(obs, { "name": "dst_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(dst_ip) }) }
+  if user_name != "" { obs = push(obs, { "name": "user.name", "type": "User Name", "type_id": 4, "value": user_name }) }
+  if url_raw != "" { obs = push(obs, { "name": "http_request.url.url_string", "type": "Uniform Resource Locator", "type_id": 23, "value": url_raw }) }
+  if file_hash != "" { obs = push(obs, { "name": "file.hashes.value", "type": "Fingerprint", "type_id": 30, "value": file_hash }) }
+
+  traffic = {}
+  if bytes_in > 0 { traffic.bytes_in = bytes_in }
+  if bytes_out > 0 { traffic.bytes_out = bytes_out }
+  if pkts_in > 0 { traffic.packets_in = pkts_in }
+  if pkts_out > 0 { traffic.packets_out = pkts_out }
+
+  # ---- URL breakdown, shared by http + finding routes ----
+  url_obj = {}
+  if url_raw != "" {
+      if starts_with(url_raw, "http://") || starts_with(url_raw, "https://") {
+          url_obj.url_string = url_raw
+      } else {
+          url_obj.url_string = "http://" + url_raw
+      }
+      dm, de = parse_regex(url_raw, r'^(?:https?://)?(?P<domain>[^/:\s]+)')
+      if de == null && dm != null { url_obj.hostname = string!(dm.domain) }
+      pm, pe = parse_regex(url_raw, r'^(?:https?://)?[^/]+(?P<path>/[^\s]*)$')
+      if pe == null && pm != null { url_obj.path = string!(pm.path) }
+      if url_category != "" { url_obj.categories = [url_category] }
+  }
+
+  # ============================================================
+  # Assemble
+  # ============================================================
+  if route == "auth" {
+      class_uid = 3002
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Authentication",
+          "category_uid": 3,
+          "category_name": "Identity & Access Management",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "user": { "name": user_name }
+      }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 {
+          .dst_endpoint = dst
+      } else {
+          .service = { "name": "PAN-OS " + log_type }
+      }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if log_type == "GLOBALPROTECT" { .logon_type = "VPN"; .is_remote = true }
+      if gp_auth_method != "" { .auth_protocol = gp_auth_method }
+      if gp_reason != "" { .status_detail = gp_reason }
+      if sys_desc != "" && gp_reason == "" { .status_detail = sys_desc }
+      if duration_s > 0 { .duration = duration_s }
+      if has_device { .device = device }
+
+  } else if route == "api" {
+      class_uid = 6003
+      op = cfg_cmd
+      if op == "" { op = "config" }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "API Activity",
+          "category_uid": 6,
+          "category_name": "Application Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "actor": { "user": { "name": user_name } },
+          "api": {
+              "operation": op,
+              "service": { "name": "PAN-OS Management" }
+          },
+          "src_endpoint": src
+      }
+      if length(src) == 0 { .src_endpoint = { "hostname": dvc_host } }
+      if length(src) == 0 && dvc_host == "" { .src_endpoint = { "svc_name": "panos-mgmt" } }
+      if cfg_path != "" { .resources = [{ "name": cfg_path, "type": "Configuration" }] }
+      if has_device { .device = device }
+
+  } else if route == "finding" {
+      class_uid = 2004
+      evidence = {}
+      if length(src) > 0 { evidence.src_endpoint = src }
+      if length(dst) > 0 { evidence.dst_endpoint = dst }
+      if proto_num > 0 { evidence.connection_info = { "direction_id": 0, "protocol_num": proto_num } }
+      if length(url_obj) > 0 { evidence.url = url_obj }
+      if user_name != "" { evidence.user = { "name": user_name } }
+      if file_name != "" {
+          fobj = { "name": file_name, "type_id": 1 }
+          if file_hash != "" { fobj.hashes = [{ "algorithm_id": 3, "algorithm": "SHA-256", "value": file_hash }] }
+          evidence.file = fobj
+      }
+      evidence.name = "PAN-OS threat"
+      fuid = threat_id
+      if fuid == "" { fuid = threat_raw }
+      if fuid == "" { fuid = log_type + ":" + subtype }
+      ftitle = threat_name
+      if ftitle == "" { ftitle = "PAN-OS " + subtype }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Detection Finding",
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "is_alert": true,
+          "metadata": metadata,
+          "finding_info": {
+              "uid": fuid,
+              "title": ftitle,
+              "types": [subtype],
+              "data_sources": ["palo_alto"],
+              "analytic": {
+                  "name": ftitle,
+                  "uid": fuid,
+                  "type_id": 1,
+                  "type": "Rule"
+              }
+          },
+          "evidences": [evidence]
+      }
+      if rule_name != "" { .firewall_rule = { "name": rule_name, "uid": rule_name } }
+      if has_device { .device = device }
+
+  } else if route == "http" {
+      class_uid = 4002
+      req = {}
+      if http_method != "" { req.http_method = http_method }
+      if user_agent != "" { req.user_agent = user_agent }
+      if referrer != "" { req.referrer = referrer }
+      if length(url_obj) > 0 { req.url = url_obj }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "http_request": req,
+          "connection_info": {
+              "direction_id": 0,
+              "protocol_num": proto_num
+          }
+      }
+      if proto != "" { .connection_info.protocol_name = proto }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if length(src) == 0 && length(dst) == 0 { .dst_endpoint = { "svc_name": "http" } }
+      if content_type != "" { .http_response = { "content_type": content_type } }
+      if length(traffic) > 0 { .traffic = traffic }
+      if rule_name != "" { .firewall_rule = { "name": rule_name, "uid": rule_name } }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if has_device { .device = device }
+      if app_name != "" { .app_name = app_name }
+
+  } else {
+      class_uid = 4001
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Network Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": {
+              "direction_id": 0,
+              "protocol_num": proto_num
+          }
+      }
+      if proto != "" { .connection_info.protocol_name = proto }
+      if session_id != "" { .connection_info.uid = session_id }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if length(src) == 0 && length(dst) == 0 {
+          fb = {}
+          if dvc_host != "" { fb.hostname = dvc_host }
+          if dvc_host == "" && serial != "" { fb.uid = serial }
+          if length(fb) == 0 { fb.hostname = "unknown" }
+          .src_endpoint = fb
+      }
+      if length(traffic) > 0 { .traffic = traffic }
+      if duration_s > 0 { .duration = duration_s }
+      if repeat_cnt > 1 { .count = repeat_cnt }
+      if rule_name != "" { .firewall_rule = { "name": rule_name, "uid": rule_name } }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if app_name != "" { .app_name = app_name }
+      if end_reason != "" { .status_detail = end_reason }
+      if has_device { .device = device }
+  }
+
+  if length(unmapped) > 0 { .unmapped = unmapped }
+  if length(obs) > 0 { .observables = obs }
+
+  .
+samples:
+- raw: 1,2024/10/30 09:54:00,013101000123,AUTHENTICATION,authentication-failed,2561,2024/10/30 09:54:00,vsys1,203.0.113.5,corp\jsmith,jsmith,mgmt,auth-policy-1,1,42,PAN-OS,LogForward,ldap-profile,Invalid credentials,Web,failure,1,987654328,0x0
+  expect:
+    class_uid: 3002
+    activity_id: 1
+    src_endpoint.ip: 203.0.113.5
+    user.name: corp\jsmith
+    actor.user.name: corp\jsmith
+    disposition_id: 2
+- raw: 1,2024/10/30 09:51:00,013101000123,CONFIG,0,2561,2024/10/30 09:51:00,10.0.0.9,vsys1,set,admin,Web,Succeeded,vsys/vsys1/rulebase/security/rules,before-change,after-change,987654326,0x0
+  expect:
+    class_uid: 6003
+    activity_id: 3
+    src_endpoint.ip: 10.0.0.9
+    actor.user.name: admin
+    disposition_id: 1
+- raw: 1,2024/10/30 09:53:00,013101000123,GLOBALPROTECT,gateway-auth,2561,2024/10/30 09:53:00,vsys1,gateway-auth,before-login,LDAP,ipsec,corp\jsmith,US,LAPTOP-7,203.0.113.5,,10.10.10.55,,hostid-1,SN123,6.1.1,Windows,10,1,Auth failed,error-1,,failure,US,0,on-demand,1
+  expect:
+    class_uid: 3002
+    activity_id: 1
+    src_endpoint.ip: 203.0.113.5
+    user.name: corp\jsmith
+    actor.user.name: corp\jsmith
+    disposition_id: 2
+- raw: 1,2024/10/30 09:55:00,013101000123,HIPMATCH,0,2561,2024/10/30 09:55:00,corp\jsmith,vsys1,LAPTOP-7,Windows,10.10.10.55,disk-encryption-ok,1,object,,,987654329,0x0
+  expect:
+    class_uid: 4001
+    activity_id: 99
+    src_endpoint.ip: 10.10.10.55
+    actor.user.name: corp\jsmith
+    disposition_id: 17
+- raw: this line is not PAN-OS csv at all
+  expect:
+    class_uid: 4001
+    activity_id: 99
+    disposition_id: 17
+- raw: 1,2024/10/30 09:50:00,013101000123,SYSTEM,general,2561,2024/10/30 09:50:00,vsys1,general,0,0,0,general,informational,User admin logged in via CLI from 10.0.0.9,987654325,0x0
+  expect:
+    class_uid: 4001
+    activity_id: 99
+    disposition_id: 17
+- raw: 1,2024/10/30 09:48:00,013101000123,THREAT,url,2561,2024/10/30 09:48:00,10.10.1.55,93.184.216.34,198.51.100.7,93.184.216.34,allow-web,corp\jsmith,,web-browsing,vsys1,trust,untrust,ethernet1/2,ethernet1/1,LogForward,2024/10/30 09:48:00,84733,1,51423,80,32101,80,0x0,tcp,block-url,"malware.example.com/payload.exe",(9999),malware,informational,client-to-server,0,987654323,0x0,US,US,,text/html,0,,0,,,,,,,,,,,curl/8.1.0,,,,,,,,,,,,,GET
+  expect:
+    class_uid: 4002
+    activity_id: 99
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 93.184.216.34
+    actor.user.name: corp\jsmith
+    http_request.url.path: /payload.exe
+    disposition_id: 2
+- raw: 1,2024/10/30 09:49:00,013101000123,THREAT,vulnerability,2561,2024/10/30 09:49:00,203.0.113.9,10.10.1.7,0.0.0.0,0.0.0.0,allow-web,,,ms-rpc,vsys1,untrust,trust,ethernet1/1,ethernet1/2,LogForward,2024/10/30 09:49:00,84734,1,44001,445,0,0,0x0,tcp,reset-both,,Microsoft Windows SMB Remote Code Execution(30810),code-execution,critical,client-to-server,0,987654324,0x0,RU,US,,,0,e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+  expect:
+    class_uid: 2004
+    activity_id: 1
+    finding_info.uid: '30810'
+    disposition_id: 21
+- raw: 1,2024/10/30 09:47:00,013101000123,TRAFFIC,drop,2561,2024/10/30 09:47:00,203.0.113.44,10.10.1.55,0.0.0.0,0.0.0.0,deny-all,,,not-applicable,vsys1,untrust,trust,ethernet1/1,ethernet1/2,LogForward,2024/10/30 09:47:00,0,1,44112,3389,0,0,0x0,tcp,drop,60,60,0,1,2024/10/30 09:47:00,0,any,0,987654322,0x0,RU,US,,1,0,policy-deny
+  expect:
+    class_uid: 4001
+    activity_id: 5
+    src_endpoint.ip: 203.0.113.44
+    dst_endpoint.ip: 10.10.1.55
+    disposition_id: 6
+- raw: <14>Oct 30 09:46:12 PA-3220 1,2024/10/30 09:46:12,013101000123,TRAFFIC,end,2561,2024/10/30 09:46:12,10.10.1.55,93.184.216.34,198.51.100.7,93.184.216.34,allow-web,corp\jsmith,,web-browsing,vsys1,trust,untrust,ethernet1/2,ethernet1/1,LogForward,2024/10/30 09:46:12,84732,1,51422,443,32100,443,0x400053,tcp,allow,15321,4210,11111,24,2024/10/30 09:45:12,60,computer-and-internet-info,0,987654321,0x0,10.0.0.0-10.255.255.255,US,,14,10,tcp-fin
+  expect:
+    class_uid: 4001
+    activity_id: 2
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 93.184.216.34
+    actor.user.name: corp\jsmith
+    disposition_id: 1
+- raw: 1,2024/10/30 09:52:00,013101000123,USERID,login,2561,2024/10/30 09:52:00,vsys1,10.10.1.55,corp\jsmith,AD-agent,0,1,3600,0,0,agent,active-directory,987654327,0x0
+  expect:
+    class_uid: 3002
+    activity_id: 1
+    src_endpoint.ip: 10.10.1.55
+    user.name: corp\jsmith
+    actor.user.name: corp\jsmith
+    disposition_id: 1

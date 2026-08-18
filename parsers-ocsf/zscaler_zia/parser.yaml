@@ -1,0 +1,534 @@
+name: zscaler_zia_ocsf
+display_name: Zscaler Internet Access (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Zscaler Internet Access NSS/LSS JSON feeds into OCSF 1.9.0, routing
+  each feed to the class that actually describes it rather than flattening
+  them all into one:
+    * zscalernss-web    -> HTTP Activity      (class_uid 4002)
+    * zscalernss-fw     -> Network Activity   (class_uid 4001)
+    * zscalernss-dns    -> DNS Activity       (class_uid 4003)
+    * zscalernss-tunnel -> Network Activity   (class_uid 4001)
+    * zscalernss-edlp   -> Detection Finding  (class_uid 2004)
+    * zscalernss-audit  -> API Activity       (class_uid 6003)
+    * anything else     -> Base Event         (class_uid 0)
+  Handles both the {"sourcetype":…,"event":{…}} envelope and flat JSON.
+  Mirrors the UDM zscaler_zia parser
+  (../parsers/parsers/zscaler_zia/parser.yaml).
+match_values:
+  - zscaler_zia
+category: network
+vendor: "Zscaler"
+product: "Internet Access"
+parser_vrl: |
+  # Zscaler Internet Access -> OCSF 1.9.0 (multi-class)
+  raw_log = string!(.message)
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
+
+  top, terr = parse_json(raw_log)
+  ok = terr == null && is_object(top)
+
+  sourcetype = ""
+  e = {}
+  if ok {
+      t = object!(top)
+      sourcetype = downcase(string(t.sourcetype) ?? "")
+      if exists(t.event) { e = object(t.event) ?? {} } else { e = t }
+  }
+
+  # ---- timestamp: epochtime (seconds) / "time" / "datetime" -------------
+  time_ms = 0
+  ep = to_int(e.epochtime) ?? 0
+  if ep > 0 { time_ms = ep * 1000 }
+  if time_ms == 0 {
+      ts_str = string(e.time) ?? ""
+      if ts_str == "" { ts_str = string(e.datetime) ?? "" }
+      if ts_str != "" {
+          tv, tverr = parse_timestamp(ts_str, "%a %b %d %H:%M:%S %Y")
+          if tverr == null { time_ms = to_unix_timestamp(tv, unit: "milliseconds") } else {
+              tv2, tv2err = parse_timestamp(ts_str, "%+")
+              if tv2err == null { time_ms = to_unix_timestamp(tv2, unit: "milliseconds") }
+          }
+      }
+  }
+
+  # ---- Zscaler action -> security-control action/disposition ------------
+  raw_action = downcase(string(e.action) ?? "")
+  if raw_action == "" { raw_action = downcase(string(e.reqaction) ?? "") }
+  if raw_action == "" { raw_action = downcase(string(e.actiontaken) ?? "") }
+  action_id = 0
+  action_name = "Unknown"
+  disposition_id = 0
+  disposition_name = "Unknown"
+  is_alert = false
+  if contains(raw_action, "block") || contains(raw_action, "drop") || contains(raw_action, "deny") {
+      action_id = 2; action_name = "Denied"
+      disposition_id = 2; disposition_name = "Blocked"
+      is_alert = true
+  } else if contains(raw_action, "quarantin") {
+      action_id = 2; action_name = "Denied"
+      disposition_id = 5; disposition_name = "Quarantined"
+      is_alert = true
+  } else if contains(raw_action, "allow") {
+      action_id = 1; action_name = "Allowed"
+      disposition_id = 1; disposition_name = "Allowed"
+  } else if raw_action != "" {
+      action_id = 99; action_name = raw_action
+  }
+
+  # ---- severity: Zscaler threat/DLP severity ---------------------------
+  severity_id = 1
+  severity = "Informational"
+  sev_raw = downcase(string(e.threatseverity) ?? "")
+  if sev_raw == "" { sev_raw = downcase(string(e.severity) ?? "") }
+  if contains(sev_raw, "critical") { severity_id = 5; severity = "Critical" } else if contains(sev_raw, "high") { severity_id = 4; severity = "High" } else if contains(sev_raw, "medium") { severity_id = 3; severity = "Medium" } else if contains(sev_raw, "low") { severity_id = 2; severity = "Low" }
+  if is_alert && severity_id < 3 { severity_id = 3; severity = "Medium" }
+
+  user_name = string(e.login) ?? ""
+  if user_name == "" { user_name = string(e.user) ?? "" }
+  if user_name == "" { user_name = string(e.adminid) ?? "" }
+  if user_name == "" { user_name = string(e.admin) ?? "" }
+
+  device_host = string(e.devicehostname) ?? ""
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": uuid_v4(),
+      "profiles": ["host", "security_control"],
+      "log_name": sourcetype,
+      "product": { "name": "Internet Access", "vendor_name": "Zscaler" }
+  }
+  if sourcetype == "" { metadata.log_name = "zscaler-zia" }
+  recid = to_string(e.recordid) ?? ""
+  if recid != "" { metadata.original_event_uid = recid }
+
+  unmapped = {}
+  for_each(["dept", "location", "locationname", "cloudname", "datacenter", "datacentercity", "datacentercountry", "deviceostype", "deviceowner", "devicemodel", "appname", "appclass", "urlclass", "urlsubcat", "urlcatmethod", "threatcat", "malwarecategory", "malwareclass", "ssldecrypted", "clttlsversion", "srvtlsversion", "rulelabel", "ruletype", "nwsvc", "nwapp", "tuntype", "tunneltype", "ikeversion", "channel", "reason"]) -> |_i, k| {
+      v = to_string(get(e, [k]) ?? "") ?? ""
+      if v != "" && v != "None" { unmapped = set!(unmapped, [k], v) }
+  }
+
+  threat_name = string(e.threatname) ?? ""
+  if threat_name == "None" { threat_name = "" }
+
+  if ok && contains(sourcetype, "web") {
+      # =================== HTTP Activity (4002) ===================
+      method = upcase(string(e.reqmethod) ?? "")
+      activity_id = 99
+      activity_name = "Other"
+      if method == "CONNECT" { activity_id = 1; activity_name = "Connect" }
+      if method == "DELETE"  { activity_id = 2; activity_name = "Delete" }
+      if method == "GET"     { activity_id = 3; activity_name = "Get" }
+      if method == "HEAD"    { activity_id = 4; activity_name = "Head" }
+      if method == "OPTIONS" { activity_id = 5; activity_name = "Options" }
+      if method == "POST"    { activity_id = 6; activity_name = "Post" }
+      if method == "PUT"     { activity_id = 7; activity_name = "Put" }
+      if method == "TRACE"   { activity_id = 8; activity_name = "Trace" }
+      if method == "PATCH"   { activity_id = 9; activity_name = "Patch" }
+
+      code = to_int(e.respcode) ?? 0
+      status_id = 2
+      status_str = "Failure"
+      if code >= 200 && code < 400 { status_id = 1; status_str = "Success" }
+      if code == 0 { status_id = 0; status_str = "Unknown" }
+
+      url_str = string(e.url) ?? ""
+      b64 = string(e.b64url) ?? ""
+      if b64 != "" {
+          dec = decode_base64(b64) ?? ""
+          if dec != "" { url_str = dec }
+      }
+      host = string(e.host) ?? ""
+
+      url_obj = {}
+      if url_str != "" { url_obj.url_string = url_str }
+      if host != "" { url_obj.hostname = downcase(host) }
+      supercat = string(e.urlsupercat) ?? ""
+      if supercat != "" && supercat != "None" { url_obj.categories = [supercat] }
+      pu, puerr = parse_url(url_str)
+      if puerr == null {
+          up = to_string(pu.path)
+          if up != "" { url_obj.path = up }
+          us = to_string(pu.scheme)
+          if us != "" { url_obj.scheme = us }
+          if !exists(url_obj.hostname) {
+              uh = to_string(pu.host)
+              if uh != "" { url_obj.hostname = downcase(uh) }
+          }
+      }
+      if !exists(url_obj.path) && !exists(url_obj.url_string) { url_obj.path = "/" }
+
+      http_request = { "url": url_obj }
+      if method != "" { http_request.http_method = method }
+      ua = string(e.useragent) ?? ""
+      if ua != "" { http_request.user_agent = ua }
+      rf = string(e.referrer) ?? ""
+      if rf != "" { http_request.referrer = rf }
+
+      http_response = { "code": code, "status": status_str }
+      ct = string(e.contenttype) ?? ""
+      if ct != "" { http_response.content_type = ct }
+      respsize = to_int(e.respsize) ?? 0
+      reqsize = to_int(e.reqsize) ?? 0
+      if respsize != 0 { http_response.length = respsize }
+
+      . = {
+          "class_uid": 4002,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": 400200 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "action_id": action_id,
+          "action": action_name,
+          "disposition_id": disposition_id,
+          "disposition": disposition_name,
+          "is_alert": is_alert,
+          "time": time_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "http_request": http_request,
+          "http_response": http_response,
+          "traffic": { "bytes_in": reqsize, "bytes_out": respsize }
+      }
+      cip = string(e.cltip) ?? ""
+      se = {}
+      if match(cip, ip_re) { se.ip = cip }
+      if device_host != "" { se.hostname = downcase(device_host) }
+      if exists(se.ip) || exists(se.hostname) { .src_endpoint = se }
+      de = {}
+      sip = string(e.serverip) ?? ""
+      if match(sip, ip_re) { de.ip = sip }
+      if host != "" { de.hostname = downcase(host) }
+      if exists(de.ip) || exists(de.hostname) { .dst_endpoint = de }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      rsc = to_int(e.riskscore) ?? -1
+      if rsc >= 0 { .risk_score = rsc }
+      if threat_name != "" {
+          .malware = [{ "name": threat_name, "classification_ids": [0], "provider": "Zscaler" }]
+      }
+      fname = string(e.filename) ?? ""
+      fhash = downcase(string(e.sha256) ?? "")
+      if fname != "" || fhash != "" {
+          fobj = {}
+          if fname != "" { fobj.name = fname }
+          if fhash != "" { fobj.hashes = [{ "algorithm_id": 3, "value": fhash }] }
+          fobj.type_id = 1
+          .file = fobj
+      }
+      dlprule = string(e.dlprulename) ?? ""
+      if dlprule != "" { .firewall_rule = { "name": dlprule, "type": "dlp" } }
+      if length(unmapped) > 0 { .unmapped = unmapped }
+  } else if ok && (contains(sourcetype, "fw") || contains(sourcetype, "tunnel")) {
+      # =================== Network Activity (4001) ===================
+      is_tunnel = contains(sourcetype, "tunnel")
+      se = {}
+      de = {}
+      if is_tunnel {
+          s = string(e.sourceip) ?? ""
+          d = string(e.destinationip) ?? ""
+          if match(s, ip_re) { se.ip = s }
+          if match(d, ip_re) { de.ip = d }
+          sp = to_int(e.sourceport) ?? 0
+          dp = to_int(e.destinationport) ?? 0
+          if sp != 0 { se.port = sp }
+          if dp != 0 { de.port = dp }
+          sh = string(e.srciphost) ?? ""
+          dh = string(e.destinationiphost) ?? ""
+          if sh != "" { se.hostname = downcase(sh) }
+          if dh != "" { de.hostname = downcase(dh) }
+      } else {
+          s = string(e.csip) ?? ""
+          d = string(e.cdip) ?? ""
+          if match(s, ip_re) { se.ip = s }
+          if match(d, ip_re) { de.ip = d }
+          sp = to_int(e.csport) ?? 0
+          dp = to_int(e.cdport) ?? 0
+          if sp != 0 { se.port = sp }
+          if dp != 0 { de.port = dp }
+          if device_host != "" { se.hostname = downcase(device_host) }
+      }
+      if !exists(se.ip) && !exists(se.hostname) && !exists(de.ip) && !exists(de.hostname) {
+          se.svc_name = "zscaler-zia"
+      }
+
+      bytes_in = to_int(e.inbytes) ?? 0
+      bytes_out = to_int(e.outbytes) ?? 0
+      if is_tunnel {
+          bytes_in = to_int(e.rxbytes) ?? 0
+          bytes_out = to_int(e.txbytes) ?? 0
+      }
+
+      proto = upcase(string(e.proto) ?? "")
+      if proto == "" { proto = upcase(string(e.protocol) ?? "") }
+
+      . = {
+          "class_uid": 4001,
+          "class_name": "Network Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": 6,
+          "activity_name": "Traffic",
+          "type_uid": 400106,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": 1,
+          "status": "Success",
+          "action_id": action_id,
+          "action": action_name,
+          "disposition_id": disposition_id,
+          "disposition": disposition_name,
+          "is_alert": is_alert,
+          "time": time_ms,
+          "duration": to_int(e.duration) ?? 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "traffic": { "bytes_in": bytes_in, "bytes_out": bytes_out }
+      }
+      if exists(se.ip) || exists(se.hostname) || exists(se.svc_name) { .src_endpoint = se }
+      if exists(de.ip) || exists(de.hostname) { .dst_endpoint = de }
+      if proto != "" { .connection_info = { "direction_id": 2, "direction": "Outbound", "protocol_name": downcase(proto) } }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      rule = string(e.rule) ?? ""
+      if rule != "" { .firewall_rule = { "name": rule } }
+      if threat_name != "" {
+          .malware = [{ "name": threat_name, "classification_ids": [0], "provider": "Zscaler" }]
+      }
+      if length(unmapped) > 0 { .unmapped = unmapped }
+  } else if ok && contains(sourcetype, "dns") {
+      # =================== DNS Activity (4003) ===================
+      qname = string(e.dns_req) ?? ""
+      answer = string(e.dns_resp) ?? ""
+      qtype = upcase(string(e.dns_reqtype) ?? "")
+
+      . = {
+          "class_uid": 4003,
+          "class_name": "DNS Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": 2,
+          "activity_name": "Response",
+          "type_uid": 400302,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": 1,
+          "status": "Success",
+          "action_id": action_id,
+          "action": action_name,
+          "disposition_id": disposition_id,
+          "disposition": disposition_name,
+          "is_alert": is_alert,
+          "time": time_ms,
+          "duration": to_int(e.durationms) ?? 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": metadata
+      }
+      if qname != "" {
+          q = { "hostname": downcase(qname) }
+          if qtype != "" { q.type = qtype }
+          .query = q
+      }
+      if answer != "" { .answers = [{ "rdata": answer }] }
+      se = {}
+      cs = string(e.clt_sip) ?? ""
+      if match(cs, ip_re) { se.ip = cs }
+      if device_host != "" { se.hostname = downcase(device_host) }
+      de = {}
+      sd = string(e.srv_dip) ?? ""
+      if match(sd, ip_re) { de.ip = sd }
+      dpn = to_int(e.srv_dport) ?? 0
+      if dpn != 0 { de.port = dpn }
+      if exists(se.ip) || exists(se.hostname) { .src_endpoint = se }
+      if exists(de.ip) { .dst_endpoint = de }
+      if !exists(.src_endpoint) && !exists(.dst_endpoint) { .dst_endpoint = { "svc_name": "zscaler-dns" } }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if length(unmapped) > 0 { .unmapped = unmapped }
+  } else if ok && (contains(sourcetype, "dlp") || contains(sourcetype, "edlp")) {
+      # =================== Detection Finding (2004) ===================
+      rule_name = string(e.dlprulename) ?? ""
+      engine = string(e.dlpeng) ?? ""
+      finding_uid = recid
+      if finding_uid == "" { finding_uid = to_string(e.dlpidentifier) ?? "" }
+      if finding_uid == "" { finding_uid = uuid_v4() }
+
+      finding_info = { "uid": finding_uid }
+      if rule_name != "" { finding_info.title = rule_name }
+      if engine != "" {
+          # analytic.type_id 1 = Rule; a DLP engine is a rule set, not an ML model.
+          finding_info.analytic = { "name": engine, "type_id": 1, "type": "Rule" }
+      }
+      finding_info.types = ["Data Loss Prevention"]
+
+      . = {
+          "class_uid": 2004,
+          "class_name": "Detection Finding",
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": 1,
+          "activity_name": "Create",
+          "type_uid": 200401,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": 1,
+          "status": "New",
+          "action_id": action_id,
+          "action": action_name,
+          "disposition_id": disposition_id,
+          "disposition": disposition_name,
+          "is_alert": true,
+          "time": time_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "finding_info": finding_info
+      }
+      fname = string(e.filename) ?? ""
+      fhash = downcase(string(e.sha256) ?? "")
+      ev = {}
+      if fname != "" || fhash != "" {
+          fobj = { "type_id": 1 }
+          if fname != "" { fobj.name = fname }
+          if fhash != "" { fobj.hashes = [{ "algorithm_id": 3, "value": fhash }] }
+          ev.file = fobj
+      }
+      if user_name != "" { ev.user = { "name": user_name } }
+      if device_host != "" { ev.device = { "type_id": 0, "hostname": downcase(device_host) } }
+      if length(ev) > 0 { .evidences = [ev] }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      # `evidences.*` is not addressable in nPL on this deployment; observables
+      # are, so the DLP file/user pivots are mirrored there.
+      obs = []
+      if user_name != "" { obs = push(obs, { "name": "evidences.user.name", "type": "User Name", "type_id": 4, "value": user_name }) }
+      if fhash != "" { obs = push(obs, { "name": "evidences.file.hashes.value", "type": "Hash", "type_id": 8, "value": fhash }) }
+      if fname != "" { obs = push(obs, { "name": "evidences.file.name", "type": "File Name", "type_id": 7, "value": fname }) }
+      if length(obs) > 0 { .observables = obs }
+      if length(unmapped) > 0 { .unmapped = unmapped }
+  } else if ok && contains(sourcetype, "audit") {
+      # =================== API Activity (6003) ===================
+      op = string(e.action) ?? ""
+      if op == "" { op = "Unknown" }
+      cat = string(e.category) ?? ""
+      result = downcase(string(e.result) ?? "")
+      status_id = 0
+      status_str = "Unknown"
+      if contains(result, "success") { status_id = 1; status_str = "Success" }
+      if contains(result, "fail") { status_id = 2; status_str = "Failure" }
+
+      api = { "operation": op, "service": { "name": "ZIA Admin Portal" } }
+
+      se = {}
+      cip = string(e.clientip) ?? ""
+      if match(cip, ip_re) { se.ip = cip } else { se.svc_name = "zia-admin" }
+
+      . = {
+          "class_uid": 6003,
+          "class_name": "API Activity",
+          "category_uid": 6,
+          "category_name": "Application Activity",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 600399,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "api": api,
+          "src_endpoint": se,
+          "actor": { "user": { "name": user_name } }
+      }
+      if user_name == "" { .actor = { "user": { "name": "unknown" } } }
+      res = string(e.resource) ?? ""
+      rtype = string(e.resourcetype) ?? ""
+      if res != "" {
+          r = { "name": res }
+          if rtype != "" { r.type = rtype }
+          .resources = [r]
+      }
+      if cat != "" { unmapped.category = cat }
+      pre = string(e.preaction) ?? ""
+      post = string(e.postaction) ?? ""
+      if pre != "" { unmapped.pre_action = pre }
+      if post != "" { unmapped.post_action = post }
+      if length(unmapped) > 0 { .unmapped = unmapped }
+  } else {
+      # =================== Base Event (0) ===================
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": 0,
+          "status": "Unknown",
+          "time": time_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "profiles": ["host"],
+              "log_name": "zscaler-zia",
+              "product": { "name": "Internet Access", "vendor_name": "Zscaler" }
+          }
+      }
+      if !ok { .metadata.log_level = "error" }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if length(unmapped) > 0 { .unmapped = unmapped }
+  }
+
+  .
+
+# Runtime samples (NAN-2327): one per event shape this parser routes.
+# `class_uid` is asserted because class routing is the whole point of the
+# OCSF conversion — a silent reroute is the defect most likely to survive
+# a compile-only check.
+samples:
+  - raw: '{"sourcetype":"zscalernss-audit","event":{"datetime":"Wed Aug 12 09:15:26 2026","adminid":"admin@corp.example","action":"UPDATE","category":"URL Filtering Policy","subcategory":"Rule","result":"SUCCESS","resource":"Block Gambling","resourcetype":"UrlFilteringRule","clientip":"198.51.100.250","recordid":"5510"}}'
+    expect:
+      class_uid: 6003
+      activity_id: 99
+  - raw: 'NOT JSON'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: '{"sourcetype":"zscalernss-edlp","event":{"datetime":"Wed Aug 12 09:15:25 2026","user":"dan@corp.example","actiontaken":"Block","dlpeng":"PCI Engine","dlpdict":"Credit Card","dlpdicthitcount":14,"dlprulename":"Block PCI Upload","dlpidentifier":99881,"filename":"cards.csv","sha256":"AA86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08","severity":"High","devicehostname":"LAP-7788","channel":"Web"}}'
+    expect:
+      class_uid: 2004
+      activity_id: 1
+  - raw: '{"sourcetype":"zscalernss-dns","event":{"datetime":"Wed Aug 12 09:15:23 2026","clt_sip":"10.70.1.12","srv_dip":"185.228.168.9","srv_dport":53,"dns_req":"c2.evil.example","dns_resp":"127.0.0.1","dns_reqtype":"A","reqaction":"BLOCK","durationms":4,"user":"carol@corp.example","devicehostname":"LAP-3300","category":"Command and Control"}}'
+    expect:
+      class_uid: 4003
+      activity_id: 2
+  - raw: '{"sourcetype":"zscalernss-fw","event":{"datetime":"Wed Aug 12 09:15:22 2026","csip":"10.70.1.11","cdip":"198.51.100.7","csport":51000,"cdport":445,"proto":"TCP","inbytes":4096,"outbytes":8192,"duration":12,"user":"bob@corp.example","action":"Drop","rule":"Block SMB Egress","devicehostname":"LAP-9001","threatname":"None"}}'
+    expect:
+      class_uid: 4001
+      activity_id: 6
+  - raw: '{"sourcetype":"zscalernss-tunnel","event":{"datetime":"Wed Aug 12 09:15:24 2026","sourceip":"203.0.113.40","destinationip":"165.225.0.10","sourceport":500,"destinationport":4500,"protocol":"UDP","rxbytes":102400,"txbytes":51200,"user":"branch-fw","tunneltype":"IPSEC","ikeversion":"IKEv2","event":"TUNNEL_UP"}}'
+    expect:
+      class_uid: 4001
+      activity_id: 6
+  - raw: '{"sourcetype":"zscalernss-mystery","event":{"user":"eve@corp.example","action":"Allow","severity":"Low"}}'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: '{"sourcetype":"zscalernss-web","event":{"epochtime":1786000522,"login":"alice@corp.example","dept":"Finance","location":"HQ","cltip":"10.70.1.10","serverip":"93.184.216.34","host":"downloads.example.com","reqmethod":"GET","respcode":403,"reqsize":900,"respsize":0,"contenttype":"application/octet-stream","useragent":"Mozilla/5.0","referrer":"https://portal.example.com/","b64url":"aHR0cHM6Ly9kb3dubG9hZHMuZXhhbXBsZS5jb20vc2V0dXAuZXhl","action":"Blocked","reason":"Malware","threatname":"Win32.Trojan.Generic","threatseverity":"Critical","urlsupercat":"Software Downloads","urlclass":"Business Use","riskscore":88,"filename":"setup.exe","sha256":"9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08","devicehostname":"LAP-4471","deviceostype":"Windows","dlprulename":"","recordid":"771122"}}'
+    expect:
+      class_uid: 4002
+      activity_id: 3

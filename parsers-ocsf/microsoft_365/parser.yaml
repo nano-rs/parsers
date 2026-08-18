@@ -1,0 +1,517 @@
+name: microsoft_365_ocsf
+display_name: Microsoft 365 (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Microsoft 365 Management Activity API records into complete OCSF 1.9.0
+  records, routed by Workload and Operation:
+    Exchange MessageTrace (SenderAddress / MessageTraceId) -> Email Activity 4009
+    Exchange mailbox operations                            -> API Activity 6003
+    SharePoint / OneDrive                                  -> File Hosting Activity 6006
+    AzureActiveDirectory UserLoggedIn / UserLoginFailed /
+      UserLoggedOut                                        -> Authentication 3002
+    AzureActiveDirectory user lifecycle ("Add user.",
+      "Delete user.", "Reset user password.", strong-auth) -> User Management 3007
+    AzureActiveDirectory group operations                  -> Group Management 3006
+    Teams, DLP, SecurityComplianceCenter, everything else  -> API Activity 6003
+  Account Change 3001 and User Access Management 3005 are DEPRECATED in OCSF
+  1.9 and are not emitted. On Azure AD directory changes the record's `UserId`
+  (or Actor[]) is the administrator (`actor.user`) and `Target[]` is the subject
+  (`user` / `group`). Carries metadata.profiles ["cloud"] because the `cloud`
+  object (tenant = OrganizationId) is profile-bound in OCSF 1.9.
+match_values:
+  - microsoft_365
+category: cloud
+vendor: "Microsoft"
+product: "Microsoft 365"
+parser_vrl: |
+  # Microsoft 365 Management Activity API JSON -> OCSF 1.9.0.
+  raw_log = string!(.message)
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      # Unparseable input is emitted as an OCSF Base Event (class_uid 0)
+      # rather than being guessed into a security class: it stays valid, and
+      # therefore visible, without fabricating a user or an outcome.
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_name": "Microsoft 365 Management Activity",
+              "log_provider": "Microsoft 365",
+              "product": { "name": "Microsoft 365", "vendor_name": "Microsoft" }
+          },
+          "unmapped": { "parse_error": "not a JSON object" }
+      }
+  } else {
+      p = object!(parsed)
+
+      # metadata.profiles must declare every profile-bound object the record
+      # carries: `cloud` always, `security_control` when a disposition is set.
+      profiles = ["cloud"]
+
+      workload = string(p.Workload) ?? ""
+      operation = string(p.Operation) ?? ""
+      op_l = downcase(operation)
+
+      # ---- time ----
+      time_ms = 0
+      raw_ts = string(p.CreationTime) ?? ""
+      if raw_ts != "" {
+          t, terr = parse_timestamp(raw_ts, "%+")
+          if terr != null { t, terr = parse_timestamp(raw_ts, "%Y-%m-%dT%H:%M:%S") }
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- outcome ----
+      status_id = 0
+      status_str = "Unknown"
+      severity_id = 1
+      severity = "Informational"
+      result_raw = downcase(string(p.ResultStatus) ?? "")
+      if result_raw == "succeeded" || result_raw == "success" || result_raw == "partiallysucceeded" {
+          status_id = 1; status_str = "Success"
+      } else if result_raw == "failed" || result_raw == "failure" {
+          status_id = 2; status_str = "Failure"; severity_id = 2; severity = "Low"
+      } else if result_raw != "" {
+          status_id = 99; status_str = "Other"
+      }
+
+      # ---- acting principal ----
+      actor_id = string(p.UserId) ?? ""
+      actor_user = { "name": downcase(actor_id) }
+      if actor_id == "" { actor_user = { "name": "unknown" } }
+      user_key = string(p.UserKey) ?? ""
+      if user_key != "" { actor_user = set!(actor_user, ["uid"], user_key) }
+      if match(actor_id, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') {
+          actor_user = set!(actor_user, ["email_addr"], downcase(actor_id))
+          apx = split(actor_id, "@")
+          if length(apx) == 2 { actor_user = set!(actor_user, ["domain"], downcase(string(apx[1]) ?? "")) }
+      }
+
+      # ---- Azure AD Target[] -> the subject of a directory change ----
+      targets = array(p.Target) ?? []
+      target_id = ""
+      for_each(targets) -> |_i, tv| {
+          to_ = object(tv) ?? {}
+          tval = string(to_.ID) ?? ""
+          if target_id == "" && tval != "" { target_id = tval }
+      }
+      subject = { "name": downcase(target_id) }
+      if match(target_id, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') {
+          subject = set!(subject, ["email_addr"], downcase(target_id))
+      }
+      have_subject = target_id != ""
+
+      # ---- source IP: ClientIP may be "ip", "ip:port" or "[v6]:port" ----
+      raw_ip = string(p.ClientIP) ?? string(p.ClientIPAddress) ?? string(p.ActorIpAddress) ?? ""
+      src_ip = ""
+      src_port = 0
+      if raw_ip != "" {
+          if starts_with(raw_ip, "[") {
+              m6, m6err = parse_regex(raw_ip, r'^\[(?P<ip>[^\]]+)\](:(?P<port>\d+))?$')
+              if m6err == null {
+                  src_ip = string(m6.ip) ?? ""
+                  src_port = to_int(m6.port) ?? 0
+              }
+          } else {
+              colon_parts = split(raw_ip, ":")
+              if length(colon_parts) == 2 {
+                  src_ip = string(colon_parts[0]) ?? ""
+                  src_port = to_int(colon_parts[1]) ?? 0
+              } else {
+                  src_ip = raw_ip
+              }
+          }
+      }
+
+      # ---- workload dispatch ----
+      is_message_trace = workload == "Exchange" && (operation == "MessageTrace" || exists(p.SenderAddress) || exists(p.MessageTraceId))
+      is_aad = workload == "AzureActiveDirectory"
+      aad_auth = operation == "UserLoggedIn" || operation == "UserLoginFailed" || operation == "UserLoggedOut" || operation == "UserLoggedInFromNewDevice"
+      aad_usermgmt = starts_with(op_l, "add user") || starts_with(op_l, "delete user") || starts_with(op_l, "update user") ||
+                     starts_with(op_l, "reset user password") || starts_with(op_l, "change user password") ||
+                     starts_with(op_l, "set force change user password") ||
+                     starts_with(op_l, "disable strong authentication") || starts_with(op_l, "enable strong authentication") ||
+                     starts_with(op_l, "enable account") || starts_with(op_l, "disable account")
+      aad_groupmgmt = starts_with(op_l, "add group") || starts_with(op_l, "delete group") || starts_with(op_l, "update group") ||
+                      starts_with(op_l, "add member to group") || starts_with(op_l, "remove member from group")
+
+      class_uid = 6003
+      if is_message_trace {
+          class_uid = 4009
+      } else if workload == "SharePoint" || workload == "OneDrive" {
+          class_uid = 6006
+      } else if is_aad && aad_auth {
+          class_uid = 3002
+      } else if is_aad && aad_usermgmt {
+          class_uid = 3007
+      } else if is_aad && aad_groupmgmt {
+          class_uid = 3006
+      }
+
+      ocsf = {}
+
+      if class_uid == 4009 {
+          # ---- Exchange message trace -> Email Activity ----
+          direction_raw = downcase(string(p.Direction) ?? string(p.Directionality) ?? "")
+          direction_id = 0
+          if direction_raw == "inbound" || direction_raw == "incoming" { direction_id = 1 }
+          if direction_raw == "outbound" || direction_raw == "originating" { direction_id = 2 }
+          if direction_raw == "intraorg" || direction_raw == "internal" { direction_id = 3 }
+
+          activity_id = 99
+          activity_name = "Other"
+          if direction_id == 1 { activity_id = 2; activity_name = "Receive" }
+          if direction_id == 2 { activity_id = 1; activity_name = "Send" }
+          if direction_id == 3 { activity_id = 1; activity_name = "Send" }
+
+          sender = string(p.SenderAddress) ?? ""
+          recipient = string(p.RecipientAddress) ?? ""
+          email_obj = {}
+          if match(sender, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["from"], downcase(sender)) }
+          if match(recipient, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["to"], [downcase(recipient)]) }
+          subj = string(p.Subject) ?? ""
+          if subj != "" { email_obj = set!(email_obj, ["subject"], subj) }
+          mid = string(p.MessageId) ?? ""
+          if mid != "" { email_obj = set!(email_obj, ["message_uid"], mid) }
+          size = to_int(p.Size) ?? 0
+          if size > 0 { email_obj = set!(email_obj, ["size"], size) }
+          # email requires at_least_one(from, to)
+          if length(email_obj) == 0 { email_obj = { "from": "unknown@invalid.local" } }
+
+          ocsf.class_uid = 4009
+          ocsf.class_name = "Email Activity"
+          ocsf.category_uid = 4
+          ocsf.category_name = "Network Activity"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          ocsf.direction_id = direction_id
+          ocsf.email = email_obj
+          trace_id = string(p.MessageTraceId) ?? ""
+          if trace_id != "" { ocsf.message_trace_uid = trace_id }
+          mail_action = downcase(string(p.Action) ?? "")
+          if mail_action != "" {
+              disp_id = 99
+              disp = "Other"
+              if contains(mail_action, "deliver") || contains(mail_action, "allow") { disp_id = 1; disp = "Allowed" }
+              if contains(mail_action, "block") || contains(mail_action, "reject") { disp_id = 2; disp = "Blocked" }
+              if contains(mail_action, "quarantine") { disp_id = 3; disp = "Quarantined" }
+              ocsf.disposition_id = disp_id
+              ocsf.disposition = disp
+              # disposition is bound to the security_control profile.
+              profiles = push(profiles, "security_control")
+          }
+          to_ip = string(p.ToIP) ?? ""
+          if to_ip != "" { ocsf.dst_endpoint = { "ip": downcase(to_ip) } }
+          from_ip = string(p.FromIP) ?? ""
+          if from_ip != "" { src_ip = from_ip }
+      } else if class_uid == 6006 {
+          activity_id = 99
+          activity_name = "Other"
+          if op_l == "fileuploaded" || op_l == "fileuploadedtoonedrive" { activity_id = 1; activity_name = "Upload" }
+          if op_l == "filedownloaded" || op_l == "filesyncdownloadedfull" { activity_id = 2; activity_name = "Download" }
+          if op_l == "filemodified" || op_l == "filecheckedin" { activity_id = 3; activity_name = "Update" }
+          if op_l == "filedeleted" || op_l == "filerecycled" || op_l == "filedeletedfirststagerecyclebin" { activity_id = 4; activity_name = "Delete" }
+          if op_l == "filerenamed" { activity_id = 5; activity_name = "Rename" }
+          if op_l == "filecopied" { activity_id = 6; activity_name = "Copy" }
+          if op_l == "filemoved" { activity_id = 7; activity_name = "Move" }
+          if op_l == "filerestored" { activity_id = 8; activity_name = "Restore" }
+          if op_l == "filepreviewed" { activity_id = 9; activity_name = "Preview" }
+          if op_l == "filecheckedout" { activity_id = 10; activity_name = "Lock" }
+          if op_l == "filecheckincancelled" { activity_id = 11; activity_name = "Unlock" }
+          if op_l == "sharinginvitationcreated" || op_l == "anonymouslinkcreated" || op_l == "companylinkcreated" || op_l == "addedtosecurelink" || op_l == "sharingset" { activity_id = 12; activity_name = "Share" }
+          if op_l == "sharingrevoked" || op_l == "anonymouslinkremoved" { activity_id = 13; activity_name = "Unshare" }
+          if op_l == "fileaccessed" || op_l == "fileaccessedextended" { activity_id = 14; activity_name = "Open" }
+          if op_l == "filesyncuploadedfull" || op_l == "filesyncdownloadedpartial" { activity_id = 15; activity_name = "Sync" }
+
+          fname = string(p.SourceFileName) ?? ""
+          if fname == "" { fname = string(p.ObjectId) ?? "" }
+          if fname == "" { fname = "unknown" }
+          file_obj = { "name": fname, "type_id": 1 }
+          fpath = string(p.ObjectId) ?? ""
+          if fpath != "" { file_obj = set!(file_obj, ["path"], fpath) }
+          fext = string(p.SourceFileExtension) ?? ""
+          if fext != "" { file_obj = set!(file_obj, ["ext"], fext) }
+          item_type = downcase(string(p.ItemType) ?? "")
+          if item_type == "folder" { file_obj = set!(file_obj, ["type_id"], 2) }
+
+          ocsf.class_uid = 6006
+          ocsf.class_name = "File Hosting Activity"
+          ocsf.category_uid = 6
+          ocsf.category_name = "Application Activity"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          ocsf.file = file_obj
+          ocsf.actor = { "user": actor_user }
+      } else if class_uid == 3002 {
+          activity_id = 1
+          activity_name = "Logon"
+          if operation == "UserLoggedOut" { activity_id = 2; activity_name = "Logoff" }
+          if operation == "UserLoginFailed" { status_id = 2; status_str = "Failure"; severity_id = 2; severity = "Low" }
+
+          ocsf.class_uid = 3002
+          ocsf.class_name = "Authentication"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          # Authentication 3002 carries the authenticating principal in `user`.
+          ocsf.user = actor_user
+          ocsf.service = { "name": "Azure Active Directory" }
+          ocsf.is_remote = true
+          sess = string(p.SessionId) ?? ""
+          if sess != "" { ocsf.session = { "uid": sess } }
+      } else if class_uid == 3007 {
+          activity_id = 2
+          activity_name = "Update"
+          if starts_with(op_l, "add user") { activity_id = 1; activity_name = "Create" }
+          if starts_with(op_l, "delete user") { activity_id = 3; activity_name = "Delete" }
+          if starts_with(op_l, "enable account") { activity_id = 4; activity_name = "Enable" }
+          if starts_with(op_l, "disable account") { activity_id = 5; activity_name = "Disable" }
+          if starts_with(op_l, "change user password") { activity_id = 8; activity_name = "Password Change" }
+          if starts_with(op_l, "reset user password") || starts_with(op_l, "set force change user password") { activity_id = 9; activity_name = "Password Reset" }
+          if starts_with(op_l, "enable strong authentication") { activity_id = 12; activity_name = "Enable MFA Factors" }
+          if starts_with(op_l, "disable strong authentication") { activity_id = 13; activity_name = "Disable MFA Factors" }
+
+          ocsf.class_uid = 3007
+          ocsf.class_name = "User Management"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          # SUBJECT = Target[] (the account changed); ACTOR = UserId (the admin).
+          if have_subject { ocsf.user = subject } else { ocsf.user = actor_user }
+          ocsf.actor = { "user": actor_user }
+      } else if class_uid == 3006 {
+          activity_id = 99
+          activity_name = "Other"
+          if starts_with(op_l, "add group") { activity_id = 6; activity_name = "Create" }
+          if starts_with(op_l, "delete group") { activity_id = 5; activity_name = "Delete" }
+          if starts_with(op_l, "update group") { activity_id = 9; activity_name = "Update" }
+          if starts_with(op_l, "add member to group") { activity_id = 3; activity_name = "Add User" }
+          if starts_with(op_l, "remove member from group") { activity_id = 4; activity_name = "Remove User" }
+
+          ocsf.class_uid = 3006
+          ocsf.class_name = "Group Management"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          gname = target_id
+          if gname == "" { gname = string(p.ObjectId) ?? "" }
+          if gname == "" { gname = "unknown" }
+          ocsf.group = { "name": gname }
+          ocsf.actor = { "user": actor_user }
+      } else {
+          activity_id = 99
+          activity_name = "Other"
+          if contains(op_l, "add") || contains(op_l, "create") || contains(op_l, "new") { activity_id = 1; activity_name = "Create" }
+          if contains(op_l, "get") || contains(op_l, "view") || contains(op_l, "read") || contains(op_l, "accessed") || contains(op_l, "search") { activity_id = 2; activity_name = "Read" }
+          if contains(op_l, "set") || contains(op_l, "update") || contains(op_l, "modify") || contains(op_l, "change") { activity_id = 3; activity_name = "Update" }
+          if contains(op_l, "remove") || contains(op_l, "delete") { activity_id = 4; activity_name = "Delete" }
+
+          ocsf.class_uid = 6003
+          ocsf.class_name = "API Activity"
+          ocsf.category_uid = 6
+          ocsf.category_name = "Application Activity"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          op = operation
+          if op == "" { op = "unknown" }
+          svc_name = workload
+          if svc_name == "" { svc_name = "Microsoft 365" }
+          ocsf.api = { "operation": op, "service": { "name": svc_name } }
+          ocsf.actor = { "user": actor_user }
+          resources = []
+          obj_id = string(p.ObjectId) ?? ""
+          if obj_id != "" { resources = push(resources, { "name": obj_id, "uid": obj_id, "type": workload }) }
+          if have_subject { resources = push(resources, { "name": target_id, "type": "Target" }) }
+          if length(resources) > 0 { ocsf.resources = resources }
+      }
+
+      # ---- source endpoint ----
+      src_ep = {}
+      if src_ip != "" { src_ep = set!(src_ep, ["ip"], downcase(src_ip)) }
+      if src_port > 0 { src_ep = set!(src_ep, ["port"], src_port) }
+      if length(src_ep) == 0 { src_ep = { "hostname": "unknown" } }
+      ocsf.src_endpoint = src_ep
+
+      user_agent = string(p.UserAgent) ?? ""
+      if user_agent != "" && to_int(ocsf.class_uid) != 4009 { ocsf.http_request = { "user_agent": user_agent } }
+
+      # ---- cloud (profile-bound) ----
+      ocsf.cloud = {
+          "provider": "Microsoft",
+          "account": { "uid": string(p.OrganizationId) ?? "", "name": workload }
+      }
+
+      # ---- common envelope ----
+      ocsf.status_id = status_id
+      ocsf.status = status_str
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.type_uid = to_int(ocsf.class_uid) * 100 + to_int(ocsf.activity_id)
+      ocsf.time = time_ms
+      msg = operation
+      if msg == "" { msg = workload }
+      if msg == "" { msg = "microsoft_365_event" }
+      ocsf.message = msg
+      ocsf.raw_data = raw_log
+
+      evt_uid = string(p.Id) ?? ""
+      if evt_uid == "" { evt_uid = uuid_v4() }
+      ocsf.metadata = {
+          "version": "1.9.0",
+          "profiles": profiles,
+          "uid": evt_uid,
+          "original_event_uid": evt_uid,
+          "event_code": operation,
+          "log_name": "Microsoft 365 Management Activity",
+          "log_provider": "Microsoft 365",
+          "tenant_uid": string(p.OrganizationId) ?? "",
+          "product": { "name": "Microsoft 365", "vendor_name": "Microsoft" }
+      }
+
+      # ---- Microsoft-specific signals with no OCSF home ----
+      user_type_raw = to_string(p.UserType) ?? ""
+      user_type = user_type_raw
+      if user_type_raw == "0" { user_type = "Regular" }
+      if user_type_raw == "2" { user_type = "Admin" }
+      if user_type_raw == "3" { user_type = "DcAdmin" }
+      if user_type_raw == "4" { user_type = "System" }
+      if user_type_raw == "5" { user_type = "Application" }
+      if user_type_raw == "6" { user_type = "ServicePrincipal" }
+
+      cand = {
+          "workload": workload,
+          "record_type": to_string(p.RecordType) ?? "",
+          "result_status": string(p.ResultStatus) ?? "",
+          "user_type": user_type,
+          "client_info": string(p.ClientInfoString) ?? "",
+          "client_app_id": string(p.ClientAppId) ?? "",
+          "mailbox_owner_upn": string(p.MailboxOwnerUPN) ?? "",
+          "mailbox_guid": string(p.MailboxGuid) ?? "",
+          "client_process_name": string(p.ClientProcessName) ?? "",
+          "external_access": to_string(p.ExternalAccess) ?? "",
+          "site_url": string(p.SiteUrl) ?? "",
+          "source_relative_url": string(p.SourceRelativeUrl) ?? "",
+          "item_type": string(p.ItemType) ?? "",
+          "event_source": string(p.EventSource) ?? "",
+          "chat_name": string(p.ChatName) ?? "",
+          "channel_name": string(p.ChannelName) ?? "",
+          "team_name": string(p.TeamName) ?? "",
+          "communication_type": string(p.CommunicationType) ?? "",
+          "incident_id": string(p.IncidentId) ?? "",
+          "message_direction": string(p.Direction) ?? string(p.Directionality) ?? "",
+          "mail_action": string(p.Action) ?? "",
+          "connector_id": string(p.ConnectorId) ?? "",
+          "message_type": string(p.MessageType) ?? "",
+          "aad_event_type": to_string(p.AzureActiveDirectoryEventType) ?? "",
+          "object_id": string(p.ObjectId) ?? "",
+          "target_id": target_id
+      }
+      unmapped = {}
+      for_each(cand) -> |k, v| {
+          if v != "" { unmapped = set!(unmapped, [k], v) }
+      }
+      scl = to_int(p.SCL) ?? -100
+      if scl != -100 { unmapped = set!(unmapped, ["scl"], scl) }
+      if exists(p.ModifiedProperties) { unmapped = set!(unmapped, ["modified_properties"], encode_json(p.ModifiedProperties)) }
+      if exists(p.ExtendedProperties) { unmapped = set!(unmapped, ["extended_properties"], encode_json(p.ExtendedProperties)) }
+      if exists(p.PolicyDetails) { unmapped = set!(unmapped, ["policy_details"], encode_json(p.PolicyDetails)) }
+      if exists(p.SensitiveInfoDetections) { unmapped = set!(unmapped, ["sensitive_info"], encode_json(p.SensitiveInfoDetections)) }
+      if exists(p.ExchangeMetaData) { unmapped = set!(unmapped, ["exchange_metadata"], encode_json(p.ExchangeMetaData)) }
+      if exists(p.Folders) { unmapped = set!(unmapped, ["folders"], encode_json(p.Folders)) }
+      if length(unmapped) > 0 { ocsf.unmapped = unmapped }
+
+      . = ocsf
+  }
+samples:
+  # aad_add_member_to_group.json
+  - raw: "{\"CreationTime\":\"2026-08-18T17:03:55\",\"Id\":\"44444444-5555-6666-7777-888888888888\",\"Operation\":\"Add member to group.\",\"OrganizationId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"RecordType\":8,\"ResultStatus\":\"Success\",\"UserKey\":\"10032000AAAAAAAA\",\"UserType\":2,\"Workload\":\"AzureActiveDirectory\",\"ClientIP\":\"192.0.2.77\",\"ObjectId\":\"Global Administrators\",\"UserId\":\"admin@example.com\",\"Target\":[{\"ID\":\"Global Administrators\",\"Type\":1},{\"ID\":\"bob.smith@example.com\",\"Type\":5}],\"ModifiedProperties\":[{\"Name\":\"Group.DisplayName\",\"NewValue\":\"Global Administrators\"}]}"
+    expect:
+      "class_uid": 3006
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  # aad_add_user.json
+  - raw: "{\"CreationTime\":\"2026-08-18T16:41:09\",\"Id\":\"33333333-4444-5555-6666-777777777777\",\"Operation\":\"Add user.\",\"OrganizationId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"RecordType\":8,\"ResultStatus\":\"Success\",\"UserKey\":\"10032000AAAAAAAA\",\"UserType\":2,\"Workload\":\"AzureActiveDirectory\",\"ClientIP\":\"192.0.2.77\",\"ObjectId\":\"bob.smith@example.com\",\"UserId\":\"admin@example.com\",\"Target\":[{\"ID\":\"bob.smith@example.com\",\"Type\":5}],\"Actor\":[{\"ID\":\"admin@example.com\",\"Type\":5}],\"ModifiedProperties\":[{\"Name\":\"AccountEnabled\",\"NewValue\":\"[true]\",\"OldValue\":\"[]\"}]}"
+    expect:
+      "class_uid": 3007
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # aad_login_failed.json
+  - raw: "{\"CreationTime\":\"2026-08-18T14:07:52\",\"Id\":\"22222222-3333-4444-5555-666666666666\",\"Operation\":\"UserLoginFailed\",\"OrganizationId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"RecordType\":15,\"ResultStatus\":\"Failed\",\"UserKey\":\"10032000ABCDEF12\",\"UserType\":0,\"Workload\":\"AzureActiveDirectory\",\"ClientIP\":\"[2001:db8::1]:52344\",\"UserId\":\"jane.doe@example.com\",\"LogonError\":\"InvalidUserNameOrPassword\",\"Actor\":[{\"ID\":\"jane.doe@example.com\",\"Type\":5}],\"Target\":[{\"ID\":\"00000002-0000-0ff1-ce00-000000000000\",\"Type\":0}]}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # aad_reset_password.json
+  - raw: "{\"CreationTime\":\"2026-08-18T16:45:00\",\"Id\":\"55555555-6666-7777-8888-999999999999\",\"Operation\":\"Reset user password.\",\"OrganizationId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"RecordType\":8,\"ResultStatus\":\"Success\",\"UserKey\":\"10032000AAAAAAAA\",\"UserType\":2,\"Workload\":\"AzureActiveDirectory\",\"ClientIP\":\"192.0.2.77\",\"UserId\":\"admin@example.com\",\"Target\":[{\"ID\":\"bob.smith@example.com\",\"Type\":5}]}"
+    expect:
+      "class_uid": 3007
+      "activity_id": 9
+      "metadata.version": "1.9.0"
+  # aad_user_logged_in.json
+  - raw: "{\"CreationTime\":\"2026-08-18T14:02:11\",\"Id\":\"11111111-2222-3333-4444-555555555555\",\"Operation\":\"UserLoggedIn\",\"OrganizationId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"RecordType\":15,\"ResultStatus\":\"Succeeded\",\"UserKey\":\"10032000ABCDEF12\",\"UserType\":0,\"Version\":1,\"Workload\":\"AzureActiveDirectory\",\"ClientIP\":\"203.0.113.55\",\"ObjectId\":\"00000002-0000-0ff1-ce00-000000000000\",\"UserId\":\"jane.doe@example.com\",\"AzureActiveDirectoryEventType\":1,\"ExtendedProperties\":[{\"Name\":\"ResultStatusDetail\",\"Value\":\"Success\"},{\"Name\":\"UserAgent\",\"Value\":\"Mozilla/5.0 (Macintosh) Chrome/126.0.0.0\"}],\"Actor\":[{\"ID\":\"jane.doe@example.com\",\"Type\":5}],\"Target\":[{\"ID\":\"00000002-0000-0ff1-ce00-000000000000\",\"Type\":0}],\"ApplicationId\":\"00000002-0000-0ff1-ce00-000000000000\",\"SessionId\":\"9f8e7d6c-5b4a-3210-9876-543210fedcba\"}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # dlp_rule_match.json
+  - raw: "{\"CreationTime\":\"2026-08-18T19:30:00\",\"Id\":\"bbbbbbbb-cccc-dddd-eeee-ffffffffffff\",\"Operation\":\"DLPRuleMatch\",\"OrganizationId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"RecordType\":11,\"UserKey\":\"10032000ABCDEF12\",\"UserType\":4,\"Workload\":\"Exchange\",\"UserId\":\"jane.doe@example.com\",\"IncidentId\":\"cccccccc-dddd-eeee-ffff-000000000000\",\"PolicyDetails\":[{\"PolicyId\":\"11112222-3333-4444-5555-666677778888\",\"PolicyName\":\"US PII\",\"Rules\":[{\"RuleId\":\"22223333-4444-5555-6666-777788889999\",\"RuleName\":\"Low volume of US PII\",\"Severity\":\"Medium\",\"Actions\":[\"Notify\"]}]}],\"SensitiveInfoDetections\":[{\"SensitiveInformationTypeName\":\"U.S. Social Security Number (SSN)\",\"Count\":3}],\"ExchangeMetaData\":{\"From\":\"jane.doe@example.com\",\"Subject\":\"customer records\",\"MessageID\":\"<abc@example.com>\",\"To\":[\"external@partner.example\"]}}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  # exchange_mailbox_op.json
+  - raw: "{\"CreationTime\":\"2026-08-18T13:10:00\",\"Id\":\"77777777-8888-9999-aaaa-bbbbbbbbbbbb\",\"Operation\":\"Set-Mailbox\",\"OrganizationId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"RecordType\":1,\"ResultStatus\":\"True\",\"UserKey\":\"10032000AAAAAAAA\",\"UserType\":2,\"Workload\":\"Exchange\",\"ClientIP\":\"192.0.2.77\",\"ObjectId\":\"example.com/Users/Bob Smith\",\"UserId\":\"admin@example.com\",\"MailboxOwnerUPN\":\"bob.smith@example.com\",\"MailboxGuid\":\"a1b2c3d4-e5f6-7890-abcd-ef1234567890\",\"ExternalAccess\":false,\"ClientInfoString\":\"Client=EXCHANGERPC\",\"SessionId\":\"session-1234\",\"ClientProcessName\":\"powershell.exe\"}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  # exchange_message_trace.json
+  - raw: "{\"CreationTime\":\"2026-08-18T12:33:44\",\"Id\":\"66666666-7777-8888-9999-aaaaaaaaaaaa\",\"Operation\":\"MessageTrace\",\"OrganizationId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"RecordType\":28,\"UserKey\":\"MessageTrace\",\"UserType\":4,\"Workload\":\"Exchange\",\"UserId\":\"MessageTrace\",\"SenderAddress\":\"attacker@evil.example\",\"RecipientAddress\":\"jane.doe@example.com\",\"Subject\":\"Invoice overdue - action required\",\"MessageId\":\"<CA+1234567890abcdef@mail.evil.example>\",\"MessageTraceId\":\"7c1f9a30-1111-2222-3333-444455556666\",\"Status\":\"Delivered\",\"Directionality\":\"Inbound\",\"FromIP\":\"198.51.100.77\",\"ToIP\":\"52.100.10.20\",\"Size\":48213,\"SCL\":5,\"Action\":\"Quarantine\",\"ConnectorId\":\"Inbound from partner\",\"MessageType\":\"Phish\"}"
+    expect:
+      "class_uid": 4009
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  # malformed.txt
+  - raw: "m365 not json"
+    expect:
+      "class_uid": 0
+      "activity_id": 0
+      "metadata.version": "1.9.0"
+  # sharepoint_anonymous_link.json
+  - raw: "{\"CreationTime\":\"2026-08-18T18:20:33\",\"Id\":\"99999999-aaaa-bbbb-cccc-dddddddddddd\",\"Operation\":\"AnonymousLinkCreated\",\"OrganizationId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"RecordType\":14,\"UserKey\":\"i:0h.f|membership|10032000ABCDEF12@live.com\",\"UserType\":0,\"Workload\":\"OneDrive\",\"ClientIP\":\"203.0.113.55\",\"ObjectId\":\"https://example-my.sharepoint.com/personal/jane_doe_example_com/Documents/passwords.xlsx\",\"UserId\":\"jane.doe@example.com\",\"ItemType\":\"File\",\"SourceFileName\":\"passwords.xlsx\",\"SourceFileExtension\":\"xlsx\",\"SiteUrl\":\"https://example-my.sharepoint.com/personal/jane_doe_example_com/\",\"EventSource\":\"SharePoint\"}"
+    expect:
+      "class_uid": 6006
+      "activity_id": 12
+      "metadata.version": "1.9.0"
+  # sharepoint_file_downloaded.json
+  - raw: "{\"CreationTime\":\"2026-08-18T18:11:02\",\"Id\":\"88888888-9999-aaaa-bbbb-cccccccccccc\",\"Operation\":\"FileDownloaded\",\"OrganizationId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"RecordType\":6,\"UserKey\":\"i:0h.f|membership|10032000ABCDEF12@live.com\",\"UserType\":0,\"Version\":1,\"Workload\":\"SharePoint\",\"ClientIP\":\"203.0.113.55\",\"ObjectId\":\"https://example.sharepoint.com/sites/finance/Shared Documents/Q3 Customer List.xlsx\",\"UserId\":\"jane.doe@example.com\",\"CorrelationId\":\"aabbccdd-1122-3344-5566-778899aabbcc\",\"EventSource\":\"SharePoint\",\"ItemType\":\"File\",\"ListItemUniqueId\":\"11112222-3333-4444-5555-666677778888\",\"Site\":\"99998888-7777-6666-5555-444433332222\",\"SourceFileExtension\":\"xlsx\",\"SourceFileName\":\"Q3 Customer List.xlsx\",\"SourceRelativeUrl\":\"Shared Documents\",\"SiteUrl\":\"https://example.sharepoint.com/sites/finance/\",\"UserAgent\":\"Mozilla/5.0 (Macintosh) Chrome/126.0.0.0\"}"
+    expect:
+      "class_uid": 6006
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  # teams_member_added.json
+  - raw: "{\"CreationTime\":\"2026-08-18T19:00:00\",\"Id\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeef\",\"Operation\":\"MemberAdded\",\"OrganizationId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"RecordType\":25,\"ResultStatus\":\"Succeeded\",\"UserKey\":\"10032000ABCDEF12\",\"UserType\":0,\"Workload\":\"MicrosoftTeams\",\"ClientIP\":\"203.0.113.55\",\"UserId\":\"jane.doe@example.com\",\"TeamName\":\"Project Falcon\",\"ChannelName\":\"General\",\"CommunicationType\":\"Team\",\"Members\":[{\"UPN\":\"external@partner.example\",\"Role\":3}]}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 1
+      "metadata.version": "1.9.0"

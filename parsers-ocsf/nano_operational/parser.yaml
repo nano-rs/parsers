@@ -1,0 +1,207 @@
+name: nano_operational_ocsf
+display_name: nano Operational Logs (OCSF)
+version: "1.0.0"
+description: >
+  Parses nano platform operational/tracing logs (Rust `tracing` JSON from
+  nanosiem-api, nanosiem-jobs, nanosiem-search) into complete OCSF 1.9.0
+  records. The stream is mixed, so routing is per event:
+    HTTP access lines (method/uri present) -> API Activity 6003
+    everything else (service/tracing lines) -> Base Event 0
+  6003 is the right class for the access lines because nano's HTTP surface IS a
+  control-plane REST API: the log records an operation on a resource by a
+  principal, which is what API Activity models. It is also the only shape that
+  keeps the caller queryable — HTTP Activity 4002 defines no `actor`/`user`
+  attribute at all (verified against the 1.9.0 contract), so the identity would
+  have to be dumped into `unmapped`. Non-HTTP tracing lines are deliberately
+  NOT forced into a security class: OCSF Base Event (class_uid 0) exists for
+  exactly this and keeps `message`, `severity`, `status` and `metadata`
+  queryable without inventing semantics.
+  Carries metadata.profiles ["trace"] on 6003 events that have a trace_id,
+  because `trace` is a profile-bound attribute in OCSF 1.9.
+  Mirrors the UDM nano_operational parser but targets OCSF instead of `.udm.*`.
+ocsf_version: "1.9.0"
+match_values:
+  - nano_operational
+category: application
+vendor: "nano"
+product: "nanosiem"
+parser_vrl: |
+  # nano operational / tracing JSON -> OCSF 1.9.0. Emits the COMPLETE record on root.
+  raw_log = string!(.message)
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_provider": "nano",
+              "log_name": "nano_operational",
+              "event_code": "unparsed",
+              "product": { "name": "nanosiem", "vendor_name": "nano" }
+          }
+      }
+  } else {
+      p = object!(parsed)
+
+      # ---- event time: RFC3339 with nanoseconds + offset -> epoch ms ----
+      time_ms = 0
+      ts_str = string(p.timestamp) ?? ""
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- Rust tracing level -> OCSF severity ----
+      level = downcase(string(p.level) ?? "info")
+      severity_id = 1
+      severity = "Informational"
+      if level == "warn" { severity_id = 3; severity = "Medium" }
+      if level == "error" { severity_id = 4; severity = "High" }
+
+      svc = string(p."service.name") ?? string(p.service_name) ?? ""
+      if svc == "" { svc = "nanosiem" }
+
+      msg = string(p.message) ?? ""
+      if msg == "" { msg = raw_log }
+
+      # ---- latency: `latency` is a formatted string, `duration_ms` numeric ----
+      duration_ms = to_int(p.duration_ms) ?? 0
+      latency_str = string(p.latency) ?? ""
+
+      trace_id = string(p.trace_id) ?? ""
+      span_id = string(p.span_id) ?? ""
+
+      # promoted `unmapped.*` carriers (queryable on every branch)
+      um = { "service_name": svc }
+      if trace_id != "" { um = set!(um, ["trace_id"], trace_id) }
+      if span_id != "" { um = set!(um, ["span_id"], span_id) }
+      if latency_str != "" { um = set!(um, ["details", "message"], latency_str) }
+
+      method = upcase(string(p.method) ?? "")
+      uri = string(p.uri) ?? ""
+      is_http = method != "" || uri != ""
+
+      ocsf = {}
+
+      if is_http {
+          # ---- HTTP access line -> API Activity 6003 ----
+          status_code = to_int(p.status) ?? 0
+
+          # OCSF 6003 activity: 1 Create, 2 Read, 3 Update, 4 Delete, 99 Other
+          activity_id = 99
+          activity_name = "Other"
+          if method == "POST" { activity_id = 1; activity_name = "Create" }
+          if method == "GET" || method == "HEAD" { activity_id = 2; activity_name = "Read" }
+          if method == "PUT" || method == "PATCH" { activity_id = 3; activity_name = "Update" }
+          if method == "DELETE" { activity_id = 4; activity_name = "Delete" }
+
+          status_id = 0
+          status_str = "Unknown"
+          if status_code >= 200 && status_code < 400 { status_id = 1; status_str = "Success" }
+          if status_code >= 400 { status_id = 2; status_str = "Failure" }
+          if status_code >= 400 && severity_id < 3 { severity_id = 3; severity = "Medium" }
+
+          op = method
+          if uri != "" { op = method + " " + uri }
+          if op == "" { op = "unknown" }
+
+          ocsf.class_uid = 6003
+          ocsf.class_name = "API Activity"
+          ocsf.category_uid = 6
+          ocsf.category_name = "Application Activity"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          ocsf.status_id = status_id
+          ocsf.status = status_str
+
+          # the emitting service is the API being called; the caller is anonymous
+          # in the tracing access log, so `actor` carries the app identity.
+          ocsf.actor = { "app_name": svc }
+          ocsf.api = {
+              "operation": op,
+              "service": { "name": svc }
+          }
+          if status_code != 0 { ocsf.api.response = { "code": status_code } }
+
+          ocsf.src_endpoint = { "svc_name": svc }
+          ocsf.dst_endpoint = { "svc_name": svc }
+
+          http_req = { "http_method": method }
+          url_obj = {}
+          if uri != "" { url_obj = set!(url_obj, ["path"], uri) }
+          full_url = string(p.url) ?? ""
+          if full_url != "" {
+              url_obj = set!(url_obj, ["url_string"], full_url)
+          } else if uri != "" {
+              url_obj = set!(url_obj, ["url_string"], uri)
+          }
+          if url_obj != {} { http_req = set!(http_req, ["url"], url_obj) }
+          ocsf.http_request = http_req
+
+          if status_code != 0 {
+              ocsf.http_response = { "code": status_code, "status": status_str }
+          }
+
+          if duration_ms != 0 { ocsf.duration = duration_ms }
+          if uri != "" { um = set!(um, ["url_path"], uri) }
+
+          if trace_id != "" {
+              ocsf.trace = { "uid": trace_id, "service": { "name": svc } }
+              ocsf.metadata = { "profiles": ["trace"] }
+          }
+      } else {
+          # ---- service / tracing line -> Base Event 0 ----
+          ocsf.class_uid = 0
+          ocsf.class_name = "Base Event"
+          ocsf.category_uid = 0
+          ocsf.category_name = "Uncategorized"
+          ocsf.activity_id = 0
+          ocsf.activity_name = "Unknown"
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+          if severity_id >= 4 { ocsf.status_id = 2; ocsf.status = "Failure" }
+          target = string(p.target) ?? ""
+          if target != "" { um = set!(um, ["source"], target) }
+      }
+
+      # ---- common envelope ----
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.type_uid = to_int(ocsf.class_uid) * 100 + to_int(ocsf.activity_id)
+      ocsf.time = time_ms
+      ocsf.message = msg
+      ocsf.raw_data = raw_log
+      ocsf.unmapped = um
+
+      profiles = array(ocsf.metadata.profiles) ?? []
+      event_code = "application_log"
+      if is_http { event_code = "http_request" }
+      md = {
+          "version": "1.9.0",
+          "uid": uuid_v4(),
+          "log_provider": "nano",
+          "log_name": svc,
+          "log_level": level,
+          "event_code": event_code,
+          "product": { "name": "nanosiem", "vendor_name": "nano" }
+      }
+      if profiles != [] { md = set!(md, ["profiles"], profiles) }
+      ocsf.metadata = md
+
+      . = ocsf
+  }

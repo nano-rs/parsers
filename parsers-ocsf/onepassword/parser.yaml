@@ -1,0 +1,325 @@
+name: onepassword_ocsf
+display_name: 1Password (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses 1Password Events API records into complete OCSF 1.9.0 records:
+    signinattempts (category/type/session_uuid) -> Authentication 3002
+    itemusages (item_uuid + action)             -> API Activity 6003 (Read) —
+      a vault item being revealed is a credential read, and the item and vault
+      are carried as `resources[]`
+    auditevents object_type=user                -> User Management 3007
+    auditevents object_type=group               -> Group Management 3006
+    auditevents (everything else)               -> API Activity 6003
+  On auditevents the acting administrator is `actor.user` (from actor_details)
+  and the account named by object_uuid/aux_details is the subject (`user`).
+match_values:
+  - onepassword
+category: security
+vendor: "1Password"
+product: "1Password"
+parser_vrl: |
+  # 1Password Events API JSON -> OCSF 1.9.0.
+  raw_log = string!(.message)
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      # Unparseable input is emitted as an OCSF Base Event (class_uid 0)
+      # rather than being guessed into a security class: it stays valid, and
+      # therefore visible, without fabricating a user or an outcome.
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_name": "1Password Events API",
+              "log_provider": "1Password",
+              "product": { "name": "1Password", "vendor_name": "1Password" }
+          },
+          "unmapped": { "parse_error": "not a JSON object" }
+      }
+  } else {
+      p = object!(parsed)
+      client = object(p.client) ?? {}
+      loc = object(p.location) ?? {}
+      target_user = object(p.target_user) ?? {}
+      item_user = object(p.user) ?? {}
+      actor_details = object(p.actor_details) ?? {}
+      aux_details = object(p.aux_details) ?? {}
+      sess = object(p.session) ?? {}
+
+      # ---- time ----
+      time_ms = 0
+      ts_str = string(p.timestamp) ?? ""
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- shape detection ----
+      is_item_usage = exists(p.item_uuid)
+      is_audit = exists(p.object_type) || exists(p.actor_uuid)
+      is_signin = !is_item_usage && !is_audit
+
+      # ---- helper: turn a 1Password user object into an OCSF user ----
+      email = string(target_user.email) ?? string(item_user.email) ?? string(actor_details.email) ?? ""
+      uname = string(target_user.name) ?? string(item_user.name) ?? string(actor_details.name) ?? ""
+      uuid_v = string(target_user.uuid) ?? string(item_user.uuid) ?? string(actor_details.uuid) ?? ""
+      if uuid_v == "" { uuid_v = string(p.actor_uuid) ?? "" }
+      principal_name = email
+      if principal_name == "" { principal_name = uname }
+      principal = { "name": downcase(principal_name) }
+      if principal_name == "" { principal = { "name": "unknown" } }
+      if uuid_v != "" { principal = set!(principal, ["uid"], uuid_v) }
+      if match(email, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') {
+          principal = set!(principal, ["email_addr"], downcase(email))
+      }
+      if uname != "" { principal = set!(principal, ["full_name"], uname) }
+
+      action = string(p.action) ?? ""
+      object_type = string(p.object_type) ?? ""
+
+      ocsf = {}
+      status_id = 1
+      status_str = "Success"
+      severity_id = 1
+      severity = "Informational"
+
+      if is_signin {
+          category = downcase(string(p.category) ?? "")
+          signin_type = string(p.type) ?? ""
+          if category == "success" {
+              status_id = 1; status_str = "Success"
+          } else if category != "" {
+              status_id = 2; status_str = "Failure"; severity_id = 2; severity = "Low"
+          }
+
+          ocsf.class_uid = 3002
+          ocsf.class_name = "Authentication"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = 1
+          ocsf.activity_name = "Logon"
+          # Authentication 3002 carries the authenticating principal in `user`.
+          ocsf.user = principal
+          ocsf.service = { "name": "1Password" }
+          sid = string(p.session_uuid) ?? ""
+          if sid != "" { ocsf.session = { "uid": sid } }
+          # 1Password reports MFA state through the failure category and the
+          # sign-in step type: mfa_failed / mfa_ok name the second factor.
+          ocsf.is_mfa = category == "mfa_failed" || contains(downcase(signin_type), "mfa")
+          ocsf.is_remote = true
+          if signin_type != "" { ocsf.status_detail = signin_type }
+      } else if is_item_usage {
+          ocsf.class_uid = 6003
+          ocsf.class_name = "API Activity"
+          ocsf.category_uid = 6
+          ocsf.category_name = "Application Activity"
+          ocsf.activity_id = 2
+          ocsf.activity_name = "Read"
+          ocsf.actor = { "user": principal }
+          op = action
+          if op == "" { op = "item_usage" }
+          ocsf.api = { "operation": op, "service": { "name": "1Password" } }
+          resources = []
+          item_uuid = string(p.item_uuid) ?? ""
+          vault_uuid = string(p.vault_uuid) ?? ""
+          if item_uuid != "" { resources = push(resources, { "uid": item_uuid, "type": "Item", "name": item_uuid }) }
+          if vault_uuid != "" { resources = push(resources, { "uid": vault_uuid, "type": "Vault", "name": vault_uuid }) }
+          if length(resources) > 0 { ocsf.resources = resources }
+      } else {
+          # auditevents
+          subject_name = string(aux_details.name) ?? string(aux_details.email) ?? ""
+          object_uuid = string(p.object_uuid) ?? ""
+          act_l = downcase(action)
+          if object_type == "user" {
+              activity_id = 2
+              activity_name = "Update"
+              if act_l == "create" || act_l == "join" || act_l == "invite" { activity_id = 1; activity_name = "Create" }
+              if act_l == "delete" || act_l == "leave" { activity_id = 3; activity_name = "Delete" }
+              if act_l == "activate" || act_l == "reactivate" { activity_id = 4; activity_name = "Enable" }
+              if act_l == "suspend" || act_l == "deactivate" { activity_id = 5; activity_name = "Disable" }
+              if act_l == "changepassword" || act_l == "change_password" { activity_id = 8; activity_name = "Password Change" }
+              ocsf.class_uid = 3007
+              ocsf.class_name = "User Management"
+              ocsf.category_uid = 3
+              ocsf.category_name = "Identity & Access Management"
+              ocsf.activity_id = activity_id
+              ocsf.activity_name = activity_name
+              # SUBJECT = the account named by the audit object.
+              subj = {}
+              if subject_name != "" { subj = set!(subj, ["name"], downcase(subject_name)) }
+              if object_uuid != "" { subj = set!(subj, ["uid"], object_uuid) }
+              if length(subj) == 0 { subj = { "name": "unknown" } }
+              ocsf.user = subj
+              ocsf.actor = { "user": principal }
+          } else if object_type == "group" {
+              activity_id = 99
+              activity_name = "Other"
+              if act_l == "create" { activity_id = 6; activity_name = "Create" }
+              if act_l == "delete" { activity_id = 5; activity_name = "Delete" }
+              if act_l == "update" || act_l == "edit" { activity_id = 9; activity_name = "Update" }
+              if act_l == "join" || act_l == "add_member" { activity_id = 3; activity_name = "Add User" }
+              if act_l == "leave" || act_l == "remove_member" { activity_id = 4; activity_name = "Remove User" }
+              ocsf.class_uid = 3006
+              ocsf.class_name = "Group Management"
+              ocsf.category_uid = 3
+              ocsf.category_name = "Identity & Access Management"
+              ocsf.activity_id = activity_id
+              ocsf.activity_name = activity_name
+              grp = {}
+              if subject_name != "" { grp = set!(grp, ["name"], subject_name) }
+              if object_uuid != "" { grp = set!(grp, ["uid"], object_uuid) }
+              if length(grp) == 0 { grp = { "name": "unknown" } }
+              ocsf.group = grp
+              ocsf.actor = { "user": principal }
+          } else {
+              activity_id = 99
+              activity_name = "Other"
+              if act_l == "create" { activity_id = 1; activity_name = "Create" }
+              if act_l == "read" || act_l == "view" { activity_id = 2; activity_name = "Read" }
+              if act_l == "update" || act_l == "edit" { activity_id = 3; activity_name = "Update" }
+              if act_l == "delete" { activity_id = 4; activity_name = "Delete" }
+              ocsf.class_uid = 6003
+              ocsf.class_name = "API Activity"
+              ocsf.category_uid = 6
+              ocsf.category_name = "Application Activity"
+              ocsf.activity_id = activity_id
+              ocsf.activity_name = activity_name
+              op = action
+              if op == "" { op = "audit_event" }
+              if object_type != "" { op = action + " " + object_type }
+              ocsf.api = { "operation": op, "service": { "name": "1Password" } }
+              ocsf.actor = { "user": principal }
+              if object_uuid != "" {
+                  rname = subject_name
+                  if rname == "" { rname = object_uuid }
+                  ocsf.resources = [{ "uid": object_uuid, "type": object_type, "name": rname }]
+              }
+          }
+      }
+
+      # ---- source endpoint ----
+      src_ip = string(client.ip_address) ?? string(client.ip) ?? string(sess.ip) ?? ""
+      src_ep = {}
+      if src_ip != "" { src_ep = set!(src_ep, ["ip"], downcase(src_ip)) }
+      country = string(p.country) ?? string(loc.country) ?? ""
+      if country != "" { src_ep = set!(src_ep, ["location"], { "country": country }) }
+      if length(src_ep) == 0 { src_ep = { "hostname": "unknown" } }
+      ocsf.src_endpoint = src_ep
+
+      # ---- common envelope ----
+      ocsf.status_id = status_id
+      ocsf.status = status_str
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.type_uid = to_int(ocsf.class_uid) * 100 + to_int(ocsf.activity_id)
+      ocsf.time = time_ms
+      msg = action
+      if msg == "" { msg = string(p.type) ?? "" }
+      if msg == "" { msg = "1password_event" }
+      ocsf.message = msg
+      ocsf.raw_data = raw_log
+
+      evt_uid = string(p.uuid) ?? ""
+      if evt_uid == "" { evt_uid = uuid_v4() }
+      event_code = string(p.type) ?? ""
+      if event_code == "" { event_code = action }
+      meta = {
+          "version": "1.9.0",
+          "uid": evt_uid,
+          "original_event_uid": evt_uid,
+          "log_name": "1Password Events API",
+          "log_provider": "1Password",
+          "product": { "name": "1Password", "vendor_name": "1Password" }
+      }
+      if event_code != "" { meta = set!(meta, ["event_code"], event_code) }
+      ocsf.metadata = meta
+
+      cand = {
+          "signin_category": string(p.category) ?? "",
+          "signin_type": string(p.type) ?? "",
+          "signin_email": string(p.details.value) ?? "",
+          "app_name": string(client.app_name) ?? "",
+          "app_version": string(client.app_version) ?? "",
+          "platform": string(client.platform_name) ?? "",
+          "platform_version": string(client.platform_version) ?? "",
+          "os_name": string(client.os_name) ?? "",
+          "os_version": string(client.os_version) ?? "",
+          "geo_country": string(loc.country) ?? string(p.country) ?? "",
+          "geo_region": string(loc.region) ?? "",
+          "geo_city": string(loc.city) ?? "",
+          "item_uuid": string(p.item_uuid) ?? "",
+          "vault_uuid": string(p.vault_uuid) ?? "",
+          "object_type": object_type,
+          "object_uuid": string(p.object_uuid) ?? "",
+          "aux_id": to_string(p.aux_id) ?? "",
+          "session_device_uuid": string(sess.device_uuid) ?? ""
+      }
+      unmapped = {}
+      for_each(cand) -> |k, v| {
+          if v != "" { unmapped = set!(unmapped, [k], v) }
+      }
+      used_version = to_int(p.used_version) ?? 0
+      if used_version != 0 { unmapped = set!(unmapped, ["item_version"], used_version) }
+      if length(unmapped) > 0 { ocsf.unmapped = unmapped }
+
+      . = ocsf
+  }
+samples:
+  # audit_group_join.json
+  - raw: "{\"uuid\":\"QR8BD1RST9UVWXYZ56789ABC0\",\"timestamp\":\"2026-08-18T15:45:30.220000Z\",\"actor_uuid\":\"ADMIN1234567890ABCDEFGHIJK\",\"actor_details\":{\"uuid\":\"ADMIN1234567890ABCDEFGHIJK\",\"email\":\"admin@example.com\",\"name\":\"Ops Admin\"},\"action\":\"join\",\"object_type\":\"group\",\"object_uuid\":\"GRP555444333222111000999\",\"aux_id\":12,\"aux_details\":{\"uuid\":\"GRP555444333222111000999\",\"name\":\"Owners\"},\"session\":{\"uuid\":\"SES111222333444555666777\",\"device_uuid\":\"DEV999888777666555444333\",\"ip\":\"192.0.2.77\"},\"location\":{\"country\":\"US\"}}"
+    expect:
+      "class_uid": 3006
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  # audit_user_suspend.json
+  - raw: "{\"uuid\":\"PQ7AC0QRS8TUVWXYZ456789AB\",\"timestamp\":\"2026-08-18T15:41:12.004000Z\",\"actor_uuid\":\"ADMIN1234567890ABCDEFGHIJK\",\"actor_details\":{\"uuid\":\"ADMIN1234567890ABCDEFGHIJK\",\"email\":\"admin@example.com\",\"name\":\"Ops Admin\"},\"action\":\"suspend\",\"object_type\":\"user\",\"object_uuid\":\"UUBOB98765432109876543210\",\"aux_id\":0,\"aux_details\":{\"uuid\":\"UUBOB98765432109876543210\",\"email\":\"bob.smith@example.com\",\"name\":\"Bob Smith\"},\"session\":{\"uuid\":\"SES111222333444555666777\",\"login_time\":\"2026-08-18T15:00:00Z\",\"device_uuid\":\"DEV999888777666555444333\",\"ip\":\"192.0.2.77\"},\"location\":{\"country\":\"US\",\"region\":\"Texas\",\"city\":\"Austin\"}}"
+    expect:
+      "class_uid": 3007
+      "activity_id": 5
+      "metadata.version": "1.9.0"
+  # audit_vault_create.json
+  - raw: "{\"uuid\":\"RS9CE2STU0VWXYZ6789ABCD12\",\"timestamp\":\"2026-08-18T15:50:11.900000Z\",\"actor_uuid\":\"ADMIN1234567890ABCDEFGHIJK\",\"actor_details\":{\"uuid\":\"ADMIN1234567890ABCDEFGHIJK\",\"email\":\"admin@example.com\",\"name\":\"Ops Admin\"},\"action\":\"create\",\"object_type\":\"vault\",\"object_uuid\":\"VLT7777888899990000111122\",\"aux_id\":0,\"aux_details\":{\"name\":\"Production Secrets\"},\"session\":{\"uuid\":\"SES111222333444555666777\",\"ip\":\"192.0.2.77\"},\"location\":{\"country\":\"US\"}}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # item_usage.json
+  - raw: "{\"uuid\":\"NO6ZB9OPQ7RSTUVWXYZ345678\",\"timestamp\":\"2026-08-18T14:20:07.882000Z\",\"used_version\":3,\"vault_uuid\":\"VLT1234567890ABCDEFGHIJKLM\",\"item_uuid\":\"ITM0987654321ZYXWVUTSRQPON\",\"user\":{\"uuid\":\"UUZ7YXWVUTSRQPONMLKJIHGFED\",\"email\":\"jane.doe@example.com\",\"name\":\"Jane Doe\"},\"client\":{\"app_name\":\"1Password Browser Extension\",\"app_version\":\"20240500\",\"platform_name\":\"Chrome\",\"platform_version\":\"126.0.0.0\",\"os_name\":\"MacOSX\",\"os_version\":\"14.5.0\",\"ip_address\":\"203.0.113.55\"},\"location\":{\"country\":\"US\",\"region\":\"Massachusetts\",\"city\":\"Boston\",\"latitude\":42.3554,\"longitude\":-71.0605},\"action\":\"fill\"}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  # malformed.txt
+  - raw: "not json 1password"
+    expect:
+      "class_uid": 0
+      "activity_id": 0
+      "metadata.version": "1.9.0"
+  # signin_mfa_failed.json
+  - raw: "{\"uuid\":\"LM5YA8NOP6QRSTUVWXYZ23456\",\"session_uuid\":\"BC4DE5FG6HI7JK8LM9NO0PQ1RS\",\"timestamp\":\"2026-08-18T14:13:40.554120Z\",\"country\":\"NL\",\"category\":\"mfa_failed\",\"type\":\"mfa_wrong\",\"details\":{\"value\":\"jane.doe@example.com\"},\"target_user\":{\"uuid\":\"UUZ7YXWVUTSRQPONMLKJIHGFED\",\"email\":\"jane.doe@example.com\",\"name\":\"Jane Doe\"},\"client\":{\"app_name\":\"1Password for Web\",\"app_version\":\"1130\",\"platform_name\":\"Chrome\",\"platform_version\":\"126.0.0.0\",\"os_name\":\"Windows\",\"os_version\":\"10\",\"ip_address\":\"198.51.100.201\"}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # signin_success.json
+  - raw: "{\"uuid\":\"KJ4XZ7LMN5PQRSTUVWXYZ12345\",\"session_uuid\":\"AB3CD4EF5GH6IJ7KL8MN9OP0QR\",\"timestamp\":\"2026-08-18T14:11:02.117321Z\",\"country\":\"US\",\"category\":\"success\",\"type\":\"credentials_ok\",\"details\":null,\"target_user\":{\"uuid\":\"UUZ7YXWVUTSRQPONMLKJIHGFED\",\"email\":\"jane.doe@example.com\",\"name\":\"Jane Doe\"},\"client\":{\"app_name\":\"1Password for Mac\",\"app_version\":\"80800\",\"platform_name\":\"macOS\",\"platform_version\":\"14.5.0\",\"os_name\":\"MacOSX\",\"os_version\":\"14.5.0\",\"ip_address\":\"203.0.113.55\"}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"

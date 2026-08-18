@@ -1,0 +1,171 @@
+name: slack_access_ocsf
+display_name: Slack Access Logs (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Slack workspace sign-in records from the team.accessLogs Web API method
+  into OCSF 1.9.0 Authentication (class_uid 3002, activity Logon) records.
+  These are NOT discrete sign-ins: each record aggregates one
+  (user, IP, user-agent) combination with a `count` of sign-ins in the window,
+  so the same logical record arrives repeatedly with a rising count. The count
+  is carried in the OCSF base attribute `count` — a hunt for noisy sessions
+  should read that rather than counting rows — and `date_last` is the event
+  time so successive copies land in order.
+  team.accessLogs reports SUCCESSFUL sign-ins only; the absence of failures here
+  does not mean none occurred (those need the Enterprise Grid audit log, which
+  parsers-ocsf/slack_audit covers).
+  Distinct from slack_audit: a different endpoint, schema and plan requirement.
+match_values:
+  - slack_access_log
+  - slack_access
+category: cloud
+vendor: "Salesforce"
+product: "Slack"
+parser_vrl: |
+  # Slack team.accessLogs record -> OCSF 1.9.0 Authentication (3002).
+  raw_log = string!(.message)
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      # Unparseable input is emitted as an OCSF Base Event (class_uid 0)
+      # rather than being guessed into a security class: it stays valid, and
+      # therefore visible, without fabricating a user or an outcome.
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_name": "Slack Access Logs",
+              "log_provider": "Slack",
+              "product": { "name": "Slack", "vendor_name": "Salesforce" }
+          },
+          "unmapped": { "parse_error": "not a JSON object" }
+      }
+  } else {
+      p = object!(parsed)
+
+      # ---- time: date_last is when the activity this copy describes happened ----
+      ts_epoch = to_int(p.date_last) ?? 0
+      if ts_epoch == 0 { ts_epoch = to_int(p.date_first) ?? 0 }
+      time_ms = 0
+      if ts_epoch > 0 { time_ms = ts_epoch * 1000 }
+
+      uname = string(p.username) ?? ""
+      user_obj = { "name": downcase(uname) }
+      if uname == "" { user_obj = { "name": "unknown" } }
+      uid = string(p.user_id) ?? ""
+      if uid != "" { user_obj = set!(user_obj, ["uid"], uid) }
+
+      ocsf = {
+          "class_uid": 3002,
+          "class_name": "Authentication",
+          "category_uid": 3,
+          "category_name": "Identity & Access Management",
+          "activity_id": 1,
+          "activity_name": "Logon",
+          "type_uid": 300201,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 1,
+          "status": "Success",
+          "time": time_ms,
+          "message": "slack sign-in",
+          "raw_data": raw_log,
+          "user": user_obj,
+          "service": { "name": "Slack" },
+          "is_remote": true
+      }
+
+      src_ep = {}
+      ip = string(p.ip) ?? ""
+      if ip != "" { src_ep = set!(src_ep, ["ip"], downcase(ip)) }
+      isp = string(p.isp) ?? ""
+      if isp != "" { src_ep = set!(src_ep, ["isp"], isp) }
+      country = string(p.country) ?? ""
+      if country != "" { src_ep = set!(src_ep, ["location"], { "country": country }) }
+      if length(src_ep) == 0 { src_ep = { "hostname": "unknown" } }
+      ocsf.src_endpoint = src_ep
+
+      ua = string(p.user_agent) ?? ""
+      if ua != "" { ocsf.http_request = { "user_agent": ua } }
+
+      # How many sign-ins this record covers — NOT a count of nano rows.
+      cnt = to_int(p.count) ?? 0
+      if cnt > 0 { ocsf.count = cnt }
+
+      # A team.accessLogs record is identified by (user, ip, user-agent); the
+      # window end makes each redelivered copy idempotent on replay.
+      record_uid = join!(["slack_access", uid, ip, ua, to_string(ts_epoch)], "|")
+      ocsf.metadata = {
+          "version": "1.9.0",
+          "uid": record_uid,
+          "original_event_uid": record_uid,
+          "event_code": "login",
+          "log_name": "Slack Access Logs",
+          "log_provider": "Slack",
+          "product": { "name": "Slack", "vendor_name": "Salesforce" }
+      }
+
+      unmapped = {}
+      first_epoch = to_int(p.date_first) ?? 0
+      if first_epoch > 0 { unmapped = set!(unmapped, ["date_first"], first_epoch) }
+      if cnt > 0 { unmapped = set!(unmapped, ["access_count"], cnt) }
+      region = string(p.region) ?? ""
+      if region != "" { unmapped = set!(unmapped, ["geo_region"], region) }
+      if country != "" { unmapped = set!(unmapped, ["geo_country"], country) }
+      if isp != "" { unmapped = set!(unmapped, ["isp"], isp) }
+      if ua != "" {
+          # Slack sends desktop/mobile client strings as well as browser UAs;
+          # parse_user_agent returns "Other"/"" for those, which would fill the
+          # facet list with blanks that look like real values.
+          uap = parse_user_agent(ua)
+          browser = to_string(uap.browser.family)
+          if browser != "" && browser != "Other" { unmapped = set!(unmapped, ["browser"], browser) }
+          os_family = to_string(uap.os.family)
+          if os_family != "" && os_family != "Other" { unmapped = set!(unmapped, ["os"], os_family) }
+          device = to_string(uap.device.family)
+          if device != "" && device != "Other" { unmapped = set!(unmapped, ["device"], device) }
+      }
+      if length(unmapped) > 0 { ocsf.unmapped = unmapped }
+
+      . = ocsf
+  }
+samples:
+  # browser_signin.json
+  - raw: "{\"user_id\":\"U012ABCDEF\",\"username\":\"jane.doe\",\"date_first\":1787060000,\"date_last\":1787062182,\"count\":7,\"ip\":\"203.0.113.55\",\"user_agent\":\"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\",\"isp\":\"Verizon Business\",\"country\":\"US\",\"region\":\"MA\"}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # desktop_client_signin.json
+  - raw: "{\"user_id\":\"U034GHIJKL\",\"username\":\"bob.smith\",\"date_first\":1787050000,\"date_last\":1787061000,\"count\":142,\"ip\":\"192.0.2.77\",\"user_agent\":\"Slack/4.39.90 CFNetwork/1494.0.7 Darwin/23.4.0\",\"isp\":\"Comcast Cable\",\"country\":\"US\",\"region\":\"TX\"}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # malformed.txt
+  - raw: "slack access not json"
+    expect:
+      "class_uid": 0
+      "activity_id": 0
+      "metadata.version": "1.9.0"
+  # minimal.json
+  - raw: "{\"user_id\":\"U056MNOPQR\",\"username\":\"svc-integration\",\"date_first\":1787040000,\"date_last\":1787040000,\"count\":1,\"ip\":\"198.51.100.9\",\"user_agent\":\"\"}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"

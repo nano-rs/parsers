@@ -1,0 +1,319 @@
+name: auth0_ocsf
+display_name: Auth0 (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Auth0 log-stream events into complete OCSF 1.9.0 records, routed by the
+  Auth0 `type` code:
+    s / f / fp / fu / fc* / ssa / fsa / slo / gd_auth_*  -> Authentication 3002
+    ss / fs / sci / fci / sce / fce / sv / fv / sdu / fdu -> User Management 3007
+    sapi / fapi / se / fe and everything else             -> API Activity 6003
+  Account Change 3001 is DEPRECATED in OCSF 1.9; signup and credential-change
+  events therefore land on User Management 3007. On those events the Auth0
+  principal is both actor and subject (self-service), so `actor.user` and `user`
+  intentionally carry the same identity.
+match_values:
+  - auth0
+category: security
+vendor: "Okta"
+product: "Auth0"
+parser_vrl: |
+  # Auth0 log event JSON -> OCSF 1.9.0.
+  raw_log = string!(.message)
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      # Unparseable input is emitted as an OCSF Base Event (class_uid 0)
+      # rather than being guessed into a security class: it stays valid, and
+      # therefore visible, without fabricating a user or an outcome.
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_name": "Auth0 Logs",
+              "log_provider": "Auth0",
+              "product": { "name": "Auth0", "vendor_name": "Okta" }
+          },
+          "unmapped": { "parse_error": "not a JSON object" }
+      }
+  } else {
+      p = object!(parsed)
+      details = object(p.details) ?? {}
+      loc = object(p.location_info) ?? {}
+      req = object(details.request) ?? {}
+      resp = object(details.response) ?? {}
+
+      type_code = string(p.type) ?? ""
+
+      # ---- time ----
+      time_ms = 0
+      ts_str = string(p.date) ?? ""
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- outcome: Auth0 encodes it in the type-code prefix ----
+      is_success = starts_with(type_code, "s") || type_code == "gd_auth_succeed"
+      is_failure = starts_with(type_code, "f") || type_code == "gd_auth_failed"
+      status_id = 0
+      status_str = "Unknown"
+      severity_id = 1
+      severity = "Informational"
+      if is_success { status_id = 1; status_str = "Success" }
+      if is_failure { status_id = 2; status_str = "Failure"; severity_id = 2; severity = "Low" }
+
+      # ---- principal ----
+      user_name = string(p.user_name) ?? ""
+      user_uid = to_string(p.user_id) ?? ""
+      principal = {}
+      if user_name != "" { principal = set!(principal, ["name"], downcase(user_name)) }
+      if user_uid != "" { principal = set!(principal, ["uid"], user_uid) }
+      # Only a real RFC-shaped address may go in email_addr: Auth0 machine
+      # principals look like "<client_id>@clients", which fails email_t.
+      if match(user_name, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') {
+          principal = set!(principal, ["email_addr"], downcase(user_name))
+          uparts = split(user_name, "@")
+          if length(uparts) == 2 { principal = set!(principal, ["domain"], downcase(string(uparts[1]) ?? "")) }
+      }
+      if length(principal) == 0 { principal = { "name": "unknown" } }
+
+      # ---- class routing ----
+      is_auth = type_code == "s" || type_code == "f" || type_code == "fp" || type_code == "fu" || type_code == "fc" || type_code == "fco" || type_code == "fcp" || type_code == "fcpn" || type_code == "fcpr" || type_code == "fcpro" || type_code == "ssa" || type_code == "fsa" || type_code == "slo" || type_code == "gd_auth_succeed" || type_code == "gd_auth_failed" || type_code == "gd_auth_rejected"
+      is_usermgmt = type_code == "ss" || type_code == "fs" || type_code == "sci" || type_code == "fci" || type_code == "sce" || type_code == "fce" || type_code == "sv" || type_code == "fv" || type_code == "sdu" || type_code == "fdu" || type_code == "scpn" || type_code == "fcpn"
+
+      class_uid = 6003
+      if is_auth { class_uid = 3002 } else if is_usermgmt { class_uid = 3007 }
+
+      ocsf = {}
+
+      if class_uid == 3002 {
+          activity_id = 1
+          activity_name = "Logon"
+          if type_code == "slo" { activity_id = 2; activity_name = "Logoff" }
+          if type_code == "se" || type_code == "fe" { activity_id = 3; activity_name = "Authentication Ticket" }
+
+          ocsf.class_uid = 3002
+          ocsf.class_name = "Authentication"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          # Authentication 3002 carries the authenticating principal in
+          # `user`; `actor` is left unset (it is the same identity).
+          ocsf.user = principal
+
+          # 3002 constraint at_least_one(service, dst_endpoint): the Auth0
+          # application the login was for, otherwise the tenant itself.
+          svc_name = string(p.client_name) ?? ""
+          if svc_name == "" { svc_name = "Auth0" }
+          svc = { "name": svc_name }
+          client_id = string(p.client_id) ?? ""
+          if client_id != "" { svc = set!(svc, ["uid"], client_id) }
+          ocsf.service = svc
+
+          sess_id = string(details.session_id) ?? ""
+          if sess_id != "" { ocsf.session = { "uid": sess_id } }
+
+          # `strategy` is the identity protocol/backing store for the connection.
+          strategy = string(p.strategy) ?? ""
+          conn = string(p.connection) ?? ""
+          proto_src = strategy
+          if proto_src == "" { proto_src = conn }
+          if proto_src != "" {
+              ps = downcase(proto_src)
+              ap_id = 99
+              if ps == "samlp" || ps == "adfs" { ap_id = 5 }
+              if ps == "oauth2" || ps == "google-oauth2" || ps == "windowslive" || ps == "github" { ap_id = 6 }
+              if ps == "oidc" || ps == "auth0-oidc" { ap_id = 4 }
+              if ps == "ad" || ps == "waad" { ap_id = 2 }
+              ocsf.auth_protocol_id = ap_id
+              ocsf.auth_protocol = proto_src
+          }
+
+          factor_name = string(details.factor.name) ?? ""
+          is_mfa = type_code == "gd_auth_succeed" || type_code == "gd_auth_failed" || type_code == "gd_auth_rejected" || factor_name != ""
+          ocsf.is_mfa = is_mfa
+          ocsf.is_remote = true
+      } else if class_uid == 3007 {
+          activity_id = 2
+          activity_name = "Update"
+          if type_code == "ss" || type_code == "fs" { activity_id = 1; activity_name = "Create" }
+          if type_code == "sdu" || type_code == "fdu" { activity_id = 3; activity_name = "Delete" }
+          if type_code == "sci" || type_code == "fci" { activity_id = 8; activity_name = "Password Change" }
+          if type_code == "scpn" || type_code == "fcpn" { activity_id = 9; activity_name = "Password Reset" }
+
+          ocsf.class_uid = 3007
+          ocsf.class_name = "User Management"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          # Auth0 signup / credential change is self-service: the actor and the
+          # subject are the same identity.
+          ocsf.user = principal
+          ocsf.actor = { "user": principal }
+      } else {
+          ocsf.class_uid = 6003
+          ocsf.class_name = "API Activity"
+          ocsf.category_uid = 6
+          ocsf.category_name = "Application Activity"
+          method = upcase(string(req.method) ?? "")
+          path = string(req.path) ?? ""
+          activity_id = 99
+          activity_name = "Other"
+          if method == "POST" { activity_id = 1; activity_name = "Create" }
+          if method == "GET" { activity_id = 2; activity_name = "Read" }
+          if method == "PATCH" || method == "PUT" { activity_id = 3; activity_name = "Update" }
+          if method == "DELETE" { activity_id = 4; activity_name = "Delete" }
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          operation = type_code
+          if method != "" && path != "" { operation = method + " " + path }
+          ocsf.api = { "operation": operation, "service": { "name": "Auth0 Management API" } }
+          ocsf.actor = { "user": principal }
+          if method != "" || path != "" {
+              hreq = {}
+              if method != "" { hreq = set!(hreq, ["http_method"], method) }
+              if path != "" { hreq = set!(hreq, ["url"], { "path": path }) }
+              ocsf.http_request = hreq
+          }
+          status_code = to_int(resp.statusCode) ?? 0
+          if status_code != 0 { ocsf.http_response = { "code": status_code } }
+      }
+
+      # ---- source endpoint ----
+      src_ip = string(p.ip) ?? ""
+      src_ep = {}
+      if src_ip != "" { src_ep = set!(src_ep, ["ip"], downcase(src_ip)) }
+      cc = string(loc.country_code) ?? ""
+      if cc != "" { src_ep = set!(src_ep, ["location"], { "country": cc }) }
+      if length(src_ep) == 0 { src_ep = { "hostname": "unknown" } }
+      ocsf.src_endpoint = src_ep
+
+      user_agent = string(p.user_agent) ?? ""
+      if user_agent != "" && !exists(ocsf.http_request) {
+          ocsf.http_request = { "user_agent": user_agent }
+      } else if user_agent != "" {
+          ocsf.http_request = set!(object!(ocsf.http_request), ["user_agent"], user_agent)
+      }
+
+      # ---- common envelope ----
+      ocsf.status_id = status_id
+      ocsf.status = status_str
+      desc = string(p.description) ?? ""
+      if desc != "" { ocsf.status_detail = desc }
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.type_uid = to_int(ocsf.class_uid) * 100 + to_int(ocsf.activity_id)
+      ocsf.time = time_ms
+      msg = desc
+      if msg == "" { msg = type_code }
+      ocsf.message = msg
+      ocsf.raw_data = raw_log
+
+      evt_uid = string(p.log_id) ?? ""
+      if evt_uid == "" { evt_uid = uuid_v4() }
+      ocsf.metadata = {
+          "version": "1.9.0",
+          "uid": evt_uid,
+          "original_event_uid": evt_uid,
+          "event_code": type_code,
+          "log_name": "Auth0 Logs",
+          "log_provider": "Auth0",
+          "product": { "name": "Auth0", "vendor_name": "Okta" }
+      }
+
+      cand = {
+          "type_code": type_code,
+          "connection": string(p.connection) ?? "",
+          "connection_id": string(p.connection_id) ?? "",
+          "strategy": string(p.strategy) ?? "",
+          "strategy_type": string(p.strategy_type) ?? "",
+          "client_name": string(p.client_name) ?? "",
+          "client_id": string(p.client_id) ?? "",
+          "auth0_domain": string(p.hostname) ?? "",
+          "mfa_factor": string(details.factor.name) ?? "",
+          "geo_country": string(loc.country_name) ?? "",
+          "geo_city": string(loc.city_name) ?? "",
+          "geo_timezone": string(loc.time_zone) ?? ""
+      }
+      unmapped = {}
+      for_each(cand) -> |k, v| {
+          if v != "" { unmapped = set!(unmapped, [k], v) }
+      }
+      if is_boolean(p.isMobile) { unmapped = set!(unmapped, ["is_mobile"], bool!(p.isMobile)) }
+      if length(unmapped) > 0 { ocsf.unmapped = unmapped }
+
+      . = ocsf
+  }
+samples:
+  # change_password_success.json
+  - raw: "{\"date\":\"2026-08-18T10:44:21.905Z\",\"type\":\"sci\",\"description\":\"Successful change password\",\"connection\":\"Username-Password-Authentication\",\"client_id\":\"aBcD1234EfGh5678IjKl\",\"client_name\":\"Customer Portal\",\"ip\":\"192.0.2.31\",\"user_agent\":\"Safari 17.5.0 / Mac OS X 14.5.0\",\"hostname\":\"example.us.auth0.com\",\"user_id\":\"auth0|66aa1122bb3344cc5566dd77\",\"user_name\":\"new.user@example.com\",\"log_id\":\"90020260818104421905000000000000000000000000000000\"}"
+    expect:
+      "class_uid": 3007
+      "activity_id": 8
+      "metadata.version": "1.9.0"
+  # login_failure_wrong_password.json
+  - raw: "{\"date\":\"2026-08-18T14:07:44.980Z\",\"type\":\"fp\",\"description\":\"Wrong email or password.\",\"connection\":\"Username-Password-Authentication\",\"connection_id\":\"con_9aBcDeFgHiJkLmNo\",\"client_id\":\"aBcD1234EfGh5678IjKl\",\"client_name\":\"Internal Admin Portal\",\"ip\":\"198.51.100.201\",\"user_agent\":\"python-requests/2.31.0\",\"hostname\":\"example.us.auth0.com\",\"user_id\":\"\",\"user_name\":\"jane.doe@example.com\",\"strategy\":\"auth0\",\"strategy_type\":\"database\",\"log_id\":\"90020260818140744980000000000000000000000000000000\",\"isMobile\":false,\"location_info\":{\"country_code\":\"NL\",\"country_name\":\"Netherlands\",\"city_name\":\"Amsterdam\"}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # login_success.json
+  - raw: "{\"date\":\"2026-08-18T14:02:11.412Z\",\"type\":\"s\",\"description\":\"Successful login\",\"connection\":\"Username-Password-Authentication\",\"connection_id\":\"con_9aBcDeFgHiJkLmNo\",\"client_id\":\"aBcD1234EfGh5678IjKl\",\"client_name\":\"Internal Admin Portal\",\"ip\":\"203.0.113.55\",\"user_agent\":\"Chrome 126.0.0 / Mac OS X 10.15.7\",\"hostname\":\"example.us.auth0.com\",\"user_id\":\"auth0|64f1a2b3c4d5e6f7a8b9c0d1\",\"user_name\":\"jane.doe@example.com\",\"strategy\":\"auth0\",\"strategy_type\":\"database\",\"log_id\":\"90020260818140211412000000000000000000000000000000\",\"isMobile\":false,\"location_info\":{\"country_code\":\"US\",\"country_code3\":\"USA\",\"country_name\":\"United States\",\"city_name\":\"Boston\",\"latitude\":42.3554,\"longitude\":-71.0605,\"time_zone\":\"America/New_York\",\"continent_code\":\"NA\"},\"details\":{\"session_id\":\"7Kq2mNpZ4rStUvWxYzAbCdEf\",\"prompts\":[{\"stats\":{\"loginsCount\":42},\"elapsedTime\":1203}]}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # logout.json
+  - raw: "{\"date\":\"2026-08-18T15:30:02.112Z\",\"type\":\"slo\",\"description\":\"Successful logout\",\"client_id\":\"aBcD1234EfGh5678IjKl\",\"client_name\":\"Internal Admin Portal\",\"ip\":\"203.0.113.55\",\"user_agent\":\"Chrome 126.0.0 / Mac OS X 10.15.7\",\"hostname\":\"example.us.auth0.com\",\"user_id\":\"auth0|64f1a2b3c4d5e6f7a8b9c0d1\",\"user_name\":\"jane.doe@example.com\",\"log_id\":\"90020260818153002112000000000000000000000000000000\",\"details\":{\"session_id\":\"7Kq2mNpZ4rStUvWxYzAbCdEf\"}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  # malformed.txt
+  - raw: "auth0 raw text line, not json"
+    expect:
+      "class_uid": 0
+      "activity_id": 0
+      "metadata.version": "1.9.0"
+  # mfa_success.json
+  - raw: "{\"date\":\"2026-08-18T14:02:19.001Z\",\"type\":\"gd_auth_succeed\",\"description\":\"Guardian authentication succeeded\",\"client_id\":\"aBcD1234EfGh5678IjKl\",\"client_name\":\"Internal Admin Portal\",\"ip\":\"203.0.113.55\",\"user_agent\":\"Chrome 126.0.0 / Mac OS X 10.15.7\",\"hostname\":\"example.us.auth0.com\",\"user_id\":\"auth0|64f1a2b3c4d5e6f7a8b9c0d1\",\"user_name\":\"jane.doe@example.com\",\"log_id\":\"90020260818140219001000000000000000000000000000000\",\"details\":{\"factor\":{\"name\":\"push-notification\"},\"session_id\":\"7Kq2mNpZ4rStUvWxYzAbCdEf\"},\"location_info\":{\"country_code\":\"US\"}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # mgmt_api_success.json
+  - raw: "{\"date\":\"2026-08-18T11:15:33.220Z\",\"type\":\"sapi\",\"description\":\"Update a user\",\"client_id\":\"MgMtApI1234567890\",\"client_name\":\"Terraform Auth0 Provider\",\"ip\":\"198.51.100.44\",\"user_agent\":\"Go-http-client/2.0\",\"hostname\":\"example.us.auth0.com\",\"user_id\":\"MgMtApI1234567890@clients\",\"user_name\":\"MgMtApI1234567890@clients\",\"log_id\":\"90020260818111533220000000000000000000000000000000\",\"details\":{\"request\":{\"method\":\"patch\",\"path\":\"/api/v2/users/auth0%7C66aa1122bb3344cc5566dd77\",\"query\":{},\"body\":{\"blocked\":true},\"channel\":\"https://manage.auth0.com/\",\"ip\":\"198.51.100.44\",\"auth\":{\"user\":{\"user_id\":\"auth0|admin\"},\"strategy\":\"jwt\"}},\"response\":{\"statusCode\":200,\"body\":{\"blocked\":true}}}}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  # signup_success.json
+  - raw: "{\"date\":\"2026-08-18T09:12:00.500Z\",\"type\":\"ss\",\"description\":\"Successful signup\",\"connection\":\"Username-Password-Authentication\",\"client_id\":\"aBcD1234EfGh5678IjKl\",\"client_name\":\"Customer Portal\",\"ip\":\"192.0.2.31\",\"user_agent\":\"Safari 17.5.0 / Mac OS X 14.5.0\",\"hostname\":\"example.us.auth0.com\",\"user_id\":\"auth0|66aa1122bb3344cc5566dd77\",\"user_name\":\"new.user@example.com\",\"strategy\":\"auth0\",\"strategy_type\":\"database\",\"log_id\":\"90020260818091200500000000000000000000000000000000\",\"location_info\":{\"country_code\":\"US\",\"country_name\":\"United States\"}}"
+    expect:
+      "class_uid": 3007
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # token_exchange_failure.json
+  - raw: "{\"date\":\"2026-08-18T11:20:09.774Z\",\"type\":\"fe\",\"description\":\"Unauthorized\",\"client_id\":\"aBcD1234EfGh5678IjKl\",\"client_name\":\"Internal Admin Portal\",\"ip\":\"198.51.100.77\",\"user_agent\":\"curl/8.6.0\",\"hostname\":\"example.us.auth0.com\",\"log_id\":\"90020260818112009774000000000000000000000000000000\",\"details\":{\"code\":\"invalid_grant\"}}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 99
+      "metadata.version": "1.9.0"

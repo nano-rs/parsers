@@ -1,0 +1,435 @@
+name: okta_ocsf
+display_name: Okta (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Okta System Log events (/api/v1/logs) into complete OCSF 1.9.0 records,
+  routed by eventType:
+    user.session.start / user.authentication.* / user.session.end
+                                   -> Authentication 3002
+    user.lifecycle.* / user.account.* / user.mfa.*
+                                   -> User Management 3007
+    group.*                        -> Group Management 3006
+    everything else (policy., application., system., app., sso.)
+                                   -> API Activity 6003
+  Account Change 3001 and User Access Management 3005 are DEPRECATED in OCSF
+  1.9 and are deliberately not emitted. On user/group management events the
+  Okta `actor` (the admin) is `actor.user` and the target from `target[]` is the
+  subject (`user` / `group`) — the reverse would invert every
+  "who did what to whom" hunt. Emits the whole OCSF object on the root so it
+  lands in ocsf_logs.event and the promoted columns materialize.
+match_values:
+  - okta
+category: security
+vendor: "Okta"
+product: "Identity Cloud"
+parser_vrl: |
+  # Okta System Log JSON -> OCSF 1.9.0.
+  raw_log = string!(.message)
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      # Unparseable input still has to be a VALID OCSF record or the lake drops
+      # it and the failure becomes invisible. Placeholders are explicit.
+      # Unparseable input is emitted as an OCSF Base Event (class_uid 0)
+      # rather than being guessed into a security class: it stays valid, and
+      # therefore visible, without fabricating a user or an outcome.
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_name": "Okta System Log",
+              "log_provider": "Okta",
+              "product": { "name": "Identity Cloud", "vendor_name": "Okta" }
+          },
+          "unmapped": { "parse_error": "not a JSON object" }
+      }
+  } else {
+      p = object!(parsed)
+      actor_in = object(p.actor) ?? {}
+      client = object(p.client) ?? {}
+      ua_o = object(client.userAgent) ?? {}
+      geo = object(client.geographicalContext) ?? {}
+      authctx = object(p.authenticationContext) ?? {}
+      outcome = object(p.outcome) ?? {}
+      debug = object(p.debugContext.debugData) ?? {}
+      sec = object(p.securityContext) ?? {}
+      tx = object(p.transaction) ?? {}
+
+      event_type = string(p.eventType) ?? ""
+
+      # ---- time: published ISO8601 -> epoch ms ----
+      time_ms = 0
+      ts_str = string(p.published) ?? ""
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- outcome -> status ----
+      result = downcase(string(outcome.result) ?? "")
+      status_id = 0
+      status_str = "Unknown"
+      if result == "success" || result == "allow" { status_id = 1; status_str = "Success" }
+      if result == "failure" || result == "deny" || result == "challenge" { status_id = 2; status_str = "Failure" }
+
+      # ---- severity: Okta DEBUG/INFO/WARN/ERROR -> OCSF ----
+      sev_raw = downcase(string(p.severity) ?? "")
+      severity_id = 1
+      severity = "Informational"
+      if sev_raw == "warn" { severity_id = 3; severity = "Medium" }
+      if sev_raw == "error" { severity_id = 4; severity = "High" }
+      if status_id == 2 && severity_id == 1 { severity_id = 2; severity = "Low" }
+
+      # ---- the acting principal ----
+      actor_alt = string(actor_in.alternateId) ?? ""
+      actor_name = actor_alt
+      if actor_name == "" { actor_name = string(actor_in.displayName) ?? "" }
+      # Only a real RFC-shaped address may go in email_addr; Okta puts service
+      # principals and "unknown" in alternateId, which fail the email_t regex.
+      actor_is_email = match(actor_alt, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$')
+      actor_domain = ""
+      aparts = split(actor_alt, "@")
+      if actor_is_email && length(aparts) == 2 { actor_domain = downcase(string(aparts[1]) ?? "") }
+      actor_user = { "name": downcase(actor_name), "uid": string(actor_in.id) ?? "", "type": string(actor_in.type) ?? "" }
+      if actor_domain != "" { actor_user = set!(actor_user, ["domain"], actor_domain) }
+      if actor_is_email { actor_user = set!(actor_user, ["email_addr"], downcase(actor_alt)) }
+
+      # ---- target[] walk: subject user / group / app / policy + resources[] ----
+      targets = array(p.target) ?? []
+      subj_user = {}
+      have_subj_user = false
+      subj_group = {}
+      have_subj_group = false
+      app_name = ""
+      app_uid = ""
+      resources = []
+      for_each(targets) -> |_i, tv| {
+          tgt = object(tv) ?? {}
+          ttype = string(tgt.type) ?? ""
+          tname = string(tgt.displayName) ?? ""
+          talt = string(tgt.alternateId) ?? ""
+          tuid = string(tgt.id) ?? ""
+          if ttype == "User" && !have_subj_user {
+              su = { "name": downcase(talt), "uid": tuid }
+              if talt == "" { su = { "name": downcase(tname), "uid": tuid } }
+              if match(talt, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { su = set!(su, ["email_addr"], downcase(talt)) }
+              if tname != "" { su = set!(su, ["full_name"], tname) }
+              subj_user = su
+              have_subj_user = true
+          }
+          if ttype == "UserGroup" && !have_subj_group {
+              subj_group = { "name": tname, "uid": tuid, "type": "Okta Group" }
+              have_subj_group = true
+          }
+          if ttype == "AppInstance" && app_name == "" {
+              app_name = tname
+              app_uid = tuid
+          }
+          rname = tname
+          if rname == "" { rname = talt }
+          resources = push(resources, { "type": ttype, "uid": tuid, "name": rname })
+      }
+
+      # ---- class routing ----
+      class_uid = 6003
+      if starts_with(event_type, "user.session.start") || starts_with(event_type, "user.authentication") || starts_with(event_type, "user.session.end") {
+          class_uid = 3002
+      } else if starts_with(event_type, "user.lifecycle") || starts_with(event_type, "user.account") || starts_with(event_type, "user.mfa") {
+          class_uid = 3007
+      } else if starts_with(event_type, "group.") {
+          class_uid = 3006
+      }
+
+      ocsf = {}
+
+      if class_uid == 3002 {
+          activity_id = 1
+          activity_name = "Logon"
+          if starts_with(event_type, "user.session.end") { activity_id = 2; activity_name = "Logoff" }
+
+          ocsf.class_uid = 3002
+          ocsf.class_name = "Authentication"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+
+          # On an Okta logon the actor IS the principal being authenticated.
+          # Authentication 3002 carries that principal in `user`, NOT in
+          # `actor` — the reverse of the endpoint classes.
+          ocsf.user = actor_user
+
+          # 3002 constraint: at_least_one(service, dst_endpoint). The app being
+          # signed into when the event names one, otherwise Okta itself.
+          svc_name = app_name
+          if svc_name == "" { svc_name = "Okta" }
+          svc = { "name": svc_name }
+          if app_uid != "" { svc = set!(svc, ["uid"], app_uid) }
+          ocsf.service = svc
+
+          sid = string(authctx.externalSessionId) ?? ""
+          if sid != "" && sid != "unknown" { ocsf.session = { "uid": sid } }
+
+          cred_type = string(authctx.credentialType) ?? ""
+          if cred_type != "" {
+              cred_l = downcase(cred_type)
+              ap_id = 99
+              if cred_l == "saml" { ap_id = 5 }
+              if cred_l == "oauth2" || cred_l == "oauth" { ap_id = 6 }
+              if cred_l == "openid" || cred_l == "oidc" { ap_id = 4 }
+              ocsf.auth_protocol_id = ap_id
+              ocsf.auth_protocol = cred_type
+          }
+
+          # MFA: an explicit MFA event type, or an MFA-shaped credential.
+          cred_l2 = downcase(cred_type)
+          is_mfa = contains(event_type, "mfa") || cred_l2 == "otp" || cred_l2 == "sms" || cred_l2 == "push" || cred_l2 == "totp" || cred_l2 == "webauthn" || cred_l2 == "signed_nonce"
+          ocsf.is_mfa = is_mfa
+          # Okta sign-ins are always remote/network; logon_type_id is a
+          # Windows-specific enum and is deliberately not emitted.
+          ocsf.is_remote = true
+      } else if class_uid == 3007 {
+          activity_id = 2
+          activity_name = "Update"
+          if starts_with(event_type, "user.lifecycle.create") { activity_id = 1; activity_name = "Create" }
+          if starts_with(event_type, "user.lifecycle.delete") { activity_id = 3; activity_name = "Delete" }
+          if starts_with(event_type, "user.lifecycle.activate") || starts_with(event_type, "user.lifecycle.reactivate") { activity_id = 4; activity_name = "Enable" }
+          if starts_with(event_type, "user.lifecycle.deactivate") { activity_id = 5; activity_name = "Disable" }
+          if starts_with(event_type, "user.lifecycle.suspend") || starts_with(event_type, "user.account.lock") { activity_id = 6; activity_name = "Lock" }
+          if starts_with(event_type, "user.lifecycle.unsuspend") || starts_with(event_type, "user.account.unlock") { activity_id = 7; activity_name = "Unlock" }
+          if starts_with(event_type, "user.account.update_password") { activity_id = 8; activity_name = "Password Change" }
+          if starts_with(event_type, "user.account.reset_password") { activity_id = 9; activity_name = "Password Reset" }
+          if starts_with(event_type, "user.mfa.factor.activate") || starts_with(event_type, "user.mfa.factor.reset") { activity_id = 12; activity_name = "Enable MFA Factors" }
+          if starts_with(event_type, "user.mfa.factor.deactivate") { activity_id = 13; activity_name = "Disable MFA Factors" }
+          if starts_with(event_type, "user.account.privilege.grant") { activity_id = 14; activity_name = "Assign Privileges" }
+          if starts_with(event_type, "user.account.privilege.revoke") { activity_id = 15; activity_name = "Remove Privileges" }
+
+          ocsf.class_uid = 3007
+          ocsf.class_name = "User Management"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          # SUBJECT = the account being changed. Falls back to the actor for
+          # self-service changes (password reset by the user themselves).
+          if have_subj_user {
+              ocsf.user = subj_user
+          } else {
+              ocsf.user = actor_user
+          }
+          # ACTOR = the admin (or the user themselves) performing the change.
+          ocsf.actor = { "user": actor_user }
+          if length(resources) > 0 { ocsf.resources = resources }
+      } else if class_uid == 3006 {
+          activity_id = 99
+          activity_name = "Other"
+          if starts_with(event_type, "group.user_membership.add") { activity_id = 3; activity_name = "Add User" }
+          if starts_with(event_type, "group.user_membership.remove") { activity_id = 4; activity_name = "Remove User" }
+          if starts_with(event_type, "group.lifecycle.create") { activity_id = 6; activity_name = "Create" }
+          if starts_with(event_type, "group.lifecycle.delete") { activity_id = 5; activity_name = "Delete" }
+          if starts_with(event_type, "group.lifecycle.update") || starts_with(event_type, "group.profile") { activity_id = 9; activity_name = "Update" }
+          if starts_with(event_type, "group.privilege.grant") { activity_id = 1; activity_name = "Assign Privileges" }
+          if starts_with(event_type, "group.privilege.revoke") { activity_id = 2; activity_name = "Revoke Privileges" }
+
+          ocsf.class_uid = 3006
+          ocsf.class_name = "Group Management"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          # `group` is REQUIRED on 3006. Okta always names the group in target[];
+          # if it somehow does not, fall back to the event type so the record is
+          # still a valid, searchable group event.
+          if have_subj_group {
+              ocsf.group = subj_group
+          } else {
+              ocsf.group = { "name": "unknown" }
+          }
+          if have_subj_user { ocsf.user = subj_user }
+          ocsf.actor = { "user": actor_user }
+          if length(resources) > 0 { ocsf.resources = resources }
+      } else {
+          ocsf.class_uid = 6003
+          ocsf.class_name = "API Activity"
+          ocsf.category_uid = 6
+          ocsf.category_name = "Application Activity"
+          activity_id = 99
+          activity_name = "Other"
+          if contains(event_type, ".create") || contains(event_type, ".add") || contains(event_type, ".grant") { activity_id = 1; activity_name = "Create" }
+          if contains(event_type, ".read") || contains(event_type, ".view") || contains(event_type, ".evaluate") { activity_id = 2; activity_name = "Read" }
+          if contains(event_type, ".update") || contains(event_type, ".activate") || contains(event_type, ".deactivate") { activity_id = 3; activity_name = "Update" }
+          if contains(event_type, ".delete") || contains(event_type, ".remove") || contains(event_type, ".revoke") { activity_id = 4; activity_name = "Delete" }
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          ocsf.api = { "operation": event_type, "service": { "name": "Okta" } }
+          ocsf.actor = { "user": actor_user }
+          if length(resources) > 0 { ocsf.resources = resources }
+      }
+
+      # ---- source endpoint (required on 6003, useful everywhere) ----
+      src_ip = string(client.ipAddress) ?? ""
+      if src_ip == "" {
+          req_chain = array(p.request.ipChain) ?? []
+          if length(req_chain) > 0 {
+              first_hop = object(req_chain[0]) ?? {}
+              src_ip = string(first_hop.ip) ?? ""
+          }
+      }
+      src_ep = {}
+      if src_ip != "" { src_ep = set!(src_ep, ["ip"], downcase(src_ip)) }
+      as_num = to_int(sec.asNumber) ?? 0
+      as_org = string(sec.asOrg) ?? ""
+      if as_num != 0 || as_org != "" {
+          src_ep = set!(src_ep, ["autonomous_system"], { "number": as_num, "name": as_org })
+      }
+      isp = string(sec.isp) ?? ""
+      if isp != "" { src_ep = set!(src_ep, ["isp"], isp) }
+      if length(src_ep) == 0 {
+          # network_endpoint needs at_least_one identifying attribute.
+          src_ep = { "hostname": "unknown" }
+      }
+      ocsf.src_endpoint = src_ep
+
+      raw_ua = string(ua_o.rawUserAgent) ?? ""
+      if raw_ua != "" { ocsf.http_request = { "user_agent": raw_ua } }
+
+      # ---- common envelope ----
+      ocsf.status_id = status_id
+      ocsf.status = status_str
+      reason = string(outcome.reason) ?? ""
+      if reason != "" { ocsf.status_detail = reason }
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.type_uid = to_int(ocsf.class_uid) * 100 + to_int(ocsf.activity_id)
+      ocsf.time = time_ms
+      msg = string(p.displayMessage) ?? ""
+      if msg == "" { msg = event_type }
+      ocsf.message = msg
+      ocsf.raw_data = raw_log
+
+      evt_uid = string(p.uuid) ?? ""
+      if evt_uid == "" { evt_uid = uuid_v4() }
+      meta = {
+          "version": "1.9.0",
+          "uid": evt_uid,
+          "original_event_uid": evt_uid,
+          "event_code": event_type,
+          "log_name": "Okta System Log",
+          "log_provider": "Okta",
+          "product": { "name": "Identity Cloud", "vendor_name": "Okta" }
+      }
+      txid = string(tx.id) ?? ""
+      if txid != "" { meta = set!(meta, ["correlation_uid"], txid) }
+      ocsf.metadata = meta
+
+      # ---- Okta signals with no OCSF home ----
+      cand = {
+          "legacy_event_type": string(p.legacyEventType) ?? "",
+          "client_device": string(client.device) ?? "",
+          "client_zone": string(client.zone) ?? "",
+          "client_os": string(ua_o.os) ?? "",
+          "client_browser": string(ua_o.browser) ?? "",
+          "geo_country": string(geo.country) ?? "",
+          "geo_city": string(geo.city) ?? "",
+          "geo_state": string(geo.state) ?? "",
+          "auth_provider": string(authctx.authenticationProvider) ?? "",
+          "credential_provider": string(authctx.credentialProvider) ?? "",
+          "auth_interface": string(authctx.interface) ?? "",
+          "policy_type": string(debug.policyType) ?? "",
+          "policy_rule": string(debug.rule) ?? "",
+          "factor": string(debug.factor) ?? "",
+          "factor_result": string(debug.factorResult) ?? "",
+          "behaviors": string(debug.behaviors) ?? "",
+          "risk": string(debug.risk) ?? "",
+          "threat_suspected": string(debug.threatSuspected) ?? "",
+          "request_uri": string(debug.requestUri) ?? "",
+          "security_domain": string(sec.domain) ?? "",
+          "transaction_type": string(tx.type) ?? ""
+      }
+      unmapped = {}
+      for_each(cand) -> |k, v| {
+          if v != "" { unmapped = set!(unmapped, [k], v) }
+      }
+      if is_boolean(sec.isProxy) { unmapped = set!(unmapped, ["is_proxy"], bool!(sec.isProxy)) }
+      if length(targets) > 0 { unmapped = set!(unmapped, ["okta_targets"], encode_json(targets)) }
+      if length(unmapped) > 0 { ocsf.unmapped = unmapped }
+
+      . = ocsf
+  }
+samples:
+  # app_sso.json
+  - raw: "{\"uuid\":\"e192d3c8-90a4-9911-f465-8aca249a888a\",\"published\":\"2026-08-18T14:22:33.451Z\",\"eventType\":\"user.authentication.sso\",\"version\":\"0\",\"severity\":\"INFO\",\"displayMessage\":\"User single sign on to app\",\"actor\":{\"id\":\"00u1a2b3c4d5e6f7g8h9\",\"type\":\"User\",\"alternateId\":\"jane.doe@example.com\",\"displayName\":\"Jane Doe\"},\"client\":{\"userAgent\":{\"rawUserAgent\":\"Mozilla/5.0 (Macintosh) Chrome/126.0.0.0\",\"os\":\"Mac OS X\",\"browser\":\"CHROME\"},\"ipAddress\":\"203.0.113.42\"},\"outcome\":{\"result\":\"SUCCESS\"},\"authenticationContext\":{\"credentialType\":\"SAML\",\"externalSessionId\":\"102Yz1aBcDeFgHiJkLmNoPqRs\"},\"target\":[{\"id\":\"0oa1a2b3c4d5e6f7g8h9\",\"type\":\"AppInstance\",\"alternateId\":\"Salesforce\",\"displayName\":\"Salesforce\"}],\"transaction\":{\"type\":\"WEB\",\"id\":\"FhG5pXqR6s7t8u9v\"}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # auth_via_mfa.json
+  - raw: "{\"uuid\":\"8b3c7d62-3a4e-33aa-9e9f-2464ce342224\",\"published\":\"2026-08-18T14:22:44.512Z\",\"eventType\":\"user.authentication.auth_via_mfa\",\"version\":\"0\",\"severity\":\"INFO\",\"displayMessage\":\"Authentication of user via MFA\",\"actor\":{\"id\":\"00u1a2b3c4d5e6f7g8h9\",\"type\":\"User\",\"alternateId\":\"jane.doe@example.com\",\"displayName\":\"Jane Doe\"},\"client\":{\"userAgent\":{\"rawUserAgent\":\"Okta Verify/6.1.0\",\"os\":\"iOS\",\"browser\":\"UNKNOWN\"},\"ipAddress\":\"203.0.113.42\",\"geographicalContext\":{\"city\":\"Boston\",\"country\":\"United States\"}},\"outcome\":{\"result\":\"SUCCESS\"},\"authenticationContext\":{\"authenticationProvider\":\"FACTOR_PROVIDER\",\"credentialType\":\"OTP\",\"externalSessionId\":\"102Yz1aBcDeFgHiJkLmNoPqRs\"},\"target\":[{\"id\":\"opf1a2b3c4d5e6f7g8h9\",\"type\":\"AuthenticatorEnrollment\",\"alternateId\":\"unknown\",\"displayName\":\"Okta Verify\"}],\"transaction\":{\"type\":\"WEB\",\"id\":\"YvT1kQpZ2m3n4o5p6q7r8s9t\"},\"debugContext\":{\"debugData\":{\"factor\":\"OKTA_VERIFY_PUSH\",\"factorResult\":\"SUCCESS\",\"requestId\":\"YvT1kQpZ2m3n4o5p\"}}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # group_membership_add.json
+  - raw: "{\"uuid\":\"cf70b1a6-7e82-77ee-d243-68a802786668\",\"published\":\"2026-08-18T17:03:55.907Z\",\"eventType\":\"group.user_membership.add\",\"version\":\"0\",\"severity\":\"INFO\",\"displayMessage\":\"Add user to group membership\",\"actor\":{\"id\":\"00uADMIN123456789\",\"type\":\"User\",\"alternateId\":\"admin@example.com\",\"displayName\":\"Ops Admin\"},\"client\":{\"userAgent\":{\"rawUserAgent\":\"Mozilla/5.0 (Windows NT 10.0) Chrome/126.0.0.0\",\"os\":\"Windows 10\",\"browser\":\"CHROME\"},\"ipAddress\":\"192.0.2.77\"},\"outcome\":{\"result\":\"SUCCESS\"},\"target\":[{\"id\":\"00uTARGET98765432\",\"type\":\"User\",\"alternateId\":\"bob.smith@example.com\",\"displayName\":\"Bob Smith\"},{\"id\":\"00g1a2b3c4d5e6f7g8h9\",\"type\":\"UserGroup\",\"alternateId\":\"unknown\",\"displayName\":\"Super Admins\"}],\"transaction\":{\"type\":\"WEB\",\"id\":\"DfE3nVoP4q5r6s7t\"}}"
+    expect:
+      "class_uid": 3006
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  # malformed.txt
+  - raw: "this is not json at all"
+    expect:
+      "class_uid": 0
+      "activity_id": 0
+      "metadata.version": "1.9.0"
+  # policy_evaluate.json
+  - raw: "{\"uuid\":\"d081c2b7-8f93-8800-e354-79b913897779\",\"published\":\"2026-08-18T14:22:30.994Z\",\"eventType\":\"policy.evaluate_sign_on\",\"version\":\"0\",\"severity\":\"INFO\",\"displayMessage\":\"Evaluation of sign-on policy\",\"actor\":{\"id\":\"00u1a2b3c4d5e6f7g8h9\",\"type\":\"User\",\"alternateId\":\"jane.doe@example.com\",\"displayName\":\"Jane Doe\"},\"client\":{\"userAgent\":{\"rawUserAgent\":\"Mozilla/5.0 (Macintosh) Chrome/126.0.0.0\",\"os\":\"Mac OS X\",\"browser\":\"CHROME\"},\"ipAddress\":\"203.0.113.42\"},\"outcome\":{\"result\":\"ALLOW\",\"reason\":\"Sign-on policy evaluation resulted in ALLOW\"},\"target\":[{\"id\":\"0oa1a2b3c4d5e6f7g8h9\",\"type\":\"AppInstance\",\"alternateId\":\"0oa1a2b3c4d5e6f7g8h9\",\"displayName\":\"Salesforce\"},{\"id\":\"00p1a2b3c4d5e6f7g8h9\",\"type\":\"Policy\",\"alternateId\":\"unknown\",\"displayName\":\"Default Policy\"}],\"transaction\":{\"type\":\"WEB\",\"id\":\"EgF4oWpQ5r6s7t8u\"},\"debugContext\":{\"debugData\":{\"policyType\":\"OKTA_SIGN_ON\",\"rule\":\"Require MFA off-network\",\"behaviors\":\"{New Geo-Location=NEGATIVE, New Device=POSITIVE}\"}}}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  # session_end.json
+  - raw: "{\"uuid\":\"9c4d8e73-4b5f-44bb-af10-3575df453335\",\"published\":\"2026-08-18T15:02:10.001Z\",\"eventType\":\"user.session.end\",\"version\":\"0\",\"severity\":\"INFO\",\"displayMessage\":\"User logout from Okta\",\"actor\":{\"id\":\"00u1a2b3c4d5e6f7g8h9\",\"type\":\"User\",\"alternateId\":\"jane.doe@example.com\",\"displayName\":\"Jane Doe\"},\"client\":{\"userAgent\":{\"rawUserAgent\":\"Mozilla/5.0 (Macintosh) Chrome/126.0.0.0\",\"os\":\"Mac OS X\",\"browser\":\"CHROME\"},\"ipAddress\":\"203.0.113.42\"},\"outcome\":{\"result\":\"SUCCESS\"},\"authenticationContext\":{\"externalSessionId\":\"102Yz1aBcDeFgHiJkLmNoPqRs\"},\"target\":[],\"transaction\":{\"type\":\"WEB\",\"id\":\"AcB0kSlM1n2o3p4q\"}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  # session_start_failure.json
+  - raw: "{\"uuid\":\"7a2b6c51-2f3d-22ff-8d8e-1353bd231113\",\"published\":\"2026-08-18T14:25:02.771Z\",\"eventType\":\"user.session.start\",\"version\":\"0\",\"severity\":\"WARN\",\"legacyEventType\":\"core.user_auth.login_failed\",\"displayMessage\":\"User login to Okta\",\"actor\":{\"id\":\"00u1a2b3c4d5e6f7g8h9\",\"type\":\"User\",\"alternateId\":\"jane.doe@example.com\",\"displayName\":\"Jane Doe\"},\"client\":{\"userAgent\":{\"rawUserAgent\":\"python-requests/2.31.0\",\"os\":\"Unknown\",\"browser\":\"UNKNOWN\"},\"zone\":\"null\",\"device\":\"Unknown\",\"ipAddress\":\"198.51.100.9\",\"geographicalContext\":{\"city\":\"Amsterdam\",\"state\":\"North Holland\",\"country\":\"Netherlands\"}},\"outcome\":{\"result\":\"FAILURE\",\"reason\":\"INVALID_CREDENTIALS\"},\"authenticationContext\":{\"authenticationProvider\":\"OKTA_AUTHENTICATION_PROVIDER\",\"credentialType\":\"PASSWORD\",\"externalSessionId\":\"unknown\"},\"securityContext\":{\"asNumber\":60781,\"asOrg\":\"leaseweb\",\"isp\":\"leaseweb\",\"domain\":\"leaseweb.com\",\"isProxy\":true},\"target\":[],\"transaction\":{\"type\":\"WEB\",\"id\":\"ZbA9jRkL0m1n2o3p\"},\"debugContext\":{\"debugData\":{\"requestId\":\"ZbA9jRkL0m1n2o3p\",\"requestUri\":\"/api/v1/authn\",\"threatSuspected\":\"true\",\"risk\":\"level=HIGH reasons=Anomalous Location\"}}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # session_start_success.json
+  - raw: "{\"uuid\":\"6f1a5b40-1f2c-11ee-9c7d-0242ac120002\",\"published\":\"2026-08-18T14:22:31.104Z\",\"eventType\":\"user.session.start\",\"version\":\"0\",\"severity\":\"INFO\",\"legacyEventType\":\"core.user_auth.login_success\",\"displayMessage\":\"User login to Okta\",\"actor\":{\"id\":\"00u1a2b3c4d5e6f7g8h9\",\"type\":\"User\",\"alternateId\":\"jane.doe@example.com\",\"displayName\":\"Jane Doe\"},\"client\":{\"userAgent\":{\"rawUserAgent\":\"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\",\"os\":\"Mac OS X\",\"browser\":\"CHROME\"},\"zone\":\"null\",\"device\":\"Computer\",\"id\":null,\"ipAddress\":\"203.0.113.42\",\"geographicalContext\":{\"city\":\"Boston\",\"state\":\"Massachusetts\",\"country\":\"United States\",\"postalCode\":\"02110\",\"geolocation\":{\"lat\":42.3554,\"lon\":-71.0605}}},\"outcome\":{\"result\":\"SUCCESS\",\"reason\":null},\"authenticationContext\":{\"authenticationProvider\":\"OKTA_AUTHENTICATION_PROVIDER\",\"credentialProvider\":null,\"credentialType\":\"PASSWORD\",\"issuer\":null,\"interface\":\"SSO\",\"authenticationStep\":0,\"externalSessionId\":\"102Yz1aBcDeFgHiJkLmNoPqRs\"},\"securityContext\":{\"asNumber\":701,\"asOrg\":\"verizon business\",\"isp\":\"verizon\",\"domain\":\"verizon.net\",\"isProxy\":false},\"target\":[],\"transaction\":{\"type\":\"WEB\",\"id\":\"YvT1kQpZ2m3n4o5p6q7r8s9t\",\"detail\":{}},\"debugContext\":{\"debugData\":{\"requestId\":\"YvT1kQpZ2m3n4o5p\",\"requestUri\":\"/api/v1/authn\",\"threatSuspected\":\"false\",\"url\":\"/api/v1/authn\"}},\"request\":{\"ipChain\":[{\"ip\":\"203.0.113.42\",\"geographicalContext\":{\"country\":\"United States\"},\"version\":\"V4\",\"source\":null}]}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # user_deactivate.json
+  - raw: "{\"uuid\":\"ad5e9f84-5c60-55cc-b021-4686e0564446\",\"published\":\"2026-08-18T16:41:09.330Z\",\"eventType\":\"user.lifecycle.deactivate\",\"version\":\"0\",\"severity\":\"INFO\",\"displayMessage\":\"Deactivate Okta user\",\"actor\":{\"id\":\"00uADMIN123456789\",\"type\":\"User\",\"alternateId\":\"admin@example.com\",\"displayName\":\"Ops Admin\"},\"client\":{\"userAgent\":{\"rawUserAgent\":\"Mozilla/5.0 (Windows NT 10.0) Chrome/126.0.0.0\",\"os\":\"Windows 10\",\"browser\":\"CHROME\"},\"ipAddress\":\"192.0.2.77\",\"geographicalContext\":{\"city\":\"Austin\",\"state\":\"Texas\",\"country\":\"United States\"}},\"outcome\":{\"result\":\"SUCCESS\"},\"target\":[{\"id\":\"00uTARGET98765432\",\"type\":\"User\",\"alternateId\":\"bob.smith@example.com\",\"displayName\":\"Bob Smith\"}],\"transaction\":{\"type\":\"WEB\",\"id\":\"BdC1lTmN2o3p4q5r\"},\"debugContext\":{\"debugData\":{\"requestUri\":\"/api/v1/users/00uTARGET98765432/lifecycle/deactivate\"}}}"
+    expect:
+      "class_uid": 3007
+      "activity_id": 5
+      "metadata.version": "1.9.0"
+  # user_password_reset.json
+  - raw: "{\"uuid\":\"be6fa095-6d71-66dd-c132-5797f1675557\",\"published\":\"2026-08-18T16:45:00.120Z\",\"eventType\":\"user.account.reset_password\",\"version\":\"0\",\"severity\":\"INFO\",\"displayMessage\":\"Fire a password reset event\",\"actor\":{\"id\":\"00uADMIN123456789\",\"type\":\"User\",\"alternateId\":\"admin@example.com\",\"displayName\":\"Ops Admin\"},\"client\":{\"userAgent\":{\"rawUserAgent\":\"okta-sdk-golang/2.0\",\"os\":\"Unknown\",\"browser\":\"UNKNOWN\"},\"ipAddress\":\"192.0.2.77\"},\"outcome\":{\"result\":\"SUCCESS\"},\"target\":[{\"id\":\"00uTARGET98765432\",\"type\":\"User\",\"alternateId\":\"bob.smith@example.com\",\"displayName\":\"Bob Smith\"}],\"transaction\":{\"type\":\"WEB\",\"id\":\"CeD2mUnO3p4q5r6s\"}}"
+    expect:
+      "class_uid": 3007
+      "activity_id": 9
+      "metadata.version": "1.9.0"

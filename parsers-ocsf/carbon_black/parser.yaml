@@ -1,0 +1,369 @@
+name: carbon_black_ocsf
+display_name: VMware Carbon Black (OCSF)
+version: "1.0.0"
+description: >
+  Parses VMware Carbon Black Cloud / EDR JSON into complete OCSF 1.9.0
+  records, routed by payload shape:
+    CB_ANALYTICS / WATCHLIST / DEVICE_CONTROL alerts -> Detection Finding 2004 (Create)
+    watchlist.* report hits                          -> Detection Finding 2004 (Create)
+    process telemetry (process_guid, no alert)       -> Process Activity 1007 (Launch)
+  On findings the detected process is the ACTOR (keeping actor.process.* queryable)
+  and is repeated in evidences[]. Carries metadata.profiles ["host"] (plus
+  "security_control" on findings, which is what disposition/action are bound to).
+  The OCSF counterpart of parsers/carbon_black - deploy one or the other.
+ocsf_version: "1.9.0"
+match_values:
+  - carbon_black
+category: endpoint
+vendor: "VMware"
+product: "Carbon Black"
+parser_vrl: |
+  # VMware Carbon Black Cloud / EDR JSON -> OCSF 1.9.0.
+  # Emits the COMPLETE OCSF record on the root.
+  #
+  #   alerts (type CB_ANALYTICS | WATCHLIST | DEVICE_CONTROL, or alert_url present)
+  #                              -> Detection Finding 2004 (Create)
+  #   watchlist.* hits           -> Detection Finding 2004 (Create)
+  #   process telemetry          -> Process Activity 1007 (Launch)
+  #   anything else / unparsable -> Process Activity 1007 (Other)
+  raw_log = string!(.message)
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      . = {
+          "class_uid": 1007,
+          "class_name": "Process Activity",
+          "category_uid": 1,
+          "category_name": "System Activity",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 100799,
+          "severity_id": 1,
+          "severity": "Informational",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          # 1007 requires actor/device/process even on the unparseable path.
+          "process": { "pid": 0 },
+          "actor": { "process": { "pid": 0 } },
+          "device": { "hostname": "", "type_id": 0 },
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["host"],
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_source": "carbon_black",
+              "product": { "name": "Carbon Black", "vendor_name": "VMware" }
+          }
+      }
+  } else {
+      p = object!(parsed)
+
+      cb_type = to_string(p.type) ?? ""
+      is_alert_shape = cb_type == "CB_ANALYTICS" || cb_type == "WATCHLIST" || cb_type == "DEVICE_CONTROL" || exists(p.alert_url)
+      is_watchlist_hit = starts_with(cb_type, "watchlist.")
+
+      # ---- time: alerts use backend/first_event_timestamp, telemetry create_time
+      time_ms = 0
+      ts_str = ""
+      if exists(p.backend_timestamp) { ts_str = to_string(p.backend_timestamp) ?? "" }
+      if ts_str == "" && exists(p.first_event_timestamp) { ts_str = to_string(p.first_event_timestamp) ?? "" }
+      if ts_str == "" && exists(p.create_time) { ts_str = to_string(p.create_time) ?? "" }
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      device_hostname = downcase(to_string(p.device_name) ?? "")
+      device_ip = downcase(to_string(p.device_internal_ip) ?? "")
+      device = { "hostname": device_hostname, "type_id": 0 }
+      if device_ip != "" { device.ip = device_ip }
+
+      # ---- the acting (detected) process -------------------------------
+      # NOTE: to_string(<missing>) yields "" (it does not error), so `??` never
+      # falls through — every fallback below has to be an explicit empty check.
+      proc_path = to_string(p.process_path) ?? ""
+      if proc_path == "" { proc_path = to_string(p.process_name) ?? "" }
+      proc_name = ""
+      pnm, pnmerr = parse_regex(proc_path, r'(?P<b>[^\\/]+)$')
+      if pnmerr == null { proc_name = string(pnm.b) ?? "" }
+      if proc_name == "" { proc_name = to_string(p.process_name) ?? "" }
+      proc_sha = downcase(to_string(p.process_sha256) ?? "")
+
+      proc_file = { "name": proc_name, "path": proc_path, "type_id": 1 }
+      if proc_sha != "" { proc_file.hashes = [{ "algorithm_id": 3, "value": proc_sha }] }
+
+      detected_process = {
+          "name": proc_name,
+          "cmd_line": to_string(p.process_cmdline) ?? "",
+          "pid": to_int(p.process_pid) ?? 0,
+          "uid": to_string(p.process_guid) ?? "",
+          "file": proc_file
+      }
+
+      # ---- the parent process ------------------------------------------
+      parent_path = to_string(p.parent_path) ?? ""
+      if parent_path == "" { parent_path = to_string(p.parent_name) ?? "" }
+      parent_name = ""
+      qnm, qnmerr = parse_regex(parent_path, r'(?P<b>[^\\/]+)$')
+      if qnmerr == null { parent_name = string(qnm.b) ?? "" }
+      if parent_name == "" { parent_name = to_string(p.parent_name) ?? "" }
+      parent_sha = downcase(to_string(p.parent_sha256) ?? "")
+      parent_file = { "name": parent_name, "path": parent_path, "type_id": 1 }
+      if parent_sha != "" { parent_file.hashes = [{ "algorithm_id": 3, "value": parent_sha }] }
+      parent_process = {
+          "name": parent_name,
+          "cmd_line": to_string(p.parent_cmdline) ?? "",
+          "pid": to_int(p.parent_pid) ?? 0,
+          "uid": to_string(p.parent_guid) ?? "",
+          "file": parent_file
+      }
+      has_parent = parent_path != "" || (to_string(p.parent_cmdline) ?? "") != ""
+
+      user_name = downcase(to_string(p.device_username) ?? "")
+      if user_name == "" { user_name = downcase(to_string(p.process_username) ?? "") }
+
+      # ---- severity: Carbon Black scores 1-10 --------------------------
+      sev_raw = to_int(p.severity) ?? 0
+      if sev_raw == 0 { sev_raw = to_int(p.report.severity) ?? 0 }
+      severity_id = 1
+      severity = "Informational"
+      risk_level_id = 0
+      risk_level = "Info"
+      if sev_raw >= 8 {
+          severity_id = 5; severity = "Critical"; risk_level_id = 4; risk_level = "Critical"
+      } else if sev_raw >= 6 {
+          severity_id = 4; severity = "High"; risk_level_id = 3; risk_level = "High"
+      } else if sev_raw >= 4 {
+          severity_id = 3; severity = "Medium"; risk_level_id = 2; risk_level = "Medium"
+      } else if sev_raw >= 1 {
+          severity_id = 2; severity = "Low"; risk_level_id = 1; risk_level = "Low"
+      }
+
+      # ---- MITRE technique ids out of ttps[] / report.tags[] -----------
+      mitre_ids = []
+      ttp_source = []
+      if is_array(p.ttps) { ttp_source = array(p.ttps) ?? [] }
+      report_tags = []
+      if is_array(p.report.tags) { report_tags = array(p.report.tags) ?? [] }
+      for_each(report_tags) -> |_i, tag| { ttp_source = push(ttp_source, tag) }
+      for_each(ttp_source) -> |_i, ttp| {
+          ttp_str = to_string(ttp) ?? ""
+          m, merr = parse_regex(ttp_str, r'(?P<tid>[tT]\d{4}(?:\.\d{3})?)')
+          if merr == null { mitre_ids = push(mitre_ids, upcase(string(m.tid) ?? "")) }
+      }
+      mitre_ids = unique(mitre_ids)
+
+      # ---- defaults; overridden per branch below ----
+      class_uid = 1007
+      class_name = "Process Activity"
+      category_uid = 1
+      category_name = "System Activity"
+      activity_id = 99
+      activity_name = "Other"
+
+      ocsf = {}
+
+      if is_alert_shape || is_watchlist_hit {
+          # ---- Detection Finding 2004 ----------------------------------
+          # The alert itself is the subject; the detected process is the ACTOR
+          # (it is what did the thing that tripped the detection), which also
+          # keeps process/file/hash queryable via the promoted actor.process.*
+          # paths. The same artifacts are repeated in evidences[] for fidelity.
+          class_uid = 2004
+          class_name = "Detection Finding"
+          category_uid = 2
+          category_name = "Findings"
+          activity_id = 1
+          activity_name = "Create"
+
+          rule_name = to_string(p.report_name) ?? ""
+          if rule_name == "" { rule_name = to_string(p.report.name) ?? "" }
+          rule_id = to_string(p.report_id) ?? ""
+          if rule_id == "" { rule_id = to_string(p.report.id) ?? "" }
+          finding_uid = to_string(p.id) ?? ""
+          if finding_uid == "" { finding_uid = to_string(p.threat_id) ?? "" }
+          if finding_uid == "" { finding_uid = uuid_v4() }
+
+          title = to_string(p.reason) ?? ""
+          if title == "" { title = rule_name }
+          if title == "" { title = cb_type }
+
+          finding_info = {
+              "uid": finding_uid,
+              "title": title,
+              "types": [cb_type],
+              "data_sources": ["carbon_black"]
+          }
+          if rule_name != "" || rule_id != "" {
+              # WATCHLIST/watchlist.* hits are report-rule driven; CB_ANALYTICS is
+              # Carbon Black's behavioural analytics engine.
+              analytic_type_id = 1
+              analytic_type = "Rule"
+              if cb_type == "CB_ANALYTICS" { analytic_type_id = 2; analytic_type = "Behavioral" }
+              finding_info.analytic = {
+                  "name": rule_name,
+                  "uid": rule_id,
+                  "type_id": analytic_type_id,
+                  "type": analytic_type
+              }
+          }
+          ocsf.finding_info = finding_info
+          ocsf.is_alert = true
+          ocsf.risk_score = sev_raw * 10
+          ocsf.risk_level_id = risk_level_id
+          ocsf.risk_level = risk_level
+
+          ocsf.actor = { "process": detected_process, "user": { "name": user_name } }
+          ocsf.device = device
+
+          evidence = { "process": detected_process }
+          if has_parent { evidence.actor = { "process": parent_process } }
+          if device_hostname != "" { evidence.device = device }
+          ocsf.evidences = [evidence]
+
+          # sensor_action -> security_control disposition/action
+          sensor_action = upcase(to_string(p.sensor_action) ?? "")
+          disposition_id = 15
+          disposition = "Detected"
+          action_id = 3
+          action = "Observed"
+          if sensor_action == "DENY" || sensor_action == "BLOCK" { disposition_id = 2; disposition = "Blocked"; action_id = 2; action = "Denied" }
+          if sensor_action == "TERMINATE" || sensor_action == "TERMINATE_PROCESS" { disposition_id = 2; disposition = "Blocked"; action_id = 2; action = "Denied" }
+          if sensor_action == "QUARANTINE" { disposition_id = 3; disposition = "Quarantined"; action_id = 2; action = "Denied" }
+          if sensor_action == "DELETE" { disposition_id = 5; disposition = "Deleted"; action_id = 2; action = "Denied" }
+          if sensor_action == "ALLOW" { disposition_id = 1; disposition = "Allowed"; action_id = 1; action = "Allowed" }
+          ocsf.disposition_id = disposition_id
+          ocsf.disposition = disposition
+          ocsf.action_id = action_id
+          ocsf.action = action
+
+          # workflow.state -> the FINDING's lifecycle status (2004 status_id is
+          # New/In Progress/Resolved, NOT Success/Failure).
+          wf_state = upcase(to_string(p.workflow.state) ?? "")
+          status_id = 1
+          status = "New"
+          if wf_state == "IN_PROGRESS" { status_id = 2; status = "In Progress" }
+          if wf_state == "CLOSED" || wf_state == "RESOLVED" { status_id = 4; status = "Resolved" }
+          if wf_state == "DISMISSED" { status_id = 3; status = "Suppressed" }
+          ocsf.status_id = status_id
+          ocsf.status = status
+          status_detail = to_string(p.reason_code) ?? ""
+          if status_detail != "" { ocsf.status_detail = status_detail }
+
+          if length(mitre_ids) > 0 {
+              attacks = []
+              for_each(mitre_ids) -> |_i, tid| {
+                  attacks = push(attacks, { "technique": { "uid": tid } })
+              }
+              ocsf.attacks = attacks
+          }
+
+          watchlists_raw = null
+          if is_array(p.watchlists) { watchlists_raw = p.watchlists }
+          ocsf.unmapped = {
+              "cb_type": cb_type,
+              "org_key": to_string(p.org_key) ?? null,
+              "device_id": to_string(p.device_id) ?? null,
+              "device_os": to_string(p.device_os) ?? null,
+              "device_os_version": to_string(p.device_os_version) ?? null,
+              "device_location": to_string(p.device_location) ?? null,
+              "device_external_ip": to_string(p.device_external_ip) ?? null,
+              "policy_name": to_string(p.policy_name) ?? null,
+              "policy_id": to_string(p.policy_id) ?? null,
+              "threat_id": to_string(p.threat_id) ?? null,
+              "ioc_id": to_string(p.ioc_id) ?? null,
+              "ioc_hit": to_string(p.ioc_hit) ?? null,
+              "alert_url": to_string(p.alert_url) ?? null,
+              "run_state": to_string(p.run_state) ?? null,
+              "target_value": to_string(p.target_value) ?? null,
+              "sensor_action": to_string(p.sensor_action) ?? null,
+              "remediation": to_string(p.workflow.remediation) ?? null,
+              "ml_verdict": to_string(p.ml_classification_final_verdict) ?? null,
+              "ml_prevalence": to_string(p.ml_classification_global_prevalence) ?? null,
+              "severity_score": sev_raw,
+              "watchlists": watchlists_raw
+          }
+      } else {
+          # ---- Process telemetry -> Process Activity 1007 --------------
+          class_uid = 1007
+          class_name = "Process Activity"
+          category_uid = 1
+          category_name = "System Activity"
+          if exists(p.process_guid) {
+              activity_id = 1
+              activity_name = "Launch"
+          } else {
+              activity_id = 99
+              activity_name = "Other"
+          }
+          # On a process-create the NEW process is `process`; its launcher is
+          # `actor.process`. Carbon Black only carries the immediate parent.
+          ocsf.process = detected_process
+          actor_process = if has_parent { parent_process } else { detected_process }
+          ocsf.actor = { "process": actor_process, "user": { "name": user_name } }
+          ocsf.device = device
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+          ocsf.unmapped = {
+              "cb_type": cb_type,
+              "org_key": to_string(p.org_key) ?? null,
+              "device_id": to_string(p.device_id) ?? null,
+              "device_os": to_string(p.device_os) ?? null,
+              "device_external_ip": to_string(p.device_external_ip) ?? null
+          }
+      }
+
+      # ---- common envelope ---------------------------------------------
+      ocsf.class_uid = class_uid
+      ocsf.class_name = class_name
+      ocsf.category_uid = category_uid
+      ocsf.category_name = category_name
+      ocsf.activity_id = activity_id
+      ocsf.activity_name = activity_name
+      ocsf.type_uid = class_uid * 100 + activity_id
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.time = time_ms
+      ocsf.message = raw_log
+      ocsf.raw_data = raw_log
+
+      record_uid = to_string(p.id) ?? ""
+      if record_uid == "" { record_uid = to_string(p.process_guid) ?? "" }
+      if record_uid == "" { record_uid = uuid_v4() }
+
+      profiles = ["host"]
+      if class_uid == 2004 { profiles = ["host", "security_control"] }
+      ocsf.metadata = {
+          "version": "1.9.0",
+          "profiles": profiles,
+          "uid": record_uid,
+          "original_event_uid": record_uid,
+          "event_code": cb_type,
+          "log_source": "carbon_black",
+          "product": { "name": "Carbon Black", "vendor_name": "VMware" }
+      }
+
+      . = ocsf
+  }
+samples:
+  - raw: "{\"type\":\"CB_ANALYTICS\",\"id\":\"a1b2c3\",\"org_key\":\"ABCD1234\",\"backend_timestamp\":\"2026-08-18T09:00:00.000Z\",\"first_event_timestamp\":\"2026-08-18T08:59:00.000Z\",\"severity\":8,\"reason\":\"The application powershell.exe invoked another application (rundll32.exe).\",\"reason_code\":\"R_ATTACK\",\"threat_id\":\"T-9999\",\"device_id\":102345,\"device_name\":\"WKS-07\",\"device_internal_ip\":\"10.5.6.7\",\"device_external_ip\":\"203.0.113.5\",\"device_username\":\"CORP\\\\alice\",\"device_os\":\"WINDOWS\",\"device_os_version\":\"Windows 10 x64\",\"device_location\":\"OFFSITE\",\"process_name\":\"c:\\\\windows\\\\system32\\\\windowspowershell\\\\v1.0\\\\powershell.exe\",\"process_pid\":4444,\"process_guid\":\"ABCD-0000-1111\",\"process_sha256\":\"9F914D42706FE215501044ACD85A32D58AAEF1419D404FDDFA5D3B48F66CCD9F\",\"process_cmdline\":\"powershell.exe -enc SQBFAFgA\",\"parent_name\":\"c:\\\\windows\\\\explorer.exe\",\"parent_pid\":1200,\"parent_guid\":\"ABCD-0000-0001\",\"parent_cmdline\":\"explorer.exe\",\"parent_sha256\":\"AA11BB22\",\"sensor_action\":\"DENY\",\"run_state\":\"RAN\",\"target_value\":\"MEDIUM\",\"policy_name\":\"Standard\",\"policy_id\":6997287,\"report_name\":\"Suspicious PowerShell\",\"report_id\":\"RPT-1\",\"alert_url\":\"https://defense.conferdeploy.net/alerts?s[c][id]=a1b2c3\",\"ml_classification_final_verdict\":\"ANOMALOUS\",\"ml_classification_global_prevalence\":\"LOW\",\"workflow\":{\"state\":\"OPEN\",\"remediation\":\"None\"},\"ttps\":[\"MITRE_T1059_001_PowerShell\",\"POLICY_DENY\"]}"
+    expect:
+      "class_uid": 2004
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "2026-08-18 carbon black plain text line"
+    expect:
+      "class_uid": 1007
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "{\"process_guid\":\"PG-123\",\"create_time\":\"2026-08-18T09:10:00Z\",\"device_name\":\"WKS-07\",\"device_internal_ip\":\"10.5.6.7\",\"device_username\":\"CORP\\\\bob\",\"process_name\":\"c:\\\\windows\\\\system32\\\\net.exe\",\"process_pid\":5555,\"process_cmdline\":\"net user administrator\",\"process_sha256\":\"CAFE00\",\"parent_name\":\"c:\\\\windows\\\\system32\\\\cmd.exe\",\"parent_pid\":5000,\"parent_guid\":\"PG-000\"}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"type\":\"watchlist.hit.process\",\"id\":\"wl-77\",\"create_time\":\"2026-08-18T09:05:00Z\",\"device_name\":\"SRV-02\",\"device_internal_ip\":\"10.9.9.9\",\"process_username\":\"SYSTEM\",\"process_name\":\"c:\\\\temp\\\\mimikatz.exe\",\"process_guid\":\"WL-1\",\"process_pid\":7788,\"process_sha256\":\"DEADBEEF\",\"process_cmdline\":\"mimikatz.exe sekurlsa::logonpasswords\",\"watchlists\":[{\"id\":\"w1\",\"name\":\"Credential Theft\"}],\"report\":{\"id\":\"r99\",\"name\":\"Mimikatz Execution\",\"severity\":9,\"tags\":[\"attack.t1003.001\",\"credential_access\"]}}"
+    expect:
+      "class_uid": 2004
+      "activity_id": 1
+      "metadata.version": "1.9.0"

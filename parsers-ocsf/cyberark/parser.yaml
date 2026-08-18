@@ -1,0 +1,355 @@
+name: cyberark_ocsf
+display_name: CyberArk PAM (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses CyberArk Privileged Access Manager vault audit and PSM session records
+  (CEF, with a JSON fallback) into complete OCSF 1.9.0 records, routed by the
+  CEF `act` / event name:
+    logon / logoff / authenticate / PSM session start|end -> Authentication 3002
+    add|update|delete|activate|deactivate user            -> User Management 3007
+    add|delete group, add|remove member                   -> Group Management 3006
+    everything else (password retrieve/change/verify,
+    safe and platform administration)                     -> API Activity 6003
+  Uses VRL's `parse_cef` rather than key=value splitting: CyberArk CEF values
+  routinely contain spaces (`act=Retrieve password`), which a space-delimited
+  key=value split silently truncates.
+  `suser` is the vault user performing the action (`actor.user`); `duser` /
+  `cs1` (Affected User Name) is the privileged account being acted on and is the
+  subject (`user`).
+match_values:
+  - cyberark
+category: security
+vendor: "CyberArk"
+product: "PAM"
+parser_vrl: |
+  # CyberArk PAM CEF (and JSON) -> OCSF 1.9.0.
+  raw_log = string!(.message)
+
+  cef = {}
+  have_cef = false
+  jsn = {}
+  have_json = false
+
+  if starts_with(raw_log, "CEF:") {
+      c, cerr = parse_cef(raw_log)
+      if cerr == null { cef = object!(c); have_cef = true }
+  }
+  if !have_cef {
+      j, jerr = parse_json(raw_log)
+      if jerr == null && is_object(j) { jsn = object!(j); have_json = true }
+  }
+
+  if !have_cef && !have_json {
+      # Unparseable input is emitted as an OCSF Base Event (class_uid 0)
+      # rather than being guessed into a security class: it stays valid, and
+      # therefore visible, without fabricating a user or an outcome.
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_name": "CyberArk PAM",
+              "log_provider": "CyberArk",
+              "product": { "name": "PAM", "vendor_name": "CyberArk" }
+          },
+          "unmapped": { "parse_error": "neither CEF nor JSON" }
+      }
+  } else {
+      # ---- normalise the two input shapes onto one set of locals ----
+      act = ""
+      suser = ""
+      duser = ""
+      src_ip = ""
+      dst_ip = ""
+      shost = ""
+      dhost = ""
+      safe = ""
+      fname = ""
+      reason = ""
+      msg_txt = ""
+      event_code = ""
+      cef_sev = 0
+      rt_raw = ""
+
+      if have_cef {
+          act = string(cef.act) ?? ""
+          if act == "" { act = string(cef.name) ?? "" }
+          suser = string(cef.suser) ?? ""
+          duser = string(cef.duser) ?? ""
+          if duser == "" { duser = string(cef.cs1) ?? "" }
+          src_ip = string(cef.src) ?? ""
+          dst_ip = string(cef.dst) ?? ""
+          shost = string(cef.shost) ?? ""
+          dhost = string(cef.dhost) ?? ""
+          safe = string(cef.cs2) ?? ""
+          fname = string(cef.fname) ?? ""
+          reason = string(cef.reason) ?? ""
+          msg_txt = string(cef.msg) ?? ""
+          event_code = string(cef.deviceEventClassId) ?? ""
+          cef_sev = to_int(cef.severity) ?? 0
+          rt_raw = string(cef.rt) ?? ""
+      } else {
+          act = string(jsn.action) ?? ""
+          suser = string(jsn.user) ?? ""
+          duser = string(jsn.target_user) ?? ""
+          src_ip = string(jsn.src) ?? ""
+          dst_ip = string(jsn.dst) ?? ""
+          safe = string(jsn.safe) ?? ""
+          msg_txt = string(jsn.message) ?? ""
+          rt_raw = to_string(jsn.timestamp) ?? ""
+      }
+
+      act_l = downcase(act)
+
+      # ---- time: rt is either epoch millis or "MMM dd yyyy HH:mm:ss" ----
+      time_ms = 0
+      if rt_raw != "" {
+          epoch = to_int(rt_raw) ?? 0
+          if epoch > 0 {
+              if epoch > 100000000000 { time_ms = epoch } else { time_ms = epoch * 1000 }
+          } else {
+              t1, t1err = parse_timestamp(rt_raw, "%b %d %Y %H:%M:%S")
+              if t1err == null {
+                  time_ms = to_unix_timestamp(t1, unit: "milliseconds")
+              } else {
+                  t2, t2err = parse_timestamp(rt_raw, "%+")
+                  if t2err == null { time_ms = to_unix_timestamp(t2, unit: "milliseconds") }
+              }
+          }
+      }
+
+      # ---- CEF severity 0-10 -> OCSF severity ----
+      severity_id = 1
+      severity = "Informational"
+      if cef_sev >= 1 { severity_id = 2; severity = "Low" }
+      if cef_sev >= 4 { severity_id = 3; severity = "Medium" }
+      if cef_sev >= 6 { severity_id = 4; severity = "High" }
+      if cef_sev >= 8 { severity_id = 5; severity = "Critical" }
+
+      # ---- outcome: CyberArk states failure in the event name ----
+      status_id = 1
+      status_str = "Success"
+      if contains(act_l, "fail") || contains(act_l, "denied") || contains(act_l, "error") || contains(act_l, "unsuccessful") {
+          status_id = 2
+          status_str = "Failure"
+          if severity_id < 2 { severity_id = 2; severity = "Low" }
+      }
+
+      # ---- identities ----
+      actor_user = { "name": downcase(suser) }
+      if suser == "" { actor_user = { "name": "unknown" } }
+      subject_user = { "name": downcase(duser) }
+      have_subject = duser != ""
+
+      # ---- class routing ----
+      is_auth = contains(act_l, "logon") || contains(act_l, "log on") || contains(act_l, "logoff") || contains(act_l, "log off") || contains(act_l, "authenticate") || contains(act_l, "sign in") || contains(act_l, "psm session")
+      is_usermgmt = contains(act_l, "user") && (contains(act_l, "add") || contains(act_l, "update") || contains(act_l, "delete") || contains(act_l, "activate") || contains(act_l, "deactivate") || contains(act_l, "rename"))
+      is_groupmgmt = contains(act_l, "group") || contains(act_l, "member")
+
+      class_uid = 6003
+      if is_auth { class_uid = 3002 } else if is_usermgmt { class_uid = 3007 } else if is_groupmgmt { class_uid = 3006 }
+
+      ocsf = {}
+
+      if class_uid == 3002 {
+          activity_id = 1
+          activity_name = "Logon"
+          if contains(act_l, "logoff") || contains(act_l, "log off") || contains(act_l, "end") { activity_id = 2; activity_name = "Logoff" }
+          ocsf.class_uid = 3002
+          ocsf.class_name = "Authentication"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          # Authentication 3002 carries the authenticating principal in `user`.
+          ocsf.user = actor_user
+          ocsf.service = { "name": "CyberArk Vault" }
+          ocsf.is_remote = true
+      } else if class_uid == 3007 {
+          activity_id = 2
+          activity_name = "Update"
+          if contains(act_l, "add") { activity_id = 1; activity_name = "Create" }
+          if contains(act_l, "delete") { activity_id = 3; activity_name = "Delete" }
+          if contains(act_l, "activate") && !contains(act_l, "deactivate") { activity_id = 4; activity_name = "Enable" }
+          if contains(act_l, "deactivate") { activity_id = 5; activity_name = "Disable" }
+          ocsf.class_uid = 3007
+          ocsf.class_name = "User Management"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          # SUBJECT = the account being changed (duser / cs1 Affected User Name).
+          if have_subject { ocsf.user = subject_user } else { ocsf.user = actor_user }
+          ocsf.actor = { "user": actor_user }
+      } else if class_uid == 3006 {
+          activity_id = 99
+          activity_name = "Other"
+          # Group lifecycle first, then membership: "Add Member To Group"
+          # contains both "add" and "group" and must NOT read as group create.
+          if contains(act_l, "add") && contains(act_l, "group") { activity_id = 6; activity_name = "Create" }
+          if contains(act_l, "delete") && contains(act_l, "group") { activity_id = 5; activity_name = "Delete" }
+          if contains(act_l, "member") {
+              if contains(act_l, "add") { activity_id = 3; activity_name = "Add User" }
+              if contains(act_l, "remove") || contains(act_l, "delete") { activity_id = 4; activity_name = "Remove User" }
+          }
+          ocsf.class_uid = 3006
+          ocsf.class_name = "Group Management"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          gname = fname
+          if gname == "" { gname = act }
+          ocsf.group = { "name": gname }
+          if have_subject { ocsf.user = subject_user }
+          ocsf.actor = { "user": actor_user }
+      } else {
+          activity_id = 99
+          activity_name = "Other"
+          if contains(act_l, "add") || contains(act_l, "create") { activity_id = 1; activity_name = "Create" }
+          if contains(act_l, "retrieve") || contains(act_l, "get") || contains(act_l, "view") || contains(act_l, "use") { activity_id = 2; activity_name = "Read" }
+          if contains(act_l, "change") || contains(act_l, "update") || contains(act_l, "reconcile") || contains(act_l, "verify") { activity_id = 3; activity_name = "Update" }
+          if contains(act_l, "delete") || contains(act_l, "remove") { activity_id = 4; activity_name = "Delete" }
+          ocsf.class_uid = 6003
+          ocsf.class_name = "API Activity"
+          ocsf.category_uid = 6
+          ocsf.category_name = "Application Activity"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          op = act
+          if op == "" { op = "unknown" }
+          ocsf.api = { "operation": op, "service": { "name": "CyberArk Vault" } }
+          ocsf.actor = { "user": actor_user }
+          # The privileged object the action targeted: the safe-qualified
+          # account name, plus the affected account as a second resource.
+          resources = []
+          if fname != "" { resources = push(resources, { "name": fname, "type": "PrivilegedAccount" }) }
+          if have_subject { resources = push(resources, { "name": duser, "type": "User" }) }
+          if length(resources) > 0 { ocsf.resources = resources }
+      }
+
+      # ---- endpoints ----
+      src_ep = {}
+      if src_ip != "" { src_ep = set!(src_ep, ["ip"], downcase(src_ip)) }
+      if shost != "" { src_ep = set!(src_ep, ["hostname"], downcase(shost)) }
+      if length(src_ep) == 0 { src_ep = { "hostname": "unknown" } }
+      ocsf.src_endpoint = src_ep
+
+      dst_ep = {}
+      if dst_ip != "" { dst_ep = set!(dst_ep, ["ip"], downcase(dst_ip)) }
+      if dhost != "" { dst_ep = set!(dst_ep, ["hostname"], downcase(dhost)) }
+      if length(dst_ep) > 0 { ocsf.dst_endpoint = dst_ep }
+
+      # ---- common envelope ----
+      ocsf.status_id = status_id
+      ocsf.status = status_str
+      if reason != "" { ocsf.status_detail = reason }
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.type_uid = to_int(ocsf.class_uid) * 100 + to_int(ocsf.activity_id)
+      ocsf.time = time_ms
+      final_msg = msg_txt
+      if final_msg == "" { final_msg = act }
+      if final_msg == "" { final_msg = raw_log }
+      ocsf.message = final_msg
+      ocsf.raw_data = raw_log
+
+      meta = {
+          "version": "1.9.0",
+          "uid": uuid_v4(),
+          "log_name": "CyberArk PAM",
+          "log_provider": "CyberArk",
+          "product": { "name": "PAM", "vendor_name": "CyberArk" }
+      }
+      if event_code != "" { meta = set!(meta, ["event_code"], event_code) }
+      ocsf.metadata = meta
+
+      cand = {
+          "cef_action": act,
+          "safe": safe,
+          "object": fname,
+          "affected_user": duser,
+          "cef_vendor": string(cef.deviceVendor) ?? "",
+          "cef_product": string(cef.deviceProduct) ?? "",
+          "cef_version": string(cef.deviceVersion) ?? "",
+          "cef_event_name": string(cef.name) ?? "",
+          "external_id": string(cef.externalId) ?? "",
+          "application": string(cef.app) ?? "",
+          "device_type": string(cef.cs3) ?? "",
+          "database": string(cef.cs4) ?? "",
+          "other_info": string(cef.cs5) ?? ""
+      }
+      unmapped = {}
+      for_each(cand) -> |k, v| {
+          if v != "" { unmapped = set!(unmapped, [k], v) }
+      }
+      risk = string(cef.cn1) ?? ""
+      if risk != "" { unmapped = set!(unmapped, ["risk_score"], risk) }
+      if length(unmapped) > 0 { ocsf.unmapped = unmapped }
+
+      . = ocsf
+  }
+samples:
+  # add_member.cef
+  - raw: "CEF:0|CyberArk|Vault|12.60.0000|24|Add Member To Group|4|act=Add Member To Group suser=vaultadmin duser=contractor01 fname=Vault Admins src=192.0.2.77 dvc=10.1.1.5 externalId=24 rt=Aug 18 2026 15:14:30 msg=contractor01 added to group Vault Admins"
+    expect:
+      "class_uid": 3006
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  # add_user.cef
+  - raw: "CEF:0|CyberArk|Vault|12.60.0000|20|Add User|4|act=Add User suser=vaultadmin duser=contractor01 src=192.0.2.77 dvc=10.1.1.5 externalId=20 rt=Aug 18 2026 15:12:00 cs1Label=Affected User Name cs1=contractor01 msg=User contractor01 was added by vaultadmin"
+    expect:
+      "class_uid": 3007
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # json_fallback.json
+  - raw: "{\"action\": \"Change password\", \"user\": \"vaultadmin\", \"target_user\": \"svc_sql\", \"src\": \"192.0.2.77\", \"dst\": \"10.1.20.44\", \"safe\": \"SQLAccounts\", \"timestamp\": 1787061782, \"details\": \"Password changed for svc_sql\"}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  # malformed.txt
+  - raw: "Aug 18 14:03:02 vault01 something entirely unstructured"
+    expect:
+      "class_uid": 0
+      "activity_id": 0
+      "metadata.version": "1.9.0"
+  # psm_session_start.cef
+  - raw: "CEF:0|CyberArk|PSM|12.60.0000|300|Start PSM Session|5|act=Start PSM Session suser=jdoe duser=svc_backup shost=jump01.corp.example.com src=203.0.113.55 dhost=dc01.corp.example.com dst=10.1.20.11 app=RDP externalId=300 rt=Aug 18 2026 14:03:10 cs2Label=Safe Name cs2=WinDomainAccounts msg=PSM session started"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # retrieve_password.cef
+  - raw: "CEF:0|CyberArk|Vault|12.60.0000|295|Retrieve password|5|act=Retrieve password suser=jdoe fname=Root\\Operating System-WinDomain-dc01-svc_backup dvc=10.1.1.5 shost=jump01.corp.example.com src=203.0.113.55 dhost=dc01.corp.example.com dst=10.1.20.11 duser=svc_backup externalId=295 app=PSM reason=Ticket 4711 rt=Aug 18 2026 14:03:02 cs1Label=Affected User Name cs1=svc_backup cs2Label=Safe Name cs2=WinDomainAccounts cs3Label=Device Type cs3=Operating System msg=Password retrieved by jdoe"
+    expect:
+      "class_uid": 6003
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  # vault_logon.cef
+  - raw: "CEF:0|CyberArk|Vault|12.60.0000|1|CyberArk Vault logon|3|act=CyberArk Vault logon suser=jdoe src=203.0.113.55 shost=jump01.corp.example.com dvc=10.1.1.5 externalId=1 rt=Aug 18 2026 14:00:11 msg=User jdoe logged on to the Vault"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # vault_logon_failed.cef
+  - raw: "CEF:0|CyberArk|Vault|12.60.0000|2|CyberArk Vault logon failed|8|act=CyberArk Vault logon failed suser=jdoe src=198.51.100.201 dvc=10.1.1.5 externalId=2 rt=Aug 18 2026 14:01:44 reason=Invalid password msg=Logon failure for user jdoe"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"

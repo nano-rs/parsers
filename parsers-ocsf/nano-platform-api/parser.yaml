@@ -1,0 +1,217 @@
+name: nano-platform-api_ocsf
+display_name: nano Platform API (OCSF)
+version: "1.0.0"
+description: >
+  Parses nano platform API logs (pino/Node.js JSON) into complete OCSF 1.9.0
+  records. The stream is mixed, so routing is per event:
+    HTTP access lines (method/path present) -> API Activity 6003
+    everything else (startup, worker, error lines) -> Base Event 0
+  API Activity 6003 is the correct class rather than HTTP Activity 4002: this is
+  a control-plane REST API and every access line carries the authenticated
+  principal (userEmail/userId). OCSF 1.9 defines NO `actor` or `user` attribute
+  on 4002 (verified against the 1.9.0 contract) — the identity would be lost to
+  `unmapped`, whereas 6003 promotes it to `actor.user.name` / `actor.user.uid`,
+  the fields analysts pivot on. Non-HTTP pino lines stay OCSF Base Event
+  (class_uid 0) rather than being forced into a security class.
+  Mirrors the UDM nano-platform-api parser but targets OCSF instead of `.udm.*`.
+ocsf_version: "1.9.0"
+match_values:
+  - nano-platform-api
+category: application
+vendor: "nano"
+product: "platform-api"
+parser_vrl: |
+  # nano platform API (pino JSON) -> OCSF 1.9.0. Emits the COMPLETE record on root.
+  raw_log = string!(.message)
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_provider": "nano",
+              "log_name": "nano-platform-api",
+              "event_code": "unparsed",
+              "product": { "name": "platform-api", "vendor_name": "nano" }
+          }
+      }
+  } else {
+      p = object!(parsed)
+
+      # ---- event time: pino `time` is epoch ms; `ts` (rare) is RFC3339 ----
+      time_ms = to_int(p.time) ?? 0
+      if time_ms == 0 {
+          ts_str = string(p.ts) ?? ""
+          if ts_str != "" {
+              t, terr = parse_timestamp(ts_str, "%+")
+              if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+          }
+      }
+
+      # ---- pino numeric level -> OCSF severity ----
+      lvl = to_int(p.level) ?? 30
+      severity_id = 1
+      severity = "Informational"
+      level_name = "info"
+      if lvl >= 40 { severity_id = 3; severity = "Medium"; level_name = "warn" }
+      if lvl >= 50 { severity_id = 4; severity = "High"; level_name = "error" }
+      if lvl >= 60 { severity_id = 6; severity = "Fatal"; level_name = "fatal" }
+      if lvl < 30 { level_name = "debug" }
+      if lvl < 20 { level_name = "trace" }
+
+      msg = string(p.msg) ?? ""
+      if msg == "" { msg = raw_log }
+
+      # ---- identity ----
+      user_email = string(p.userEmail) ?? ""
+      user_id = string(p.userId) ?? ""
+
+      # ---- client IP: strip the IPv4-mapped-IPv6 prefix ----
+      client_ip = ""
+      raw_ip = string(p.ip) ?? ""
+      if raw_ip != "" {
+          candidate = downcase(replace(raw_ip, r'^::ffff:', ""))
+          if is_ipv4(candidate) || is_ipv6(candidate) { client_ip = candidate }
+      }
+
+      replica = string(p.replica) ?? ""
+      req_id = string(p.reqId) ?? string(p.requestId) ?? ""
+
+      # promoted `unmapped.*` carriers (queryable on every branch)
+      um = { "service_name": "platform-api" }
+      if replica != "" { um = set!(um, ["host_name"], replica) }
+      if user_id != "" { um = set!(um, ["enduser_id"], user_id) }
+      if raw_ip != "" { um = set!(um, ["client_address"], raw_ip) }
+
+      method = upcase(string(p.method) ?? "")
+      path = string(p.path) ?? ""
+      is_http = method != "" || path != ""
+
+      ocsf = {}
+
+      if is_http {
+          # ---- HTTP access line -> API Activity 6003 ----
+          status_code = to_int(p.status) ?? 0
+
+          # OCSF 6003 activity: 1 Create, 2 Read, 3 Update, 4 Delete, 99 Other
+          activity_id = 99
+          activity_name = "Other"
+          if method == "POST" { activity_id = 1; activity_name = "Create" }
+          if method == "GET" || method == "HEAD" { activity_id = 2; activity_name = "Read" }
+          if method == "PUT" || method == "PATCH" { activity_id = 3; activity_name = "Update" }
+          if method == "DELETE" { activity_id = 4; activity_name = "Delete" }
+
+          status_id = 0
+          status_str = "Unknown"
+          if status_code >= 200 && status_code < 400 { status_id = 1; status_str = "Success" }
+          if status_code >= 400 { status_id = 2; status_str = "Failure" }
+          if status_code >= 400 && severity_id < 3 { severity_id = 3; severity = "Medium" }
+
+          op = method
+          if path != "" { op = method + " " + path }
+          if op == "" { op = "unknown" }
+
+          ocsf.class_uid = 6003
+          ocsf.class_name = "API Activity"
+          ocsf.category_uid = 6
+          ocsf.category_name = "Application Activity"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          ocsf.status_id = status_id
+          ocsf.status = status_str
+          if status_code != 0 { ocsf.status_code = to_string(status_code) }
+
+          # the authenticated caller, when the request carried one
+          if user_email != "" || user_id != "" {
+              ocsf.actor = { "user": { "name": downcase(user_email), "uid": user_id } }
+          } else {
+              ocsf.actor = { "app_name": "platform-api" }
+          }
+
+          ocsf.api = { "operation": op, "service": { "name": "platform-api" } }
+          if req_id != "" { ocsf.api.request = { "uid": req_id } }
+          if status_code != 0 { ocsf.api.response = { "code": status_code } }
+
+          src = {}
+          if client_ip != "" { src = set!(src, ["ip"], client_ip) }
+          if src == {} { src = { "svc_name": "unknown" } }
+          ocsf.src_endpoint = src
+          dst = { "svc_name": "platform-api" }
+          if replica != "" { dst = set!(dst, ["hostname"], downcase(replica)) }
+          ocsf.dst_endpoint = dst
+
+          http_req = { "http_method": method }
+          ua = string(p.ua) ?? ""
+          if ua != "" { http_req = set!(http_req, ["user_agent"], ua) }
+          url_obj = {}
+          if path != "" {
+              url_obj = set!(url_obj, ["path"], path)
+              url_obj = set!(url_obj, ["url_string"], path)
+          }
+          if url_obj != {} { http_req = set!(http_req, ["url"], url_obj) }
+          ocsf.http_request = http_req
+
+          if status_code != 0 {
+              ocsf.http_response = { "code": status_code, "status": status_str }
+          }
+
+          dur = to_int(p.ms) ?? 0
+          if dur != 0 { ocsf.duration = dur }
+          if path != "" { um = set!(um, ["url_path"], path) }
+          if req_id != "" { ocsf.metadata = { "correlation_uid": req_id } }
+      } else {
+          # ---- non-request pino line -> Base Event 0 ----
+          ocsf.class_uid = 0
+          ocsf.class_name = "Base Event"
+          ocsf.category_uid = 0
+          ocsf.category_name = "Uncategorized"
+          ocsf.activity_id = 0
+          ocsf.activity_name = "Unknown"
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+          if severity_id >= 4 { ocsf.status_id = 2; ocsf.status = "Failure" }
+          err_msg = string(p.err.message) ?? string(p.error) ?? ""
+          if err_msg != "" { um = set!(um, ["details", "error"], err_msg) }
+      }
+
+      # ---- common envelope ----
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.type_uid = to_int(ocsf.class_uid) * 100 + to_int(ocsf.activity_id)
+      ocsf.time = time_ms
+      ocsf.message = msg
+      ocsf.raw_data = raw_log
+      ocsf.unmapped = um
+
+      correlation_uid = string(ocsf.metadata.correlation_uid) ?? ""
+      event_code = "application_log"
+      if is_http { event_code = "http_request" }
+      md = {
+          "version": "1.9.0",
+          "uid": uuid_v4(),
+          "log_provider": "nano",
+          "log_name": "nano-platform-api",
+          "log_level": level_name,
+          "event_code": event_code,
+          "product": { "name": "platform-api", "vendor_name": "nano" }
+      }
+      if correlation_uid != "" { md = set!(md, ["correlation_uid"], correlation_uid) }
+      ocsf.metadata = md
+
+      . = ocsf
+  }

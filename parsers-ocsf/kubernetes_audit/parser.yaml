@@ -1,0 +1,244 @@
+name: kubernetes_audit_ocsf
+display_name: Kubernetes Audit Log (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Kubernetes API server audit events into complete OCSF 1.9.0
+  "API Activity" (class_uid 6003) records. The audit verb maps to the CRUD
+  activity_id, the requesting identity to actor.user, the objectRef to
+  resources[], and the RBAC decision to status / status_detail. The whole OCSF
+  object is emitted on the root so it lands in ocsf_logs.event and the promoted
+  columns materialize. Mirrors the UDM kubernetes_audit parser but targets OCSF
+  instead of `.udm.*`.
+match_values:
+  - kubernetes_audit
+category: cloud
+vendor: "CNCF"
+product: "Kubernetes"
+parser_vrl: |
+  # Kubernetes API server audit event -> OCSF 1.9.0 API Activity (class_uid 6003)
+  raw_log = to_string(.message) ?? ""
+  class_uid = 6003
+
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      . = {
+          "class_uid": class_uid,
+          "class_name": "API Activity",
+          "category_uid": 6,
+          "category_name": "Application Activity",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": class_uid * 100 + 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_name": "kubernetes-audit",
+              "product": { "name": "Kubernetes", "vendor_name": "CNCF" }
+          },
+          "api": { "operation": "Unknown", "service": { "name": "kubernetes" } },
+          "actor": { "user": { "name": "unknown" } },
+          "src_endpoint": { "ip": "0.0.0.0" }
+      }
+  } else {
+      p = object!(parsed)
+      user_obj = object(p.user) ?? {}
+      obj_ref = object(p.objectRef) ?? {}
+      resp = object(p.responseStatus) ?? {}
+      annotations = object(p.annotations) ?? {}
+
+      # ---- time ----
+      time_ms = 0
+      ts_str = to_string(p.requestReceivedTimestamp) ?? ""
+      if ts_str == "" { ts_str = to_string(p.stageTimestamp) ?? "" }
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- verb -> activity_id ----
+      verb = downcase(to_string(p.verb) ?? "")
+      activity_id = 99
+      activity_name = "Other"
+      if verb == "create" || verb == "post" { activity_id = 1; activity_name = "Create" }
+      if verb == "get" || verb == "list" || verb == "watch" { activity_id = 2; activity_name = "Read" }
+      if verb == "update" || verb == "patch" { activity_id = 3; activity_name = "Update" }
+      if verb == "delete" || verb == "deletecollection" { activity_id = 4; activity_name = "Delete" }
+
+      # ---- identity ----
+      username = to_string(user_obj.username) ?? ""
+      user = { "name": "unknown" }
+      if username != "" {
+          user = { "name": username }
+          if starts_with(username, "system:serviceaccount:") {
+              user.type_id = 4
+              user.type = "Service"
+              sa_parts = split(username, ":")
+              if length(sa_parts) == 4 { user.domain = to_string(sa_parts[2]) }
+          } else if starts_with(username, "system:") {
+              user.type_id = 3
+              user.type = "System"
+          } else {
+              user.type_id = 1
+              user.type = "User"
+          }
+          if contains(username, "@") { user.email_addr = username }
+      }
+      user_uid = to_string(user_obj.uid) ?? ""
+      if user_uid != "" { user.uid = user_uid }
+      groups = array(user_obj.groups) ?? []
+      actor = { "user": user }
+
+      # ---- source ----
+      source_ips = array(p.sourceIPs) ?? []
+      first_ip = get(source_ips, [0]) ?? null
+      src_endpoint = { "ip": "0.0.0.0" }
+      if first_ip != null {
+          ip_str = to_string(first_ip) ?? ""
+          if ip_str != "" { src_endpoint = { "ip": downcase(ip_str) } }
+      }
+
+      # ---- outcome ----
+      code = to_int(resp.code) ?? 0
+      status_id = 0
+      status_str = "Unknown"
+      severity_id = 1
+      severity = "Informational"
+      if code > 0 {
+          if code >= 200 && code < 400 {
+              status_id = 1
+              status_str = "Success"
+          } else {
+              status_id = 2
+              status_str = "Failure"
+              severity_id = 2
+              severity = "Low"
+          }
+      }
+      decision = downcase(to_string(get(annotations, ["authorization.k8s.io/decision"]) ?? "") ?? "")
+      if decision == "forbid" {
+          status_id = 2
+          status_str = "Failure"
+          if severity_id < 3 { severity_id = 3; severity = "Medium" }
+      }
+      auth_reason = to_string(get(annotations, ["authorization.k8s.io/reason"]) ?? "") ?? ""
+
+      # ---- the API operation: "<verb> <resource>[/<subresource>]" ----
+      k_resource = to_string(obj_ref.resource) ?? ""
+      subresource = to_string(obj_ref.subresource) ?? ""
+      operation = verb
+      if k_resource != "" {
+          operation = verb + " " + k_resource
+          if subresource != "" { operation = operation + "/" + subresource }
+      }
+      if operation == "" { operation = "Unknown" }
+
+      api_group = to_string(obj_ref.apiGroup) ?? ""
+      api_obj = { "operation": operation, "service": { "name": "kubernetes" } }
+      audit_id = to_string(p.auditID) ?? ""
+      if audit_id != "" { api_obj.request = { "uid": audit_id } }
+      api_version = to_string(p.apiVersion) ?? ""
+      if api_version != "" { api_obj.version = api_version }
+      resp_msg = to_string(resp.message) ?? ""
+      if resp_msg != "" { api_obj.response = { "message": resp_msg } }
+
+      # ---- resources ----
+      resources = []
+      if k_resource != "" {
+          res = { "type": k_resource }
+          ns = to_string(obj_ref.namespace) ?? ""
+          rname = to_string(obj_ref.name) ?? ""
+          # Collection verbs (list/watch/deletecollection) carry no objectRef.name;
+          # OCSF resource_details still requires name or uid, so name the collection.
+          if rname == "" {
+              if ns != "" { rname = ns + "/" + k_resource } else { rname = k_resource }
+          }
+          res.name = rname
+          res.uid = rname
+          if ns != "" { res.namespace = ns }
+          if api_group != "" { res.version = api_group }
+          resources = push(resources, res)
+      }
+
+      # ---- request URI + user agent ----
+      http_request = {}
+      request_uri = to_string(p.requestURI) ?? ""
+      if request_uri != "" {
+          url_obj = {}
+          uri_parts = split(request_uri, "?", limit: 2)
+          url_obj.path = to_string(uri_parts[0])
+          if length(uri_parts) == 2 { url_obj.query_string = to_string(uri_parts[1]) }
+          http_request.url = url_obj
+      }
+      ua = to_string(p.userAgent) ?? ""
+      if ua != "" { http_request.user_agent = ua }
+      http_method = ""
+      if verb == "create" { http_method = "POST" }
+      if verb == "get" || verb == "list" || verb == "watch" { http_method = "GET" }
+      if verb == "update" { http_method = "PUT" }
+      if verb == "patch" { http_method = "PATCH" }
+      if verb == "delete" || verb == "deletecollection" { http_method = "DELETE" }
+      if http_method != "" { http_request.http_method = http_method }
+
+      ocsf = {
+          "class_uid": class_uid,
+          "class_name": "API Activity",
+          "category_uid": 6,
+          "category_name": "Application Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_name": "kubernetes-audit",
+              "log_provider": "Kubernetes API Server",
+              "product": { "name": "Kubernetes", "vendor_name": "CNCF" }
+          },
+          "api": api_obj,
+          "actor": actor,
+          "src_endpoint": src_endpoint
+      }
+      if audit_id != "" { ocsf.metadata.uid = audit_id; ocsf.metadata.correlation_uid = audit_id }
+      if code > 0 { ocsf.status_code = to_string(code) }
+      if resp_msg != "" { ocsf.status_detail = resp_msg }
+      if length(resources) > 0 { ocsf.resources = resources }
+      if length(keys(http_request)) > 0 { ocsf.http_request = http_request }
+      if code > 0 { ocsf.http_response = { "code": code, "status": status_str } }
+
+      unmapped = {}
+      level = to_string(p.level) ?? ""
+      if level != "" { unmapped.audit_level = level }
+      stage = to_string(p.stage) ?? ""
+      if stage != "" { unmapped.stage = stage }
+      if length(groups) > 0 { unmapped.user_groups = encode_json(groups) }
+      if decision != "" { unmapped.authorization_decision = decision }
+      if auth_reason != "" { unmapped.authorization_reason = auth_reason }
+      resp_reason = to_string(resp.reason) ?? ""
+      if resp_reason != "" { unmapped.response_reason = resp_reason }
+      ns2 = to_string(obj_ref.namespace) ?? ""
+      if ns2 != "" { unmapped.k8s_namespace = ns2 }
+      if subresource != "" { unmapped.subresource = subresource }
+      if api_group != "" { unmapped.api_group = api_group }
+      stage_ts = to_string(p.stageTimestamp) ?? ""
+      if stage_ts != "" { unmapped.stage_timestamp = stage_ts }
+      if length(source_ips) > 1 { unmapped.source_ips = encode_json(source_ips) }
+      if length(keys(unmapped)) > 0 { ocsf.unmapped = unmapped }
+
+      . = ocsf
+  }

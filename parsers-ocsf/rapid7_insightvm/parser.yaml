@@ -1,0 +1,264 @@
+name: rapid7_insightvm_ocsf
+display_name: Rapid7 InsightVM (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Rapid7 InsightVM (Nexpose) vulnerability findings, remediation events
+  and asset records into OCSF 1.9.0 "Detection Finding" (class_uid 2004).
+  A vulnerability finding is activity 1 (Create) with status New; a
+  remediation is activity 3 (Close) with status Resolved; an asset record is
+  activity 2 (Update) carrying the asset's rolled-up risk in `resources[]`.
+  CVEs land at the promoted `vulnerabilities[].cve.uid`; the OCSF
+  `vulnerability` object requires exactly one of advisory/cve/cwe, so a
+  finding with no CVE emits none. Unrecognised shapes become Base Event
+  (class_uid 0). Mirrors the UDM rapid7_insightvm parser
+  (../parsers/parsers/rapid7_insightvm/parser.yaml).
+match_values:
+  - rapid7_insightvm
+category: security
+vendor: "Rapid7"
+product: "InsightVM"
+parser_vrl: |
+  # Rapid7 InsightVM -> OCSF 1.9.0 Detection Finding (2004) / Base Event (0)
+  raw_log = string!(.message)
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
+
+  p, perr = parse_json(raw_log)
+  ok = perr == null && is_object(p)
+  e = {}
+  if ok { e = object!(p) }
+
+  type_field = downcase(to_string(e.type) ?? "")
+  is_remediation = type_field == "remediation" || exists(e.remediated_date)
+  is_vuln = exists(e.vulnerability_id) && !is_remediation
+  is_asset = type_field == "asset" || (exists(e.vulnerabilities) && !exists(e.vulnerability_id))
+
+  shape = "unknown"
+  if is_vuln { shape = "vulnerability" } else if is_remediation { shape = "remediation" } else if is_asset { shape = "asset" }
+
+  host_ip = to_string(e.ip) ?? ""
+  host_name = to_string(e.hostname) ?? ""
+  asset_id = to_string(e.asset_id) ?? ""
+  if asset_id == "" { asset_id = to_string(e.id) ?? "" }
+
+  severity_id = 1
+  severity = "Informational"
+  sev_raw = downcase(to_string(e.severity) ?? "")
+  if sev_raw == "critical" { severity_id = 5; severity = "Critical" } else if sev_raw == "severe" { severity_id = 4; severity = "High" } else if sev_raw == "moderate" { severity_id = 3; severity = "Medium" } else if sev_raw == "low" { severity_id = 2; severity = "Low" }
+
+  time_ms = 0
+  activity_id = 1
+  activity_name = "Create"
+  status_id = 1
+  status_str = "New"
+  title = to_string(e.title) ?? ""
+  finding_uid = to_string(e.vulnerability_id) ?? ""
+  cves = []
+  solution = to_string(e.solution) ?? ""
+  unmapped = {}
+  port = 0
+  types = []
+
+  for_each(["os_name", "os_version", "os_architecture", "mac_address", "site_name", "scan_template", "proof", "exploits", "malware_kits", "cvss_v2_vector", "cvss_v3_vector", "service", "protocol", "status", "first_found", "published", "verified_by", "solution_id", "fqdn"]) -> |_i, k| {
+      v = to_string(get(e, [k]) ?? "") ?? ""
+      if v != "" { unmapped = set!(unmapped, [k], v) }
+  }
+  if asset_id != "" { unmapped.asset_id = asset_id }
+
+  cv3 = to_float(e.cvss_v3_score) ?? -1.0
+  if cv3 >= 0.0 { unmapped.cvss_v3_score = cv3 }
+  cv2 = to_float(e.cvss_v2_score) ?? -1.0
+  if cv2 >= 0.0 { unmapped.cvss_v2_score = cv2 }
+
+  cl = array(e.cves) ?? []
+  for_each(cl) -> |_i, c| {
+      cs = to_string(c) ?? ""
+      if cs != "" { cves = push(cves, cs) }
+  }
+
+  if shape == "vulnerability" {
+      types = ["Vulnerability"]
+      pv = to_int(e.port) ?? 0
+      if pv != 0 { port = pv }
+      lf = to_string(e.last_found) ?? ""
+      if lf != "" {
+          t, terr = parse_timestamp(lf, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+      cats = array(e.categories) ?? []
+      if length(cats) > 0 { unmapped.categories = encode_json(cats) }
+      sid = to_string(e.scan_id) ?? ""
+      if sid != "" { unmapped.scan_id = sid }
+  } else if shape == "remediation" {
+      types = ["Vulnerability Remediation"]
+      activity_id = 3
+      activity_name = "Close"
+      status_id = 4
+      status_str = "Resolved"
+      rd = to_string(e.remediated_date) ?? ""
+      if rd != "" {
+          t, terr = parse_timestamp(rd, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+  } else if shape == "asset" {
+      types = ["Asset Assessment"]
+      activity_id = 2
+      activity_name = "Update"
+      status_id = 2
+      status_str = "In Progress"
+      if title == "" { title = "Asset assessment" }
+      if finding_uid == "" { finding_uid = asset_id }
+      la = to_string(e.last_assessed_for_vulnerabilities) ?? ""
+      if la != "" {
+          t, terr = parse_timestamp(la, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+      v = object(e.vulnerabilities) ?? {}
+      for_each(["total", "critical", "severe", "moderate", "low"]) -> |_i, k| {
+          n = to_int(get(v, [k]) ?? -1) ?? -1
+          if n >= 0 { unmapped = set!(unmapped, ["vuln_" + k], n) }
+      }
+      tg = array(e.tags) ?? []
+      if length(tg) > 0 { unmapped.tags = encode_json(tg) }
+      lsi = to_string(e.last_scan_id) ?? ""
+      if lsi != "" { unmapped.scan_id = lsi }
+  }
+
+  risk = to_float(e.risk_score) ?? -1.0
+
+  if ok && shape != "unknown" {
+      if finding_uid == "" { finding_uid = uuid_v4() }
+      if title == "" { title = "InsightVM finding " + finding_uid }
+
+      finding_info = { "uid": finding_uid, "title": title, "data_sources": ["rapid7_insightvm"] }
+      if length(types) > 0 { finding_info.types = types }
+      finding_info.analytic = { "name": "Rapid7 InsightVM", "type_id": 1, "type": "Rule" }
+
+      . = {
+          "class_uid": 2004,
+          "class_name": "Detection Finding",
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": 200400 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "is_alert": severity_id >= 4,
+          "time": time_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_name": "insightvm-" + shape,
+              "product": { "name": "InsightVM", "vendor_name": "Rapid7" }
+          },
+          "finding_info": finding_info
+      }
+
+      res = {}
+      if match(host_ip, ip_re) { res.ip = host_ip }
+      if host_name != "" { res.hostname = downcase(host_name); res.name = host_name }
+      if !exists(res.name) && exists(res.ip) { res.name = host_ip }
+      if !exists(res.name) && asset_id != "" { res.uid = asset_id }
+      if length(res) > 0 {
+          res.type = "Host"
+          # InsightVM's asset risk score is a rolled-up per-asset number, which
+          # is exactly what resource_details.device.risk_score is for. It is
+          # NOT the event's risk_score — that is owned by nano's RBA engine.
+          if risk >= 0.0 {
+              dev = { "type_id": 0, "risk_score": to_int(round(risk)) }
+              if exists(res.hostname) { dev.hostname = res.hostname }
+              if exists(res.ip) { dev.ip = res.ip }
+              res.device = dev
+          }
+          .resources = [res]
+      }
+
+      if match(host_ip, ip_re) {
+          de = { "ip": host_ip }
+          if port != 0 { de.port = port }
+          if host_name != "" { de.hostname = downcase(host_name) }
+          .evidences = [{ "dst_endpoint": de }]
+      }
+
+      if length(cves) > 0 {
+          vulns = []
+          for_each(cves) -> |_i, c| {
+              v = { "cve": { "uid": to_string(c) ?? "" } }
+              if title != "" { v.title = title }
+              if severity != "" { v.severity = severity }
+              if solution != "" { v.remediation = { "desc": solution } }
+              if shape == "remediation" { v.is_fix_available = true }
+              vulns = push(vulns, v)
+          }
+          .vulnerabilities = vulns
+      } else if solution != "" {
+          .remediation = { "desc": solution }
+      }
+
+      # See the qualys parser: `evidences.*` and `vulnerabilities[].cve.uid`
+      # are not addressable in nPL, so pivotable entities are ALSO emitted as
+      # OCSF observables, which ARE promoted.
+      obs = []
+      for_each(cves) -> |_i, c| {
+          cv = to_string(c) ?? ""
+          if cv != "" { obs = push(obs, { "name": "vulnerabilities.cve.uid", "type": "CVE Object: uid", "type_id": 18, "value": cv }) }
+      }
+      if match(host_ip, ip_re) { obs = push(obs, { "name": "resources.ip", "type": "IP Address", "type_id": 2, "value": host_ip }) }
+      if host_name != "" { obs = push(obs, { "name": "resources.hostname", "type": "Hostname", "type_id": 1, "value": downcase(host_name) }) }
+      if length(obs) > 0 { .observables = obs }
+
+      if length(unmapped) > 0 { .unmapped = unmapped }
+  } else {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_name": "insightvm",
+              "product": { "name": "InsightVM", "vendor_name": "Rapid7" }
+          }
+      }
+      if !ok { .metadata.log_level = "error" }
+  }
+
+  .
+
+# Runtime samples (NAN-2327): one per event shape this parser routes.
+# `class_uid` is asserted because class routing is the whole point of the
+# OCSF conversion — a silent reroute is the defect most likely to survive
+# a compile-only check.
+samples:
+  - raw: '{"type":"asset","id":"asset-4471","ip":"10.95.2.8","hostname":"db03.corp.example","fqdn":"db03.corp.example","os_name":"Windows Server 2022","mac_address":"00:11:22:33:44:55","site_name":"Prod DMZ","risk_score":15230.5,"vulnerabilities":{"total":47,"critical":3,"severe":19,"moderate":21,"low":4},"tags":["pci","prod"],"last_assessed_for_vulnerabilities":"2026-08-12T06:00:00Z","last_scan_id":"scan-771"}'
+    expect:
+      class_uid: 2004
+      activity_id: 2
+  - raw: '{"type":"remediation","vulnerability_id":"ssl-cve-2026-1234","title":"OpenSSL Remote Code Execution","ip":"10.95.2.7","hostname":"app02.corp.example","solution":"Upgrade OpenSSL to 3.0.14 or later","solution_id":"openssl-upgrade","verified_by":"scan-802","remediated_date":"2026-08-15T04:00:00Z","cves":["CVE-2026-1234"],"severity":"Critical"}'
+    expect:
+      class_uid: 2004
+      activity_id: 3
+  - raw: '{"foo":"bar"}'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: '{"type":"vulnerability","vulnerability_id":"ssl-cve-2026-1234","title":"OpenSSL Remote Code Execution","severity":"Critical","cvss_v3_score":9.8,"cvss_v2_score":10.0,"cvss_v3_vector":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H","cves":["CVE-2026-1234"],"ip":"10.95.2.7","hostname":"app02.corp.example","os_name":"Ubuntu Linux","os_version":"24.04","port":443,"protocol":"tcp","service":"https","status":"vulnerable-version","risk_score":892.4,"exploits":3,"malware_kits":1,"proof":"Version banner reports OpenSSL 3.0.1","solution":"Upgrade OpenSSL to 3.0.14 or later","solution_id":"openssl-upgrade","categories":["Web","Encryption"],"scan_id":"scan-771","first_found":"2026-07-01T00:00:00Z","last_found":"2026-08-12T06:00:00Z","site_name":"Prod DMZ"}'
+    expect:
+      class_uid: 2004
+      activity_id: 1

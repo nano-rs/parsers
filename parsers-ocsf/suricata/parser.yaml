@@ -1,0 +1,690 @@
+name: suricata_ocsf
+display_name: Suricata IDS/IPS (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Suricata EVE JSON into OCSF 1.9.0, routed on event_type:
+  alert and anomaly -> Detection Finding (2004); dns -> DNS Activity (4003);
+  http -> HTTP Activity (4002); dhcp -> DHCP Activity (4004); flow, netflow,
+  drop, tls, ssh, smb, krb5, rdp, quic, sip, nfs, dcerpc, tftp, ikev2, mqtt,
+  snmp, fileinfo, smtp, stats and every other EVE record -> Network Activity
+  (4001), carrying app_protocol_name and the protocol-specific detail under
+  unmapped.*. A line that is not JSON still emits a Network Activity record
+  with activity_id 99 and the raw line in `message`.
+match_values:
+  - suricata
+category: security
+vendor: "OISF"
+product: "Suricata"
+parser_vrl: |
+  # Suricata EVE JSON -> OCSF 1.9.0
+
+  raw_log = to_string(.message) ?? ""
+  parsed, perr = parse_json(raw_log)
+  ev = {}
+  if perr == null && is_object(parsed) { ev = object!(parsed) }
+
+  # ---- time ----
+  time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
+  tsv = to_string(ev.timestamp) ?? ""
+  if tsv != "" {
+      ts, ts_err = parse_timestamp(tsv, "%Y-%m-%dT%H:%M:%S%.f%z")
+      if ts_err == null {
+          time_ms = to_int(to_unix_timestamp(ts, unit: "milliseconds"))
+      } else {
+          ts2, ts2_err = parse_timestamp(tsv, "%+")
+          if ts2_err == null { time_ms = to_int(to_unix_timestamp(ts2, unit: "milliseconds")) }
+      }
+  }
+
+  event_type = downcase(to_string(ev.event_type) ?? "")
+  src_ip = to_string(ev.src_ip) ?? ""
+  dst_ip = to_string(ev.dest_ip) ?? ""
+  src_port = to_int(to_string(ev.src_port) ?? "") ?? 0
+  dst_port = to_int(to_string(ev.dest_port) ?? "") ?? 0
+  proto = downcase(to_string(ev.proto) ?? "")
+  app_proto = downcase(to_string(ev.app_proto) ?? "")
+  iface = to_string(ev.in_iface) ?? ""
+  flow_id = to_string(ev.flow_id) ?? ""
+  community_id = to_string(ev.community_id) ?? ""
+  host = to_string(ev.host) ?? ""
+
+  proto_num = 0
+  if proto == "tcp" { proto_num = 6 }
+  if proto == "udp" { proto_num = 17 }
+  if proto == "icmp" { proto_num = 1 }
+  if proto == "ipv6-icmp" { proto_num = 58 }
+  if proto == "gre" { proto_num = 47 }
+  if proto == "esp" { proto_num = 50 }
+  if proto == "sctp" { proto_num = 132 }
+
+  # ---- flow volumes (present on alert, flow and netflow records) ----
+  bytes_out = 0
+  bytes_in = 0
+  pkts_out = 0
+  pkts_in = 0
+  flow_state = ""
+  if is_object(ev.flow) {
+      fl = object!(ev.flow)
+      bytes_out = to_int(to_string(fl.bytes_toserver) ?? "") ?? 0
+      bytes_in = to_int(to_string(fl.bytes_toclient) ?? "") ?? 0
+      pkts_out = to_int(to_string(fl.pkts_toserver) ?? "") ?? 0
+      pkts_in = to_int(to_string(fl.pkts_toclient) ?? "") ?? 0
+      flow_state = downcase(to_string(fl.state) ?? "")
+  }
+  if is_object(ev.netflow) {
+      nf = object!(ev.netflow)
+      if bytes_out == 0 { bytes_out = to_int(to_string(nf.bytes) ?? "") ?? 0 }
+      if pkts_out == 0 { pkts_out = to_int(to_string(nf.pkts) ?? "") ?? 0 }
+  }
+
+  # ---- defaults ----
+  route = "network"
+  activity_id = 6
+  activity_name = "Traffic"
+  action_id = 3
+  action = "Observed"
+  disposition_id = 17
+  disposition = "Logged"
+  status_id = 1
+  status_str = "Success"
+  severity_id = 1
+  severity = "Informational"
+
+  sig = ""
+  sig_id = ""
+  sig_category = ""
+  sig_action = ""
+  sig_gid = ""
+  sig_rev = ""
+  mitre_ids = []
+
+  if event_type == "alert" && is_object(ev.alert) {
+      route = "finding"
+      a = object!(ev.alert)
+      sig = to_string(a.signature) ?? ""
+      sig_id = to_string(a.signature_id) ?? ""
+      sig_category = to_string(a.category) ?? ""
+      sig_action = downcase(to_string(a.action) ?? "")
+      sig_gid = to_string(a.gid) ?? ""
+      sig_rev = to_string(a.rev) ?? ""
+      sev_num = to_int(to_string(a.severity) ?? "") ?? 3
+      severity_id = 2
+      severity = "Low"
+      if sev_num == 1 { severity_id = 4; severity = "High" }
+      if sev_num == 2 { severity_id = 3; severity = "Medium" }
+      if is_object(a.metadata) {
+          md = object!(a.metadata)
+          if is_array(md.mitre_technique_id) { mitre_ids = array!(md.mitre_technique_id) }
+      }
+      activity_id = 1
+      activity_name = "Create"
+      if sig_action == "blocked" || sig_action == "drop" || sig_action == "rejected" {
+          action_id = 2
+          action = "Denied"
+          disposition_id = 2
+          disposition = "Blocked"
+      } else {
+          action_id = 3
+          action = "Observed"
+          disposition_id = 15
+          disposition = "Detected"
+      }
+  } else if event_type == "anomaly" {
+      route = "finding"
+      activity_id = 1
+      activity_name = "Create"
+      severity_id = 2
+      severity = "Low"
+      disposition_id = 15
+      disposition = "Detected"
+      if is_object(ev.anomaly) {
+          an = object!(ev.anomaly)
+          sig = to_string(an.event) ?? ""
+          sig_category = to_string(an.type) ?? ""
+      }
+      if sig == "" { sig = "Suricata anomaly" }
+      sig_id = sig
+  } else if event_type == "dns" {
+      route = "dns"
+  } else if event_type == "http" {
+      route = "http"
+  } else if event_type == "dhcp" {
+      route = "dhcp"
+  } else if event_type == "drop" {
+      activity_id = 5
+      activity_name = "Refuse"
+      action_id = 2
+      action = "Denied"
+      disposition_id = 6
+      disposition = "Dropped"
+      status_id = 2
+      status_str = "Failure"
+      severity_id = 2
+      severity = "Low"
+  } else if event_type == "flow" || event_type == "netflow" {
+      activity_id = 6
+      activity_name = "Traffic"
+      if flow_state == "closed" || flow_state == "closing" { activity_id = 2; activity_name = "Close" }
+  } else if event_type == "stats" {
+      activity_id = 99
+      activity_name = "Other"
+  }
+  if event_type == "" { activity_id = 99; activity_name = "Other" }
+
+  # ---- shared objects ----
+  src = {}
+  if src_ip != "" { src.ip = downcase(src_ip) }
+  if src_port > 0 { src.port = src_port }
+  if iface != "" { src.interface_name = iface }
+  dst = {}
+  if dst_ip != "" { dst.ip = downcase(dst_ip) }
+  if dst_port > 0 { dst.port = dst_port }
+  if app_proto != "" && app_proto != "failed" && app_proto != "unknown" { dst.svc_name = app_proto }
+
+  traffic = {}
+  if bytes_in > 0 { traffic.bytes_in = bytes_in }
+  if bytes_out > 0 { traffic.bytes_out = bytes_out }
+  if pkts_in > 0 { traffic.packets_in = pkts_in }
+  if pkts_out > 0 { traffic.packets_out = pkts_out }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": uuid_v4(),
+      "log_source": "suricata",
+      "log_provider": "Suricata EVE",
+      "profiles": ["host", "security_control"],
+      "product": {
+          "name": "Suricata",
+          "vendor_name": "OISF",
+          "feature": { "name": "ids" }
+      }
+  }
+  if event_type != "" { metadata.log_name = event_type }
+  if flow_id != "" { metadata.correlation_uid = flow_id }
+
+  device = { "type_id": 13, "type": "IDS" }
+  has_device = false
+  if host != "" { device.hostname = host; has_device = true }
+
+  unmapped = {}
+  if community_id != "" { unmapped.community_id = community_id }
+  if flow_id != "" { unmapped.flow_id = flow_id }
+  if event_type != "" { unmapped.eve_event_type = event_type }
+  if app_proto != "" { unmapped.app_proto = app_proto }
+  if flow_state != "" { unmapped.flow_state = flow_state }
+  if perr != null { unmapped.parse_status = "not_json" }
+
+  # protocol-specific detail that OCSF 4001 has no home for
+  if is_object(ev.tls) {
+      tl = object!(ev.tls)
+      sni = to_string(tl.sni) ?? ""
+      if sni != "" { unmapped.tls_sni = sni }
+      tv2 = to_string(tl.version) ?? ""
+      if tv2 != "" { unmapped.tls_version = tv2 }
+      ja3o = tl.ja3
+      if is_object(ja3o) { unmapped.tls_ja3 = to_string(object!(ja3o).hash) ?? "" }
+      subj = to_string(tl.subject) ?? ""
+      if subj != "" { unmapped.tls_subject = subj }
+  }
+  if is_object(ev.ssh) {
+      sh = object!(ev.ssh)
+      if is_object(sh.client) { unmapped.ssh_client_version = to_string(object!(sh.client).software_version) ?? "" }
+      if is_object(sh.server) { unmapped.ssh_server_version = to_string(object!(sh.server).software_version) ?? "" }
+  }
+  if is_object(ev.smtp) {
+      sp2 = object!(ev.smtp)
+      mf = to_string(sp2.mail_from) ?? ""
+      if mf != "" { unmapped.smtp_mail_from = mf }
+      hl = to_string(sp2.helo) ?? ""
+      if hl != "" { unmapped.smtp_helo = hl }
+  }
+  if is_object(ev.smb) {
+      sb = object!(ev.smb)
+      cmd = to_string(sb.command) ?? ""
+      if cmd != "" { unmapped.smb_command = cmd }
+      shr = to_string(sb.share) ?? ""
+      if shr != "" { unmapped.smb_share = shr }
+  }
+  if is_object(ev.krb5) {
+      kb = object!(ev.krb5)
+      cn = to_string(kb.cname) ?? ""
+      if cn != "" { unmapped.krb5_cname = cn }
+      rl = to_string(kb.realm) ?? ""
+      if rl != "" { unmapped.krb5_realm = rl }
+  }
+  if is_object(ev.rdp) {
+      rp = object!(ev.rdp)
+      ec = to_string(rp.event_type) ?? ""
+      if ec != "" { unmapped.rdp_event = ec }
+  }
+
+  obs = []
+  if src_ip != "" { obs = push(obs, { "name": "src_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(src_ip) }) }
+  if dst_ip != "" { obs = push(obs, { "name": "dst_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(dst_ip) }) }
+
+  # ---- file (fileinfo) ----
+  file_obj = {}
+  if is_object(ev.fileinfo) {
+      fi = object!(ev.fileinfo)
+      fn = to_string(fi.filename) ?? ""
+      if fn != "" { file_obj = { "name": fn, "path": fn, "type_id": 1 } }
+      sha = to_string(fi.sha256) ?? ""
+      md5 = to_string(fi.md5) ?? ""
+      hashes = []
+      if sha != "" { hashes = push(hashes, { "algorithm_id": 3, "algorithm": "SHA-256", "value": sha }) }
+      if md5 != "" { hashes = push(hashes, { "algorithm_id": 1, "algorithm": "MD5", "value": md5 }) }
+      if length(hashes) > 0 && length(file_obj) > 0 { file_obj.hashes = hashes }
+      if sha != "" { obs = push(obs, { "name": "file.hashes.value", "type": "Fingerprint", "type_id": 30, "value": sha }) }
+      fs = to_int(to_string(fi.size) ?? "") ?? 0
+      if fs > 0 && length(file_obj) > 0 { file_obj.size = fs }
+  }
+
+  # ============================================================
+  # Assemble
+  # ============================================================
+  if route == "finding" {
+      class_uid = 2004
+      title = sig
+      if title == "" { title = "Suricata detection" }
+      fuid = sig_id
+      if fuid == "" { fuid = title }
+      evidence = {}
+      if length(src) > 0 { evidence.src_endpoint = src }
+      if length(dst) > 0 { evidence.dst_endpoint = dst }
+      if proto_num > 0 { evidence.connection_info = { "direction_id": 0, "protocol_num": proto_num } }
+      if length(file_obj) > 0 { evidence.file = file_obj }
+      evidence.name = "network detection"
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Detection Finding",
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": 1,
+          "activity_name": "Create",
+          "type_uid": class_uid * 100 + 1,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "is_alert": true,
+          "metadata": metadata,
+          "finding_info": {
+              "uid": fuid,
+              "title": title,
+              "data_sources": ["suricata"],
+              "analytic": { "name": title, "uid": fuid, "type_id": 1, "type": "Rule" }
+          },
+          "evidences": [evidence]
+      }
+      if sig_category != "" { .finding_info.types = [sig_category] }
+      if sig_gid != "" { .metadata.event_code = sig_gid + ":" + sig_id + ":" + sig_rev }
+      if length(mitre_ids) > 0 {
+          attacks = []
+          for_each(mitre_ids) -> |_i, t| {
+              attacks = push(attacks, { "technique": { "uid": to_string(t) ?? "" }, "version": "v15" })
+          }
+          .attacks = attacks
+      }
+      if has_device { .device = device }
+      if sig_action != "" { .unmapped = { "suricata_action": sig_action } }
+
+  } else if route == "dns" {
+      class_uid = 4003
+      dnso = {}
+      if is_object(ev.dns) { dnso = object!(ev.dns) }
+      dtype = downcase(to_string(dnso.type) ?? "")
+      dns_activity = 1
+      dns_activity_name = "Query"
+      if dtype == "answer" || dtype == "response" { dns_activity = 2; dns_activity_name = "Response" }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "DNS Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": dns_activity,
+          "activity_name": dns_activity_name,
+          "type_uid": class_uid * 100 + dns_activity,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": { "direction_id": 0, "protocol_num": proto_num }
+      }
+      if proto != "" { .connection_info.protocol_name = proto }
+      qname = to_string(dnso.rrname) ?? ""
+      qtype = to_string(dnso.rrtype) ?? ""
+      q = {}
+      if qname != "" { q.hostname = qname }
+      if qtype != "" { q.type = qtype }
+      if length(q) > 0 { .query = q }
+      rcode = to_string(dnso.rcode) ?? ""
+      if rcode != "" { .rcode = rcode }
+      txid = to_int(to_string(dnso.id) ?? "") ?? 0
+      if txid > 0 { .transaction_id = txid }
+      if is_array(dnso.answers) {
+          answers = []
+          for_each(array!(dnso.answers)) -> |_i, a2| {
+              if is_object(a2) {
+                  ao = object!(a2)
+                  rd = to_string(ao.rdata) ?? ""
+                  if rd != "" {
+                      ans = { "rdata": rd }
+                      at = to_string(ao.rrtype) ?? ""
+                      if at != "" { ans.type = at }
+                      ttl = to_int(to_string(ao.ttl) ?? "") ?? 0
+                      if ttl > 0 { ans.ttl = ttl }
+                      answers = push(answers, ans)
+                  }
+              }
+          }
+          if length(answers) > 0 { .answers = answers }
+      }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if length(src) == 0 && length(dst) == 0 { .dst_endpoint = { "svc_name": "dns" } }
+      if has_device { .device = device }
+      if qname != "" { obs = push(obs, { "name": "query.hostname", "type": "Hostname", "type_id": 1, "value": qname }) }
+
+  } else if route == "http" {
+      class_uid = 4002
+      ho = {}
+      if is_object(ev.http) { ho = object!(ev.http) }
+      method = upcase(to_string(ho.http_method) ?? "")
+      http_activity = 99
+      http_activity_name = "Other"
+      if method == "CONNECT" { http_activity = 1;  http_activity_name = "Connect" }
+      if method == "DELETE"  { http_activity = 2;  http_activity_name = "Delete" }
+      if method == "GET"     { http_activity = 3;  http_activity_name = "Get" }
+      if method == "HEAD"    { http_activity = 4;  http_activity_name = "Head" }
+      if method == "OPTIONS" { http_activity = 5;  http_activity_name = "Options" }
+      if method == "POST"    { http_activity = 6;  http_activity_name = "Post" }
+      if method == "PUT"     { http_activity = 7;  http_activity_name = "Put" }
+      if method == "TRACE"   { http_activity = 8;  http_activity_name = "Trace" }
+      if method == "PATCH"   { http_activity = 9;  http_activity_name = "Patch" }
+      hostname = to_string(ho.hostname) ?? ""
+      url_path = to_string(ho.url) ?? ""
+      code = to_int(to_string(ho.status) ?? "") ?? 0
+      hstatus = "Unknown"
+      if code > 0 && code < 400 { status_id = 1; status_str = "Success"; hstatus = "Success" }
+      if code >= 400 { status_id = 2; status_str = "Failure"; hstatus = "Failure" }
+      url = {}
+      if hostname != "" { url.hostname = hostname }
+      if url_path != "" { url.path = url_path }
+      if hostname != "" && url_path != "" { url.url_string = "http://" + hostname + url_path }
+      req = {}
+      if http_activity != 99 { req.http_method = method }
+      ua = to_string(ho.http_user_agent) ?? ""
+      if ua != "" { req.user_agent = ua }
+      rf = to_string(ho.http_refer) ?? ""
+      if rf != "" { req.referrer = rf }
+      if length(url) > 0 { req.url = url }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": http_activity,
+          "activity_name": http_activity_name,
+          "type_uid": class_uid * 100 + http_activity,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "http_request": req,
+          "connection_info": { "direction_id": 0, "protocol_num": proto_num }
+      }
+      if proto != "" { .connection_info.protocol_name = proto }
+      if code > 0 {
+          resp = { "code": code, "status": hstatus }
+          ct = to_string(ho.http_content_type) ?? ""
+          if ct != "" { resp.content_type = ct }
+          ln = to_int(to_string(ho.length) ?? "") ?? 0
+          if ln > 0 { resp.length = ln }
+          .http_response = resp
+      }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if length(src) == 0 && length(dst) == 0 { .dst_endpoint = { "svc_name": "http" } }
+      if length(traffic) > 0 { .traffic = traffic }
+      if length(file_obj) > 0 { .file = file_obj }
+      if has_device { .device = device }
+      if ua != "" { obs = push(obs, { "name": "http_request.user_agent", "type": "HTTP User-Agent", "type_id": 16, "value": ua }) }
+
+  } else if route == "dhcp" {
+      class_uid = 4004
+      dh = {}
+      if is_object(ev.dhcp) { dh = object!(ev.dhcp) }
+      dtype = downcase(to_string(dh.dhcp_type) ?? "")
+      dhcp_activity = 99
+      dhcp_activity_name = "Other"
+      if dtype == "discover" { dhcp_activity = 1; dhcp_activity_name = "Discover" }
+      if dtype == "offer"    { dhcp_activity = 2; dhcp_activity_name = "Offer" }
+      if dtype == "request"  { dhcp_activity = 3; dhcp_activity_name = "Request" }
+      if dtype == "decline"  { dhcp_activity = 4; dhcp_activity_name = "Decline" }
+      if dtype == "ack"      { dhcp_activity = 5; dhcp_activity_name = "Ack" }
+      if dtype == "nak"      { dhcp_activity = 6; dhcp_activity_name = "Nak" }
+      if dtype == "release"  { dhcp_activity = 7; dhcp_activity_name = "Release" }
+      if dtype == "inform"   { dhcp_activity = 8; dhcp_activity_name = "Inform" }
+      cmac = to_string(dh.client_mac) ?? ""
+      aip = to_string(dh.assigned_ip) ?? ""
+      csrc = src
+      if cmac != "" { csrc.mac = downcase(cmac) }
+      if aip != "" && aip != "0.0.0.0" { csrc.ip = downcase(aip) }
+      hn = to_string(dh.hostname) ?? ""
+      if hn != "" { csrc.hostname = hn }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "DHCP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": dhcp_activity,
+          "activity_name": dhcp_activity_name,
+          "type_uid": class_uid * 100 + dhcp_activity,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": { "direction_id": 0, "protocol_num": proto_num }
+      }
+      if length(csrc) > 0 { .src_endpoint = csrc }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if length(csrc) == 0 && length(dst) == 0 { .dst_endpoint = { "svc_name": "dhcp", "port": 67 } }
+      lt = to_int(to_string(dh.lease_time) ?? "") ?? 0
+      if lt > 0 { .lease_dur = lt }
+      if has_device { .device = device }
+
+  } else {
+      class_uid = 4001
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Network Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": { "direction_id": 0, "protocol_num": proto_num }
+      }
+      if proto != "" { .connection_info.protocol_name = proto }
+      if community_id != "" { .connection_info.community_uid = community_id }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if length(src) == 0 && length(dst) == 0 {
+          fb = {}
+          if host != "" { fb.hostname = host }
+          if length(fb) == 0 { fb.hostname = "unknown" }
+          .src_endpoint = fb
+      }
+      if length(traffic) > 0 { .traffic = traffic }
+      if app_proto != "" && app_proto != "failed" { .app_protocol_name = app_proto }
+      # 4001 Network Activity defines no `file` — carry fileinfo detail as
+      # unmapped scalars instead of inventing an attribute.
+      if length(file_obj) > 0 {
+          unmapped.file_name = to_string(file_obj.name)
+          unmapped.file_size = to_string(file_obj.size)
+      }
+      if has_device { .device = device }
+  }
+
+  if length(unmapped) > 0 {
+      if exists(.unmapped) {
+          .unmapped = merge(object!(.unmapped), unmapped)
+      } else {
+          .unmapped = unmapped
+      }
+  }
+  if length(obs) > 0 { .observables = obs }
+
+  .
+samples:
+- raw: '{"timestamp":"2024-10-30T09:46:12.123456+0000","flow_id":1234567890,"in_iface":"eth0","event_type":"alert","src_ip":"203.0.113.9","src_port":44001,"dest_ip":"10.10.1.7","dest_port":445,"proto":"TCP","community_id":"1:abc=","alert":{"action":"blocked","gid":1,"signature_id":2001219,"rev":5,"signature":"ET EXPLOIT SMB MS17-010","category":"Attempted Administrator Privilege Gain","severity":1,"metadata":{"mitre_technique_id":["T1210"]}},"flow":{"pkts_toserver":12,"pkts_toclient":3,"bytes_toserver":2048,"bytes_toclient":512,"start":"2024-10-30T09:46:10.000000+0000"},"host":"ids-sensor-1"}
+
+    '
+  expect:
+    class_uid: 2004
+    activity_id: 1
+    finding_info.uid: '2001219'
+    disposition_id: 2
+- raw: '{"timestamp":"2024-10-30T09:54:12.123456+0000","flow_id":999,"event_type":"anomaly","src_ip":"203.0.113.44","src_port":1,"dest_ip":"10.10.1.20","dest_port":1,"proto":"TCP","anomaly":{"type":"decoder","event":"decoder.ipv4.opt_invalid_len"}}
+
+    '
+  expect:
+    class_uid: 2004
+    activity_id: 1
+    finding_info.uid: decoder.ipv4.opt_invalid_len
+    disposition_id: 15
+- raw: '{"timestamp":"2024-10-30T09:52:12.123456+0000","flow_id":777,"event_type":"dhcp","src_ip":"0.0.0.0","src_port":68,"dest_ip":"255.255.255.255","dest_port":67,"proto":"UDP","dhcp":{"type":"request","id":12345,"client_mac":"00:0c:29:3a:1b:5f","assigned_ip":"10.10.1.99","dhcp_type":"request","hostname":"LAPTOP-7","lease_time":86400}}
+
+    '
+  expect:
+    class_uid: 4004
+    activity_id: 3
+    src_endpoint.ip: 10.10.1.99
+    dst_endpoint.ip: 255.255.255.255
+    disposition_id: 17
+- raw: '{"timestamp":"2024-10-30T09:48:12.123456+0000","flow_id":333,"event_type":"dns","src_ip":"10.10.1.55","src_port":51000,"dest_ip":"8.8.8.8","dest_port":53,"proto":"UDP","dns":{"type":"answer","id":42513,"rcode":"NOERROR","rrname":"example.com","rrtype":"A","answers":[{"rrname":"example.com","rrtype":"A","ttl":300,"rdata":"93.184.216.34"}]},"host":"ids-sensor-1"}
+
+    '
+  expect:
+    class_uid: 4003
+    activity_id: 2
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 8.8.8.8
+    query.hostname: example.com
+    disposition_id: 17
+- raw: '{"timestamp":"2024-10-30T09:48:11.123456+0000","flow_id":333,"event_type":"dns","src_ip":"10.10.1.55","src_port":51000,"dest_ip":"8.8.8.8","dest_port":53,"proto":"UDP","dns":{"type":"query","id":42513,"rrname":"example.com","rrtype":"A"}}
+
+    '
+  expect:
+    class_uid: 4003
+    activity_id: 1
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 8.8.8.8
+    query.hostname: example.com
+    disposition_id: 17
+- raw: '{"timestamp":"2024-10-30T09:53:12.123456+0000","flow_id":888,"event_type":"drop","src_ip":"203.0.113.44","src_port":44112,"dest_ip":"10.10.1.20","dest_port":3389,"proto":"TCP","drop":{"len":60,"tos":0,"ttl":64,"ipid":1234}}
+
+    '
+  expect:
+    class_uid: 4001
+    activity_id: 5
+    src_endpoint.ip: 203.0.113.44
+    dst_endpoint.ip: 10.10.1.20
+    disposition_id: 6
+- raw: '{"timestamp":"2024-10-30T09:51:12.123456+0000","flow_id":666,"event_type":"fileinfo","src_ip":"93.184.216.34","src_port":80,"dest_ip":"10.10.1.55","dest_port":51425,"proto":"TCP","app_proto":"http","fileinfo":{"filename":"/payload.exe","sid":[],"md5":"d41d8cd98f00b204e9800998ecf8427e","sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","state":"CLOSED","stored":false,"size":10240,"tx_id":0}}
+
+    '
+  expect:
+    class_uid: 4001
+    activity_id: 6
+    src_endpoint.ip: 93.184.216.34
+    dst_endpoint.ip: 10.10.1.55
+    disposition_id: 17
+- raw: '{"timestamp":"2024-10-30T09:47:12.123456+0000","flow_id":222,"event_type":"flow","src_ip":"10.10.1.55","src_port":51422,"dest_ip":"93.184.216.34","dest_port":443,"proto":"TCP","app_proto":"tls","flow":{"pkts_toserver":14,"pkts_toclient":10,"bytes_toserver":4210,"bytes_toclient":11111,"state":"closed","reason":"timeout"},"host":"ids-sensor-1"}
+
+    '
+  expect:
+    class_uid: 4001
+    activity_id: 2
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 93.184.216.34
+    disposition_id: 17
+- raw: '{"timestamp":"2024-10-30T09:49:12.123456+0000","flow_id":444,"event_type":"http","src_ip":"10.10.1.55","src_port":51423,"dest_ip":"93.184.216.34","dest_port":80,"proto":"TCP","app_proto":"http","http":{"hostname":"malware.example.com","url":"/payload.exe","http_user_agent":"curl/8.1.0","http_content_type":"application/octet-stream","http_method":"GET","protocol":"HTTP/1.1","status":200,"length":10240,"http_refer":"http://example.com/"},"host":"ids-sensor-1"}
+
+    '
+  expect:
+    class_uid: 4002
+    activity_id: 3
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 93.184.216.34
+    http_request.url.path: /payload.exe
+    disposition_id: 17
+- raw: this is not json at all
+  expect:
+    class_uid: 4001
+    activity_id: 99
+    disposition_id: 17
+- raw: '{"timestamp":"2024-10-30T09:55:12.123456+0000","flow_id":1010,"event_type":"ssh","src_ip":"10.10.1.55","src_port":51426,"dest_ip":"10.10.1.7","dest_port":22,"proto":"TCP","app_proto":"ssh","ssh":{"client":{"proto_version":"2.0","software_version":"OpenSSH_9.0"},"server":{"proto_version":"2.0","software_version":"OpenSSH_8.9p1"}}}
+
+    '
+  expect:
+    class_uid: 4001
+    activity_id: 6
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 10.10.1.7
+    disposition_id: 17
+- raw: '{"timestamp":"2024-10-30T09:56:12.123456+0000","event_type":"stats","stats":{"uptime":3600,"capture":{"kernel_packets":100000,"kernel_drops":12}}}
+
+    '
+  expect:
+    class_uid: 4001
+    activity_id: 99
+    disposition_id: 17
+- raw: '{"timestamp":"2024-10-30T09:50:12.123456+0000","flow_id":555,"event_type":"tls","src_ip":"10.10.1.55","src_port":51424,"dest_ip":"93.184.216.34","dest_port":443,"proto":"TCP","tls":{"subject":"CN=example.com","issuerdn":"CN=DigiCert","sni":"example.com","version":"TLS 1.3","ja3":{"hash":"e7d705a3286e19ea42f587b344ee6865"}}}
+
+    '
+  expect:
+    class_uid: 4001
+    activity_id: 6
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 93.184.216.34
+    disposition_id: 17

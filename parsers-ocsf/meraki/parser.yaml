@@ -1,0 +1,484 @@
+name: meraki_ocsf
+display_name: Cisco Meraki (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Cisco Meraki syslog (<PRI>1 EPOCH DEVICE LOGTYPE key=value ...) into
+  OCSF 1.9.0. `flows` and MX firewall events route to Network Activity (4001);
+  `ids-alerts` and `security_event` route to Detection Finding (2004); `urls`
+  routes to HTTP Activity (4002); `events` of type 8021x_auth route to
+  Authentication (3002). Every other `events` payload (VPN connectivity,
+  association, switch port state) and any line whose Meraki header does not
+  match still emits a Network Activity record with activity_id 99 and the raw
+  line in `message` — unlike the UDM parser this one never aborts.
+match_values:
+  - meraki
+category: network
+vendor: "Cisco"
+product: "Meraki"
+parser_vrl: |
+  # Cisco Meraki -> OCSF 1.9.0
+
+  raw_log = string!(.message)
+
+  time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
+  device_name = ""
+  log_type = ""
+  rest = raw_log
+
+  hm, he = parse_regex(raw_log, r'^<(?P<pri>\d+)>\d*\s*(?P<epoch>[\d.]+)\s+(?P<device>\S+)\s+(?P<logtype>\S+)\s+(?P<rest>.*)$')
+  if he == null && hm != null {
+      device_name = string!(hm.device)
+      log_type = downcase(string!(hm.logtype))
+      rest = string!(hm.rest)
+      ep, epe = parse_regex(string!(hm.epoch), r'^(?P<secs>\d+)')
+      if epe == null && ep != null {
+          secs = to_int(ep.secs) ?? 0
+          if secs > 0 { time_ms = secs * 1000 }
+      }
+  }
+
+  # ---- pull the trailing free-text tail (pattern: / message: / request:) ----
+  kv_str = rest
+  pattern_val = ""
+  ids_message = ""
+  http_method = ""
+  url_raw = ""
+
+  pm, pe = parse_regex(rest, r'^(?P<kvpart>.*?)\s*pattern:\s*(?P<pattern>.+)$')
+  if pe == null && pm != null {
+      kv_str = string!(pm.kvpart)
+      pattern_val = downcase(string!(pm.pattern))
+  }
+  mm, me = parse_regex(rest, r'^(?P<kvpart>.*?)\s*message:\s*(?P<msg>.+)$')
+  if me == null && mm != null {
+      kv_str = string!(mm.kvpart)
+      ids_message = string!(mm.msg)
+  }
+  rm, re = parse_regex(rest, r'^(?P<kvpart>.*?)\s*request:\s*(?P<method>\S+)\s+(?P<url>.+)$')
+  if re == null && rm != null {
+      kv_str = string!(rm.kvpart)
+      http_method = upcase(string!(rm.method))
+      url_raw = string!(rm.url)
+  }
+
+  kv = parse_key_value(kv_str, key_value_delimiter: "=", field_delimiter: " ") ?? {}
+
+  # ---- endpoints: Meraki writes ip, ip:port, or ip:port:iface ----
+  src_raw = to_string(kv.src) ?? ""
+  dst_raw = to_string(kv.dst) ?? ""
+  src_ip = ""
+  src_port = 0
+  dst_ip = ""
+  dst_port = 0
+  if src_raw != "" {
+      sm2, se2 = parse_regex(src_raw, r'^(?P<ip>[^:]+):(?P<port>\d+)')
+      if se2 == null && sm2 != null {
+          src_ip = string!(sm2.ip)
+          src_port = to_int(sm2.port) ?? 0
+      } else {
+          src_ip = src_raw
+      }
+  }
+  if dst_raw != "" {
+      dm2, de2 = parse_regex(dst_raw, r'^(?P<ip>[^:]+):(?P<port>\d+)')
+      if de2 == null && dm2 != null {
+          dst_ip = string!(dm2.ip)
+          dst_port = to_int(dm2.port) ?? 0
+      } else {
+          dst_ip = dst_raw
+      }
+  }
+  if src_ip == "" { src_ip = to_string(kv.sip) ?? "" }
+  if dst_ip == "" { dst_ip = to_string(kv.dip) ?? "" }
+  if src_port == 0 { src_port = to_int(to_string(kv.sport) ?? "") ?? 0 }
+  if dst_port == 0 { dst_port = to_int(to_string(kv.dport) ?? "") ?? 0 }
+
+  client_mac = to_string(kv.mac) ?? ""
+  proto = downcase(to_string(kv.protocol) ?? "")
+  if proto == "" { proto = downcase(to_string(kv.proto) ?? "") }
+  proto_num = 0
+  if proto == "tcp" { proto_num = 6 }
+  if proto == "udp" { proto_num = 17 }
+  if proto == "icmp" { proto_num = 1 }
+
+  direction_id = 0
+  dirv = downcase(to_string(kv.direction) ?? "")
+  if dirv == "ingress" || dirv == "inbound" { direction_id = 1 }
+  if dirv == "egress" || dirv == "outbound" { direction_id = 2 }
+
+  user_name = to_string(kv.identity) ?? ""
+  if user_name == "" { user_name = to_string(kv.user) ?? "" }
+  evt_type = downcase(to_string(kv.type) ?? "")
+  sig_id = to_string(kv.signature) ?? ""
+  priority = to_int(to_string(kv.priority) ?? "") ?? 0
+
+  # ---- severity ----
+  severity_id = 1
+  severity = "Informational"
+  if priority == 1 { severity_id = 5; severity = "Critical" }
+  if priority == 2 { severity_id = 4; severity = "High" }
+  if priority == 3 { severity_id = 3; severity = "Medium" }
+  if priority > 3 { severity_id = 2; severity = "Low" }
+
+  # ---- verdict ----
+  action_id = 3
+  action = "Observed"
+  disposition_id = 17
+  disposition = "Logged"
+  status_id = 1
+  status_str = "Success"
+  activity_id = 99
+  activity_name = "Other"
+
+  # ---- routing ----
+  route = "network"
+  if log_type == "flows" {
+      route = "network"
+      activity_id = 6
+      activity_name = "Traffic"
+      if contains(pattern_val, "allow") {
+          action_id = 1
+          action = "Allowed"
+          disposition_id = 1
+          disposition = "Allowed"
+      }
+      if contains(pattern_val, "deny") || contains(pattern_val, "drop") {
+          action_id = 2
+          action = "Denied"
+          disposition_id = 2
+          disposition = "Blocked"
+          status_id = 2
+          status_str = "Failure"
+          activity_id = 5
+          activity_name = "Refuse"
+          if severity_id < 2 { severity_id = 2; severity = "Low" }
+      }
+  } else if log_type == "ids-alerts" || log_type == "security_event" || log_type == "security_events" {
+      route = "finding"
+      activity_id = 1
+      activity_name = "Create"
+      if severity_id < 2 { severity_id = 2; severity = "Low" }
+      blocked = downcase(to_string(kv.blocked) ?? "")
+      dhost = downcase(to_string(kv.action) ?? "")
+      if blocked == "true" || dhost == "block" || dhost == "blocked" {
+          action_id = 2
+          action = "Denied"
+          disposition_id = 2
+          disposition = "Blocked"
+      } else {
+          disposition_id = 15
+          disposition = "Detected"
+      }
+  } else if log_type == "urls" {
+      route = "http"
+      action_id = 1
+      action = "Allowed"
+      disposition_id = 1
+      disposition = "Allowed"
+      activity_id = 99
+      activity_name = "Other"
+      if http_method == "CONNECT" { activity_id = 1;  activity_name = "Connect" }
+      if http_method == "DELETE"  { activity_id = 2;  activity_name = "Delete" }
+      if http_method == "GET"     { activity_id = 3;  activity_name = "Get" }
+      if http_method == "HEAD"    { activity_id = 4;  activity_name = "Head" }
+      if http_method == "OPTIONS" { activity_id = 5;  activity_name = "Options" }
+      if http_method == "POST"    { activity_id = 6;  activity_name = "Post" }
+      if http_method == "PUT"     { activity_id = 7;  activity_name = "Put" }
+      if http_method == "TRACE"   { activity_id = 8;  activity_name = "Trace" }
+      if http_method == "PATCH"   { activity_id = 9;  activity_name = "Patch" }
+  } else if log_type == "events" && evt_type == "8021x_auth" {
+      route = "auth"
+      activity_id = 1
+      activity_name = "Logon"
+      action_id = 1
+      action = "Allowed"
+      disposition_id = 1
+      disposition = "Allowed"
+  } else if log_type == "events" && (evt_type == "8021x_deauth" || evt_type == "disassociation") {
+      route = "auth"
+      activity_id = 2
+      activity_name = "Logoff"
+      action_id = 1
+      action = "Allowed"
+      disposition_id = 1
+      disposition = "Allowed"
+  } else if log_type == "events" && evt_type == "association" {
+      route = "network"
+      activity_id = 1
+      activity_name = "Open"
+  }
+
+  # ---- objects ----
+  src = {}
+  if src_ip != "" { src.ip = downcase(src_ip) }
+  if src_port > 0 { src.port = src_port }
+  if client_mac != "" { src.mac = downcase(client_mac) }
+  dst = {}
+  if dst_ip != "" { dst.ip = downcase(dst_ip) }
+  if dst_port > 0 { dst.port = dst_port }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": uuid_v4(),
+      "log_source": "meraki",
+      "log_provider": "Meraki",
+      "profiles": ["host", "security_control"],
+      "product": {
+          "name": "Meraki",
+          "vendor_name": "Cisco",
+          "feature": { "name": "firewall" }
+      }
+  }
+  if log_type != "" { metadata.log_name = log_type }
+  if evt_type != "" { metadata.event_code = evt_type }
+
+  device = { "type_id": 9, "type": "Firewall" }
+  has_device = false
+  if device_name != "" { device.hostname = device_name; has_device = true }
+
+  unmapped = {}
+  if pattern_val != "" { unmapped.pattern = pattern_val }
+  if evt_type != "" { unmapped.meraki_event_type = evt_type }
+  ft = to_string(kv.type) ?? ""
+  if ft != "" && log_type == "flows" { unmapped.flow_type = ft }
+  vt = to_string(kv.vpn_type) ?? ""
+  if vt != "" { unmapped.vpn_type = vt }
+  cn = to_string(kv.connectivity) ?? ""
+  if cn != "" { unmapped.connectivity = cn }
+  rd = to_string(kv.radio) ?? ""
+  if rd != "" { unmapped.radio = rd }
+  vp = to_string(kv.vap) ?? ""
+  if vp != "" { unmapped.vap = vp }
+  rs = to_string(kv.rssi) ?? ""
+  if rs != "" { unmapped.rssi = rs }
+  if log_type == "" { unmapped.parse_status = "no_meraki_header" }
+
+  # switch port state, when present
+  spm, spe = parse_regex(rest, r'port\s+(?P<port>\d+)\s+status\s+(?P<status>\S+)')
+  if spe == null && spm != null {
+      unmapped.switch_port = string!(spm.port)
+      unmapped.switch_port_status = string!(spm.status)
+  }
+
+  obs = []
+  if src_ip != "" { obs = push(obs, { "name": "src_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(src_ip) }) }
+  if dst_ip != "" { obs = push(obs, { "name": "dst_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(dst_ip) }) }
+  if user_name != "" { obs = push(obs, { "name": "user.name", "type": "User Name", "type_id": 4, "value": user_name }) }
+  if client_mac != "" { obs = push(obs, { "name": "src_endpoint.mac", "type": "MAC Address", "type_id": 3, "value": downcase(client_mac) }) }
+
+  # ============================================================
+  # Assemble
+  # ============================================================
+  if route == "finding" {
+      class_uid = 2004
+      title = ids_message
+      if title == "" { title = to_string(kv.name) ?? "" }
+      if title == "" { title = "Meraki security event" }
+      fuid = sig_id
+      if fuid == "" { fuid = title }
+      evidence = {}
+      if length(src) > 0 { evidence.src_endpoint = src }
+      if length(dst) > 0 { evidence.dst_endpoint = dst }
+      if proto_num > 0 { evidence.connection_info = { "direction_id": direction_id, "protocol_num": proto_num } }
+      evidence.name = "Meraki IDS alert"
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Detection Finding",
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": 1,
+          "activity_name": "Create",
+          "type_uid": class_uid * 100 + 1,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "is_alert": true,
+          "metadata": metadata,
+          "finding_info": {
+              "uid": fuid,
+              "title": title,
+              "data_sources": ["meraki"],
+              "analytic": { "name": title, "uid": fuid, "type_id": 1, "type": "Rule" }
+          },
+          "evidences": [evidence]
+      }
+      if has_device { .device = device }
+
+  } else if route == "http" {
+      class_uid = 4002
+      url = {}
+      if url_raw != "" {
+          if starts_with(url_raw, "http://") || starts_with(url_raw, "https://") {
+              url.url_string = url_raw
+          } else {
+              url.url_string = "http://" + url_raw
+          }
+          dm3, de3 = parse_regex(url_raw, r'^(?:https?://)?(?P<domain>[^/:\s]+)')
+          if de3 == null && dm3 != null { url.hostname = string!(dm3.domain) }
+          pm3, pe3 = parse_regex(url_raw, r'^(?:https?://)?[^/]+(?P<path>/[^\s]*)$')
+          if pe3 == null && pm3 != null { url.path = string!(pm3.path) }
+      }
+      req = {}
+      if activity_id != 99 { req.http_method = http_method }
+      if length(url) > 0 { req.url = url }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "http_request": req,
+          "connection_info": { "direction_id": direction_id, "protocol_num": proto_num }
+      }
+      if proto != "" { .connection_info.protocol_name = proto }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if length(src) == 0 && length(dst) == 0 { .dst_endpoint = { "svc_name": "http" } }
+      if has_device { .device = device }
+
+  } else if route == "auth" {
+      class_uid = 3002
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Authentication",
+          "category_uid": 3,
+          "category_name": "Identity & Access Management",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "user": { "name": user_name },
+          "auth_protocol": "802.1x",
+          "auth_protocol_id": 99
+      }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 {
+          .dst_endpoint = dst
+      } else {
+          .service = { "name": "Meraki 802.1X" }
+      }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if has_device { .device = device }
+
+  } else {
+      class_uid = 4001
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Network Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": { "direction_id": direction_id, "protocol_num": proto_num }
+      }
+      if proto != "" { .connection_info.protocol_name = proto }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if length(src) == 0 && length(dst) == 0 {
+          fb = {}
+          if device_name != "" { fb.hostname = device_name }
+          if length(fb) == 0 { fb.hostname = "unknown" }
+          .src_endpoint = fb
+      }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if has_device { .device = device }
+  }
+
+  if length(unmapped) > 0 { .unmapped = unmapped }
+  if length(obs) > 0 { .observables = obs }
+
+  .
+samples:
+- raw: <134>1 1730281900.000000000 MR33-OFFICE events type=8021x_auth radio=1 vap=2 client_mac=00:0C:29:3A:1B:5F identity=corp\\jsmith aid=1234
+  expect:
+    class_uid: 3002
+    activity_id: 1
+    user.name: corp\\jsmith
+    actor.user.name: corp\\jsmith
+    disposition_id: 1
+- raw: '<134>1 1730281572.123456789 MX84-BRANCH flows src=10.10.1.55 dst=93.184.216.34 mac=00:0C:29:3A:1B:5F protocol=tcp sport=51422 dport=443 pattern: allow all'
+  expect:
+    class_uid: 4001
+    activity_id: 6
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 93.184.216.34
+    disposition_id: 1
+- raw: '<134>1 1730281600.000000000 MX84-BRANCH flows src=203.0.113.44 dst=10.10.1.20 mac=AA:BB:CC:DD:EE:FF protocol=tcp sport=44112 dport=3389 pattern: deny all'
+  expect:
+    class_uid: 4001
+    activity_id: 5
+    src_endpoint.ip: 203.0.113.44
+    dst_endpoint.ip: 10.10.1.20
+    disposition_id: 2
+- raw: '<134>1 1730281700.000000000 MX84-BRANCH ids-alerts signature=1:2001219:5 priority=1 timestamp=1730281700.0 dhost=00:0C:29:3A:1B:5F direction=ingress protocol=tcp/ip src=203.0.113.9:44001 dst=10.10.1.7:445 message: ET SCAN Potential SSH Scan'
+  expect:
+    class_uid: 2004
+    activity_id: 1
+    finding_info.uid: 1:2001219:5
+    disposition_id: 15
+- raw: not a meraki line
+  expect:
+    class_uid: 4001
+    activity_id: 99
+    disposition_id: 17
+- raw: <134>1 1730282100.000000000 MS220-CLOSET events port 12 status changed from 1 Gbps to down
+  expect:
+    class_uid: 4001
+    activity_id: 99
+    disposition_id: 17
+- raw: '<134>1 1730281800.000000000 MX84-BRANCH urls src=10.10.1.55:51423 dst=93.184.216.34:80 mac=00:0C:29:3A:1B:5F request: GET http://malware.example.com/payload.exe'
+  expect:
+    class_uid: 4002
+    activity_id: 3
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 93.184.216.34
+    http_request.url.path: /payload.exe
+    disposition_id: 1
+- raw: <134>1 1730282000.000000000 MX84-BRANCH events type=vpn_connectivity_change vpn_type=site-to-site peer_contact=198.51.100.9:51928 peer_ident=abcdef connectivity=false
+  expect:
+    class_uid: 4001
+    activity_id: 99
+    disposition_id: 17

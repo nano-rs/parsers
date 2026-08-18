@@ -1,20 +1,32 @@
 name: apache_ocsf
 display_name: Apache HTTP Server (OCSF)
-version: "1.0.0"
+version: "1.1.0"
+ocsf_version: "1.9.0"
 description: >
-  Parses Apache combined/common log format into a complete OCSF 1.8.0
+  Parses Apache combined/common log format into a complete OCSF 1.9.0
   "HTTP Activity" (class_uid 4002) record. The whole OCSF object is emitted
   on the root so it can be inserted into the ocsf_logs `event` column, from
   which the promoted columns materialize. Mirrors the shape of the UDM
   apache parser (../parsers/parsers/apache/parser.yaml) but targets OCSF
   instead of `.udm.*`.
+
+  v1.1.0 — OCSF 1.8.0 -> 1.9.0 upgrade:
+    * metadata.version is now "1.9.0" (1.8.0 is rejected by this release).
+    * `actor` is a host-profile attribute on 4002, so the event now declares
+      metadata.profiles ["host"]; without it the authenticated-user mapping
+      was rejected as "attribute \"actor\" is not defined for this OCSF
+      class/profile".
+    * The unparsable-line fallback used to emit class 4002 with neither
+      http_request nor http_response, which violates the class constraint
+      "at least one of [http_request, http_response]". It now emits Base
+      Event (class_uid 0), which is what an unparsable line actually is.
 match_values:
   - apache_access
 category: application
 vendor: "Apache Software Foundation"
 product: "Apache HTTP Server"
 parser_vrl: |
-  # Apache Combined Log Format -> OCSF 1.8.0 HTTP Activity (class_uid 4002)
+  # Apache Combined Log Format -> OCSF 1.9.0 HTTP Activity (class_uid 4002)
   # Format: %h %l %u %t "%r" %>s %b "%{Referer}i" "%{User-Agent}i"
   #
   # Emits the COMPLETE standard OCSF record on the root. This object is what
@@ -22,10 +34,12 @@ parser_vrl: |
 
   raw_log = string!(.message)
 
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
+
   parsed, err = parse_apache_log(raw_log, "combined")
 
   if err == null {
-      # ---- method -> activity_id (OCSF HTTP Activity enum, 1.8.0) ----
+      # ---- method -> activity_id (OCSF HTTP Activity enum, 1.9.0) ----
       # parse_apache_log returns method as a known String; no coalescing needed.
       method = upcase(string!(parsed.method))
       activity_id = 99
@@ -95,16 +109,17 @@ parser_vrl: |
           "status": status_str,
           "time": time_ms,
           "message": raw_log,
+          "raw_data": raw_log,
           "metadata": {
-              "version": "1.8.0",
+              "version": "1.9.0",
               "uid": uuid_v4(),
+              # `actor` is host-profile-bound on 4002 in OCSF 1.9.
+              "profiles": ["host"],
+              "log_name": "apache",
               "product": {
                   "name": "Apache HTTP Server",
                   "vendor_name": "Apache Software Foundation"
               }
-          },
-          "src_endpoint": {
-              "ip": to_string(parsed.host)
           },
           "http_request": http_request,
           "http_response": http_response,
@@ -114,26 +129,44 @@ parser_vrl: |
           }
       }
 
+      # %h is an IP unless HostnameLookups is on; network_endpoint.ip is
+      # regex-checked as ip_t, so a resolved name must go to hostname.
+      remote = to_string(parsed.host)
+      if match(remote, ip_re) {
+          .src_endpoint = { "ip": remote }
+      } else if remote != "" && remote != "-" {
+          .src_endpoint = { "hostname": downcase(remote) }
+      }
+
       # authenticated user (Apache %u) -> actor.user.name, omit "-"
       auth_user = to_string(parsed.user)
       if auth_user != "-" && auth_user != "" {
           .actor = { "user": { "name": auth_user } }
       }
   } else {
-      # On parse failure, emit a minimal record carrying the raw + error so the
-      # row still lands and is debuggable rather than silently dropped.
+      # On parse failure, emit a Base Event carrying the raw line so the row
+      # still lands and is debuggable rather than silently dropped. It is NOT
+      # emitted as 4002: an unparsable line has neither http_request nor
+      # http_response, which violates the HTTP Activity class constraint.
       . = {
-          "class_uid": 4002,
-          "category_uid": 4,
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
           "activity_id": 99,
-          "type_uid": 400299,
+          "activity_name": "Other",
+          "type_uid": 99,
           "severity_id": 1,
+          "severity": "Informational",
           "status_id": 0,
+          "status": "Unknown",
           "time": 0,
           "message": raw_log,
+          "raw_data": raw_log,
           "metadata": {
-              "version": "1.8.0",
+              "version": "1.9.0",
               "uid": uuid_v4(),
+              "log_name": "apache",
               "product": {
                   "name": "Apache HTTP Server",
                   "vendor_name": "Apache Software Foundation"
@@ -142,3 +175,23 @@ parser_vrl: |
           }
       }
   }
+
+  .
+
+# Runtime samples (NAN-2327): one per event shape this parser routes.
+# `class_uid` is asserted because class routing is the whole point of the
+# OCSF conversion — a silent reroute is the defect most likely to survive
+# a compile-only check.
+samples:
+  - raw: '127.0.0.1 - frank [10/Oct/2000:13:55:36 -0700] "GET /apache_pb.gif HTTP/1.0" 200 2326 "http://www.example.com/start.html" "Mozilla/4.08 [en] (Win98; I ;Nav)"'
+    expect:
+      class_uid: 4002
+      activity_id: 3
+  - raw: 'this is not an nginx log line at all'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: '10.1.2.3 - - [12/Aug/2026:09:15:22 +0000] "POST /wp-login.php HTTP/1.1" 500 0 "-" "-"'
+    expect:
+      class_uid: 4002
+      activity_id: 6

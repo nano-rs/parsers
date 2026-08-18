@@ -1,0 +1,310 @@
+name: nginx_ocsf
+display_name: Nginx (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Nginx access logs (JSON log_format, combined) and error logs into
+  OCSF 1.9.0 records. Access lines become "HTTP Activity" (class_uid 4002);
+  error lines that carry a request line stay 4002, error lines that do not
+  (worker/config/upstream messages) become "Base Event" (class_uid 0) because
+  they are not HTTP transactions. The whole OCSF object is emitted on the root
+  so it lands in the ocsf_logs `event` column and the promoted columns
+  materialize. Mirrors the UDM nginx parser (../parsers/parsers/nginx/parser.yaml).
+match_values:
+  - nginx
+category: application
+vendor: "Nginx"
+product: "Nginx"
+parser_vrl: |
+  # Nginx -> OCSF 1.9.0 HTTP Activity (4002) / Base Event (0)
+  # Emits the COMPLETE OCSF record on the root.
+
+  raw_log = string!(.message)
+
+  # ---- accumulators ------------------------------------------------------
+  parsed_ok = false
+  is_error = false
+  client_ip = ""
+  user_name = ""
+  code = 0
+  resp_bytes = 0
+  method = ""
+  uri_path = ""
+  query_string = ""
+  http_version = ""
+  referrer = ""
+  user_agent = ""
+  dst_ip = ""
+  dst_host = ""
+  dst_port = 0
+  time_ms = 0
+  duration_ms = 0
+  have_request = false
+  log_level = ""
+  unmapped = {}
+
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
+
+  j, jerr = parse_json(raw_log)
+  if jerr == null && is_object(j) {
+      # ---------------- JSON log_format ----------------
+      parsed_ok = true
+      client_ip = string(j.remote_addr) ?? ""
+      ru = string(j.remote_user) ?? ""
+      if ru != "-" { user_name = ru }
+      code = to_int(j.status) ?? 0
+      resp_bytes = to_int(j.body_bytes_sent) ?? 0
+      rf = string(j.http_referer) ?? ""
+      if rf != "-" { referrer = rf }
+      user_agent = string(j.http_user_agent) ?? ""
+      # request_time is seconds (float) -> OCSF duration is milliseconds
+      rt = to_float(j.request_time) ?? 0.0
+      duration_ms = to_int(round(rt * 1000.0))
+
+      urt = string(j.upstream_response_time) ?? ""
+      if urt != "" { unmapped = set!(unmapped, ["upstream_response_time"], urt) }
+      rl = to_int(j.request_length) ?? 0
+      if rl != 0 { unmapped = set!(unmapped, ["request_length"], rl) }
+      xff = string(j.http_x_forwarded_for) ?? ""
+      if xff != "" && xff != "-" { unmapped = set!(unmapped, ["x_forwarded_for"], xff) }
+
+      upstream = string(j.upstream_addr) ?? ""
+      if upstream != "" && upstream != "-" {
+          ua = split(upstream, ":")
+          cand = string(ua[0]) ?? ""
+          if match(cand, ip_re) { dst_ip = cand } else if cand != "" { dst_host = cand }
+          if length(ua) >= 2 { dst_port = to_int(ua[1]) ?? 0 }
+      }
+
+      request_line = string(j.request) ?? ""
+      if request_line != "" {
+          have_request = true
+          rp = split(request_line, " ")
+          if length(rp) >= 1 { method = upcase(string(rp[0]) ?? "") }
+          if length(rp) >= 2 {
+              full_uri = string(rp[1]) ?? ""
+              up = split(full_uri, "?", limit: 2)
+              uri_path = string(up[0]) ?? ""
+              if length(up) == 2 { query_string = string(up[1]) ?? "" }
+          }
+          if length(rp) >= 3 { http_version = string(rp[2]) ?? "" }
+      }
+
+      tl = string(j.time_local) ?? ""
+      if tl != "" {
+          t, terr = parse_timestamp(tl, "%d/%b/%Y:%H:%M:%S %z")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+  } else {
+      c, cerr = parse_nginx_log(raw_log, "combined")
+      if cerr == null {
+          # ---------------- combined access log ----------------
+          parsed_ok = true
+          client_ip = to_string(c.client)
+          cu = to_string(c.user)
+          if cu != "-" { user_name = cu }
+          code = to_int(c.status)
+          resp_bytes = to_int(c.size)
+          cr = to_string(c.referer)
+          if cr != "-" { referrer = cr }
+          user_agent = to_string(c.agent)
+          tms, tmerr = to_unix_timestamp(c.timestamp, unit: "milliseconds")
+          if tmerr == null { time_ms = tms }
+
+          request_line = to_string(c.request)
+          if request_line != "" {
+              have_request = true
+              rp = split(request_line, " ")
+              if length(rp) >= 1 { method = upcase(string(rp[0]) ?? "") }
+              if length(rp) >= 2 {
+                  full_uri = string(rp[1]) ?? ""
+                  up = split(full_uri, "?", limit: 2)
+                  uri_path = string(up[0]) ?? ""
+                  if length(up) == 2 { query_string = string(up[1]) ?? "" }
+              }
+              if length(rp) >= 3 { http_version = string(rp[2]) ?? "" }
+          }
+      } else {
+          e, eerr = parse_nginx_log(raw_log, "error")
+          if eerr == null {
+              # ---------------- error log ----------------
+              parsed_ok = true
+              is_error = true
+              log_level = to_string(e.severity)
+              tms2, tm2err = to_unix_timestamp(e.timestamp, unit: "milliseconds")
+              if tm2err == null { time_ms = tms2 }
+              ec = to_string(e.client)
+              if match(ec, ip_re) { client_ip = ec }
+              es = to_string(e.server)
+              if es != "" { unmapped = set!(unmapped, ["server_name"], es) }
+              eh = to_string(e.host)
+              if eh != "" { dst_host = eh }
+              em = to_string(e.message)
+              if em != "" { unmapped = set!(unmapped, ["error_message"], em) }
+              eu = to_string(e.upstream)
+              if eu != "" { unmapped = set!(unmapped, ["upstream"], eu) }
+              epid = to_string(e.pid)
+              if epid != "" { unmapped = set!(unmapped, ["pid"], epid) }
+
+              erq = to_string(e.request)
+              if erq != "" {
+                  have_request = true
+                  rp = split(erq, " ")
+                  if length(rp) >= 1 { method = upcase(string(rp[0]) ?? "") }
+                  if length(rp) >= 2 {
+                      full_uri = string(rp[1]) ?? ""
+                      up = split(full_uri, "?", limit: 2)
+                      uri_path = string(up[0]) ?? ""
+                      if length(up) == 2 { query_string = string(up[1]) ?? "" }
+                  }
+                  if length(rp) >= 3 { http_version = string(rp[2]) ?? "" }
+              }
+          }
+      }
+  }
+
+  # ---- severity ----------------------------------------------------------
+  severity_id = 1
+  severity = "Informational"
+  if is_error {
+      lvl = downcase(log_level)
+      if lvl == "warn" { severity_id = 3; severity = "Medium" }
+      if lvl == "error" { severity_id = 4; severity = "High" }
+      if lvl == "crit" || lvl == "alert" { severity_id = 5; severity = "Critical" }
+      if lvl == "emerg" { severity_id = 6; severity = "Fatal" }
+  }
+
+  if parsed_ok && (have_request || !is_error) {
+      # ---------------- HTTP Activity (4002) ----------------
+      activity_id = 99
+      activity_name = "Other"
+      if method == "CONNECT" { activity_id = 1; activity_name = "Connect" }
+      if method == "DELETE"  { activity_id = 2; activity_name = "Delete" }
+      if method == "GET"     { activity_id = 3; activity_name = "Get" }
+      if method == "HEAD"    { activity_id = 4; activity_name = "Head" }
+      if method == "OPTIONS" { activity_id = 5; activity_name = "Options" }
+      if method == "POST"    { activity_id = 6; activity_name = "Post" }
+      if method == "PUT"     { activity_id = 7; activity_name = "Put" }
+      if method == "TRACE"   { activity_id = 8; activity_name = "Trace" }
+      if method == "PATCH"   { activity_id = 9; activity_name = "Patch" }
+
+      status_id = 2
+      status_str = "Failure"
+      if code >= 200 && code < 400 { status_id = 1; status_str = "Success" }
+      if code == 0 { status_id = 0; status_str = "Unknown" }
+
+      url_obj = {}
+      if uri_path != "" { url_obj.path = uri_path }
+      if query_string != "" { url_obj.query_string = query_string }
+      if dst_host != "" { url_obj.hostname = downcase(dst_host) }
+      # url.json requires url_string or path; a bare path is never a url_string.
+      if !exists(url_obj.path) { url_obj.path = "/" }
+
+      http_request = { "url": url_obj }
+      if method != "" { http_request.http_method = method }
+      if user_agent != "" && user_agent != "-" { http_request.user_agent = user_agent }
+      if referrer != "" { http_request.referrer = referrer }
+      if http_version != "" { http_request.version = http_version }
+
+      http_response = { "code": code, "status": status_str }
+      if resp_bytes != 0 { http_response.length = resp_bytes }
+
+      src_endpoint = {}
+      if match(client_ip, ip_re) { src_endpoint.ip = client_ip }
+
+      dst_endpoint = {}
+      if match(dst_ip, ip_re) { dst_endpoint.ip = dst_ip }
+      if dst_host != "" { dst_endpoint.hostname = downcase(dst_host) }
+      if dst_port != 0 { dst_endpoint.port = dst_port }
+
+      . = {
+          "class_uid": 4002,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": 400200 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "profiles": ["host"],
+              "log_name": "nginx",
+              "product": { "name": "Nginx", "vendor_name": "Nginx" }
+          },
+          "http_request": http_request,
+          "http_response": http_response
+      }
+      if duration_ms != 0 { .duration = duration_ms }
+      if resp_bytes != 0 { .traffic = { "bytes_out": resp_bytes } }
+      if exists(src_endpoint.ip) { .src_endpoint = src_endpoint }
+      if exists(dst_endpoint.ip) || exists(dst_endpoint.hostname) { .dst_endpoint = dst_endpoint }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if length(unmapped) > 0 { .unmapped = unmapped }
+      if is_error { .metadata.log_level = log_level }
+  } else {
+      # ---------------- Base Event (0) ----------------
+      # Non-transactional error lines and unparsable input. OCSF's Base Event
+      # is the spec's concrete home for an event with no better-fitting class;
+      # forcing these into 4002 would poison class-scoped HTTP hunts.
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": 0,
+          "status": "Unknown",
+          "time": time_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_name": "nginx",
+              "product": { "name": "Nginx", "vendor_name": "Nginx" }
+          }
+      }
+      if log_level != "" { .metadata.log_level = log_level }
+      if !parsed_ok { .metadata.log_level = "error" }
+      if length(unmapped) > 0 { .unmapped = unmapped }
+  }
+
+  .
+
+# Runtime samples (NAN-2327): one per event shape this parser routes.
+# `class_uid` is asserted because class routing is the whole point of the
+# OCSF conversion — a silent reroute is the defect most likely to survive
+# a compile-only check.
+samples:
+  - raw: '203.0.113.45 - alice [12/Aug/2026:09:15:22 +0000] "GET /api/v2/orders?limit=50 HTTP/1.1" 200 4213 "https://shop.example.com/cart" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"'
+    expect:
+      class_uid: 4002
+      activity_id: 3
+  - raw: '2026/08/12 09:16:05 [emerg] 2840#2840: bind() to 0.0.0.0:80 failed (98: Address already in use)'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: '2026/08/12 09:16:01 [error] 2847#2847: *1024 open() "/var/www/html/missing.php" failed (2: No such file or directory), client: 203.0.113.77, server: shop.example.com, request: "GET /missing.php HTTP/1.1", host: "shop.example.com"'
+    expect:
+      class_uid: 4002
+      activity_id: 3
+  - raw: 'this is not an nginx log line at all'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: '{"time_local":"12/Aug/2026:09:15:23 +0000","remote_addr":"198.51.100.12","remote_user":"-","request":"POST /login HTTP/1.1","status":403,"body_bytes_sent":512,"request_length":842,"request_time":0.187,"http_referer":"-","http_user_agent":"curl/8.4.0","http_x_forwarded_for":"203.0.113.9","upstream_addr":"10.0.3.14:8080","upstream_response_time":"0.180"}'
+    expect:
+      class_uid: 4002
+      activity_id: 6

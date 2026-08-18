@@ -1,0 +1,519 @@
+name: sonicwall_ocsf
+display_name: SonicWall (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses SonicWall SonicOS key=value syslog into OCSF 1.9.0, routed by the
+  msg= text and message id: connection opened/closed/dropped -> Network
+  Activity (4001) with activity Open / Close / Refuse; IPS detections and
+  malware/anti-spyware alerts -> Detection Finding (2004); web site hit and web
+  site blocked -> HTTP Activity (4002); user login/logout -> Authentication
+  (3002). Any other SonicWall message still emits a Network Activity record
+  with activity_id 99 and the raw line preserved in `message`.
+match_values:
+  - sonicwall
+category: network
+vendor: "SonicWall"
+product: "Firewall"
+parser_vrl: |
+  # SonicWall SonicOS -> OCSF 1.9.0
+
+  raw_log = string!(.message)
+
+  body = raw_log
+  pm, pe = parse_regex(raw_log, r'^<(?P<pri>\d+)>(?P<body>.*)$')
+  if pe == null && pm != null { body = string!(pm.body) }
+
+  kv = parse_key_value(body, key_value_delimiter: "=", field_delimiter: " ") ?? {}
+
+  # ---- time ----
+  time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
+  tv = to_string(kv.time) ?? ""
+  if tv != "" {
+      cm, ce = parse_regex(tv, r'^(?P<dt>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})')
+      if ce == null && cm != null {
+          ts, ts_err = parse_timestamp(string!(cm.dt), "%Y-%m-%d %H:%M:%S")
+          if ts_err == null { time_ms = to_int(to_unix_timestamp(ts, unit: "milliseconds")) }
+      }
+  }
+
+  msg_txt = to_string(kv.msg) ?? ""
+  msg_l = downcase(msg_txt)
+  msg_id = to_string(kv.m) ?? ""
+  category = to_string(kv.c) ?? ""
+  fw_ip = to_string(kv.fw) ?? ""
+  serial = to_string(kv.sn) ?? ""
+  fw_action = downcase(to_string(kv.fw_action) ?? "")
+  rule_name = to_string(kv.rule) ?? ""
+  user_name = to_string(kv.usr) ?? ""
+  attack_name = to_string(kv.attack_name) ?? ""
+  ips_sid = to_string(kv.sid) ?? ""
+  ipscat = to_string(kv.ipscat) ?? ""
+  dstname = to_string(kv.dstname) ?? ""
+  url_arg = to_string(kv.arg) ?? ""
+  url_cat = to_string(kv.Category) ?? ""
+  app_name = to_string(kv.app) ?? ""
+
+  # ---- priority -> severity ----
+  pri = to_int(to_string(kv.pri) ?? "") ?? 0
+  severity_id = 1
+  severity = "Informational"
+  if pri == 1 { severity_id = 5; severity = "Critical" }
+  if pri == 2 { severity_id = 4; severity = "High" }
+  if pri == 3 || pri == 4 { severity_id = 3; severity = "Medium" }
+  if pri == 5 { severity_id = 2; severity = "Low" }
+
+  # ---- endpoints: ip[:port[:iface]] ----
+  src_raw = to_string(kv.src) ?? ""
+  dst_raw = to_string(kv.dst) ?? ""
+  src_ip = ""
+  src_port = 0
+  src_if = ""
+  dst_ip = ""
+  dst_port = 0
+  dst_if = ""
+  if src_raw != "" {
+      sm, se = parse_regex(src_raw, r'^(?P<ip>[^:]+)(?::(?P<port>\d+))?(?::(?P<iface>\S+))?$')
+      if se == null && sm != null {
+          src_ip = string!(sm.ip)
+          sp = to_string(sm.port)
+          if sp != "" { src_port = to_int(sp) ?? 0 }
+          src_if = to_string(sm.iface)
+      } else {
+          src_ip = src_raw
+      }
+  }
+  if dst_raw != "" {
+      dm, de = parse_regex(dst_raw, r'^(?P<ip>[^:]+)(?::(?P<port>\d+))?(?::(?P<iface>\S+))?$')
+      if de == null && dm != null {
+          dst_ip = string!(dm.ip)
+          dp = to_string(dm.port)
+          if dp != "" { dst_port = to_int(dp) ?? 0 }
+          dst_if = to_string(dm.iface)
+      } else {
+          dst_ip = dst_raw
+      }
+  }
+
+  # ---- protocol: "tcp/https" -> tcp ----
+  proto_raw = downcase(to_string(kv.proto) ?? "")
+  proto = proto_raw
+  svc_hint = ""
+  ppm, ppe = parse_regex(proto_raw, r'^(?P<proto>[^/]+)(?:/(?P<svc>\S+))?$')
+  if ppe == null && ppm != null {
+      proto = string!(ppm.proto)
+      svc_hint = to_string(ppm.svc)
+  }
+  proto_num = 0
+  if proto == "tcp" { proto_num = 6 }
+  if proto == "udp" { proto_num = 17 }
+  if proto == "icmp" { proto_num = 1 }
+
+  bytes_out = to_int(to_string(kv.sent) ?? "") ?? 0
+  bytes_in = to_int(to_string(kv.rcvd) ?? "") ?? 0
+  pkts_out = to_int(to_string(kv.spkt) ?? "") ?? 0
+  pkts_in = to_int(to_string(kv.rpkt) ?? "") ?? 0
+
+  # ---- routing by message text ----
+  route = "network"
+  activity_id = 99
+  activity_name = "Other"
+  action_id = 3
+  action = "Observed"
+  disposition_id = 17
+  disposition = "Logged"
+  status_id = 1
+  status_str = "Success"
+
+  if contains(msg_l, "connection opened") {
+      activity_id = 1
+      activity_name = "Open"
+      action_id = 1
+      action = "Allowed"
+      disposition_id = 1
+      disposition = "Allowed"
+  } else if contains(msg_l, "connection closed") {
+      activity_id = 2
+      activity_name = "Close"
+      action_id = 1
+      action = "Allowed"
+      disposition_id = 1
+      disposition = "Allowed"
+  } else if contains(msg_l, "connection dropped") || contains(msg_l, "denied") || contains(msg_l, "blocked due to") {
+      activity_id = 5
+      activity_name = "Refuse"
+      action_id = 2
+      action = "Denied"
+      disposition_id = 6
+      disposition = "Dropped"
+      status_id = 2
+      status_str = "Failure"
+      if severity_id < 2 { severity_id = 2; severity = "Low" }
+  } else if contains(msg_l, "ips detection") || contains(msg_l, "intrusion") || contains(msg_l, "spyware") || contains(msg_l, "virus") || contains(msg_l, "malware") || attack_name != "" {
+      route = "finding"
+      activity_id = 1
+      activity_name = "Create"
+      if severity_id < 2 { severity_id = 2; severity = "Low" }
+      if contains(msg_l, "prevent") || fw_action == "drop" || fw_action == "reset" {
+          action_id = 2
+          action = "Denied"
+          disposition_id = 2
+          disposition = "Blocked"
+      } else {
+          disposition_id = 15
+          disposition = "Detected"
+      }
+  } else if contains(msg_l, "web site hit") {
+      route = "http"
+      action_id = 1
+      action = "Allowed"
+      disposition_id = 1
+      disposition = "Allowed"
+  } else if contains(msg_l, "web site blocked") || contains(msg_l, "web site access denied") {
+      route = "http"
+      action_id = 2
+      action = "Denied"
+      disposition_id = 2
+      disposition = "Blocked"
+      status_id = 2
+      status_str = "Failure"
+      if severity_id < 2 { severity_id = 2; severity = "Low" }
+  } else if contains(msg_l, "login successful") || contains(msg_l, "log in successful") {
+      route = "auth"
+      activity_id = 1
+      activity_name = "Logon"
+      action_id = 1
+      action = "Allowed"
+      disposition_id = 1
+      disposition = "Allowed"
+  } else if contains(msg_l, "login failed") || contains(msg_l, "authentication failed") {
+      route = "auth"
+      activity_id = 1
+      activity_name = "Logon"
+      action_id = 2
+      action = "Denied"
+      disposition_id = 2
+      disposition = "Blocked"
+      status_id = 2
+      status_str = "Failure"
+      if severity_id < 2 { severity_id = 2; severity = "Low" }
+  } else if contains(msg_l, "logout") || contains(msg_l, "logged out") {
+      route = "auth"
+      activity_id = 2
+      activity_name = "Logoff"
+      action_id = 1
+      action = "Allowed"
+      disposition_id = 1
+      disposition = "Allowed"
+  }
+
+  # explicit fw_action overrides for connection events
+  if route == "network" {
+      if fw_action == "drop" || fw_action == "deny" {
+          activity_id = 5
+          activity_name = "Refuse"
+          action_id = 2
+          action = "Denied"
+          disposition_id = 6
+          disposition = "Dropped"
+          status_id = 2
+          status_str = "Failure"
+      }
+  }
+
+  # ---- objects ----
+  src = {}
+  if src_ip != "" { src.ip = downcase(src_ip) }
+  if src_port > 0 { src.port = src_port }
+  if src_if != "" { src.interface_name = src_if }
+  dst = {}
+  if dst_ip != "" { dst.ip = downcase(dst_ip) }
+  if dst_port > 0 { dst.port = dst_port }
+  if dst_if != "" { dst.interface_name = dst_if }
+  if dstname != "" { dst.hostname = dstname }
+  if svc_hint != "" { dst.svc_name = svc_hint }
+
+  traffic = {}
+  if bytes_in > 0 { traffic.bytes_in = bytes_in }
+  if bytes_out > 0 { traffic.bytes_out = bytes_out }
+  if pkts_in > 0 { traffic.packets_in = pkts_in }
+  if pkts_out > 0 { traffic.packets_out = pkts_out }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": uuid_v4(),
+      "log_source": "sonicwall",
+      "log_provider": "SonicOS",
+      "profiles": ["host", "security_control"],
+      "product": {
+          "name": "SonicWall Firewall",
+          "vendor_name": "SonicWall",
+          "feature": { "name": "firewall" }
+      }
+  }
+  if msg_id != "" { metadata.event_code = msg_id }
+  if category != "" { metadata.log_name = category }
+
+  device = { "type_id": 9, "type": "Firewall" }
+  has_device = false
+  if fw_ip != "" { device.ip = downcase(fw_ip); has_device = true }
+  if serial != "" { device.uid = serial; has_device = true }
+
+  fw_rule = {}
+  if rule_name != "" { fw_rule.name = rule_name; fw_rule.uid = rule_name }
+
+  unmapped = {}
+  if msg_txt != "" { unmapped.msg = msg_txt }
+  if fw_action != "" && fw_action != "na" { unmapped.fw_action = fw_action }
+  if ipscat != "" { unmapped.ips_category = ipscat }
+  ipspri = to_string(kv.ipspri) ?? ""
+  if ipspri != "" { unmapped.ips_priority = ipspri }
+  if url_cat != "" { unmapped.url_category = url_cat }
+  if app_name != "" { unmapped.app = app_name }
+  if length(kv) == 0 { unmapped.parse_status = "no_key_value_pairs" }
+
+  obs = []
+  if src_ip != "" { obs = push(obs, { "name": "src_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(src_ip) }) }
+  if dst_ip != "" { obs = push(obs, { "name": "dst_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(dst_ip) }) }
+  if user_name != "" { obs = push(obs, { "name": "user.name", "type": "User Name", "type_id": 4, "value": user_name }) }
+
+  # ============================================================
+  # Assemble
+  # ============================================================
+  if route == "finding" {
+      class_uid = 2004
+      title = attack_name
+      if title == "" { title = msg_txt }
+      if title == "" { title = "SonicWall threat detection" }
+      fuid = ips_sid
+      if fuid == "" { fuid = msg_id }
+      if fuid == "" { fuid = title }
+      evidence = {}
+      if length(src) > 0 { evidence.src_endpoint = src }
+      if length(dst) > 0 { evidence.dst_endpoint = dst }
+      if proto_num > 0 { evidence.connection_info = { "direction_id": 0, "protocol_num": proto_num } }
+      if user_name != "" { evidence.user = { "name": user_name } }
+      evidence.name = "SonicWall threat"
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Detection Finding",
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": 1,
+          "activity_name": "Create",
+          "type_uid": class_uid * 100 + 1,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "is_alert": true,
+          "metadata": metadata,
+          "finding_info": {
+              "uid": fuid,
+              "title": title,
+              "data_sources": ["sonicwall"],
+              "analytic": { "name": title, "uid": fuid, "type_id": 1, "type": "Rule" }
+          },
+          "evidences": [evidence]
+      }
+      if length(fw_rule) > 0 { .firewall_rule = fw_rule }
+      if has_device { .device = device }
+
+  } else if route == "http" {
+      class_uid = 4002
+      url = {}
+      if dstname != "" { url.hostname = dstname }
+      if url_arg != "" { url.path = url_arg }
+      if dstname != "" && url_arg != "" { url.url_string = "https://" + dstname + url_arg }
+      if url_cat != "" { url.categories = [url_cat] }
+      req = {}
+      if length(url) > 0 { req.url = url }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": class_uid * 100 + 99,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "http_request": req,
+          "connection_info": { "direction_id": 0, "protocol_num": proto_num }
+      }
+      if proto != "" { .connection_info.protocol_name = proto }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if length(src) == 0 && length(dst) == 0 { .dst_endpoint = { "svc_name": "http" } }
+      if length(traffic) > 0 { .traffic = traffic }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if length(fw_rule) > 0 { .firewall_rule = fw_rule }
+      if has_device { .device = device }
+
+  } else if route == "auth" {
+      class_uid = 3002
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Authentication",
+          "category_uid": 3,
+          "category_name": "Identity & Access Management",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "user": { "name": user_name }
+      }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 {
+          .dst_endpoint = dst
+      } else {
+          .service = { "name": "SonicWall management" }
+      }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if msg_txt != "" { .status_detail = msg_txt }
+      if has_device { .device = device }
+
+  } else {
+      class_uid = 4001
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Network Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": { "direction_id": 0, "protocol_num": proto_num }
+      }
+      if proto != "" { .connection_info.protocol_name = proto }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if length(src) == 0 && length(dst) == 0 {
+          fb = {}
+          if fw_ip != "" { fb.ip = downcase(fw_ip) }
+          if length(fb) == 0 { fb.hostname = "unknown" }
+          .src_endpoint = fb
+      }
+      if length(traffic) > 0 { .traffic = traffic }
+      if length(fw_rule) > 0 { .firewall_rule = fw_rule }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if app_name != "" { .app_name = app_name }
+      if msg_txt != "" { .status_detail = msg_txt }
+      if has_device { .device = device }
+  }
+
+  if length(unmapped) > 0 { .unmapped = unmapped }
+  if length(obs) > 0 { .observables = obs }
+
+  .
+samples:
+- raw: <134>id=firewall sn=0017C5AABBCC time="2024-10-30 09:47:12 UTC" fw=198.51.100.1 pri=6 c=1024 m=537 msg="Connection Closed" n=12346 src=10.10.1.55:51422:X0 dst=93.184.216.34:443:X1 proto=tcp/https sent=4210 rcvd=11111 spkt=14 rpkt=10
+  expect:
+    class_uid: 4001
+    activity_id: 2
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 93.184.216.34
+    disposition_id: 1
+- raw: <134>id=firewall sn=0017C5AABBCC time="2024-10-30 09:48:12 UTC" fw=198.51.100.1 pri=4 c=32 m=38 msg="TCP connection dropped" n=12347 src=203.0.113.44:44112:X1 dst=10.10.1.20:3389:X0 proto=tcp/3389 fw_action="drop" rule="Default Deny"
+  expect:
+    class_uid: 4001
+    activity_id: 5
+    src_endpoint.ip: 203.0.113.44
+    dst_endpoint.ip: 10.10.1.20
+    disposition_id: 6
+- raw: <134>id=firewall sn=0017C5AABBCC time="2024-10-30 09:46:12 UTC" fw=198.51.100.1 pri=6 c=262 m=537 msg="Connection Opened" n=12345 src=10.10.1.55:51422:X0 dst=93.184.216.34:443:X1 proto=tcp/https rule="LAN->WAN" fw_action="NA" usr="jsmith"
+  expect:
+    class_uid: 4001
+    activity_id: 1
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 93.184.216.34
+    actor.user.name: jsmith
+    disposition_id: 1
+- raw: '<134>id=firewall sn=0017C5AABBCC time="2024-10-30 09:49:12 UTC" fw=198.51.100.1 pri=1 c=32 m=794 msg="IPS Detection Alert: SMB EXPLOIT MS17-010" n=12348 src=203.0.113.9:44001:X1 dst=10.10.1.7:445:X0 proto=tcp/445 attack_name="SMB EXPLOIT MS17-010" sid=8765 ipscat="EXPLOIT" ipspri=1 fw_action="reset"'
+  expect:
+    class_uid: 2004
+    activity_id: 1
+    finding_info.uid: '8765'
+    disposition_id: 2
+- raw: <134>id=firewall sn=0017C5AABBCC time="2024-10-30 09:53:12 UTC" fw=198.51.100.1 pri=2 c=64 m=31 msg="Administrator login failed - incorrect password" n=12352 src=203.0.113.5:52001:X1 usr="admin"
+  expect:
+    class_uid: 3002
+    activity_id: 1
+    src_endpoint.ip: 203.0.113.5
+    user.name: admin
+    actor.user.name: admin
+    disposition_id: 2
+- raw: <134>id=firewall sn=0017C5AABBCC time="2024-10-30 09:52:12 UTC" fw=198.51.100.1 pri=6 c=64 m=30 msg="Administrator login successful" n=12351 src=10.0.0.9:52000:X0 dst=198.51.100.1:443:X0 usr="admin"
+  expect:
+    class_uid: 3002
+    activity_id: 1
+    src_endpoint.ip: 10.0.0.9
+    dst_endpoint.ip: 198.51.100.1
+    user.name: admin
+    actor.user.name: admin
+    disposition_id: 1
+- raw: not a sonicwall line at all
+  expect:
+    class_uid: 4001
+    activity_id: 99
+    disposition_id: 17
+- raw: <134>id=firewall sn=0017C5AABBCC time="2024-10-30 09:54:12 UTC" fw=198.51.100.1 pri=6 c=1024 m=1 msg="System restarted" n=12353
+  expect:
+    class_uid: 4001
+    activity_id: 99
+    src_endpoint.ip: 198.51.100.1
+    disposition_id: 17
+- raw: <134>id=firewall sn=0017C5AABBCC time="2024-10-30 09:51:12 UTC" fw=198.51.100.1 pri=3 c=1024 m=98 msg="Web site blocked" n=12350 src=10.10.1.55:51424:X0 dst=93.184.216.34:443:X1 proto=tcp/https dstname=malware.example.com arg=/payload.exe Category="Malware" usr="jsmith"
+  expect:
+    class_uid: 4002
+    activity_id: 99
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 93.184.216.34
+    actor.user.name: jsmith
+    http_request.url.path: /payload.exe
+    disposition_id: 2
+- raw: <134>id=firewall sn=0017C5AABBCC time="2024-10-30 09:50:12 UTC" fw=198.51.100.1 pri=6 c=1024 m=97 msg="Web site hit" n=12349 src=10.10.1.55:51423:X0 dst=93.184.216.34:80:X1 proto=tcp/http dstname=example.com arg=/index.html Category="Information Technology" usr="jsmith"
+  expect:
+    class_uid: 4002
+    activity_id: 99
+    src_endpoint.ip: 10.10.1.55
+    dst_endpoint.ip: 93.184.216.34
+    actor.user.name: jsmith
+    http_request.url.path: /index.html
+    disposition_id: 1

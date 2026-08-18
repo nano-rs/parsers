@@ -1,0 +1,434 @@
+name: netskope_ocsf
+display_name: Netskope (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses Netskope CASB/SSE Data Export records into OCSF 1.9.0, routed by
+  `record_type` (with `type` and field-sniffing as fallbacks):
+    * alert / incident, or any record Netskope escalated (alert="yes")
+                              -> Detection Finding (class_uid 2004)
+    * page                    -> HTTP Activity     (class_uid 4002)
+    * application / audit     -> API Activity      (class_uid 6003)
+    * network / connection    -> Network Activity  (class_uid 4001)
+    * infrastructure / endpoint / unknown
+                              -> Base Event        (class_uid 0)
+  Netskope names bytes from the client's point of view, so client_bytes is
+  traffic.bytes_in (client -> server) and server_bytes is traffic.bytes_out.
+  Mirrors the UDM netskope parser (../parsers/parsers/netskope/parser.yaml).
+match_values:
+  - netskope
+  - netskope_events
+  - netskope_alert
+  - netskope_application
+  - netskope_network
+  - netskope_audit
+  - netskope_page
+  - netskope_connection
+  - netskope_incident
+  - netskope_infrastructure
+  - netskope_endpoint
+category: security
+vendor: "Netskope"
+product: "SSE"
+parser_vrl: |
+  # Netskope SSE -> OCSF 1.9.0 (multi-class)
+  raw_log = string!(.message)
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
+
+  p, perr = parse_json(raw_log)
+  ok = perr == null && is_object(p)
+  e = {}
+  if ok { e = object!(p) }
+
+  # ---- event class -------------------------------------------------------
+  record_type = downcase(to_string(e.record_type) ?? "")
+  if record_type == "" { record_type = downcase(to_string(e.type) ?? "") }
+  if record_type == "" {
+      if exists(e.alert_type) || exists(e.alert_name) { record_type = "alert" } else if exists(e.audit_log_event) { record_type = "audit" } else if exists(e.activity) || exists(e.app) { record_type = "application" } else { record_type = "unknown" }
+  }
+  is_alert = record_type == "alert" || record_type == "incident"
+  if downcase(to_string(e.alert) ?? "") == "yes" { is_alert = true }
+
+  # ---- time (epoch seconds) ---------------------------------------------
+  time_ms = 0
+  ts_sec = to_int(e.timestamp) ?? 0
+  if ts_sec > 0 { time_ms = ts_sec * 1000 }
+
+  # ---- action -> security-control action/disposition --------------------
+  raw_action = downcase(to_string(e.action) ?? "")
+  action_id = 0
+  action_name = "Unknown"
+  disposition_id = 0
+  disposition_name = "Unknown"
+  blocked = false
+  if raw_action == "block" || raw_action == "deny" {
+      action_id = 2; action_name = "Denied"
+      disposition_id = 2; disposition_name = "Blocked"
+      blocked = true
+  } else if raw_action == "quarantine" {
+      action_id = 2; action_name = "Denied"
+      disposition_id = 5; disposition_name = "Quarantined"
+      blocked = true
+  } else if raw_action == "allow" || raw_action == "bypass" {
+      action_id = 1; action_name = "Allowed"
+      disposition_id = 1; disposition_name = "Allowed"
+  } else if raw_action != "" {
+      action_id = 99; action_name = raw_action
+  }
+
+  # ---- severity ----------------------------------------------------------
+  sev_raw = downcase(to_string(e.severity) ?? "")
+  if sev_raw == "" { sev_raw = downcase(to_string(e.dlp_rule_severity) ?? "") }
+  if sev_raw == "" { sev_raw = downcase(to_string(e.risk_level) ?? "") }
+  severity_id = 1
+  severity = "Informational"
+  if contains(sev_raw, "critical") { severity_id = 5; severity = "Critical" } else if contains(sev_raw, "high") { severity_id = 4; severity = "High" } else if contains(sev_raw, "medium") { severity_id = 3; severity = "Medium" } else if contains(sev_raw, "low") { severity_id = 2; severity = "Low" }
+  if is_alert && severity_id < 3 { severity_id = 3; severity = "Medium" }
+
+  user_name = to_string(e.user) ?? ""
+  app_name = to_string(e.app) ?? ""
+  activity_verb = to_string(e.activity) ?? ""
+  url_str = to_string(e.url) ?? ""
+  domain = downcase(to_string(e.domain) ?? "")
+  if domain == "" && url_str != "" {
+      pu, puerr = parse_url(url_str)
+      if puerr == null { domain = downcase(to_string(pu.host)) }
+  }
+
+  src_endpoint = {}
+  sip = to_string(e.srcip) ?? ""
+  if sip == "" { sip = to_string(e.userip) ?? "" }
+  if match(sip, ip_re) { src_endpoint.ip = sip }
+  shost = downcase(to_string(e.hostname) ?? "")
+  if shost != "" { src_endpoint.hostname = shost }
+  sport = to_int(e.srcport) ?? 0
+  if sport != 0 { src_endpoint.port = sport }
+  sctry = to_string(e.src_country) ?? ""
+  if sctry != "" { src_endpoint.location = { "country": upcase(sctry) } }
+
+  dst_endpoint = {}
+  dip = to_string(e.dstip) ?? ""
+  if match(dip, ip_re) { dst_endpoint.ip = dip }
+  dhost = downcase(to_string(e.dsthost) ?? "")
+  if dhost == "" { dhost = domain }
+  if dhost != "" { dst_endpoint.hostname = dhost }
+  dport = to_int(e.dstport) ?? 0
+  if dport != 0 { dst_endpoint.port = dport }
+  dctry = to_string(e.dst_country) ?? ""
+  if dctry != "" { dst_endpoint.location = { "country": upcase(dctry) } }
+
+  has_src = exists(src_endpoint.ip) || exists(src_endpoint.hostname)
+  has_dst = exists(dst_endpoint.ip) || exists(dst_endpoint.hostname)
+
+  bytes_in = to_int(e.client_bytes) ?? 0
+  bytes_out = to_int(e.server_bytes) ?? 0
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": uuid_v4(),
+      "profiles": ["host", "security_control"],
+      "log_name": "netskope-" + record_type,
+      "product": { "name": "SSE", "vendor_name": "Netskope" }
+  }
+  nsid = to_string(e._id) ?? ""
+  if nsid != "" { metadata.original_event_uid = nsid }
+  txid = to_string(e.transaction_id) ?? ""
+  if txid != "" { metadata.correlation_uid = txid }
+
+  unmapped = {}
+  for_each(["access_method", "traffic_type", "appcategory", "ccl", "instance_name", "instance_id", "organization_unit", "device", "device_classification", "os", "os_version", "browser", "browser_version", "object_type", "dlp_profile", "dlp_rule", "dlp_incident_id", "site", "page", "from_user", "to_user", "connection_id", "detection_engine", "malware_type", "policy", "alert_type", "audit_log_event", "audit_type"]) -> |_i, k| {
+      v = to_string(get(e, [k]) ?? "") ?? ""
+      if v != "" { unmapped = set!(unmapped, [k], v) }
+  }
+  if activity_verb != "" { unmapped.activity = activity_verb }
+  if raw_action != "" { unmapped.action = raw_action }
+  cci = to_int(e.cci) ?? -1
+  if cci >= 0 { unmapped.cci = cci }
+
+  file_obj = {}
+  fname = to_string(e.object) ?? ""
+  otype = downcase(to_string(e.object_type) ?? "")
+  if fname != "" && (otype == "file" || otype == "") { file_obj.name = fname }
+  fpath = to_string(e.file_path) ?? ""
+  if fpath != "" { file_obj.path = fpath }
+  fsha = downcase(to_string(e.sha256) ?? "")
+  fmd5 = downcase(to_string(e.md5) ?? "")
+  hashes = []
+  if fsha != "" { hashes = push(hashes, { "algorithm_id": 3, "algorithm": "SHA-256", "value": fsha }) }
+  if fmd5 != "" { hashes = push(hashes, { "algorithm_id": 1, "algorithm": "MD5", "value": fmd5 }) }
+  if length(hashes) > 0 { file_obj.hashes = hashes }
+  if length(file_obj) > 0 { file_obj.type_id = 1 }
+
+  if ok && is_alert {
+      # =================== Detection Finding (2004) ===================
+      finding_uid = to_string(e.alert_id) ?? ""
+      if finding_uid == "" { finding_uid = to_string(e.dlp_incident_id) ?? "" }
+      if finding_uid == "" { finding_uid = nsid }
+      if finding_uid == "" { finding_uid = uuid_v4() }
+
+      title = to_string(e.alert_name) ?? ""
+      if title == "" { title = to_string(e.malware_name) ?? "" }
+      if title == "" { title = to_string(e.dlp_rule) ?? "" }
+      if title == "" { title = "Netskope alert" }
+
+      finding_info = { "uid": finding_uid, "title": title }
+      atype = to_string(e.alert_type) ?? ""
+      if atype != "" { finding_info.types = [atype] }
+      engine = to_string(e.detection_engine) ?? ""
+      if engine == "" { engine = to_string(e.dlp_profile) ?? "" }
+      if engine != "" { finding_info.analytic = { "name": engine, "type_id": 1, "type": "Rule" } }
+      finding_info.data_sources = ["netskope"]
+
+      . = {
+          "class_uid": 2004,
+          "class_name": "Detection Finding",
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": 1,
+          "activity_name": "Create",
+          "type_uid": 200401,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": 1,
+          "status": "New",
+          "action_id": action_id,
+          "action": action_name,
+          "disposition_id": disposition_id,
+          "disposition": disposition_name,
+          "is_alert": true,
+          "time": time_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "finding_info": finding_info
+      }
+      ev = {}
+      if length(file_obj) > 0 { ev.file = file_obj }
+      if user_name != "" { ev.user = { "name": user_name } }
+      if has_src { ev.src_endpoint = src_endpoint }
+      if has_dst { ev.dst_endpoint = dst_endpoint }
+      if url_str != "" { ev.url = { "url_string": url_str } }
+      if length(ev) > 0 { .evidences = [ev] }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      mal = to_string(e.malware_name) ?? ""
+      if mal != "" { .malware = [{ "name": mal, "classification_ids": [0], "provider": "Netskope" }] }
+      # `evidences.*` is not addressable in nPL on this deployment, so every
+      # pivotable entity is ALSO emitted as an OCSF observable, which is.
+      obs = []
+      if user_name != "" { obs = push(obs, { "name": "evidences.user.name", "type": "User Name", "type_id": 4, "value": user_name }) }
+      if fsha != "" { obs = push(obs, { "name": "evidences.file.hashes.value", "type": "Hash", "type_id": 8, "value": fsha }) }
+      if fmd5 != "" { obs = push(obs, { "name": "evidences.file.hashes.value", "type": "Hash", "type_id": 8, "value": fmd5 }) }
+      if fname != "" { obs = push(obs, { "name": "evidences.file.name", "type": "File Name", "type_id": 7, "value": fname }) }
+      if url_str != "" { obs = push(obs, { "name": "evidences.url.url_string", "type": "URL String", "type_id": 6, "value": url_str }) }
+      if sip != "" { obs = push(obs, { "name": "evidences.src_endpoint.ip", "type": "IP Address", "type_id": 2, "value": sip }) }
+      if dip != "" { obs = push(obs, { "name": "evidences.dst_endpoint.ip", "type": "IP Address", "type_id": 2, "value": dip }) }
+      if length(obs) > 0 { .observables = obs }
+      if length(unmapped) > 0 { .unmapped = unmapped }
+  } else if ok && record_type == "page" {
+      # =================== HTTP Activity (4002) ===================
+      code = to_int(e.http_status_code) ?? 0
+      status_id = 2
+      status_str = "Failure"
+      if code >= 200 && code < 400 { status_id = 1; status_str = "Success" }
+      if code == 0 { status_id = 0; status_str = "Unknown" }
+
+      url_obj = {}
+      if url_str != "" { url_obj.url_string = url_str }
+      if domain != "" { url_obj.hostname = domain }
+      pu2, pu2err = parse_url(url_str)
+      if pu2err == null {
+          up = to_string(pu2.path)
+          if up != "" { url_obj.path = up }
+          us = to_string(pu2.scheme)
+          if us != "" { url_obj.scheme = us }
+      }
+      appcat = to_string(e.appcategory) ?? ""
+      if appcat != "" { url_obj.categories = [appcat] }
+      if !exists(url_obj.path) && !exists(url_obj.url_string) { url_obj.path = "/" }
+
+      http_request = { "url": url_obj }
+      ua = to_string(e.useragent) ?? ""
+      if ua != "" { http_request.user_agent = ua }
+      rf = to_string(e.referer) ?? ""
+      if rf != "" { http_request.referrer = rf }
+
+      . = {
+          "class_uid": 4002,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 400299,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "action_id": action_id,
+          "action": action_name,
+          "disposition_id": disposition_id,
+          "disposition": disposition_name,
+          "is_alert": blocked,
+          "time": time_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "http_request": http_request,
+          "http_response": { "code": code, "status": status_str },
+          "traffic": { "bytes_in": bytes_in, "bytes_out": bytes_out }
+      }
+      if has_src { .src_endpoint = src_endpoint }
+      if has_dst { .dst_endpoint = dst_endpoint }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if app_name != "" { .app_name = app_name }
+      if length(unmapped) > 0 { .unmapped = unmapped }
+  } else if ok && (record_type == "network" || record_type == "connection") {
+      # =================== Network Activity (4001) ===================
+      . = {
+          "class_uid": 4001,
+          "class_name": "Network Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": 6,
+          "activity_name": "Traffic",
+          "type_uid": 400106,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": 1,
+          "status": "Success",
+          "action_id": action_id,
+          "action": action_name,
+          "disposition_id": disposition_id,
+          "disposition": disposition_name,
+          "is_alert": blocked,
+          "time": time_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "traffic": { "bytes_in": bytes_in, "bytes_out": bytes_out }
+      }
+      if has_src { .src_endpoint = src_endpoint } else { .src_endpoint = { "svc_name": "netskope" } }
+      if has_dst { .dst_endpoint = dst_endpoint }
+      proto = downcase(to_string(e.protocol) ?? "")
+      if proto != "" { .connection_info = { "direction_id": 2, "direction": "Outbound", "protocol_name": proto } }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if app_name != "" { .app_name = app_name }
+      if length(unmapped) > 0 { .unmapped = unmapped }
+  } else if ok && (record_type == "application" || record_type == "audit") {
+      # =================== API Activity (6003) ===================
+      # A Netskope application event is "user did <activity> in <app>", and an
+      # audit event is "admin did <event> in the Netskope tenant". Both are
+      # operations against a service API, which is exactly 6003 — not 4002:
+      # most of them carry no HTTP request at all.
+      op = activity_verb
+      if op == "" { op = to_string(e.audit_log_event) ?? "" }
+      if op == "" { op = "Unknown" }
+      svc = app_name
+      if svc == "" { svc = "Netskope Admin" }
+
+      status_id = 1
+      status_str = "Success"
+      if blocked { status_id = 2; status_str = "Failure" }
+
+      . = {
+          "class_uid": 6003,
+          "class_name": "API Activity",
+          "category_uid": 6,
+          "category_name": "Application Activity",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 600399,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "action_id": action_id,
+          "action": action_name,
+          "disposition_id": disposition_id,
+          "disposition": disposition_name,
+          "is_alert": blocked,
+          "time": time_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "api": { "operation": op, "service": { "name": svc } },
+          "actor": { "user": { "name": "unknown" } },
+          "src_endpoint": { "svc_name": "netskope" }
+      }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if has_src { .src_endpoint = src_endpoint }
+      if has_dst { .dst_endpoint = dst_endpoint }
+      res = {}
+      if fname != "" { res.name = fname }
+      otyp = to_string(e.object_type) ?? ""
+      if otyp != "" { res.type = otyp }
+      if length(res) > 0 { .resources = [res] }
+      if length(unmapped) > 0 { .unmapped = unmapped }
+  } else {
+      # =================== Base Event (0) ===================
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": 0,
+          "status": "Unknown",
+          "time": time_ms,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": metadata
+      }
+      if !ok {
+          .metadata = {
+              "version": "1.9.0",
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_name": "netskope",
+              "product": { "name": "SSE", "vendor_name": "Netskope" }
+          }
+      } else {
+          if user_name != "" { .actor = { "user": { "name": user_name } } }
+          if length(unmapped) > 0 { .unmapped = unmapped }
+      }
+  }
+
+  .
+
+# Runtime samples (NAN-2327): one per event shape this parser routes.
+# `class_uid` is asserted because class routing is the whole point of the
+# OCSF conversion — a silent reroute is the defect most likely to survive
+# a compile-only check.
+samples:
+  - raw: '{"_id":"66ab12cd","record_type":"alert","timestamp":1786000522,"alert":"yes","alert_id":"ALRT-5512","alert_name":"Malware Detected in Upload","alert_type":"Malware","malware_name":"Trojan.GenericKD","malware_type":"Trojan","detection_engine":"Netskope Threat Protection","severity":"high","user":"alice@corp.example","userip":"10.80.1.5","srcip":"203.0.113.10","dstip":"104.18.32.7","hostname":"LAP-1","app":"Box","appcategory":"Cloud Storage","activity":"Upload","action":"block","url":"https://box.com/upload/file","object":"invoice.exe","object_type":"File","sha256":"BB86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08","src_country":"US","dst_country":"US"}'
+    expect:
+      class_uid: 2004
+      activity_id: 1
+  - raw: '{"_id":"66ab12cf","record_type":"application","timestamp":1786000535,"user":"carol@corp.example","srcip":"203.0.113.12","app":"Salesforce","appcategory":"CRM","activity":"Download","action":"allow","object":"Q3-pipeline.csv","object_type":"File","instance_name":"corp-prod","access_method":"Reverse Proxy","organization_unit":"Sales"}'
+    expect:
+      class_uid: 6003
+      activity_id: 99
+  - raw: '{"_id":"66ab12d1","record_type":"audit","timestamp":1786000545,"user":"admin@corp.example","audit_log_event":"Policy Modified","audit_type":"Admin","supporting_data":{"data_type":"policy","data_values":["Block PII Upload"]},"srcip":"198.51.100.251"}'
+    expect:
+      class_uid: 6003
+      activity_id: 99
+  - raw: '[1,2,3]'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: '{"_id":"66ab12d2","record_type":"infrastructure","timestamp":1786000550,"severity":"low","device":"NPA-Publisher-1"}'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: '{"_id":"66ab12d0","record_type":"network","timestamp":1786000540,"user":"dan@corp.example","srcip":"203.0.113.13","dstip":"198.51.100.44","srcport":52000,"dstport":443,"protocol":"tcp","client_bytes":8000,"server_bytes":32000,"action":"allow","app":"Zoom"}'
+    expect:
+      class_uid: 4001
+      activity_id: 6
+  - raw: '{"_id":"66ab12ce","record_type":"page","timestamp":1786000530,"user":"bob@corp.example","userip":"10.80.1.6","srcip":"203.0.113.11","dstip":"104.18.32.8","hostname":"LAP-2","url":"https://docs.example.com/handbook?v=3","domain":"docs.example.com","useragent":"Mozilla/5.0","referer":"https://intranet.example.com/","http_status_code":200,"client_bytes":1200,"server_bytes":48000,"app":"Confluence","appcategory":"Collaboration","action":"allow","access_method":"Client","traffic_type":"CloudApp"}'
+    expect:
+      class_uid: 4002
+      activity_id: 99

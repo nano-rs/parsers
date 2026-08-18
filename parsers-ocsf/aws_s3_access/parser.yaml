@@ -1,0 +1,207 @@
+name: aws_s3_access_ocsf
+display_name: AWS S3 Access Logs (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Parses AWS S3 server access logs into complete OCSF 1.9.0 "API Activity"
+  (class_uid 6003) records. S3 server access logs describe S3 data-plane API
+  calls (REST.GET.OBJECT, REST.PUT.OBJECT, ...), so they map to API Activity
+  rather than HTTP Activity; the underlying HTTP exchange is still carried in
+  http_request / http_response. The whole OCSF object is emitted on the root so
+  it lands in ocsf_logs.event and the promoted columns materialize. Mirrors the
+  UDM aws_s3_access parser but targets OCSF instead of `.udm.*`.
+match_values:
+  - aws_s3_access
+category: cloud
+vendor: "Amazon"
+product: "S3"
+parser_vrl: |
+  # AWS S3 server access log -> OCSF 1.9.0 API Activity (class_uid 6003)
+  raw_log = to_string(.message) ?? ""
+
+  class_uid = 6003
+
+  m = parse_regex(raw_log, r'^(?P<bucket_owner>\S+)\s+(?P<bucket>\S+)\s+\[(?P<time>[^\x5D]+)\]\s+(?P<remote_ip>\S+)\s+(?P<requester>\S+)\s+(?P<request_id>\S+)\s+(?P<operation>\S+)\s+(?P<key>\S+)\s+"(?P<request_uri>[^"]*)"\s+(?P<http_status>\S+)\s+(?P<error_code>\S+)\s+(?P<bytes_sent>\S+)\s+(?P<object_size>\S+)\s+(?P<total_time>\S+)\s+(?P<turn_around_time>\S+)\s+"(?P<referer>[^"]*)"\s+"(?P<user_agent>[^"]*)"\s+(?P<version_id>\S+)') ?? {}
+
+  if length(keys(m)) > 0 {
+      # ---- time ----
+      time_ms = 0
+      ts_str = to_string(m.time)
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%d/%b/%Y:%H:%M:%S %z")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- operation "REST.GET.OBJECT" -> CRUD activity ----
+      operation = to_string(m.operation)
+      op_parts = split(operation, ".")
+      verb = ""
+      if length(op_parts) >= 2 { verb = upcase(to_string(op_parts[1])) }
+      activity_id = 99
+      activity_name = "Other"
+      if verb == "GET" || verb == "HEAD" || verb == "OPTIONS" || verb == "SELECT" { activity_id = 2; activity_name = "Read" }
+      if verb == "PUT" || verb == "COPY" { activity_id = 1; activity_name = "Create" }
+      if verb == "POST" { activity_id = 3; activity_name = "Update" }
+      if verb == "DELETE" { activity_id = 4; activity_name = "Delete" }
+
+      # ---- status ----
+      http_status = to_string(m.http_status)
+      code = to_int(http_status) ?? 0
+      error_code = to_string(m.error_code)
+      status_id = 0
+      status_str = "Unknown"
+      severity_id = 1
+      severity = "Informational"
+      if code > 0 {
+          if code >= 200 && code < 400 && (error_code == "-" || error_code == "") {
+              status_id = 1
+              status_str = "Success"
+          } else {
+              status_id = 2
+              status_str = "Failure"
+              severity_id = 2
+              severity = "Low"
+          }
+      }
+
+      # ---- request URI "METHOD /path HTTP/1.1" ----
+      request_uri = to_string(m.request_uri)
+      uri_parts = split(request_uri, " ")
+      method = ""
+      uri_path = ""
+      http_ver = ""
+      if length(uri_parts) >= 1 { method = upcase(to_string(uri_parts[0])) }
+      if length(uri_parts) >= 2 { uri_path = to_string(uri_parts[1]) }
+      if length(uri_parts) >= 3 { http_ver = to_string(uri_parts[2]) }
+
+      bucket = to_string(m.bucket)
+      key_val = to_string(m.key)
+
+      http_request = {}
+      if method != "" && method != "-" { http_request.http_method = method }
+      if http_ver != "" && http_ver != "-" { http_request.version = http_ver }
+      ua = to_string(m.user_agent)
+      if ua != "" && ua != "-" { http_request.user_agent = ua }
+      referer = to_string(m.referer)
+      if referer != "" && referer != "-" { http_request.referrer = referer }
+      req_id = to_string(m.request_id)
+      if req_id != "" && req_id != "-" { http_request.uid = req_id }
+      url_obj = {}
+      if uri_path != "" && uri_path != "-" { url_obj.path = uri_path }
+      if bucket != "" && bucket != "-" { url_obj.hostname = bucket + ".s3.amazonaws.com" }
+      if length(keys(url_obj)) > 0 { http_request.url = url_obj }
+
+      bytes_sent = to_int(to_string(m.bytes_sent)) ?? 0
+      http_response = { "length": bytes_sent }
+      if code > 0 { http_response.code = code; http_response.status = status_str }
+
+      # ---- resources: the bucket, plus the object key when present ----
+      resources = []
+      if bucket != "" && bucket != "-" {
+          resources = push(resources, { "type": "AWS::S3::Bucket", "name": bucket, "uid": "arn:aws:s3:::" + bucket })
+      }
+      if key_val != "" && key_val != "-" {
+          resources = push(resources, { "type": "AWS::S3::Object", "name": key_val, "uid": "arn:aws:s3:::" + bucket + "/" + key_val })
+      }
+
+      # ---- requester: an IAM ARN, a canonical user id, or "-" (anonymous) ----
+      requester = to_string(m.requester)
+      user = { "name": "anonymous", "type_id": 0 }
+      if requester != "" && requester != "-" {
+          user = { "uid": requester }
+          req_parts = split(requester, "/")
+          last_idx = length(req_parts) - 1
+          short_name, sn_err = get(req_parts, [last_idx])
+          if sn_err == null {
+              user.name = to_string(short_name) ?? requester
+          } else {
+              user.name = requester
+          }
+      }
+
+      total_time = to_int(to_string(m.total_time)) ?? 0
+
+      remote_ip = downcase(to_string(m.remote_ip))
+      src_endpoint = { "ip": "0.0.0.0" }
+      if is_ipv4(remote_ip) || is_ipv6(remote_ip) { src_endpoint = { "ip": remote_ip } }
+
+      ocsf = {
+          "class_uid": class_uid,
+          "class_name": "API Activity",
+          "category_uid": 6,
+          "category_name": "Application Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "duration": total_time,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud"],
+              "uid": uuid_v4(),
+              "log_name": "S3 Server Access Log",
+              "log_provider": "AWS S3",
+              "product": { "name": "AWS S3", "vendor_name": "Amazon" }
+          },
+          "api": {
+              "operation": operation,
+              "service": { "name": "s3" },
+              "request": { "uid": req_id }
+          },
+          "cloud": { "provider": "AWS" },
+          "actor": { "user": user },
+          "src_endpoint": src_endpoint,
+          "http_request": http_request,
+          "http_response": http_response
+      }
+      if length(resources) > 0 { ocsf.resources = resources }
+      if error_code != "" && error_code != "-" { ocsf.status_detail = error_code; ocsf.status_code = error_code }
+
+      unmapped = {}
+      owner = to_string(m.bucket_owner)
+      if owner != "" && owner != "-" { unmapped.bucket_owner = owner }
+      obj_size = to_string(m.object_size)
+      if obj_size != "" && obj_size != "-" { unmapped.object_size = to_int(obj_size) ?? 0 }
+      tat = to_string(m.turn_around_time)
+      if tat != "" && tat != "-" { unmapped.turn_around_time = to_int(tat) ?? 0 }
+      ver_id = to_string(m.version_id)
+      if ver_id != "" && ver_id != "-" { unmapped.version_id = ver_id }
+      if key_val != "" && key_val != "-" { unmapped.object_key = key_val }
+      if length(keys(unmapped)) > 0 { ocsf.unmapped = unmapped }
+
+      . = ocsf
+  } else {
+      . = {
+          "class_uid": class_uid,
+          "class_name": "API Activity",
+          "category_uid": 6,
+          "category_name": "Application Activity",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": class_uid * 100 + 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud"],
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_name": "S3 Server Access Log",
+              "product": { "name": "AWS S3", "vendor_name": "Amazon" }
+          },
+          "api": { "operation": "Unknown", "service": { "name": "s3" } },
+          "cloud": { "provider": "AWS" },
+          "actor": { "user": { "name": "unknown" } },
+          "src_endpoint": { "ip": "0.0.0.0" }
+      }
+  }

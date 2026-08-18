@@ -1,0 +1,855 @@
+name: limacharlie_ocsf
+display_name: LimaCharlie EDR (OCSF)
+version: "1.0.0"
+description: >
+  Parses LimaCharlie EDR sensor telemetry (routing + event envelope) into
+  complete OCSF 1.9.0 records, routed by routing.event_type:
+    NEW_PROCESS / EXISTING_PROCESS / TERMINATE_PROCESS -> Process Activity 1007
+    SENSITIVE_PROCESS_ACCESS / NEW_REMOTE_THREAD / OPEN_HANDLES -> Process Activity 1007
+    NEW_TCP4|TCP6|UDP4|UDP6_CONNECTION / NETWORK_SUMMARY -> Network Activity 4001
+    DNS_REQUEST                       -> DNS Activity 4003
+    MODULE_LOAD / MODULE_UNLOAD       -> Module Activity 1005
+    FILE_* / NEW_DOCUMENT / CODE_IDENTITY / NEW_NAMED_PIPE -> File System Activity 1001
+    REGISTRY_CREATE|DELETE            -> Registry Key Activity 201001 (win ext)
+    REGISTRY_WRITE|READ               -> Registry Value Activity 201002 (win ext)
+    NEW_LOGON / BAD_LOGON             -> Authentication 3002
+    USER_OBSERVED                     -> User Inventory Info 5003
+    SERVICE_CHANGE                    -> Windows Service Activity 201004 (win ext)
+    DETECTION / YARA_DETECTION / INCIDENT_REPORT -> Detection Finding 2004
+    CONNECTED / DISCONNECTED / STARTING_UP -> Application Lifecycle 6002
+    SENSOR_HOSTNAME                   -> Device Inventory Info 5001
+    LOG / CLOUD_* / OUTBOUND_DATA_REPORT -> Base Event 0 (no OCSF class fits)
+  Emits the whole OCSF object on the root so it lands in ocsf_logs.event and the
+  promoted columns materialize. Carries metadata.profiles ["host"] because the
+  `device` object is profile-bound in OCSF 1.9. The OCSF counterpart of
+  parsers/limacharlie - deploy one or the other, never both.
+ocsf_version: "1.9.0"
+match_values:
+  - limacharlie
+category: endpoint
+vendor: "LimaCharlie"
+product: "LimaCharlie EDR"
+parser_vrl: |
+  # LimaCharlie EDR sensor telemetry -> OCSF 1.9.0.
+  # Emits the COMPLETE OCSF record on the root.
+  #
+  # Wire format:
+  #   .routing — event_type, event_time (epoch MS), hostname, oid/sid/iid, int_ip /
+  #              ext_ip, parent/this atom chain (causality)
+  #   .event   — payload, SCREAMING_SNAKE_CASE keys; shape varies by event_type
+  raw_log = string!(.message)
+  parsed, err = parse_json(raw_log)
+
+  if err != null || !is_object(parsed) {
+      . = {
+          "class_uid": 1007,
+          "class_name": "Process Activity",
+          "category_uid": 1,
+          "category_name": "System Activity",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 100799,
+          "severity_id": 1,
+          "severity": "Informational",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          # 1007 requires actor/device/process even on the unparseable path.
+          "process": { "pid": 0 },
+          "actor": { "process": { "pid": 0 } },
+          "device": { "hostname": "", "type_id": 0 },
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["host"],
+              "uid": uuid_v4(),
+              "log_level": "error",
+              "log_source": "limacharlie",
+              "product": { "name": "LimaCharlie EDR", "vendor_name": "LimaCharlie" }
+          }
+      }
+  } else {
+      p = object!(parsed)
+      routing = object(p.routing) ?? {}
+      ev = object(p.event) ?? {}
+
+      event_type = upcase(to_string(routing.event_type) ?? "")
+      if event_type == "" { event_type = "UNKNOWN" }
+
+      # ---- time: routing.event_time is already epoch MILLISECONDS ----
+      time_ms = to_int(routing.event_time) ?? 0
+
+      # ---- the device the sensor runs on -------------------------------
+      hostname = downcase(to_string(routing.hostname) ?? "")
+      int_ip = downcase(to_string(routing.int_ip) ?? "")
+      sensor_id = to_string(routing.sid) ?? ""
+      device = { "hostname": hostname, "type_id": 0 }
+      if int_ip != "" { device.ip = int_ip }
+      if sensor_id != "" { device.uid = sensor_id }
+
+      user_name = downcase(to_string(ev.USER_NAME) ?? "")
+
+      # ---- the process this event is about -----------------------------
+      # NOTE: to_string(<missing>) yields "" (it does not error), so `??` never
+      # falls through — every fallback below is an explicit empty check.
+      file_path = to_string(ev.FILE_PATH) ?? ""
+      file_name = ""
+      fnm, fnmerr = parse_regex(file_path, r'(?P<b>[^\\/]+)$')
+      if fnmerr == null { file_name = string(fnm.b) ?? "" }
+      file_hash = downcase(to_string(ev.HASH) ?? "")
+
+      proc_file = { "name": file_name, "path": file_path, "type_id": 1 }
+      if file_hash != "" { proc_file.hashes = [{ "algorithm_id": 3, "value": file_hash }] }
+
+      # LimaCharlie atoms are the causality chain: routing.this identifies THIS
+      # process/event, routing.parent identifies the one that caused it.
+      this_atom = to_string(routing.this) ?? ""
+      parent_atom = to_string(routing.parent) ?? ""
+
+      subject_process = {
+          "name": file_name,
+          "cmd_line": to_string(ev.COMMAND_LINE) ?? "",
+          "pid": to_int(ev.PROCESS_ID) ?? 0,
+          "uid": this_atom,
+          "file": proc_file
+      }
+
+      # ---- the parent process (rich PARENT block on Linux/macOS sensors) ----
+      parent_obj = object(ev.PARENT) ?? {}
+      parent_path = to_string(parent_obj.FILE_PATH) ?? ""
+      parent_name = ""
+      pnm, pnmerr = parse_regex(parent_path, r'(?P<b>[^\\/]+)$')
+      if pnmerr == null { parent_name = string(pnm.b) ?? "" }
+      parent_hash = downcase(to_string(parent_obj.HASH) ?? "")
+      parent_file = { "name": parent_name, "path": parent_path, "type_id": 1 }
+      if parent_hash != "" { parent_file.hashes = [{ "algorithm_id": 3, "value": parent_hash }] }
+      parent_pid = to_int(ev.PARENT_PROCESS_ID) ?? 0
+      if parent_pid == 0 { parent_pid = to_int(parent_obj.PROCESS_ID) ?? 0 }
+      parent_process = {
+          "name": parent_name,
+          "cmd_line": to_string(parent_obj.COMMAND_LINE) ?? "",
+          "pid": parent_pid,
+          "uid": parent_atom,
+          "file": parent_file
+      }
+
+      # ---- defaults; overridden per branch below ----
+      class_uid = 1007
+      class_name = "Process Activity"
+      category_uid = 1
+      category_name = "System Activity"
+      activity_id = 99
+      activity_name = "Other"
+      severity_id = 1
+      severity = "Informational"
+      profiles = ["host"]
+
+      ocsf = {}
+
+      if event_type == "NEW_PROCESS" || event_type == "EXISTING_PROCESS" || event_type == "TERMINATE_PROCESS" {
+          # Process family -> Process Activity 1007. The subject is the process
+          # itself; its launcher is actor.process.
+          if event_type == "NEW_PROCESS" {
+              activity_id = 1; activity_name = "Launch"
+          } else if event_type == "TERMINATE_PROCESS" {
+              activity_id = 2; activity_name = "Terminate"
+          } else {
+              # EXISTING_PROCESS is an inventory observation of an already-running
+              # process, not a launch.
+              activity_id = 99; activity_name = "Other"
+          }
+          ocsf.process = subject_process
+          ocsf.actor = { "process": parent_process, "user": { "name": user_name } }
+          ocsf.device = device
+      } else if event_type == "SENSITIVE_PROCESS_ACCESS" {
+          # Handle open against a protected process -> 1007 Open.
+          # SOURCE is the accessor (actor), TARGET is the accessed process.
+          activity_id = 3; activity_name = "Open"
+          src = object(ev.SOURCE) ?? {}
+          tgt = object(ev.TARGET) ?? {}
+          src_path = to_string(src.FILE_PATH) ?? ""
+          src_name = ""
+          snm, snmerr = parse_regex(src_path, r'(?P<b>[^\\/]+)$')
+          if snmerr == null { src_name = string(snm.b) ?? "" }
+          tgt_path = to_string(tgt.FILE_PATH) ?? ""
+          tgt_name = ""
+          tnm, tnmerr = parse_regex(tgt_path, r'(?P<b>[^\\/]+)$')
+          if tnmerr == null { tgt_name = string(tnm.b) ?? "" }
+          ocsf.actor = {
+              "process": {
+                  "name": src_name,
+                  "pid": to_int(src.PROCESS_ID) ?? 0,
+                  "file": { "name": src_name, "path": src_path, "type_id": 1 }
+              },
+              "user": { "name": downcase(to_string(src.USER_NAME) ?? "") }
+          }
+          ocsf.process = {
+              "name": tgt_name,
+              "pid": to_int(tgt.PROCESS_ID) ?? 0,
+              "file": { "name": tgt_name, "path": tgt_path, "type_id": 1 }
+          }
+          ocsf.device = device
+          # ACCESS_MASK is a Windows access mask; actual_permissions is integer_t.
+          access_mask_raw = downcase(to_string(ev.ACCESS_MASK) ?? "")
+          if access_mask_raw != "" {
+              access_mask_hex = replace(access_mask_raw, "0x", "")
+              access_mask, access_mask_err = parse_int(access_mask_hex, base: 16)
+              if access_mask_err == null { ocsf.actual_permissions = access_mask }
+          }
+          ocsf.unmapped = { "target_user": to_string(tgt.USER_NAME) ?? null }
+      } else if event_type == "NEW_REMOTE_THREAD" {
+          # Remote thread created in another process -> 1007 Inject.
+          activity_id = 4; activity_name = "Inject"
+          src = object(ev.SOURCE) ?? {}
+          tgt = object(ev.TARGET) ?? {}
+          src_path = to_string(src.FILE_PATH) ?? ""
+          src_name = ""
+          snm, snmerr = parse_regex(src_path, r'(?P<b>[^\\/]+)$')
+          if snmerr == null { src_name = string(snm.b) ?? "" }
+          tgt_path = to_string(tgt.FILE_PATH) ?? ""
+          tgt_name = ""
+          tnm, tnmerr = parse_regex(tgt_path, r'(?P<b>[^\\/]+)$')
+          if tnmerr == null { tgt_name = string(tnm.b) ?? "" }
+          ocsf.actor = {
+              "process": {
+                  "name": src_name,
+                  "pid": to_int(src.PROCESS_ID) ?? 0,
+                  "file": { "name": src_name, "path": src_path, "type_id": 1 }
+              },
+              "user": { "name": user_name }
+          }
+          ocsf.process = {
+              "name": tgt_name,
+              "pid": to_int(tgt.PROCESS_ID) ?? 0,
+              "file": { "name": tgt_name, "path": tgt_path, "type_id": 1 }
+          }
+          ocsf.device = device
+          ocsf.injection_type_id = 1
+          ocsf.injection_type = "Remote Thread"
+          ocsf.unmapped = { "thread_start_address": to_string(ev.START_ADDRESS) ?? null }
+      } else if event_type == "OPEN_HANDLES" {
+          # A snapshot of the handles a process holds -> 1007 Other.
+          activity_id = 99; activity_name = "Other"
+          ocsf.process = subject_process
+          ocsf.actor = { "process": subject_process, "user": { "name": user_name } }
+          ocsf.device = device
+          handle_count = 0
+          if is_array(ev.HANDLES) { handle_count = length(array(ev.HANDLES) ?? []) }
+          ocsf.unmapped = { "handle_count": handle_count }
+      } else if event_type == "NEW_TCP4_CONNECTION" || event_type == "NEW_TCP6_CONNECTION" ||
+                event_type == "NEW_UDP4_CONNECTION" || event_type == "NEW_UDP6_CONNECTION" {
+          # -> Network Activity 4001 (Open). The connecting process is the ACTOR.
+          class_uid = 4001; class_name = "Network Activity"
+          category_uid = 4; category_name = "Network Activity"
+          activity_id = 1; activity_name = "Open"
+          src = object(ev.SOURCE) ?? {}
+          dst = object(ev.DESTINATION) ?? {}
+          ocsf.src_endpoint = {
+              "ip": downcase(to_string(src.IP) ?? ""),
+              "port": to_int(src.PORT) ?? 0,
+              "hostname": hostname
+          }
+          ocsf.dst_endpoint = {
+              "ip": downcase(to_string(dst.IP) ?? ""),
+              "port": to_int(dst.PORT) ?? 0
+          }
+          # protocol_num is the IANA number; direction is not carried by LC.
+          protocol_num = 6
+          if event_type == "NEW_UDP4_CONNECTION" || event_type == "NEW_UDP6_CONNECTION" { protocol_num = 17 }
+          ocsf.connection_info = { "direction_id": 0, "protocol_num": protocol_num }
+          ocsf.actor = { "process": subject_process, "user": { "name": user_name } }
+          ocsf.device = device
+      } else if event_type == "NETWORK_CONNECTIONS" || event_type == "NETWORK_SUMMARY" {
+          # A rollup of a process's connections -> Network Activity 4001 (Traffic).
+          class_uid = 4001; class_name = "Network Activity"
+          category_uid = 4; category_name = "Network Activity"
+          activity_id = 6; activity_name = "Traffic"
+          # 4001 needs at least one endpoint; the summary is observed on this host.
+          ocsf.src_endpoint = { "hostname": hostname }
+          if int_ip != "" { ocsf.src_endpoint.ip = int_ip }
+          ocsf.actor = { "process": subject_process, "user": { "name": user_name } }
+          ocsf.device = device
+          conn_count = 0
+          if is_array(ev.NETWORK_ACTIVITY) { conn_count = length(array(ev.NETWORK_ACTIVITY) ?? []) }
+          ocsf.unmapped = { "connection_count": conn_count }
+      } else if event_type == "DNS_REQUEST" {
+          # -> DNS Activity 4003 (Query). LC folds the resolved addresses into the
+          # request event, so they become answers[].
+          class_uid = 4003; class_name = "DNS Activity"
+          category_uid = 4; category_name = "Network Activity"
+          activity_id = 1; activity_name = "Query"
+          # 4003 needs at least one endpoint; the query is observed on this host.
+          ocsf.src_endpoint = { "hostname": hostname }
+          if int_ip != "" { ocsf.src_endpoint.ip = int_ip }
+
+          query = { "hostname": downcase(to_string(ev.DOMAIN_NAME) ?? "") }
+          # DNS_TYPE is the numeric RR code in LC's learned schema; TYPE is the
+          # older string form.
+          dns_type_num = to_int(ev.DNS_TYPE) ?? 0
+          dns_type = ""
+          if dns_type_num == 1 { dns_type = "A" }
+          if dns_type_num == 2 { dns_type = "NS" }
+          if dns_type_num == 5 { dns_type = "CNAME" }
+          if dns_type_num == 6 { dns_type = "SOA" }
+          if dns_type_num == 12 { dns_type = "PTR" }
+          if dns_type_num == 15 { dns_type = "MX" }
+          if dns_type_num == 16 { dns_type = "TXT" }
+          if dns_type_num == 28 { dns_type = "AAAA" }
+          if dns_type_num == 33 { dns_type = "SRV" }
+          if dns_type_num == 65 { dns_type = "HTTPS" }
+          if dns_type_num == 255 { dns_type = "ANY" }
+          if dns_type == "" { dns_type = upcase(to_string(ev.TYPE) ?? "") }
+          if dns_type != "" { query.type = dns_type }
+          ocsf.query = query
+
+          answers = []
+          addresses = []
+          if is_array(ev.IP_ADDRESSES) { addresses = array(ev.IP_ADDRESSES) ?? [] }
+          for_each(addresses) -> |_i, addr| {
+              addr_str = downcase(to_string(addr) ?? "")
+              if addr_str != "" { answers = push(answers, { "rdata": addr_str }) }
+          }
+          if length(answers) == 0 {
+              single_addr = downcase(to_string(ev.IP_ADDRESS) ?? "")
+              if single_addr != "" { answers = push(answers, { "rdata": single_addr }) }
+          }
+          if length(answers) > 0 { ocsf.answers = answers }
+          ocsf.actor = { "process": subject_process, "user": { "name": user_name } }
+          ocsf.device = device
+      } else if event_type == "MODULE_LOAD" || event_type == "MODULE_UNLOAD" {
+          # -> Module Activity 1005. The loading process is the ACTOR; FILE_PATH
+          # here is the LOADED LIBRARY, which is the module (the subject).
+          class_uid = 1005; class_name = "Module Activity"
+          if event_type == "MODULE_LOAD" {
+              activity_id = 1; activity_name = "Load"
+          } else {
+              activity_id = 2; activity_name = "Unload"
+          }
+          module_file = { "name": file_name, "path": file_path, "type_id": 1 }
+          if file_hash != "" { module_file.hashes = [{ "algorithm_id": 3, "value": file_hash }] }
+          ocsf.module = { "load_type_id": 1, "file": module_file }
+          # The module path is NOT this process's image, so actor.process carries
+          # only the identity LC gives us for the loader.
+          ocsf.actor = {
+              "process": { "pid": to_int(ev.PROCESS_ID) ?? 0, "uid": this_atom },
+              "user": { "name": user_name }
+          }
+          ocsf.device = device
+          ocsf.unmapped = {
+              "module_size": to_int(ev.MEMORY_SIZE) ?? null,
+              "module_base": to_string(ev.BASE_ADDRESS) ?? null
+          }
+      } else if event_type == "FILE_CREATE" || event_type == "FILE_DELETE" ||
+                event_type == "FILE_MODIFIED" || event_type == "FILE_GET" ||
+                event_type == "FILE_READ" || event_type == "NEW_DOCUMENT" ||
+                event_type == "CODE_IDENTITY" {
+          # -> File System Activity 1001. FILE_PATH is the file artifact.
+          class_uid = 1001; class_name = "File System Activity"
+          if event_type == "FILE_CREATE" || event_type == "NEW_DOCUMENT" {
+              activity_id = 1; activity_name = "Create"
+          } else if event_type == "FILE_DELETE" {
+              activity_id = 4; activity_name = "Delete"
+          } else if event_type == "FILE_MODIFIED" {
+              activity_id = 3; activity_name = "Update"
+          } else if event_type == "FILE_GET" || event_type == "FILE_READ" {
+              activity_id = 2; activity_name = "Read"
+          } else {
+              # CODE_IDENTITY is a signature/identity observation about a binary,
+              # not a filesystem mutation.
+              activity_id = 99; activity_name = "Other"
+          }
+          file_obj = { "name": file_name, "path": file_path, "type_id": 1 }
+          if file_hash != "" { file_obj.hashes = [{ "algorithm_id": 3, "value": file_hash }] }
+          file_size = to_int(ev.FILE_SIZE) ?? 0
+          if file_size > 0 { file_obj.size = file_size }
+          if event_type == "CODE_IDENTITY" {
+              # Positive signing evidence -> file.signatures[]. LC gives a status
+              # string plus a boolean; only assert a signature when it is signed.
+              sig_valid = to_bool(ev.SIGNATURE_VALID) ?? false
+              sig_status = to_string(ev.SIGNATURE_STATUS) ?? ""
+              sig_state_id = 99
+              sig_state = sig_status
+              if downcase(sig_status) == "valid" { sig_state_id = 1; sig_state = "Valid" }
+              if downcase(sig_status) == "expired" { sig_state_id = 2; sig_state = "Expired" }
+              if downcase(sig_status) == "revoked" { sig_state_id = 3; sig_state = "Revoked" }
+              if downcase(sig_status) == "untrusted" { sig_state_id = 6; sig_state = "Untrusted" }
+              if sig_valid {
+                  if sig_state == "" { sig_state = "Valid" }
+                  if sig_state_id == 99 && sig_status == "" { sig_state_id = 1 }
+                  # LC does not name the signing algorithm (it reports Windows
+                  # Authenticode, macOS codesign and Linux signing the same way),
+                  # so the generic "Code Signing" algorithm_id is the honest value.
+                  file_obj.signatures = [{
+                      "algorithm_id": 5,
+                      "algorithm": "Code Signing",
+                      "state_id": sig_state_id,
+                      "state": sig_state
+                  }]
+              }
+          }
+          ocsf.file = file_obj
+          ocsf.actor = {
+              "process": { "pid": to_int(ev.PROCESS_ID) ?? 0, "uid": this_atom },
+              "user": { "name": user_name }
+          }
+          ocsf.device = device
+          if event_type == "CODE_IDENTITY" {
+              signers_count = 0
+              if is_array(ev.SIGNERS) { signers_count = length(array(ev.SIGNERS) ?? []) }
+              signers_list = null
+              if is_array(ev.SIGNERS) { signers_list = ev.SIGNERS }
+              ocsf.unmapped = {
+                  "signature_status": to_string(ev.SIGNATURE_STATUS) ?? null,
+                  "signature_valid": ev.SIGNATURE_VALID,
+                  "signer_count": signers_count,
+                  "signers": signers_list
+              }
+          }
+      } else if event_type == "NEW_NAMED_PIPE" {
+          # A named pipe is a file object in OCSF (file.type_id 6).
+          class_uid = 1001; class_name = "File System Activity"
+          activity_id = 1; activity_name = "Create"
+          pipe_name = to_string(ev.NAME) ?? ""
+          ocsf.file = { "name": pipe_name, "path": pipe_name, "type_id": 6 }
+          ocsf.actor = { "process": subject_process, "user": { "name": user_name } }
+          ocsf.device = device
+      } else if event_type == "REGISTRY_CREATE" || event_type == "REGISTRY_DELETE" {
+          # Key-level change -> Registry Key Activity 201001 (win extension).
+          class_uid = 201001; class_name = "Registry Key Activity"
+          if event_type == "REGISTRY_CREATE" {
+              activity_id = 1; activity_name = "Create"
+          } else {
+              activity_id = 4; activity_name = "Delete"
+          }
+          reg_path = to_string(ev.REGISTRY_PATH) ?? ""
+          if reg_path == "" { reg_path = to_string(ev.PATH) ?? "" }
+          ocsf.reg_key = { "path": reg_path }
+          ocsf.actor = { "process": subject_process, "user": { "name": user_name } }
+          ocsf.device = device
+      } else if event_type == "REGISTRY_WRITE" || event_type == "REGISTRY_READ" {
+          # Value-level access -> Registry Value Activity 201002 (win extension).
+          class_uid = 201002; class_name = "Registry Value Activity"
+          if event_type == "REGISTRY_WRITE" {
+              activity_id = 2; activity_name = "Set"
+          } else {
+              activity_id = 1; activity_name = "Get"
+          }
+          reg_path = to_string(ev.REGISTRY_PATH) ?? ""
+          if reg_path == "" { reg_path = to_string(ev.PATH) ?? "" }
+          reg_value_name = to_string(ev.VALUE_NAME) ?? ""
+          if reg_value_name == "" {
+              # No explicit value name: take the trailing key segment.
+              rvm, rvmerr = parse_regex(reg_path, r'(?P<n>[^\\]+)$')
+              if rvmerr == null { reg_value_name = string(rvm.n) ?? "" }
+          }
+          reg_data = to_string(ev.NEW_VALUE) ?? ""
+          if reg_data == "" { reg_data = to_string(ev.VALUE) ?? "" }
+          ocsf.reg_value = { "name": reg_value_name, "path": reg_path, "data": reg_data }
+          ocsf.actor = { "process": subject_process, "user": { "name": user_name } }
+          ocsf.device = device
+          ocsf.unmapped = { "registry_old_value": to_string(ev.OLD_VALUE) ?? null }
+      } else if event_type == "NEW_LOGON" || event_type == "BAD_LOGON" || event_type == "FAILED_LOGON" {
+          # -> Authentication 3002 (Logon).
+          class_uid = 3002; class_name = "Authentication"
+          category_uid = 3; category_name = "Identity & Access Management"
+          activity_id = 1; activity_name = "Logon"
+          ocsf.user = {
+              "name": user_name,
+              "domain": downcase(to_string(ev.DOMAIN) ?? ""),
+              "uid": to_string(ev.USER_ID) ?? ""
+          }
+          # 3002 needs one of [service, dst_endpoint]; the logon target is this host.
+          ocsf.dst_endpoint = { "hostname": hostname }
+          source_ip = downcase(to_string(ev.SOURCE_IP) ?? "")
+          if source_ip != "" { ocsf.src_endpoint = { "ip": source_ip } }
+          if event_type == "NEW_LOGON" {
+              ocsf.status_id = 1
+              ocsf.status = "Success"
+          } else {
+              ocsf.status_id = 2
+              ocsf.status = "Failure"
+              severity_id = 2; severity = "Low"
+              logon_error = to_string(ev.ERROR) ?? ""
+              if logon_error != "" { ocsf.status_detail = logon_error }
+          }
+          session_id = to_string(ev.SESSION_ID) ?? ""
+          if session_id != "" { ocsf.session = { "uid": session_id } }
+          ocsf.device = device
+          ocsf.unmapped = { "logon_type": to_string(ev.LOGON_TYPE) ?? null }
+      } else if event_type == "USER_OBSERVED" {
+          # An observation of a user account on the host -> User Inventory 5003.
+          class_uid = 5003; class_name = "User Inventory Info"
+          category_uid = 5; category_name = "Discovery"
+          activity_id = 2; activity_name = "Collect"
+          ocsf.user = {
+              "name": user_name,
+              "domain": downcase(to_string(ev.DOMAIN) ?? ""),
+              "uid": to_string(ev.USER_ID) ?? ""
+          }
+          ocsf.device = device
+          session_id = to_string(ev.SESSION_ID) ?? ""
+          if session_id != "" { ocsf.unmapped = { "session_id": session_id } }
+      } else if event_type == "SERVICE_CHANGE" {
+          # -> Windows Service Activity 201004 (win extension).
+          class_uid = 201004; class_name = "Windows Service Activity"
+          activity_id = 2; activity_name = "Reconfigure"
+          # win_service needs one of [cmd_line, service_*_id, service_start_name,
+          # service_dependencies]; SVC_BINARY is the service's command line.
+          ocsf.win_service = {
+              "name": to_string(ev.SVC_NAME) ?? "",
+              "cmd_line": to_string(ev.SVC_BINARY) ?? ""
+          }
+          ocsf.actor = { "process": subject_process, "user": { "name": user_name } }
+          ocsf.device = device
+          ocsf.unmapped = {
+              "service_display_name": to_string(ev.SVC_DISPLAY_NAME) ?? null,
+              "service_start_type": to_string(ev.SVC_START_TYPE) ?? null,
+              "service_state": to_string(ev.SVC_STATE) ?? null
+          }
+      } else if event_type == "DETECTION" || event_type == "YARA_DETECTION" || event_type == "INCIDENT_REPORT" {
+          # LC's own rule engine / YARA / incident rollup -> Detection Finding 2004.
+          # The process that tripped the rule is the ACTOR, which also keeps
+          # actor.process.* queryable; artifacts repeat in evidences[].
+          class_uid = 2004; class_name = "Detection Finding"
+          category_uid = 2; category_name = "Findings"
+          activity_id = 1; activity_name = "Create"
+          severity_id = 3; severity = "Medium"
+
+          finding_uid = to_string(ev.detect_id) ?? ""
+          if finding_uid == "" { finding_uid = to_string(routing.event_id) ?? "" }
+          if finding_uid == "" { finding_uid = uuid_v4() }
+
+          rule_name = to_string(ev.cat) ?? ""
+          if rule_name == "" { rule_name = to_string(ev.RULE_NAME) ?? "" }
+          title = to_string(ev.summary) ?? ""
+          if title == "" { title = to_string(ev.SUMMARY) ?? "" }
+          if title == "" { title = rule_name }
+          if title == "" { title = event_type }
+
+          analytic_type_id = 1
+          analytic_type = "Rule"
+          if event_type == "YARA_DETECTION" {
+              # YARA is signature/pattern matching, not a behavioural rule.
+              analytic_type_id = 6; analytic_type = "Tagging"
+          }
+          finding_info = {
+              "uid": finding_uid,
+              "title": title,
+              "types": [event_type],
+              "data_sources": ["limacharlie"]
+          }
+          if rule_name != "" {
+              finding_info.analytic = {
+                  "name": rule_name,
+                  "uid": rule_name,
+                  "type_id": analytic_type_id,
+                  "type": analytic_type
+              }
+          }
+          ocsf.finding_info = finding_info
+          ocsf.is_alert = true
+          ocsf.status_id = 1
+          ocsf.status = "New"
+          ocsf.actor = { "process": subject_process, "user": { "name": user_name } }
+          ocsf.device = device
+
+          evidence = { "process": subject_process }
+          if file_path != "" && event_type == "YARA_DETECTION" {
+              evidence.file = { "name": file_name, "path": file_path, "type_id": 1 }
+          }
+          ocsf.evidences = [evidence]
+
+          # INCIDENT_REPORT carries LC's own 1-5 severity scale.
+          incident_sev = to_int(ev.SEVERITY) ?? 0
+          if incident_sev >= 4 {
+              severity_id = 5; severity = "Critical"
+          } else if incident_sev == 3 {
+              severity_id = 4; severity = "High"
+          } else if incident_sev == 2 {
+              severity_id = 3; severity = "Medium"
+          } else if incident_sev == 1 {
+              severity_id = 2; severity = "Low"
+          }
+          ocsf.unmapped = {
+              "detection_source": to_string(ev.source) ?? null,
+              "detection_author": to_string(ev.author) ?? null,
+              "detection_category": to_string(ev.cat) ?? null,
+              "yara_rule_namespace": to_string(ev.RULE_NS) ?? null
+          }
+      } else if event_type == "CONNECTED" || event_type == "DISCONNECTED" || event_type == "STARTING_UP" {
+          # Sensor lifecycle -> Application Lifecycle 6002; the LC sensor running
+          # on the host is the application.
+          class_uid = 6002; class_name = "Application Lifecycle"
+          category_uid = 6; category_name = "Application Activity"
+          if event_type == "STARTING_UP" {
+              activity_id = 3; activity_name = "Start"
+          } else if event_type == "DISCONNECTED" {
+              activity_id = 4; activity_name = "Stop"
+          } else {
+              # CONNECTED is the sensor reaching the LC cloud, not a start/stop.
+              activity_id = 99; activity_name = "Other"
+          }
+          ocsf.app = { "name": "LimaCharlie Sensor", "uid": sensor_id }
+          ocsf.device = device
+      } else if event_type == "SENSOR_HOSTNAME" {
+          # The sensor reporting the host's name -> Device Inventory Info 5001.
+          class_uid = 5001; class_name = "Device Inventory Info"
+          category_uid = 5; category_name = "Discovery"
+          activity_id = 1; activity_name = "Log"
+          reported_hostname = downcase(to_string(ev.HOSTNAME) ?? "")
+          if reported_hostname != "" { device.hostname = reported_hostname }
+          ocsf.device = device
+      } else if event_type == "LOG" || event_type == "CLOUD_API_RECEIVED" ||
+                event_type == "CLOUD_NOTIFICATION" || event_type == "OUTBOUND_DATA_REPORT" {
+          # LC adapter / cloud-side records. These are not endpoint activity and
+          # OCSF has no class that fits without fabricating required attributes
+          # (6003 API Activity would need api + src_endpoint), so they land on the
+          # Base Event with the payload preserved under unmapped.
+          class_uid = 0; class_name = "Base Event"
+          category_uid = 0; category_name = "Uncategorized"
+          activity_id = 99; activity_name = "Other"
+          ocsf.device = device
+          ocsf.unmapped = {
+              "cloud_service": to_string(ev.SERVICE) ?? null,
+              "cloud_region": to_string(ev.REGION) ?? null,
+              "log_source_path": to_string(ev.FILE_PATH) ?? null
+          }
+      } else {
+          # Unknown LC event_type -> Process Activity 1007 / Other, carrying
+          # whatever process context the payload happens to have.
+          activity_id = 99; activity_name = "Other"
+          ocsf.process = subject_process
+          ocsf.actor = { "process": parent_process, "user": { "name": user_name } }
+          ocsf.device = device
+      }
+
+      # ---- common envelope ---------------------------------------------
+      ocsf.class_uid = class_uid
+      ocsf.class_name = class_name
+      ocsf.category_uid = category_uid
+      ocsf.category_name = category_name
+      ocsf.activity_id = activity_id
+      ocsf.activity_name = activity_name
+      ocsf.type_uid = class_uid * 100 + activity_id
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.time = time_ms
+      ocsf.message = raw_log
+      ocsf.raw_data = raw_log
+
+      record_uid = to_string(routing.event_id) ?? ""
+      if record_uid == "" { record_uid = this_atom }
+      if record_uid == "" { record_uid = uuid_v4() }
+
+      ocsf.metadata = {
+          "version": "1.9.0",
+          "profiles": profiles,
+          "uid": record_uid,
+          "original_event_uid": record_uid,
+          "event_code": event_type,
+          "log_source": "limacharlie",
+          "product": { "name": "LimaCharlie EDR", "vendor_name": "LimaCharlie" }
+      }
+
+      . = ocsf
+  }
+samples:
+  - raw: "{\"routing\": {\"event_type\": \"BAD_LOGON\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-bad_logon\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"USER_NAME\": \"administrator\", \"LOGON_TYPE\": \"3\", \"SOURCE_IP\": \"203.0.113.9\", \"ERROR\": \"STATUS_LOGON_FAILURE\"}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "2026-08-18 limacharlie sensor emitted a non-json line"
+    expect:
+      "class_uid": 1007
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"CLOUD_API_RECEIVED\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-cloud_api_received\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"SERVICE\": \"s3\", \"REGION\": \"us-east-1\", \"PAYLOAD\": {\"a\": 1}}}"
+    expect:
+      "class_uid": 0
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"CODE_IDENTITY\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-code_identity\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"FILE_PATH\": \"C:\\\\tmp\\\\bad.exe\", \"HASH\": \"BAD999\", \"SIGNATURE_STATUS\": \"Unavailable\", \"SIGNATURE_VALID\": false}}"
+    expect:
+      "class_uid": 1001
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"CODE_IDENTITY\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-code_identity\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"FILE_PATH\": \"C:\\\\Windows\\\\System32\\\\svchost.exe\", \"HASH\": \"ABC123\", \"FILE_SIZE\": 55000, \"SIGNATURE_STATUS\": \"Valid\", \"SIGNATURE_VALID\": true, \"SIGNERS\": [\"Microsoft Windows\", \"Microsoft Root CA\"]}}"
+    expect:
+      "class_uid": 1001
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"CONNECTED\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-connected\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {}}"
+    expect:
+      "class_uid": 6002
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"DETECTION\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-detection\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"cat\": \"Credential Dumping\", \"source\": \"sid-abc\", \"author\": \"soc@corp\", \"detect_id\": \"det-1234\", \"summary\": \"mimikatz sekurlsa::logonpasswords observed\", \"detect\": {\"event\": {\"FILE_PATH\": \"C:\\\\tools\\\\mimikatz.exe\"}}, \"FILE_PATH\": \"C:\\\\tools\\\\mimikatz.exe\", \"PROCESS_ID\": 777, \"USER_NAME\": \"CORP\\\\alice\"}}"
+    expect:
+      "class_uid": 2004
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"DISCONNECTED\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-disconnected\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {}}"
+    expect:
+      "class_uid": 6002
+      "activity_id": 4
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"DNS_REQUEST\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-dns_request\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"DOMAIN_NAME\": \"api.example.net\", \"TYPE\": \"aaaa\", \"IP_ADDRESS\": \"2606:4700::1\", \"PROCESS_ID\": 1013}}"
+    expect:
+      "class_uid": 4003
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"DNS_REQUEST\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-dns_request\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"DOMAIN_NAME\": \"evil.example.com\", \"DNS_TYPE\": 1, \"IP_ADDRESSES\": [\"1.2.3.4\", \"5.6.7.8\"], \"PROCESS_ID\": 1012, \"FILE_PATH\": \"C:\\\\Windows\\\\System32\\\\svchost.exe\", \"USER_NAME\": \"SYSTEM\"}}"
+    expect:
+      "class_uid": 4003
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"EXISTING_PROCESS\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-existing_process\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"FILE_PATH\": \"/usr/sbin/sshd\", \"PROCESS_ID\": 900, \"USER_NAME\": \"root\", \"COMMAND_LINE\": \"/usr/sbin/sshd -D\"}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"FILE_CREATE\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-file_create\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"FILE_PATH\": \"C:\\\\Users\\\\alice\\\\Downloads\\\\invoice.js\", \"HASH\": \"DEAD01\", \"FILE_SIZE\": 4096, \"PROCESS_ID\": 1010, \"USER_NAME\": \"CORP\\\\alice\", \"USER_ID\": 1001}}"
+    expect:
+      "class_uid": 1001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"FILE_DELETE\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-file_delete\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"FILE_PATH\": \"C:\\\\Users\\\\alice\\\\secret.docx\", \"PROCESS_ID\": 1011}}"
+    expect:
+      "class_uid": 1001
+      "activity_id": 4
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"FILE_MODIFIED\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-file_modified\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"FILE_PATH\": \"/etc/passwd\", \"PROCESS_ID\": 1200, \"USER_NAME\": \"root\"}}"
+    expect:
+      "class_uid": 1001
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"FILE_GET\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-file_get\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"FILE_PATH\": \"/etc/shadow\", \"HASH\": \"FEED02\", \"PROCESS_ID\": 1201, \"USER_NAME\": \"root\"}}"
+    expect:
+      "class_uid": 1001
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"INCIDENT_REPORT\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-incident_report\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"SUMMARY\": \"Multiple credential access attempts\", \"SEVERITY\": 4}}"
+    expect:
+      "class_uid": 2004
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"LOG\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-log\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"FILE_PATH\": \"/var/log/syslog\", \"RAW\": \"Aug 18 10:00:00 host sshd[1]: ok\"}}"
+    expect:
+      "class_uid": 0
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"MODULE_LOAD\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-module_load\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"FILE_PATH\": \"C:\\\\Windows\\\\System32\\\\ntdll.dll\", \"HASH\": \"BEEF01\", \"MEMORY_SIZE\": 1998848, \"BASE_ADDRESS\": \"0x7ffb00000000\", \"PROCESS_ID\": 900, \"USER_NAME\": \"SYSTEM\"}}"
+    expect:
+      "class_uid": 1005
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"MODULE_UNLOAD\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-module_unload\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"FILE_PATH\": \"/usr/lib/libcrypto.so.3\", \"PROCESS_ID\": 901}}"
+    expect:
+      "class_uid": 1005
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"NEW_NAMED_PIPE\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-new_named_pipe\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"NAME\": \"\\\\\\\\.\\\\pipe\\\\msagent_1a\", \"PROCESS_ID\": 3000, \"FILE_PATH\": \"C:\\\\tmp\\\\beacon.exe\", \"USER_NAME\": \"CORP\\\\bob\"}}"
+    expect:
+      "class_uid": 1001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"NETWORK_SUMMARY\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-network_summary\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"PROCESS_ID\": 888, \"FILE_PATH\": \"C:\\\\Windows\\\\System32\\\\curl.exe\", \"NETWORK_ACTIVITY\": [{\"IP\": \"1.1.1.1\", \"PORT\": 443}, {\"IP\": \"8.8.8.8\", \"PORT\": 53}]}}"
+    expect:
+      "class_uid": 4001
+      "activity_id": 6
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"NEW_DOCUMENT\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-new_document\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"FILE_PATH\": \"C:\\\\Users\\\\bob\\\\report.docx\", \"FILE_SIZE\": 20480, \"PROCESS_ID\": 2000}}"
+    expect:
+      "class_uid": 1001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"NEW_LOGON\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-new_logon\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"USER_NAME\": \"alice\", \"USER_ID\": 1001, \"SESSION_ID\": 7, \"LOGON_TYPE\": \"10\", \"SOURCE_IP\": \"10.9.9.9\", \"DOMAIN\": \"CORP\"}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"NEW_PROCESS\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-new_process\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"COMMAND_LINE\": \"powershell.exe -enc SQBFAFgA\", \"FILE_PATH\": \"C:\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\", \"HASH\": \"9F914D42706FE215501044ACD85A32D58AAEF1419D404FDDFA5D3B48F66CCD9F\", \"PROCESS_ID\": 4444, \"PARENT_PROCESS_ID\": 1200, \"USER_NAME\": \"CORP\\\\alice\", \"USER_ID\": 1001, \"MEMORY_USAGE\": 51200, \"THREADS\": 8, \"PARENT\": {\"COMMAND_LINE\": \"explorer.exe\", \"FILE_PATH\": \"C:\\\\Windows\\\\explorer.exe\", \"HASH\": \"AA11BB22CC33\", \"PROCESS_ID\": 1200, \"USER_NAME\": \"CORP\\\\alice\", \"TIMESTAMP\": 1787049000000, \"PARENT_ATOM\": \"atom-gp\", \"THIS_ATOM\": \"atom-parent\"}}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"NEW_REMOTE_THREAD\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-new_remote_thread\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"SOURCE\": {\"PROCESS_ID\": 777, \"FILE_PATH\": \"C:\\\\tmp\\\\loader.exe\"}, \"TARGET\": {\"PROCESS_ID\": 1500, \"FILE_PATH\": \"C:\\\\Windows\\\\System32\\\\svchost.exe\"}, \"START_ADDRESS\": \"0x7ffb12340000\"}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 4
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"OPEN_HANDLES\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-open_handles\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"PROCESS_ID\": 4444, \"FILE_PATH\": \"C:\\\\Windows\\\\System32\\\\cmd.exe\", \"HANDLES\": [{\"NAME\": \"\\\\Device\\\\HarddiskVolume2\"}, {\"NAME\": \"\\\\BaseNamedObjects\\\\x\"}]}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"REGISTRY_CREATE\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-registry_create\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"REGISTRY_PATH\": \"HKLM\\\\SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run\", \"PROCESS_ID\": 555, \"USER_NAME\": \"CORP\\\\bob\", \"FILE_PATH\": \"C:\\\\Windows\\\\regedit.exe\"}}"
+    expect:
+      "class_uid": 201001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"REGISTRY_DELETE\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-registry_delete\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"PATH\": \"HKLM\\\\SOFTWARE\\\\Evil\", \"PROCESS_ID\": 556}}"
+    expect:
+      "class_uid": 201001
+      "activity_id": 4
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"REGISTRY_READ\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-registry_read\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"PATH\": \"HKLM\\\\SYSTEM\\\\CurrentControlSet\\\\Services\\\\Tcpip\\\\Parameters\\\\Hostname\", \"VALUE\": \"wks-11\", \"PROCESS_ID\": 557}}"
+    expect:
+      "class_uid": 201002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"REGISTRY_WRITE\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-registry_write\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"REGISTRY_PATH\": \"HKLM\\\\SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run\", \"VALUE_NAME\": \"Updater\", \"NEW_VALUE\": \"C:\\\\tmp\\\\bad.exe\", \"OLD_VALUE\": \"\", \"PROCESS_ID\": 555, \"USER_NAME\": \"CORP\\\\bob\", \"FILE_PATH\": \"C:\\\\Windows\\\\regedit.exe\"}}"
+    expect:
+      "class_uid": 201002
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"SENSITIVE_PROCESS_ACCESS\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-sensitive_process_access\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"SOURCE\": {\"PROCESS_ID\": 777, \"FILE_PATH\": \"C:\\\\tools\\\\mimikatz.exe\", \"USER_NAME\": \"CORP\\\\alice\"}, \"TARGET\": {\"PROCESS_ID\": 640, \"FILE_PATH\": \"C:\\\\Windows\\\\System32\\\\lsass.exe\", \"USER_NAME\": \"SYSTEM\"}, \"ACCESS_MASK\": \"0x1fffff\"}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"SENSOR_HOSTNAME\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-sensor_hostname\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"HOSTNAME\": \"WKS-11-RENAMED.corp.local\"}}"
+    expect:
+      "class_uid": 5001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"SERVICE_CHANGE\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-service_change\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"SVC_NAME\": \"EvilSvc\", \"SVC_DISPLAY_NAME\": \"Evil Service\", \"SVC_BINARY\": \"C:\\\\tmp\\\\bad.exe -k netsvcs\", \"SVC_START_TYPE\": \"AUTO_START\", \"SVC_STATE\": \"RUNNING\", \"PROCESS_ID\": 600, \"USER_NAME\": \"SYSTEM\"}}"
+    expect:
+      "class_uid": 201004
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"STARTING_UP\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-starting_up\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {}}"
+    expect:
+      "class_uid": 6002
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"NEW_TCP4_CONNECTION\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-new_tcp4_connection\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"SOURCE\": {\"IP\": \"10.4.5.6\", \"PORT\": 51234}, \"DESTINATION\": {\"IP\": \"93.184.216.34\", \"PORT\": 443}, \"PROCESS_ID\": 888, \"FILE_PATH\": \"C:\\\\Windows\\\\System32\\\\curl.exe\", \"HASH\": \"CAFE01\", \"USER_NAME\": \"CORP\\\\alice\"}}"
+    expect:
+      "class_uid": 4001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"TERMINATE_PROCESS\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-terminate_process\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"PROCESS_ID\": 4444, \"PARENT_PROCESS_ID\": 1200}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"NEW_UDP6_CONNECTION\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-new_udp6_connection\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"SOURCE\": {\"IP\": \"fe80::1\", \"PORT\": 5353}, \"DESTINATION\": {\"IP\": \"ff02::fb\", \"PORT\": 5353}, \"PROCESS_ID\": 300, \"FILE_PATH\": \"/usr/sbin/mDNSResponder\"}}"
+    expect:
+      "class_uid": 4001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"VOLUME_MOUNT\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-volume_mount\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"PROCESS_ID\": 10, \"FILE_PATH\": \"/sbin/mount\", \"USER_NAME\": \"root\", \"COMMAND_LINE\": \"mount /dev/sdb1 /mnt\", \"HASH\": \"FF00\"}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"USER_OBSERVED\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-user_observed\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"USER_NAME\": \"svc_backup\", \"USER_ID\": 1050, \"SESSION_ID\": 3, \"DOMAIN\": \"CORP\"}}"
+    expect:
+      "class_uid": 5003
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "{\"routing\": {\"event_type\": \"YARA_DETECTION\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-yara_detection\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"RULE_NAME\": \"APT_Loader_Generic\", \"RULE_NS\": \"corp_rules\", \"PROCESS_ID\": 3000, \"FILE_PATH\": \"C:\\\\tmp\\\\beacon.exe\", \"HASH\": \"BAD999\"}}"
+    expect:
+      "class_uid": 2004
+      "activity_id": 1
+      "metadata.version": "1.9.0"
