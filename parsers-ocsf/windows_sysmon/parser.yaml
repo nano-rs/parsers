@@ -1,6 +1,6 @@
 name: windows_sysmon_ocsf
 display_name: Microsoft Sysmon (OCSF)
-version: "1.1.0"
+version: "1.1.1"
 description: >
   Parses Windows Sysmon events in JSON form (top-level event_id + event_data)
   into complete OCSF 1.9.0 records, routed by Sysmon EventID:
@@ -58,12 +58,34 @@ parser_vrl: |
 
       computer = downcase(string(p.computer) ?? string(p.host) ?? "")
 
-      # ---- event time (top-level ISO8601) -> epoch ms ----
+      # ---- event time (common Sysmon JSON shapes) -> epoch ms ----------
       time_ms = 0
       ts_str = string(p.timestamp) ?? ""
       if ts_str != "" {
           t, terr = parse_timestamp(ts_str, "%+")
           if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+      if time_ms == 0 {
+          ts_str = string(p.time_created) ?? ""
+          if ts_str != "" {
+              t, terr = parse_timestamp(ts_str, "%+")
+              if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+          }
+      }
+      if time_ms == 0 {
+          ts_str = string(ed.UtcTime) ?? ""
+          if ts_str != "" {
+              t, terr = parse_timestamp(ts_str, "%+")
+              if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+              if terr != null {
+                  # EventData.UtcTime omits an explicit zone but is UTC by
+                  # contract. Add it before parsing so host timezone cannot
+                  # shift the event clock.
+                  utc_ts = replace(ts_str, " ", "T") + "Z"
+                  t2, terr2 = parse_timestamp(utc_ts, "%+")
+                  if terr2 == null { time_ms = to_unix_timestamp(t2, unit: "milliseconds") }
+              }
+          }
       }
 
       # ---- shared helpers (inlined) ------------------------------------
@@ -392,6 +414,24 @@ samples:
     expect:
       "class_uid": 1007
       "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":1,\"record_id\":91246,\"computer\":\"WKS-01\",\"time_created\":\"2026-08-18T10:26:00.123Z\",\"event_data\":{\"UtcTime\":\"2026-08-18 10:20:00.000\",\"Image\":\"C:\\\\Windows\\\\System32\\\\cmd.exe\",\"ProcessId\":\"4322\",\"ProcessGuid\":\"{aaaa-2222}\",\"ParentImage\":\"C:\\\\Windows\\\\explorer.exe\",\"ParentProcessId\":\"1200\",\"User\":\"CORP\\\\alice\"}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "time": 1787048760123
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":1,\"record_id\":91247,\"computer\":\"WKS-01\",\"event_data\":{\"UtcTime\":\"2026-08-18 10:27:00.456\",\"Image\":\"C:\\\\Windows\\\\System32\\\\cmd.exe\",\"ProcessId\":\"4323\",\"ProcessGuid\":\"{aaaa-3333}\",\"ParentImage\":\"C:\\\\Windows\\\\explorer.exe\",\"ParentProcessId\":\"1200\",\"User\":\"CORP\\\\alice\"}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "time": 1787048820456
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":1,\"record_id\":91248,\"computer\":\"WKS-01\",\"timestamp\":\"not-a-time\",\"event_data\":{\"UtcTime\":\"2026-08-18 10:28:00.789\",\"Image\":\"C:\\\\Windows\\\\System32\\\\cmd.exe\",\"ProcessId\":\"4324\",\"ProcessGuid\":\"{aaaa-4444}\",\"ParentImage\":\"C:\\\\Windows\\\\explorer.exe\",\"ParentProcessId\":\"1200\",\"User\":\"CORP\\\\alice\"}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "time": 1787048880789
       "metadata.version": "1.9.0"
   - raw: "not json at all"
     expect:
