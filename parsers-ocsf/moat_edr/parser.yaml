@@ -64,7 +64,7 @@ parser_vrl: |
           "time": to_int(to_unix_timestamp(now(), unit: "milliseconds")),
           "raw_data": raw_log,
           "finding_info": { "uid": uuid_v4(), "title": "Unparseable moat record" },
-          "device": { "hostname": "", "type_id": 0 },
+          "device": { "hostname": "unknown", "type_id": 0 },
           "metadata": {
               "version": "1.9.0",
               "profiles": ["host"],
@@ -81,6 +81,8 @@ parser_vrl: |
       kind = to_string(p.kind) ?? ""
       host = downcase(to_string(p.host) ?? "")
       event_id = to_string(p.event_id) ?? ""
+      record_uid_seed = event_id
+      if record_uid_seed == "" { record_uid_seed = uuid_v4() }
       moat_tier = to_string(p.moat_tier) ?? ""
       env_sev = downcase(to_string(p.severity) ?? "")
       m = object(p.moat) ?? {}
@@ -116,7 +118,9 @@ parser_vrl: |
       if sev_name == "high" { severity_id = 4; severity = "High" }
       if sev_name == "critical" { severity_id = 5; severity = "Critical" }
 
-      device = { "hostname": host, "type_id": 0 }
+      device_hostname = host
+      if device_hostname == "" { device_hostname = "unknown" }
+      device = { "hostname": device_hostname, "type_id": 0 }
 
       obs = []
       if host != "" {
@@ -243,7 +247,7 @@ parser_vrl: |
           if proc_pid >= 0 { actor_process.pid = proc_pid }
 
           actor = {}
-          if length(actor_process) > 0 { actor.process = actor_process }
+          if proc_pid >= 0 { actor.process = actor_process }
           proc_uid = to_int(proc.uid) ?? -1
           if proc_uid >= 0 { actor.user = { "uid": to_string(proc_uid) } }
           if length(actor) > 0 { ocsf.actor = actor }
@@ -495,13 +499,15 @@ parser_vrl: |
           activity_name = "Terminate"
 
           r = object(m.receipt) ?? {}
+          receipt_id = to_string(r.id) ?? ""
+          if receipt_id == "" { receipt_id = record_uid_seed }
           root_exe = to_string(r.root_exe) ?? ""
           root_name = ""
           if root_exe != "" {
               rn, rn_err = parse_regex(root_exe, r'(?P<b>[^/]+)$')
               if rn_err == null { root_name = to_string(rn.b) }
           }
-          rp = {}
+          rp = { "uid": receipt_id }
           if root_name != "" { rp.name = root_name }
           if root_exe != "" { rp.file = { "name": root_name, "path": root_exe, "type_id": 1 } }
           root_args = to_string(r.root_args) ?? ""
@@ -523,8 +529,7 @@ parser_vrl: |
               obs = push(obs, { "name": "process.name", "type": "Process Name", "type_id": 9, "value": root_name })
           }
 
-          receipt_id = to_string(r.id) ?? ""
-          if receipt_id != "" { unmapped.receipt_id = receipt_id }
+          unmapped.receipt_id = receipt_id
           event_code = "receipt"
           rcwd = to_string(r.cwd) ?? ""
           if rcwd != "" { unmapped.cwd = rcwd }
@@ -617,6 +622,7 @@ parser_vrl: |
           if spid >= 0 { subject.pid = spid }
           exec_id = to_string(m.exec_id) ?? ""
           if exec_id != "" { subject.uid = exec_id }
+          if spid < 0 && exec_id == "" { subject.uid = record_uid_seed }
           ocsf.process = subject
 
           # `inline_parent = true` restores a parent block for collectors that
@@ -638,6 +644,7 @@ parser_vrl: |
               if ppid >= 0 { parent_process.pid = ppid }
               pexec = to_string(par.exec_id) ?? ""
               if pexec != "" { parent_process.uid = pexec }
+              if ppid < 0 && pexec == "" { parent_process.uid = record_uid_seed }
               ocsf.actor = { "process": parent_process }
           } else {
               ocsf.actor = { "process": subject }
@@ -687,8 +694,8 @@ parser_vrl: |
           if dst_ip != "" { dst.ip = dst_ip }
           dst_port = to_int(m.dst_port) ?? 0
           if dst_port > 0 { dst.port = dst_port }
-          if length(dst) > 0 { ocsf.dst_endpoint = dst }
-          ocsf.src_endpoint = { "hostname": host }
+          if dst_ip != "" { ocsf.dst_endpoint = dst }
+          ocsf.src_endpoint = { "hostname": device_hostname }
           ocsf.connection_info = { "direction_id": 2 }
           ocsf.status_id = 1
           ocsf.status = "Success"
@@ -709,7 +716,7 @@ parser_vrl: |
           if npid >= 0 { np.pid = npid }
           nexec = to_string(m.exec_id) ?? ""
           if nexec != "" { np.uid = nexec }
-          if length(np) > 0 { net_actor.process = np }
+          if npid >= 0 || nexec != "" { net_actor.process = np }
           nuid = to_int(m.uid) ?? -1
           if nuid >= 0 { net_actor.user = { "uid": to_string(nuid) } }
           if length(net_actor) > 0 { ocsf.actor = net_actor }
@@ -758,7 +765,9 @@ parser_vrl: |
               fn, fn_err = parse_regex(fpath, r'(?P<b>[^/]+)$')
               if fn_err == null { fname = to_string(fn.b) }
           }
-          file_obj = { "name": fname, "path": fpath, "type_id": 1 }
+          if fname == "" { fname = "unknown" }
+          file_obj = { "name": fname, "type_id": 1 }
+          if fpath != "" { file_obj.path = fpath }
           fsize = to_int(m.bytes) ?? -1
           if fsize >= 0 { file_obj.size = fsize }
           fsha = downcase(to_string(m.sha256) ?? "")
@@ -781,7 +790,7 @@ parser_vrl: |
           if fpid >= 0 { fp.pid = fpid }
           fexec = to_string(m.exec_id) ?? ""
           if fexec != "" { fp.uid = fexec }
-          if length(fp) > 0 { file_actor.process = fp }
+          if fpid >= 0 || fexec != "" { file_actor.process = fp }
           fuid = to_int(m.uid) ?? -1
           if fuid >= 0 { file_actor.user = { "uid": to_string(fuid) } }
           if length(file_actor) > 0 { ocsf.actor = file_actor }
