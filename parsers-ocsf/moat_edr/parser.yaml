@@ -410,9 +410,22 @@ parser_vrl: |
                   osint = push(osint, ind)
               }
           }
-          # Emitted even when empty: the attribute is required, and an empty
-          # array is the honest way to say this finding rests on no indicator.
-          ocsf.osint = osint
+          # `osint` lives behind the OSINT PROFILE, and that is the whole of
+          # the rule: the profile ADDS the attribute, and `requirement:
+          # required` inside it means "if you apply this profile you must
+          # supply one" -- not "every Detection Finding needs one". So the
+          # attribute is legal only when "osint" is in metadata.profiles, and
+          # the profile is only worth applying when there is an indicator.
+          #
+          # An earlier version got both halves wrong: it emitted `osint: []`
+          # unconditionally and never declared the profile, which a real OCSF
+          # validator rejects outright -- `attribute "osint" is not defined for
+          # this OCSF class/profile`. Nothing local caught it, because the gate
+          # reports schema=SKIPPED unless OCSF_VALIDATOR is set.
+          if length(osint) > 0 {
+              ocsf.osint = osint
+              profiles = push(profiles, "osint")
+          }
 
           # ...and the same indicator as an ENRICHMENT, because the two answer
           # different questions.
