@@ -202,7 +202,16 @@ EOF
                     # you looking in the wrong place. `0` was always fine: jq counts
                     # it truthy. Absent and null still collapse to "<missing>",
                     # which is the behaviour every existing sample relies on.
-                    got=$(printf '%s' "$s_json" | jq -r --arg p "$key" 'getpath($p | split(".")) as $v | if $v == null then "<missing>" else $v end')
+                    # Numeric path components index ARRAYS. `split(".")` gives
+                    # strings, and jq refuses to index an array with "0", so any
+                    # expectation reaching into evidences[], osint[] or
+                    # observables[] died with "Cannot index array with string"
+                    # -- which is a jq error, not a parser failure, and the
+                    # sample simply could not be written. OCSF puts a great deal
+                    # in arrays; asserting into them is not exotic.
+                    got=$(printf '%s' "$s_json" | jq -r --arg p "$key" '
+                        ($p | split(".") | map(if test("^[0-9]+$") then tonumber else . end)) as $path
+                        | getpath($path) as $v | if $v == null then "<missing>" else $v end')
                     if [ "$got" != "$want" ]; then
                         echo "  FAIL: sample[$idx] expected $key = '$want' but got '$got'"
                         echo "    input: $raw"

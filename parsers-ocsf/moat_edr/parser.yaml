@@ -295,47 +295,56 @@ parser_vrl: |
 
           # ---- name resolution (moat docs/DNS.md) -----------------------
           #
-          # The kernel sees addresses. moat learns the NAME from
-          # systemd-resolved's own query stream and ships four fields about it,
-          # three of which are new and none of which had a home here.
+          # OCSF has real homes for this and they are not `unmapped`:
           #
-          # `domain` above is keyed by ADDRESS -- this machine resolved that
-          # name to that address recently, so a connection there probably
-          # belongs to it. `domain_queried_by` is keyed by the NAME and is
-          # observed in the asking process's own context, so it is a strictly
-          # stronger claim: it says who looked it up rather than inferring it
-          # from a shared cache. Keeping them apart matters, because the
-          # interesting case is when they DISAGREE -- one process resolves a
-          # name and a different one connects to the address.
+          #   evidences[].query    a dns_query. `query.hostname` is a PROMOTED
+          #                        field, so the resolved name is a column.
+          #   evidences[].actor    an actor, distinct from the top-level one.
+          #                        The top-level actor is the process that
+          #                        ACTED; this is the process that ASKED, and
+          #                        the whole point of moat's varlink probe is
+          #                        that those two can differ.
           #
-          # Absent is NOT RECORDED, never "nobody asked": a Go binary with its
-          # own resolver never touches nss, a literal-IP connection has no
-          # lookup at all, and a lookup predating moatd is gone. So these keys
-          # are omitted rather than emitted empty -- a null here would read as
-          # a negative finding, which is the one thing it is not.
+          # `query` is not an attribute of Detection Finding 2004 itself -- it
+          # belongs to DNS Activity 4003 -- but `evidences` (evidence_artifacts)
+          # carries one, which is the correct way to attach a lookup to a
+          # finding that is not itself a DNS event.
+          #
+          # What stays under `unmapped` stays there because OCSF 1.9 has no
+          # field for it, not because it was easier: the age of a cached
+          # resolution, whether the asker and the actor are the same process,
+          # and a CNAME owner outside a dns_answer array.
+          if dst_domain != "" {
+              evidence.query = { "hostname": downcase(dst_domain) }
+          }
+
           dns = {}
           queried_by = to_string(m.net.domain_queried_by) ?? ""
           if queried_by != "" {
-              dns.queried_by = queried_by
-              # moat ships "<exe> (pid N)". Split it so the lake can facet on
-              # the binary and join on the pid without a LIKE.
+              # moat ships "<exe> (pid N)". Split it so the asker lands in a
+              # real actor.process rather than as a string nobody can join on.
               qm = parse_regex(queried_by, r'^(?P<exe>.+?)\s+\(pid\s+(?P<pid>\d+)\)$') ?? {}
               q_exe = to_string(qm.exe)
               q_pid = to_int(qm.pid) ?? 0
+              q_proc = {}
               if q_exe != "" {
-                  dns.queried_by_exe = q_exe
                   q_parts = split(q_exe, "/")
                   q_name = to_string(q_parts[-1])
-                  if q_name != "" {
-                      dns.queried_by_name = q_name
-                      obs = push(obs, { "name": "unmapped.dns.queried_by_name", "type": "Process Name", "type_id": 9, "value": q_name })
+                  if q_name != "" { q_proc.name = q_name }
+                  q_proc.file = { "name": q_name, "path": q_exe, "type_id": 1 }
+              }
+              if q_pid > 0 { q_proc.pid = q_pid }
+              if length(q_proc) > 0 {
+                  evidence.actor = { "process": q_proc }
+                  q_obs_name = to_string(q_proc.name)
+                  if q_obs_name != "" {
+                      obs = push(obs, { "name": "evidences.actor.process.name", "type": "Process Name", "type_id": 9, "value": q_obs_name })
                   }
               }
-              if q_pid > 0 { dns.queried_by_pid = q_pid }
-              # Did the process that asked also connect? The answer is the
-              # difference between "this program resolved and used the name"
-              # and "something else resolved it and this used the address",
-              # and a reader should not have to compare two strings to get it.
+              # Did the process that asked also connect? OCSF has no field for
+              # it and it is the single most useful thing on the record: one
+              # program resolving a name and a different one using the address
+              # is the shape worth looking at.
               if q_pid > 0 && proc_pid >= 0 {
                   dns.queried_by_self = q_pid == proc_pid
               }
@@ -353,35 +362,95 @@ parser_vrl: |
           }
           if length(dns) > 0 { unmapped.dns = dns }
 
-          # ---- the indicator that fired ---------------------------------
+          # ---- the indicator that fired -> osint[] ----------------------
           #
-          # `ioc` is what makes a domain-feed or hash-feed finding a finding at
-          # all, and it was not carried anywhere. `matched` is prefixed by kind
-          # ("domain:evil.example", "sha256:..."), which is exactly enough to
-          # type the observable correctly instead of dumping a string.
+          # `osint` is a REQUIRED attribute of Detection Finding 2004 and this
+          # parser emitted none, so every moat finding was short a required
+          # field. Nothing caught it: the local gate reports schema=SKIPPED
+          # unless OCSF_VALIDATOR is set, and the promoted-path check
+          # deliberately skips everything under `unmapped.`, which is where the
+          # indicator would otherwise have gone.
+          #
+          # moat's `ioc.matched` is prefixed by kind ("domain:evil.example",
+          # "sha256:..."), which maps straight onto osint.type_id: 2 Domain,
+          # 4 Hash, 99 Other. `vendor_name` carries which feed said so --
+          # "domain-feed" is the published ThreatFox list, "hash-feed" the
+          # operator's own -- because "who claims this" is the first question
+          # asked of any indicator.
+          osint = []
           ioc = object(m.ioc) ?? {}
           if length(ioc) > 0 {
               ioc_source = to_string(ioc.source) ?? ""
               ioc_matched = to_string(ioc.matched) ?? ""
-              if ioc_source != "" { unmapped.ioc_source = ioc_source }
               if ioc_matched != "" {
-                  unmapped.ioc_matched = ioc_matched
                   iparts = split(ioc_matched, ":", limit: 2)
                   ikind = to_string(iparts[0])
                   ivalue = to_string(iparts[1])
-                  if ivalue != "" {
-                      unmapped.ioc_kind = ikind
-                      unmapped.ioc_value = ivalue
-                      if ikind == "domain" {
-                          obs = push(obs, { "name": "unmapped.ioc_value", "type": "Hostname", "type_id": 1, "value": downcase(ivalue) })
-                      } else if ikind == "sha256" || ikind == "hash" {
-                          obs = push(obs, { "name": "unmapped.ioc_value", "type": "Hash", "type_id": 8, "value": downcase(ivalue) })
-                      } else {
-                          obs = push(obs, { "name": "unmapped.ioc_value", "type": "Other", "type_id": 0, "value": ivalue })
-                      }
+                  if ivalue == "" {
+                      # No prefix: the whole string is the value and the kind
+                      # is not something to guess at.
+                      ivalue = ioc_matched
+                      ikind = ""
                   }
+                  ind = { "value": ivalue, "type_id": 99, "type": "Other" }
+                  if ikind == "domain" {
+                      ind.type_id = 2
+                      ind.type = "Domain"
+                      ind.value = downcase(ivalue)
+                      obs = push(obs, { "name": "osint.value", "type": "Hostname", "type_id": 1, "value": downcase(ivalue) })
+                  } else if ikind == "sha256" || ikind == "hash" {
+                      ind.type_id = 4
+                      ind.type = "Hash"
+                      ind.value = downcase(ivalue)
+                      obs = push(obs, { "name": "osint.value", "type": "Hash", "type_id": 8, "value": downcase(ivalue) })
+                  } else {
+                      obs = push(obs, { "name": "osint.value", "type": "Other", "type_id": 0, "value": ivalue })
+                  }
+                  if ioc_source != "" { ind.vendor_name = ioc_source }
+                  osint = push(osint, ind)
               }
           }
+          # Emitted even when empty: the attribute is required, and an empty
+          # array is the honest way to say this finding rests on no indicator.
+          ocsf.osint = osint
+
+          # ...and the same indicator as an ENRICHMENT, because the two answer
+          # different questions.
+          #
+          # `osint` is what OCSF 1.9 says an indicator is, and it is a required
+          # attribute of this class. `enrichments` is what this platform
+          # PROMOTES: `enrichments.value`, `enrichments.provider`,
+          # `enrichments.data.is_ioc`, `.ioc_type`, `.matched_field` and
+          # `.threat_type` are all columns, while nothing under `osint.` or
+          # `evidences.` is. A record carrying only `osint` is correct and
+          # effectively unqueryable here; one carrying only `enrichments` is
+          # queryable and not conformant. The promoted list even names the
+          # convention -- `enrichments[name=ioc_domain_threat_type].value` --
+          # so this follows it rather than inventing a shape.
+          if length(osint) > 0 {
+              ind0 = object(osint[0]) ?? {}
+              i_type = downcase(to_string(ind0.type))
+              if i_type == "" { i_type = "other" }
+              # WHICH field of the record the feed matched. Without it a
+              # reader cannot tell an indicator that matched the connection's
+              # name from one that matched a file hash.
+              matched_field = "net.domain"
+              if i_type == "hash" { matched_field = "file.sha256" }
+              enrich = {
+                  "name": "ioc_" + i_type + "_threat_type",
+                  "type": "ioc",
+                  "value": to_string(ind0.value),
+                  "data": {
+                      "is_ioc": true,
+                      "ioc_type": i_type,
+                      "matched_field": matched_field
+                  }
+              }
+              v_name = to_string(ind0.vendor_name)
+              if v_name != "" { enrich.provider = v_name }
+              ocsf.enrichments = [enrich]
+          }
+
           if length(evidence) > 0 { ocsf.evidences = [evidence] }
           if exe_name != "" {
               obs = push(obs, { "name": "actor.process.name", "type": "Process Name", "type_id": 9, "value": exe_name })
@@ -1034,26 +1103,34 @@ samples:
   - raw: "{\"v\":1,\"event_id\":\"01M28N4RG9SEP7349KA2P7KNBN\",\"host\":\"mars\",\"class\":\"alerts\",\"kind\":\"alert\",\"moat_tier\":\"alert\",\"severity\":\"high\",\"@timestamp\":\"2026-09-11T16:44:03.512Z\",\"moat\":{\"v\":1,\"id\":\"01M28N4RG9SEP7349KA2P7KNBN\",\"ts\":\"2026-09-11T16:44:03.512Z\",\"severity\":\"high\",\"rule\":\"moat-x-net-domain-ioc\",\"family\":\"net\",\"title\":\"Connection to a domain on the local threat feed\",\"summary\":\"python3 connected to 83.79.212.211:443, resolved from skiimo.club.\",\"process\":{\"pid\":2874033,\"uid\":1000,\"exe\":\"/usr/bin/python3\",\"args\":\"python3 -c connect\",\"cwd\":\"~/proj\",\"start_ts\":\"2026-09-11T16:44:03.000Z\",\"ancestry\":[{\"pid\":2874000,\"exe\":\"/usr/bin/bash\",\"others_total\":223}]},\"net\":{\"dst_ip\":\"83.79.212.211\",\"dst_port\":443,\"domain\":\"skiimo.club\",\"domain_age_secs\":0,\"domain_queried_by\":\"/usr/bin/python3 (pid 2874033)\"},\"ioc\":{\"source\":\"domain-feed\",\"matched\":\"domain:skiimo.club\"},\"action_taken\":\"none\",\"actions\":[\"kill\",\"ignore\"],\"acked\":false,\"mode\":\"monitor\",\"actor\":{\"provenance\":\"official\",\"package\":\"python\"},\"context\":\"interactive\",\"severity_base\":\"high\",\"severity_reason\":\"high\",\"surface\":\"alerts\",\"tier\":\"detection\",\"suppressed_by\":null,\"rarity\":\"rare\",\"rarity_text\":\"rare\"}}"
     expect:
       "class_uid": 2004
-      "unmapped.dns.queried_by_name": "python3"
-      "unmapped.dns.queried_by_pid": 2874033
-      "unmapped.dns.queried_by_self": true
-      "unmapped.ioc_kind": "domain"
-      "unmapped.ioc_value": "skiimo.club"
+      "evidences.0.actor.process.name": "python3"
+      "evidences.0.actor.process.pid": 2874033
+      "evidences.0.query.hostname": "skiimo.club"
+      "osint.0.type_id": 2
+      "osint.0.value": "skiimo.club"
+      "osint.0.vendor_name": "domain-feed"
+      "enrichments.0.data.is_ioc": true
+      "enrichments.0.data.ioc_type": "domain"
+      "enrichments.0.value": "skiimo.club"
+      "enrichments.0.provider": "domain-feed"
   - raw: "{\"v\":1,\"event_id\":\"01M28N4RG9SEP7349KA2P7KNBN\",\"host\":\"mars\",\"class\":\"alerts\",\"kind\":\"alert\",\"moat_tier\":\"alert\",\"severity\":\"high\",\"@timestamp\":\"2026-09-11T16:44:03.512Z\",\"moat\":{\"v\":1,\"id\":\"01M28N4RG9SEP7349KA2P7KNBN\",\"ts\":\"2026-09-11T16:44:03.512Z\",\"severity\":\"high\",\"rule\":\"moat-x-net-domain-ioc\",\"family\":\"net\",\"title\":\"Connection to a domain on the local threat feed\",\"summary\":\"python3 connected to 83.79.212.211:443, resolved from skiimo.club.\",\"process\":{\"pid\":2874033,\"uid\":1000,\"exe\":\"/usr/bin/python3\",\"args\":\"python3 -c connect\",\"cwd\":\"~/proj\",\"start_ts\":\"2026-09-11T16:44:03.000Z\",\"ancestry\":[{\"pid\":2874000,\"exe\":\"/usr/bin/bash\",\"others_total\":223}]},\"net\":{\"dst_ip\":\"83.79.212.211\",\"dst_port\":443,\"domain\":\"skiimo.club\",\"domain_age_secs\":91,\"domain_queried_by\":\"/usr/bin/firefox (pid 4242)\",\"domain_cname\":\"cdn.edge.example\"},\"ioc\":{\"source\":\"domain-feed\",\"matched\":\"domain:skiimo.club\"},\"action_taken\":\"none\",\"actions\":[\"kill\",\"ignore\"],\"acked\":false,\"mode\":\"monitor\",\"actor\":{\"provenance\":\"official\",\"package\":\"python\"},\"context\":\"interactive\",\"severity_base\":\"high\",\"severity_reason\":\"high\",\"surface\":\"alerts\",\"tier\":\"detection\",\"suppressed_by\":null,\"rarity\":\"rare\",\"rarity_text\":\"rare\"}}"
     expect:
       "class_uid": 2004
-      "unmapped.dns.queried_by_name": "firefox"
-      "unmapped.dns.queried_by_pid": 4242
+      "evidences.0.actor.process.name": "firefox"
+      "evidences.0.actor.process.pid": 4242
       "unmapped.dns.queried_by_self": false
       "unmapped.dns.resolution_age_secs": 91
       "unmapped.dns.cname": "cdn.edge.example"
   - raw: "{\"v\":1,\"event_id\":\"01M28N4RG9SEP7349KA2P7KNBN\",\"host\":\"mars\",\"class\":\"alerts\",\"kind\":\"alert\",\"moat_tier\":\"alert\",\"severity\":\"high\",\"@timestamp\":\"2026-09-11T16:44:03.512Z\",\"moat\":{\"v\":1,\"id\":\"01M28N4RG9SEP7349KA2P7KNBN\",\"ts\":\"2026-09-11T16:44:03.512Z\",\"severity\":\"high\",\"rule\":\"moat-x-net-domain-ioc\",\"family\":\"net\",\"title\":\"Connection to a domain on the local threat feed\",\"summary\":\"python3 connected to 83.79.212.211:443, resolved from skiimo.club.\",\"process\":{\"pid\":2874033,\"uid\":1000,\"exe\":\"/usr/bin/python3\",\"args\":\"python3 -c connect\",\"cwd\":\"~/proj\",\"start_ts\":\"2026-09-11T16:44:03.000Z\",\"ancestry\":[{\"pid\":2874000,\"exe\":\"/usr/bin/bash\",\"others_total\":223}]},\"net\":{\"dst_ip\":\"83.79.212.211\",\"dst_port\":443},\"ioc\":null,\"action_taken\":\"none\",\"actions\":[\"kill\",\"ignore\"],\"acked\":false,\"mode\":\"monitor\",\"actor\":{\"provenance\":\"official\",\"package\":\"python\"},\"context\":\"interactive\",\"severity_base\":\"high\",\"severity_reason\":\"high\",\"surface\":\"alerts\",\"tier\":\"detection\",\"suppressed_by\":null,\"rarity\":\"rare\",\"rarity_text\":\"rare\"}}"
     expect:
       "class_uid": 2004
-      "unmapped.dns.queried_by": "<missing>"
-      "unmapped.ioc_source": "<missing>"
+      "evidences.0.query.hostname": "<missing>"
+      "evidences.0.actor.process.name": "<missing>"
   - raw: "{\"v\":1,\"event_id\":\"01M28N4RG9SEP7349KA2P7KNBN\",\"host\":\"mars\",\"class\":\"alerts\",\"kind\":\"alert\",\"moat_tier\":\"alert\",\"severity\":\"high\",\"@timestamp\":\"2026-09-11T16:44:03.512Z\",\"moat\":{\"v\":1,\"id\":\"01M28N4RG9SEP7349KA2P7KNBN\",\"ts\":\"2026-09-11T16:44:03.512Z\",\"severity\":\"high\",\"rule\":\"moat-x-new-exec-ioc\",\"family\":\"exec\",\"title\":\"Connection to a domain on the local threat feed\",\"summary\":\"python3 connected to 83.79.212.211:443, resolved from skiimo.club.\",\"process\":{\"pid\":2874033,\"uid\":1000,\"exe\":\"/usr/bin/python3\",\"args\":\"python3 -c connect\",\"cwd\":\"~/proj\",\"start_ts\":\"2026-09-11T16:44:03.000Z\",\"ancestry\":[{\"pid\":2874000,\"exe\":\"/usr/bin/bash\",\"others_total\":223}]},\"net\":{\"dst_ip\":\"83.79.212.211\",\"dst_port\":443,\"domain\":\"skiimo.club\",\"domain_age_secs\":0,\"domain_queried_by\":\"/usr/bin/python3 (pid 2874033)\"},\"ioc\":{\"source\":\"hash-feed\",\"matched\":\"sha256:abababababababababababababababababababababababababababababababab\"},\"action_taken\":\"none\",\"actions\":[\"kill\",\"ignore\"],\"acked\":false,\"mode\":\"monitor\",\"actor\":{\"provenance\":\"official\",\"package\":\"python\"},\"context\":\"interactive\",\"severity_base\":\"high\",\"severity_reason\":\"high\",\"surface\":\"alerts\",\"tier\":\"detection\",\"suppressed_by\":null,\"rarity\":\"rare\",\"rarity_text\":\"rare\"}}"
     expect:
       "class_uid": 2004
-      "unmapped.ioc_kind": "sha256"
-      "unmapped.ioc_source": "hash-feed"
+      "osint.0.type_id": 4
+      "osint.0.type": "Hash"
+      "osint.0.vendor_name": "hash-feed"
+      "enrichments.0.data.ioc_type": "hash"
+      "enrichments.0.data.matched_field": "file.sha256"
