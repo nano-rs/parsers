@@ -193,7 +193,16 @@ EOF
                 exp_keys=$(yq -o=json ".samples[$idx].expect // {}" "$parser_file" | jq -r 'keys[]?')
                 for key in $exp_keys; do
                     want=$(yq ".samples[$idx].expect.\"$key\"" "$parser_file")
-                    got=$(printf '%s' "$s_json" | jq -r --arg p "$key" 'getpath($p | split(".")) // "<missing>"')
+                    # `// "<missing>"` was wrong for two values. jq's alternative
+                    # operator treats BOTH null and `false` as empty, so any
+                    # expectation of a boolean false reported "<missing>" -- which
+                    # reads as "the parser never emitted the field" when the parser
+                    # emitted it correctly. That made a false assertion impossible
+                    # to write anywhere in this repo, and the failure message sent
+                    # you looking in the wrong place. `0` was always fine: jq counts
+                    # it truthy. Absent and null still collapse to "<missing>",
+                    # which is the behaviour every existing sample relies on.
+                    got=$(printf '%s' "$s_json" | jq -r --arg p "$key" 'getpath($p | split(".")) as $v | if $v == null then "<missing>" else $v end')
                     if [ "$got" != "$want" ]; then
                         echo "  FAIL: sample[$idx] expected $key = '$want' but got '$got'"
                         echo "    input: $raw"
