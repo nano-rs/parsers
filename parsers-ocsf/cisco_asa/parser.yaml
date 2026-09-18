@@ -1,8 +1,9 @@
 name: cisco_asa_ocsf
 display_name: Cisco ASA (OCSF)
-version: "1.0.0"
+version: "1.1.0"
 ocsf_version: "1.9.0"
 description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses Cisco ASA / FTD syslog (%ASA-<sev>-<msgid>) into OCSF 1.9.0. Routes by
   message id: connection build/teardown, ACL permit/deny, NAT, ICMP and TCP
   drops -> Network Activity (4001); AAA, console/VPN login and device
@@ -20,6 +21,8 @@ parser_vrl: |
   # 2004 Detection Finding)
 
   raw_log = string!(.message)
+  __raw_body = raw_log
+  __source_kv = {}
 
   time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
   dvc_host = ""
@@ -27,10 +30,34 @@ parser_vrl: |
 
   # ---- syslog PRI ----
   pri_match, pri_err = parse_regex(working, r'^<(?P<pri>\d+)>(?P<body>.*)$')
+  # Capture parsed fields before mapping; omit structural raw-body captures.
+  __capture = object(parse_json!(encode_json(pri_match))) ?? {}
+  __ignore = del(__capture.body)
+  __ignore = del(__capture.content)
+  __ignore = del(__capture.kvdata)
+  __ignore = del(__capture.kvpart)
+  __ignore = del(__capture.msg)
+  __ignore = del(__capture.payload)
+  __ignore = del(__capture.remainder)
+  __ignore = del(__capture.rest)
+  __ignore = del(__capture.sd)
+  __source_kv = set!(__source_kv, ["header"], merge(object(get(__source_kv, ["header"]) ?? null) ?? {}, __capture))
   if pri_err == null && pri_match != null { working = string!(pri_match.body) }
 
   # ---- syslog timestamp + optional hostname before %ASA ----
   sm, se = parse_regex(working, r'^(?P<ts>(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+(?:\d{4}\s+)?\d{2}:\d{2}:\d{2})\s*:?\s*(?P<host>[^\s:]+)?\s*:?\s*(?P<rest>%ASA-.*)$')
+  # Capture parsed fields before mapping; omit structural raw-body captures.
+  __capture = object(parse_json!(encode_json(sm))) ?? {}
+  __ignore = del(__capture.body)
+  __ignore = del(__capture.content)
+  __ignore = del(__capture.kvdata)
+  __ignore = del(__capture.kvpart)
+  __ignore = del(__capture.msg)
+  __ignore = del(__capture.payload)
+  __ignore = del(__capture.remainder)
+  __ignore = del(__capture.rest)
+  __ignore = del(__capture.sd)
+  __source_kv = set!(__source_kv, ["header"], merge(object(get(__source_kv, ["header"]) ?? null) ?? {}, __capture))
   if se == null && sm != null {
       ts_str = string!(sm.ts)
       ts, ts_err = parse_timestamp(ts_str, "%b %d %Y %H:%M:%S")
@@ -50,6 +77,18 @@ parser_vrl: |
   msg_body = working
   sev_num = 6
   am, ae = parse_regex(working, r'%ASA-(?P<sev>\d)-(?P<msgid>\d+):\s*(?P<body>.*)$')
+  # Capture parsed fields before mapping; omit structural raw-body captures.
+  __capture = object(parse_json!(encode_json(am))) ?? {}
+  __ignore = del(__capture.body)
+  __ignore = del(__capture.content)
+  __ignore = del(__capture.kvdata)
+  __ignore = del(__capture.kvpart)
+  __ignore = del(__capture.msg)
+  __ignore = del(__capture.payload)
+  __ignore = del(__capture.remainder)
+  __ignore = del(__capture.rest)
+  __ignore = del(__capture.sd)
+  __source_kv = set!(__source_kv, ["header"], merge(object(get(__source_kv, ["header"]) ?? null) ?? {}, __capture))
   if ae == null && am != null {
       msg_id = string!(am.msgid)
       msg_body = string!(am.body)
@@ -115,6 +154,18 @@ parser_vrl: |
       disposition_id = 1
       disposition = "Allowed"
       cm, ce = parse_regex(msg_body, r'Built\s+(?P<direction>inbound|outbound)\s+(?P<protocol>\w+)\s+connection\s+(?P<conn_id>\d+)\s+for\s+(?P<src_iface>\w+):(?P<src_ip>[^/]+)/(?P<src_port>\d+)\s*(?:\x28(?P<src_nat_ip>[^/]+)/(?P<src_nat_port>\d+)\x29)?\s+to\s+(?P<dst_iface>\w+):(?P<dst_ip>[^/]+)/(?P<dst_port>\d+)\s*(?:\x28(?P<dst_nat_ip>[^/]+)/(?P<dst_nat_port>\d+)\x29)?')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(cm))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if ce == null && cm != null {
           d = downcase(string!(cm.direction))
           if d == "inbound" { direction_id = 1 }
@@ -145,6 +196,18 @@ parser_vrl: |
       disposition_id = 1
       disposition = "Allowed"
       tm, te = parse_regex(msg_body, r'Teardown\s+(?P<protocol>\w+)\s+connection\s+(?P<conn_id>\d+)\s+for\s+(?P<src_iface>\w+):(?P<src_ip>[^/]+)/(?P<src_port>\d+)\s+to\s+(?P<dst_iface>\w+):(?P<dst_ip>[^/]+)/(?P<dst_port>\d+)\s+duration\s+(?P<h>\d+):(?P<m>\d{2}):(?P<s>\d{2})\s+bytes\s+(?P<bytes>\d+)(?:\s+reason\s+(?P<reason>.+))?')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(tm))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if te == null && tm != null {
           proto = downcase(string!(tm.protocol))
           conn_id = string!(tm.conn_id)
@@ -177,6 +240,18 @@ parser_vrl: |
       status_id = 2
       status_str = "Failure"
       dm, de = parse_regex(msg_body, r'Deny\s+(?P<protocol>\w+)\s+src\s+(?P<src_iface>\w+):(?P<src_ip>[^/]+)/(?P<src_port>\d+)\s+dst\s+(?P<dst_iface>\w+):(?P<dst_ip>[^/]+)/(?P<dst_port>\d+)\s+by\s+access-group\s+"(?P<acl>[^"]+)"')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(dm))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if de == null && dm != null {
           proto = downcase(string!(dm.protocol))
           src_iface = string!(dm.src_iface)
@@ -194,6 +269,18 @@ parser_vrl: |
   } else if msg_id == "106100" {
       desc = "ACL hit"
       am2, ae2 = parse_regex(msg_body, r'access-list\s+(?P<acl>\S+)\s+(?P<action>\w+)\s+(?P<protocol>\w+)\s+(?P<src_iface>\w+)/(?P<src_ip>[^\x28]+?)\x28(?P<src_port>\d+)\x29\s*->\s*(?P<dst_iface>\w+)/(?P<dst_ip>[^\x28]+?)\x28(?P<dst_port>\d+)\x29\s+hit-cnt\s+(?P<hits>\d+)')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(am2))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if ae2 == null && am2 != null {
           act = downcase(string!(am2.action))
           if act == "permitted" || act == "permit" {
@@ -240,9 +327,33 @@ parser_vrl: |
       if msg_id == "106001" { direction_id = 1 }
       if msg_id == "106006" || msg_id == "106007" { direction_id = 1 }
       pm, pe = parse_regex(msg_body, r'(?P<protocol>TCP|UDP|ICMP|tcp|udp|icmp)')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(pm))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if pe == null && pm != null { proto = downcase(string!(pm.protocol)) }
       # "from <ip>/<port> to <ip>/<port>" or "src <if>:<ip>/<port> dst <if>:<ip>/<port>"
       fm, fe = parse_regex(msg_body, r'(?:from|src)\s+(?:(?P<src_iface>\w+):)?(?P<src_ip>\d+\.\d+\.\d+\.\d+)/(?P<src_port>\d+)\s+(?:to|dst)\s+(?:(?P<dst_iface>\w+):)?(?P<dst_ip>\d+\.\d+\.\d+\.\d+)/(?P<dst_port>\d+)')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(fm))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if fe == null && fm != null {
           src_iface = to_string(fm.src_iface)
           src_ip = string!(fm.src_ip)
@@ -252,8 +363,32 @@ parser_vrl: |
           dst_port = to_int(fm.dst_port) ?? 0
       }
       rm, re = parse_regex(msg_body, r'due\s+to\s+(?P<reason>.+)$')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(rm))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if re == null && rm != null { reason = string!(rm.reason) }
       im, ie = parse_regex(msg_body, r'on\s+interface\s+(?P<iface>\S+)')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(im))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if ie == null && im != null && dst_iface == "" { dst_iface = string!(im.iface) }
 
   # ============================================================
@@ -269,6 +404,18 @@ parser_vrl: |
       disposition_id = 1
       disposition = "Allowed"
       nm, ne = parse_regex(msg_body, r'(?:Built|Teardown)\s+(?:dynamic|static)\s+(?P<protocol>\w+)?\s*translation\s+from\s+(?P<src_iface>\w+):(?P<src_ip>[^\s/]+)(?:/(?P<src_port>\d+))?\s+to\s+(?P<dst_iface>\w+):(?P<dst_ip>[^\s/]+)(?:/(?P<dst_port>\d+))?(?:\s+duration\s+(?P<h>\d+):(?P<m>\d{2}):(?P<s>\d{2}))?')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(nm))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if ne == null && nm != null {
           proto = downcase(to_string(nm.protocol))
           src_iface = string!(nm.src_iface)
@@ -300,6 +447,18 @@ parser_vrl: |
       status_str = "Failure"
       proto = "icmp"
       cm2, ce2 = parse_regex(msg_body, r'Denied\s+ICMP\s+type=(?P<t>\d+),?\s*code=(?P<c>\d+)\s+from\s+(?P<src_ip>\S+)\s+on\s+interface\s+(?P<iface>\w+)')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(cm2))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if ce2 == null && cm2 != null {
           icmp_type = string!(cm2.t)
           icmp_code = string!(cm2.c)
@@ -314,6 +473,18 @@ parser_vrl: |
       desc = "TCP access by ACL"
       proto = "tcp"
       tm2, te2 = parse_regex(msg_body, r'TCP\s+access\s+(?P<action>permitted|denied)\s+by\s+ACL\s+from\s+(?P<src_ip>[^/]+)/(?P<src_port>\d+)\s+to\s+(?P<dst_iface>\w+):(?P<dst_ip>[^/]+)/(?P<dst_port>\d+)')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(tm2))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if te2 == null && tm2 != null {
           if string!(tm2.action) == "permitted" {
               activity_id = 6
@@ -361,12 +532,60 @@ parser_vrl: |
           status_str = "Failure"
       }
       um, ue = parse_regex(msg_body, r'user\s*=\s*(?P<user>[^\s:,]+)')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(um))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if ue == null && um != null { user_name = string!(um.user) }
       sm2, se2 = parse_regex(msg_body, r'server\s*=\s*(?P<server>[^\s:,]+)')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(sm2))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if se2 == null && sm2 != null { dst_ip = string!(sm2.server) }
       rm2, re2 = parse_regex(msg_body, r'reason\s*=\s*(?P<reason>[^:]+)')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(rm2))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if re2 == null && rm2 != null { reason = strip_whitespace(string!(rm2.reason)) }
       um2, ue2 = parse_regex(msg_body, r'user\s+IP\s*=\s*(?P<ip>\S+)')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(um2))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if ue2 == null && um2 != null { src_ip = string!(um2.ip) }
 
   # ============================================================
@@ -391,6 +610,18 @@ parser_vrl: |
           disposition = "Allowed"
       }
       lm, le = parse_regex(msg_body, r'Login\s+(?P<verdict>permitted|denied)\s+from\s+(?P<src_ip>[^/\s]+)/(?P<src_port>\d+)\s+to\s+(?P<dst_iface>\w+):(?P<dst_ip>[^/\s]+)(?:/(?P<dst_port>\S+))?(?:\s+for\s+user\s+"(?P<user>[^"]*)")?')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(lm))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if le == null && lm != null {
           src_ip = string!(lm.src_ip)
           src_port = to_int(lm.src_port) ?? 0
@@ -437,6 +668,18 @@ parser_vrl: |
           status_str = "Failure"
       }
       dm2, de2 = parse_regex(msg_body, r'IP\s+address:\s*(?P<ip>\S+),\s*Uname:\s*(?P<user>\S+)')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(dm2))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if de2 == null && dm2 != null {
           src_ip = string!(dm2.ip)
           user_name = string!(dm2.user)
@@ -459,6 +702,18 @@ parser_vrl: |
           activity_name = "Logoff"
       }
       vm, ve = parse_regex(msg_body, r'Group\s*=?\s*<?\s*(?P<group>[^,>]+?)\s*>?\s*,?\s+Username\s*=?\s*<?\s*(?P<user>[^,>]+?)\s*>?\s*,?\s+IP\s*=?\s*<?\s*(?P<ip>[^,>\s]+)')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(vm))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if ve == null && vm != null {
           vpn_group = strip_whitespace(string!(vm.group))
           user_name = strip_whitespace(string!(vm.user))
@@ -467,6 +722,18 @@ parser_vrl: |
       }
       if user_name == "" {
           vm2, ve2 = parse_regex(msg_body, r'Group\s+<?(?P<group>[^>\s]+)>?\s+User\s+<?(?P<user>[^>\s]+)>?\s+IP\s+<?(?P<ip>[^>\s]+)>?')
+          # Capture parsed fields before mapping; omit structural raw-body captures.
+          __capture = object(parse_json!(encode_json(vm2))) ?? {}
+          __ignore = del(__capture.body)
+          __ignore = del(__capture.content)
+          __ignore = del(__capture.kvdata)
+          __ignore = del(__capture.kvpart)
+          __ignore = del(__capture.msg)
+          __ignore = del(__capture.payload)
+          __ignore = del(__capture.remainder)
+          __ignore = del(__capture.rest)
+          __ignore = del(__capture.sd)
+          __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
           if ve2 == null && vm2 != null {
               vpn_group = string!(vm2.group)
               user_name = string!(vm2.user)
@@ -475,6 +742,18 @@ parser_vrl: |
           }
       }
       am3, ae3 = parse_regex(msg_body, r'Assigned\s+private\s+IP\s+address\s+(?P<ip>\S+)')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(am3))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if ae3 == null && am3 != null { assigned_ip = string!(am3.ip) }
 
   # ============================================================
@@ -491,6 +770,18 @@ parser_vrl: |
       disposition = "Blocked"
       if severity_id < 3 { severity_id = 3; severity = "Medium" }
       im2, ie2 = parse_regex(msg_body, r'IDS:(?P<sig>\d+)\s+(?P<name>.*?)\s+from\s+(?P<src_ip>\S+)\s+to\s+(?P<dst_ip>\S+)(?:\s+on\s+interface\s+(?P<iface>\w+))?')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(im2))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if ie2 == null && im2 != null {
           sig_id = string!(im2.sig)
           sig_name = strip_whitespace(string!(im2.name))
@@ -499,6 +790,18 @@ parser_vrl: |
           src_iface = to_string(im2.iface)
       } else {
           tm3, te3 = parse_regex(msg_body, r'(?P<threat>[\w\s-]+?)\s+from\s+(?P<src_ip>\d+\.\d+\.\d+\.\d+)')
+          # Capture parsed fields before mapping; omit structural raw-body captures.
+          __capture = object(parse_json!(encode_json(tm3))) ?? {}
+          __ignore = del(__capture.body)
+          __ignore = del(__capture.content)
+          __ignore = del(__capture.kvdata)
+          __ignore = del(__capture.kvpart)
+          __ignore = del(__capture.msg)
+          __ignore = del(__capture.payload)
+          __ignore = del(__capture.remainder)
+          __ignore = del(__capture.rest)
+          __ignore = del(__capture.sd)
+          __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
           if te3 == null && tm3 != null {
               sig_name = strip_whitespace(string!(tm3.threat))
               src_ip = string!(tm3.src_ip)
@@ -515,6 +818,18 @@ parser_vrl: |
       activity_id = 99
       activity_name = "Other"
       gm, ge = parse_regex(msg_body, r'(?:src|from)\s+(?:(?P<src_iface>\w+):)?(?P<src_ip>\d+\.\d+\.\d+\.\d+)(?:/(?P<src_port>\d+))?')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(gm))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if ge == null && gm != null {
           src_iface = to_string(gm.src_iface)
           src_ip = string!(gm.src_ip)
@@ -522,6 +837,18 @@ parser_vrl: |
           if sp2 != "" { src_port = to_int(sp2) ?? 0 }
       }
       gd, gde = parse_regex(msg_body, r'(?:dst|to)\s+(?:(?P<dst_iface>\w+):)?(?P<dst_ip>\d+\.\d+\.\d+\.\d+)(?:/(?P<dst_port>\d+))?')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(gd))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if gde == null && gd != null {
           dst_iface = to_string(gd.dst_iface)
           dst_ip = string!(gd.dst_ip)
@@ -529,6 +856,18 @@ parser_vrl: |
           if dp2 != "" { dst_port = to_int(dp2) ?? 0 }
       }
       gu, gue = parse_regex(msg_body, r'[Uu]ser\s+.(?P<user>[^\x27"\s.]+).')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(gu))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if gue == null && gu != null { user_name = string!(gu.user) }
       lb = downcase(msg_body)
       if contains(lb, "denied") || contains(lb, "deny") || contains(lb, "discard") || contains(lb, "drop") {
@@ -724,6 +1063,171 @@ parser_vrl: |
   if length(obs) > 0 { .observables = obs }
 
   .
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  __mapped = object!(parse_json!(encode_json(.)))
+  __existing = object(__mapped.unmapped) ?? {}
+  __discard = del(__mapped.raw_data)
+  __discard = del(__mapped.unmapped)
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __represented = []
+  __walk = map_values(__mapped, recursive: true) -> |value| {
+      __represented = push(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __represented = push(__represented, to_string(value) ?? "")
+      }
+      value
+  }
+  __consumed = []
+  # BEGIN parser-specific transformations
+  # event.action: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
+  # event.protocol: Case normalization already performed by the parser; observed at connection_info.protocol_name, and checked against the emitted branch.
+  # event.protocol: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = ["event.acl", "event.action", "event.bytes", "event.c", "event.conn_id", "event.direction", "event.dst_iface", "event.dst_ip", "event.dst_nat_ip", "event.dst_nat_port", "event.dst_port", "event.group", "event.h", "event.hits", "event.iface", "event.ip", "event.m", "event.name", "event.protocol", "event.reason", "event.s", "event.server", "event.sig", "event.src_iface", "event.src_ip", "event.src_nat_ip", "event.src_nat_port", "event.src_port", "event.t", "event.threat", "event.user", "event.verdict", "header.body", "header.host", "header.msgid", "header.rest", "header.sev", "header.ts"]
+  __preserve = []
+  __rules = array!(parse_json!("[{\"source\":\"event.action\",\"kind\":\"enum\",\"target\":\"action_id\",\"values\":{\"allow\":1,\"allowed\":1,\"accept\":1,\"accepted\":1,\"permit\":1,\"permitted\":1,\"pass\":1,\"passed\":1,\"deny\":2,\"denied\":2,\"block\":2,\"blocked\":2,\"reject\":2,\"rejected\":2,\"drop\":2,\"dropped\":2,\"log\":3,\"observed\":3},\"reason\":\"Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.\"},{\"source\":\"event.protocol\",\"kind\":\"lowercase\",\"reason\":\"Case normalization already performed by the parser; observed at connection_info.protocol_name, and checked against the emitted branch.\"},{\"source\":\"event.protocol\",\"kind\":\"enum\",\"target\":\"connection_info.protocol_num\",\"values\":{\"tcp\":6,\"udp\":17,\"icmp\":1,\"icmpv6\":58,\"ipv6-icmp\":58},\"reason\":\"Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.\"}]"))
+  __source_flat = flatten(__source_kv)
+  for_each(__rules) -> |_index, rule| {
+      __source_key = string!(rule.source)
+      __value = get!(__source_flat, [__source_key])
+      __expected = null
+      __valid = false
+      if rule.kind == "lowercase" && is_string(__value) {
+          __expected = downcase(string!(__value))
+          __valid = true
+      } else if rule.kind == "epoch_ms" {
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", string(rule.format) ?? "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              __valid = true
+          }
+      } else if rule.kind == "scale" {
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * to_float!(rule.factor))
+              __valid = true
+          }
+      } else if rule.kind == "hex" {
+          __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
+          __integer, __integer_err = parse_int(__hex, base: 16)
+          __expected = __integer
+          __valid = is_string(__value) && starts_with(downcase(string(__value) ?? ""), "0x") && __integer_err == null
+      } else if rule.kind == "enum" {
+          __expected = get!(object!(rule.values), [downcase(to_string(__value) ?? "")])
+          __valid = __expected != null
+      }
+      __matches = includes(__represented, encode_json(__expected))
+      if is_string(rule.target) { __matches = get!(., split(string!(rule.target), ".")) == __expected }
+      if __valid && __matches { __consumed = push(__consumed, __source_key) }
+  }
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  __safe = map_values(object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing}))), recursive: true) -> |value| {
+      if is_object(value) {
+          # Header/parameter arrays commonly encode sensitive keys as name/value
+          # or Key/Value objects instead of using the secret name as an object key.
+          __sensitive_pair = false
+          for_each(object!(value)) -> |key, child| {
+              if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                  __sensitive_pair = true
+              }
+          }
+          for_each(object!(value)) -> |key, _child| {
+              if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                  value = set!(value, [key], "<redacted>")
+              }
+          }
+      }
+      value
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  __escaped = map_keys(object!(__safe.source), recursive: true) -> |key| {
+      replace(replace(key, "~", "~0"), ".", "~1")
+  }
+  __flat = flatten(__escaped)
+  __residual = {}
+  for_each(__flat) -> |key, value| {
+      key = replace(replace(key, "~1", "."), "~0", "~")
+      __same = includes(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __same = __same || includes(__represented, to_string(value) ?? "")
+      }
+      # A scalar array is consumed only if every element is represented. Preserve
+      # partially represented arrays intact, including their ordering and repeats.
+      if is_array(value) && !is_empty(array!(value)) {
+          __all_items = true
+          for_each(array!(value)) -> |_index, item| {
+              __item_same = includes(__represented, encode_json(item))
+              if !is_object(item) && !is_array(item) && !is_null(item) {
+                  __item_same = __item_same || includes(__represented, to_string(item) ?? "")
+              }
+              if is_object(item) || is_array(item) || !__item_same { __all_items = false }
+          }
+          __same = __same || __all_items
+      }
+      if __same && includes(__candidates, key) { __consumed = push(__consumed, key) }
+      # Redacted leaves always remain visible. Do not spill a copy of the raw body.
+      if (!includes(__consumed, key) || value == "<redacted>") && value != __raw_body {
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          __base = join!(__parts, ".")
+          __key = __base
+          __suffix = 2
+          if includes(keys(__residual), __key) {
+              for_each(__flat) -> |_other_key, _other_value| {
+                  if includes(keys(__residual), __key) {
+                      __key = __base + "_" + to_string(__suffix)
+                      __suffix = __suffix + 1
+                  }
+              }
+          }
+          __complex = is_object(value)
+          if is_array(value) {
+              for_each(array!(value)) -> |_index, item| {
+                  if is_object(item) || is_array(item) { __complex = true }
+              }
+          }
+          __spill = if __complex { encode_json(value) } else { value }
+          __residual = set!(__residual, [__key], __spill)
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  __original_values = []
+  for_each(flatten(__source_kv)) -> |_key, value| {
+      __original_values = push(__original_values, encode_json(value))
+      if !is_object(value) && !is_array(value) { __original_values = push(__original_values, to_string(value) ?? "") }
+  }
+  for_each(flatten(__existing)) -> |key, value| {
+      __source_alias = includes(__original_values, encode_json(value)) || includes(__original_values, to_string(value) ?? "")
+      __mapped_alias = includes(__represented, encode_json(value)) || includes(__represented, to_string(value) ?? "")
+      __decoded, __decode_err = parse_json(string(value) ?? "")
+      __encoded_container = __decode_err == null && (is_object(__decoded) || is_array(__decoded))
+      if !is_null(value) && value != "" && !__source_alias && !__mapped_alias && !__encoded_container && value != __raw_body {
+          # Existing aggregates may contain sensitive descendants; the canonical
+          # source spill above is the authoritative representation of containers.
+          if !is_array(value) && !is_object(value) && !match(downcase(key), r'password|secret|authorization|token') {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
 samples:
 - raw: 'Apr 15 09:38:10 fw-edge-01 : %ASA-6-113005: AAA user authentication Rejected : reason = Invalid password : server = 10.1.1.5 : user = jsmith : user IP = 203.0.113.5'
   expect:

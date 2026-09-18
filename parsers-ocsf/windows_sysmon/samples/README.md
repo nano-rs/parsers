@@ -29,5 +29,8 @@ python3 scripts/sysmon_coverage_check.py \
 
 The check requires mapped values at their intended OCSF paths, checks every
 remaining EventData value in `unmapped`, and excludes `raw_data` as evidence.
-Arrays/objects must round-trip through JSON strings; scalar types must survive.
+Residual paths now include the `event_data.` prefix and nested objects flatten
+to dotted paths. Scalar arrays stay arrays; object arrays round-trip through JSON
+strings. The Sysmon checker shares these checks with `field_coverage_check.py`
+and retains its independent branch-specific destination assertions.
 Unknown EIDs must retain the 1007/99 fallback; empty residual must be absent.

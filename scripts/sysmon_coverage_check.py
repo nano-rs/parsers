@@ -112,27 +112,12 @@ def check(sample, output):
             return 0
     ed = source.get('event_data',{})
     expected = mappings(source)
-    residual = output.get('unmapped',{})
-    assert 'unmapped' not in output or residual, 'empty unmapped must be omitted'
-    used = set()
-    for key,value in ed.items():
-        if key in expected:
-            path, want = expected[key]
-            actual = get(output,path)
-            assert actual == want, f'{key}: expected {path}={want!r}, got {actual!r}'
-            continue
-        # Match distinct residual slots: two normalized keys cannot claim one.
-        candidates = [k for k in residual if k == snake(key) or re.fullmatch(re.escape(snake(key))+r'_\d+',k)]
-        matched = False
-        for k in candidates:
-            if k in used: continue
-            actual = residual[k]
-            if isinstance(value,(dict,list)):
-                try: actual = json.loads(actual)
-                except (TypeError,json.JSONDecodeError): continue
-            if actual == value and type(actual) is type(value):
-                used.add(k);matched=True;break
-        assert matched, f'{key}: source value absent from mapped output and unmapped'
+    # NAN-2421 shares source/residual checks with every parser. Keep the
+    # independent EID-specific destination expectations and role assertions.
+    import yaml
+    from field_coverage_check import check as check_fields, reference_consumed
+    config = yaml.safe_load((Path(__file__).resolve().parents[1] / 'parsers-ocsf/windows_sysmon/field-coverage.yaml').read_text())
+    check_fields(source, output, output.get('raw_data', ''), config['transforms'], reference_consumed(source, output), config['consumed_candidates'])
     if Path(sample).stem == '05_no_residual': assert 'unmapped' not in output
     if source.get('event_id') == 999: assert output['class_uid'] == 1007 and output['activity_id'] == 99
     if source.get('event_id') in (7,11,23):
