@@ -1,0 +1,85 @@
+source: json
+transforms:
+- source: changeType
+  kind: lowercase
+  reason: Parser lowercases this source value; consume only when the normalized value
+    is emitted.
+- source: level
+  kind: lowercase
+  reason: Parser lowercases this source value; consume only when the normalized value
+    is emitted.
+- source: eventTimestamp
+  kind: epoch_ms
+  target: time
+  reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+- source: time
+  kind: epoch_ms
+  target: time
+  format: '%+'
+  reason: Existing timestamp conversion verified against the emitted millisecond clock.
+- source: level
+  kind: enum
+  target: severity_id
+  values:
+    informational: 1
+    info: 1
+    debug: 1
+    low: 2
+    medium: 3
+    warn: 3
+    warning: 3
+    high: 4
+    error: 4
+    critical: 5
+    fatal: 6
+  reason: Named vendor outcome/protocol/severity normalized by the existing mapping;
+    consume only when the expected ID is emitted.
+- source: changeType
+  kind: enum
+  target: activity_name
+  values:
+    create: Create
+  reason: Parser normalizes the caption case; verify the emitted caption.
+consumed_candidates:
+- caller
+- callerType
+- category.value
+- changeType
+- claims
+- claims.appid
+- claims.http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name
+- claims.http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn
+- claims.ipaddr
+- claims.iss
+- correlationId
+- eventName.value
+- eventTimestamp
+- httpRequest
+- httpRequest.clientIpAddress
+- httpRequest.clientRequestId
+- httpRequest.method
+- httpRequest.uri
+- level
+- operationId
+- operationName.value
+- properties
+- properties.deletedResourceId
+- properties.serviceRequestId
+- properties.statusCode
+- properties.statusMessage
+- resourceGroupName
+- resourceId
+- resourceLocation
+- resourceName
+- resourceProviderName.value
+- resourceType.value
+- resultType
+- status.value
+- subStatus.value
+- subscriptionId
+- subscriptionName
+- tenantId
+- time
+consumed_reason: Only source keys read by this parser are eligible for exact-value
+  consumption; the selected branch must emit the value. Unknown keys always spill,
+  even when their value equals an OCSF default.

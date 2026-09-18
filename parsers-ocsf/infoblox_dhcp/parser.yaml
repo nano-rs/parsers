@@ -1,8 +1,9 @@
 name: infoblox_dhcp_ocsf
 display_name: Infoblox DHCP (OCSF)
-version: "1.0.0"
+version: "1.1.0"
 ocsf_version: "1.9.0"
 description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses Infoblox NIOS dhcpd syslog (DHCPDISCOVER / OFFER / REQUEST / ACK /
   NAK / DECLINE / RELEASE / INFORM / EXPIRE) into OCSF 1.9.0 DHCP Activity
   (class_uid 4004). The client is modelled as src_endpoint (leased IP, MAC,
@@ -18,12 +19,26 @@ parser_vrl: |
   # Infoblox DHCP -> OCSF 1.9.0 DHCP Activity (class_uid 4004)
 
   raw_log = string!(.message)
+  __raw_body = raw_log
+  __source_kv = {}
 
   time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
   server_host = null
   body = raw_log
 
   syslog_match, syslog_err = parse_regex(raw_log, r'^(?:<(?P<pri>\d+)>)?(?P<ts>[A-Z][a-z]{2}\s+\d+\s+\d+:\d+:\d+)\s+(?P<host>\S+)\s+(?P<proc>[^:\x5B]+)(?:\[\d+\])?:\s+(?P<body>.*)$')
+  # Capture parsed fields before mapping; omit structural raw-body captures.
+  __capture = object(parse_json!(encode_json(syslog_match))) ?? {}
+  __ignore = del(__capture.body)
+  __ignore = del(__capture.content)
+  __ignore = del(__capture.kvdata)
+  __ignore = del(__capture.kvpart)
+  __ignore = del(__capture.msg)
+  __ignore = del(__capture.payload)
+  __ignore = del(__capture.remainder)
+  __ignore = del(__capture.rest)
+  __ignore = del(__capture.sd)
+  __source_kv = set!(__source_kv, ["header"], merge(object(get(__source_kv, ["header"]) ?? null) ?? {}, __capture))
   if syslog_err == null && syslog_match != null {
       body = string!(syslog_match.body)
       hv = to_string(syslog_match.host)
@@ -39,6 +54,18 @@ parser_vrl: |
   # ---- DHCP message type -> activity_id ----
   dhcp_type = ""
   type_match, type_err = parse_regex(body, r'^(?P<type>DHCP[A-Z]+)')
+  # Capture parsed fields before mapping; omit structural raw-body captures.
+  __capture = object(parse_json!(encode_json(type_match))) ?? {}
+  __ignore = del(__capture.body)
+  __ignore = del(__capture.content)
+  __ignore = del(__capture.kvdata)
+  __ignore = del(__capture.kvpart)
+  __ignore = del(__capture.msg)
+  __ignore = del(__capture.payload)
+  __ignore = del(__capture.remainder)
+  __ignore = del(__capture.rest)
+  __ignore = del(__capture.sd)
+  __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
   if type_err == null && type_match != null { dhcp_type = string!(type_match.type) }
 
   activity_id = 99
@@ -61,6 +88,18 @@ parser_vrl: |
 
   # "on 10.1.2.3 to aa:bb:.. (host) via eth1"  (OFFER / ACK / NAK)
   m, e = parse_regex(body, r'\bon\s+(?P<ip>\d+\.\d+\.\d+\.\d+)\s+to\s+(?P<mac>[0-9a-fA-F:]{17})(?:\s+\((?P<host>[^\x29]*)\))?')
+  # Capture parsed fields before mapping; omit structural raw-body captures.
+  __capture = object(parse_json!(encode_json(m))) ?? {}
+  __ignore = del(__capture.body)
+  __ignore = del(__capture.content)
+  __ignore = del(__capture.kvdata)
+  __ignore = del(__capture.kvpart)
+  __ignore = del(__capture.msg)
+  __ignore = del(__capture.payload)
+  __ignore = del(__capture.remainder)
+  __ignore = del(__capture.rest)
+  __ignore = del(__capture.sd)
+  __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
   if e == null && m != null {
       client_ip = string!(m.ip)
       client_mac = downcase(string!(m.mac))
@@ -71,6 +110,18 @@ parser_vrl: |
   # "for 10.1.2.3 from aa:bb:.. (host)"  (REQUEST)
   if client_ip == null {
       m2, e2 = parse_regex(body, r'\bfor\s+(?P<ip>\d+\.\d+\.\d+\.\d+)\s+from\s+(?P<mac>[0-9a-fA-F:]{17})(?:\s+\((?P<host>[^\x29]*)\))?')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(m2))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if e2 == null && m2 != null {
           client_ip = string!(m2.ip)
           client_mac = downcase(string!(m2.mac))
@@ -82,6 +133,18 @@ parser_vrl: |
   # "of 10.1.2.3 from aa:bb:.. (host)"  (RELEASE / DECLINE)
   if client_ip == null {
       m3, e3 = parse_regex(body, r'\bof\s+(?P<ip>\d+\.\d+\.\d+\.\d+)\s+from\s+(?P<mac>[0-9a-fA-F:]{17})(?:\s+\((?P<host>[^\x29]*)\))?')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(m3))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if e3 == null && m3 != null {
           client_ip = string!(m3.ip)
           client_mac = downcase(string!(m3.mac))
@@ -93,27 +156,87 @@ parser_vrl: |
   # "from aa:bb:.." with no lease IP (DISCOVER)
   if client_mac == null {
       m4, e4 = parse_regex(body, r'\bfrom\s+(?P<mac>[0-9a-fA-F:]{17})')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(m4))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if e4 == null && m4 != null { client_mac = downcase(string!(m4.mac)) }
   }
 
   # "from 10.1.2.3 via eth1" (INFORM)
   if client_ip == null {
       m5, e5 = parse_regex(body, r'\bfrom\s+(?P<ip>\d+\.\d+\.\d+\.\d+)')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(m5))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if e5 == null && m5 != null { client_ip = string!(m5.ip) }
   }
 
   mi, mie = parse_regex(body, r'\bvia\s+(?P<iface>\S+)')
+  # Capture parsed fields before mapping; omit structural raw-body captures.
+  __capture = object(parse_json!(encode_json(mi))) ?? {}
+  __ignore = del(__capture.body)
+  __ignore = del(__capture.content)
+  __ignore = del(__capture.kvdata)
+  __ignore = del(__capture.kvpart)
+  __ignore = del(__capture.msg)
+  __ignore = del(__capture.payload)
+  __ignore = del(__capture.remainder)
+  __ignore = del(__capture.rest)
+  __ignore = del(__capture.sd)
+  __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
   if mie == null && mi != null { iface = string!(mi.iface) }
 
   # "(hostname)" as a standalone trailing token, when not captured above
   if client_host == null {
       mh, mhe = parse_regex(body, r'\((?P<host>[^\x29]{1,253})\)\s+via\b')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(mh))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
       if mhe == null && mh != null { client_host = string!(mh.host) }
   }
 
   # lease duration, when dhcpd emits it
   lease_dur = null
   ml, mle = parse_regex(body, r'\blease-duration\s+(?P<d>\d+)|\blease\s+time\s+(?P<d2>\d+)')
+  # Capture parsed fields before mapping; omit structural raw-body captures.
+  __capture = object(parse_json!(encode_json(ml))) ?? {}
+  __ignore = del(__capture.body)
+  __ignore = del(__capture.content)
+  __ignore = del(__capture.kvdata)
+  __ignore = del(__capture.kvpart)
+  __ignore = del(__capture.msg)
+  __ignore = del(__capture.payload)
+  __ignore = del(__capture.remainder)
+  __ignore = del(__capture.rest)
+  __ignore = del(__capture.sd)
+  __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
   if mle == null && ml != null {
       d = to_string(ml.d)
       if d == "" { d = to_string(ml.d2) }
@@ -209,6 +332,168 @@ parser_vrl: |
 
   # emit the assembled OCSF record
   .
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  __mapped = object!(parse_json!(encode_json(.)))
+  __existing = object(__mapped.unmapped) ?? {}
+  __discard = del(__mapped.raw_data)
+  __discard = del(__mapped.unmapped)
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __represented = []
+  __walk = map_values(__mapped, recursive: true) -> |value| {
+      __represented = push(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __represented = push(__represented, to_string(value) ?? "")
+      }
+      value
+  }
+  __consumed = []
+  # BEGIN parser-specific transformations
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = ["event.d", "event.d2", "event.host", "event.iface", "event.ip", "event.mac", "event.type", "header.body", "header.host", "header.ts"]
+  __preserve = []
+  __rules = array!(parse_json!("[]"))
+  __source_flat = flatten(__source_kv)
+  for_each(__rules) -> |_index, rule| {
+      __source_key = string!(rule.source)
+      __value = get!(__source_flat, [__source_key])
+      __expected = null
+      __valid = false
+      if rule.kind == "lowercase" && is_string(__value) {
+          __expected = downcase(string!(__value))
+          __valid = true
+      } else if rule.kind == "epoch_ms" {
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", string(rule.format) ?? "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              __valid = true
+          }
+      } else if rule.kind == "scale" {
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * to_float!(rule.factor))
+              __valid = true
+          }
+      } else if rule.kind == "hex" {
+          __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
+          __integer, __integer_err = parse_int(__hex, base: 16)
+          __expected = __integer
+          __valid = is_string(__value) && starts_with(downcase(string(__value) ?? ""), "0x") && __integer_err == null
+      } else if rule.kind == "enum" {
+          __expected = get!(object!(rule.values), [downcase(to_string(__value) ?? "")])
+          __valid = __expected != null
+      }
+      __matches = includes(__represented, encode_json(__expected))
+      if is_string(rule.target) { __matches = get!(., split(string!(rule.target), ".")) == __expected }
+      if __valid && __matches { __consumed = push(__consumed, __source_key) }
+  }
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  __safe = map_values(object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing}))), recursive: true) -> |value| {
+      if is_object(value) {
+          # Header/parameter arrays commonly encode sensitive keys as name/value
+          # or Key/Value objects instead of using the secret name as an object key.
+          __sensitive_pair = false
+          for_each(object!(value)) -> |key, child| {
+              if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                  __sensitive_pair = true
+              }
+          }
+          for_each(object!(value)) -> |key, _child| {
+              if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                  value = set!(value, [key], "<redacted>")
+              }
+          }
+      }
+      value
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  __escaped = map_keys(object!(__safe.source), recursive: true) -> |key| {
+      replace(replace(key, "~", "~0"), ".", "~1")
+  }
+  __flat = flatten(__escaped)
+  __residual = {}
+  for_each(__flat) -> |key, value| {
+      key = replace(replace(key, "~1", "."), "~0", "~")
+      __same = includes(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __same = __same || includes(__represented, to_string(value) ?? "")
+      }
+      # A scalar array is consumed only if every element is represented. Preserve
+      # partially represented arrays intact, including their ordering and repeats.
+      if is_array(value) && !is_empty(array!(value)) {
+          __all_items = true
+          for_each(array!(value)) -> |_index, item| {
+              __item_same = includes(__represented, encode_json(item))
+              if !is_object(item) && !is_array(item) && !is_null(item) {
+                  __item_same = __item_same || includes(__represented, to_string(item) ?? "")
+              }
+              if is_object(item) || is_array(item) || !__item_same { __all_items = false }
+          }
+          __same = __same || __all_items
+      }
+      if __same && includes(__candidates, key) { __consumed = push(__consumed, key) }
+      # Redacted leaves always remain visible. Do not spill a copy of the raw body.
+      if (!includes(__consumed, key) || value == "<redacted>") && value != __raw_body {
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          __base = join!(__parts, ".")
+          __key = __base
+          __suffix = 2
+          if includes(keys(__residual), __key) {
+              for_each(__flat) -> |_other_key, _other_value| {
+                  if includes(keys(__residual), __key) {
+                      __key = __base + "_" + to_string(__suffix)
+                      __suffix = __suffix + 1
+                  }
+              }
+          }
+          __complex = is_object(value)
+          if is_array(value) {
+              for_each(array!(value)) -> |_index, item| {
+                  if is_object(item) || is_array(item) { __complex = true }
+              }
+          }
+          __spill = if __complex { encode_json(value) } else { value }
+          __residual = set!(__residual, [__key], __spill)
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  __original_values = []
+  for_each(flatten(__source_kv)) -> |_key, value| {
+      __original_values = push(__original_values, encode_json(value))
+      if !is_object(value) && !is_array(value) { __original_values = push(__original_values, to_string(value) ?? "") }
+  }
+  for_each(flatten(__existing)) -> |key, value| {
+      __source_alias = includes(__original_values, encode_json(value)) || includes(__original_values, to_string(value) ?? "")
+      __mapped_alias = includes(__represented, encode_json(value)) || includes(__represented, to_string(value) ?? "")
+      __decoded, __decode_err = parse_json(string(value) ?? "")
+      __encoded_container = __decode_err == null && (is_object(__decoded) || is_array(__decoded))
+      if !is_null(value) && value != "" && !__source_alias && !__mapped_alias && !__encoded_container && value != __raw_body {
+          # Existing aggregates may contain sensitive descendants; the canonical
+          # source spill above is the authoritative representation of containers.
+          if !is_array(value) && !is_object(value) && !match(downcase(key), r'password|secret|authorization|token') {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
 samples:
 - raw: 'Jan 25 13:13:13 infoblox02 dhcpd[1236]: DHCPACK on 10.20.30.44 to 00:0c:29:3a:1b:5f (LAPTOP-7) via eth1 lease-duration 86400'
   expect:
