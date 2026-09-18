@@ -1,6 +1,6 @@
 name: windows_sysmon_ocsf
 display_name: Microsoft Sysmon (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 description: >
   Parses Windows Sysmon events in JSON form (top-level event_id + event_data)
   into complete OCSF 1.9.0 records, routed by Sysmon EventID:
@@ -14,6 +14,8 @@ description: >
     11 File Create       -> File System Activity 1001 (Create)
     23 File Delete       -> File System Activity 1001 (Delete)
     22 DNS Query         -> DNS Activity 4003 (Query)
+  Preserves unconsumed EventData in unmapped, including unknown EventIDs, and
+  maps process/session, executable metadata, network direction and file clocks.
   Emits the whole OCSF object on the root so it lands in ocsf_logs.event and the
   promoted columns materialize. Carries metadata.profiles ["host"] because the
   `device` object is profile-bound in OCSF 1.9. The OCSF counterpart of
@@ -58,12 +60,35 @@ parser_vrl: |
 
       computer = downcase(string(p.computer) ?? string(p.host) ?? "")
 
-      # ---- event time (top-level ISO8601) -> epoch ms ----
+      # ---- event time (common Sysmon JSON shapes) -> epoch ms ----------
+      consumed = []
       time_ms = 0
       ts_str = string(p.timestamp) ?? ""
       if ts_str != "" {
           t, terr = parse_timestamp(ts_str, "%+")
           if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+      if time_ms == 0 {
+          ts_str = string(p.time_created) ?? ""
+          if ts_str != "" {
+              t, terr = parse_timestamp(ts_str, "%+")
+              if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+          }
+      }
+      if time_ms == 0 {
+          ts_str = string(ed.UtcTime) ?? ""
+          if ts_str != "" {
+              t, terr = parse_timestamp(ts_str, "%+")
+              if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds"); consumed = push(consumed, "UtcTime") }
+              if terr != null {
+                  # EventData.UtcTime omits an explicit zone but is UTC by
+                  # contract. Add it before parsing so host timezone cannot
+                  # shift the event clock.
+                  utc_ts = replace(ts_str, " ", "T") + "Z"
+                  t2, terr2 = parse_timestamp(utc_ts, "%+")
+                  if terr2 == null { time_ms = to_unix_timestamp(t2, unit: "milliseconds"); consumed = push(consumed, "UtcTime") }
+              }
+          }
       }
 
       # ---- shared helpers (inlined) ------------------------------------
@@ -103,7 +128,7 @@ parser_vrl: |
           "uid": string(ed.ProcessGuid) ?? "",
           "file": { "name": actor_proc_name, "path": img, "type_id": 1 }
       }
-      if sha != "" { subject_process.file = { "name": actor_proc_name, "path": img, "type_id": 1, "hashes": [{ "algorithm_id": 3, "value": sha }] } }
+      if sha != "" && eid != 7 && eid != 11 && eid != 23 { subject_process.file = { "name": actor_proc_name, "path": img, "type_id": 1, "hashes": [{ "algorithm_id": 3, "value": sha }] } }
 
       # The PARENT process (initiator), present on Process Create (EID 1).
       parent_process = {
@@ -111,7 +136,10 @@ parser_vrl: |
           "cmd_line": string(ed.ParentCommandLine) ?? "",
           "pid": to_int(ed.ParentProcessId) ?? 0
       }
-      has_parent = pimg != "" || (string(ed.ParentCommandLine) ?? "") != ""
+      if is_string(ed.ParentImage) { parent_process.file = { "path": pimg, "name": parent_proc_name, "type_id": 1 } }
+      if is_string(ed.ParentProcessGuid) { parent_process.uid = ed.ParentProcessGuid }
+      if is_string(ed.ParentUser) { parent_process.user = { "name": ed.ParentUser } }
+      has_parent = exists(ed.ParentImage) || exists(ed.ParentCommandLine) || exists(ed.ParentProcessId) || exists(ed.ParentProcessGuid) || exists(ed.ParentUser)
 
       # actor.process for the non-1007 classes (network/file/dns): the initiator
       # is the Image-based process, with its parent nested.
@@ -151,7 +179,7 @@ parser_vrl: |
           activity_id = 99; activity_name = "Other"
           if reg_event == "CreateKey" { activity_id = 1; activity_name = "Create" }
           if reg_event == "DeleteKey" { activity_id = 4; activity_name = "Delete" }
-          ocsf.actor = { "process": subject_process, "user": { "name": actor_user } }
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
           ocsf.reg_key = { "path": string(ed.TargetObject) ?? "" }
           ocsf.device = { "hostname": computer }
       } else if eid == 13 {
@@ -159,7 +187,7 @@ parser_vrl: |
           # extension), activity 2 (Set). reg_value carries the value + data.
           class_uid = 201002; class_name = "Registry Value Activity"; category_uid = 1; category_name = "System Activity"
           activity_id = 2; activity_name = "Set"
-          ocsf.actor = { "process": subject_process, "user": { "name": actor_user } }
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
           # Sysmon TargetObject is the full key\value; split on the LAST backslash:
           # tail -> reg_value.name (required), head -> reg_value.path (required).
           tgt = string(ed.TargetObject) ?? ""
@@ -181,7 +209,7 @@ parser_vrl: |
           mod_name = ""
           mnm, mnmerr = parse_regex(loaded, r'(?P<b>[^\\/]+)$')
           if mnmerr == null { mod_name = string(mnm.b) ?? "" }
-          ocsf.actor = { "process": subject_process, "user": { "name": actor_user } }
+          ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
           signed_raw = downcase(string(ed.Signed) ?? "")
           signature_state = string(ed.SignatureStatus) ?? ""
           signature_state_id = 99
@@ -204,17 +232,8 @@ parser_vrl: |
                   "state_id": signature_state_id,
                   "state": signature_state
               }]
-          } else {
-              # OCSF models positive signing evidence as `signatures[]` but has
-              # no explicit unsigned boolean. Preserve that negative source
-              # assertion (and any source status text) without fabricating a
-              # Digital Signature object.
-              ocsf.unmapped = {
-                  "signed": ed.Signed,
-                  "signature": string(ed.Signature) ?? null,
-                  "signature_status": string(ed.SignatureStatus) ?? null
-              }
           }
+          if sha != "" { module_file.hashes = [{ "algorithm_id": 3, "value": sha }] }
           ocsf.module = { "load_type_id": 1, "file": module_file }
           ocsf.device = { "hostname": computer }
       } else if eid == 10 {
@@ -292,6 +311,141 @@ parser_vrl: |
           ocsf.actor = { "process": actor_process, "user": { "name": actor_user } }
           ocsf.device = { "hostname": computer }
       }
+
+      # ---- consumed source keys, specific to the branch that emitted them ----
+      # Only successfully represented scalar values are removed below. Merely
+      # reading a helper is not consumption (e.g. Image on Process Access).
+      process_keys = ["Image", "CommandLine", "ProcessId", "ProcessGuid", "User"]
+      parent_keys = ["ParentImage", "ParentCommandLine", "ParentProcessId", "ParentProcessGuid", "ParentUser"]
+      branch_keys = []
+      if eid == 1 { branch_keys = append(process_keys, parent_keys) }
+      if eid == 5 { branch_keys = process_keys }
+      if eid == 3 { branch_keys = append(append(process_keys, parent_keys), ["SourceIp", "SourcePort", "SourceHostname", "DestinationIp", "DestinationPort", "DestinationHostname"]) }
+      if eid == 7 { branch_keys = append(append(process_keys, parent_keys), ["ImageLoaded"]) }
+      if eid == 10 { branch_keys = ["SourceImage", "SourceProcessGUID", "SourceProcessId", "TargetImage", "TargetProcessGUID", "TargetProcessId", "User"] }
+      if eid == 11 || eid == 23 { branch_keys = append(append(process_keys, parent_keys), ["TargetFilename"]) }
+      if eid == 12 { branch_keys = append(append(process_keys, parent_keys), ["TargetObject"]) }
+      if eid == 13 { branch_keys = append(append(process_keys, parent_keys), ["TargetObject", "Details"]) }
+      if eid == 22 { branch_keys = append(append(process_keys, parent_keys), ["QueryName", "QueryResults"]) }
+      if !includes([1, 3, 5, 7, 10, 11, 12, 13, 22, 23], eid) { branch_keys = append(process_keys, parent_keys) }
+      for_each(branch_keys) -> |_index, key| {
+          value = get!(ed, [key])
+          if is_string(value) { consumed = push(consumed, key) }
+          if includes(["ProcessId", "ParentProcessId", "SourceProcessId", "TargetProcessId", "SourcePort", "DestinationPort"], key) {
+              number, number_err = to_int(value)
+              consumed = filter(consumed) -> |_i, k| { k != key }
+              if number_err == null && (is_string(value) || is_integer(value)) { consumed = push(consumed, key) }
+          }
+      }
+      if eid == 22 && (string(ed.QueryResults) ?? "") == "" { consumed = filter(consumed) -> |_i, key| { key != "QueryResults" } }
+      if eid == 12 && includes(["CreateKey", "DeleteKey"], ed.EventType) { consumed = push(consumed, "EventType") }
+      if eid == 13 && ed.EventType == "SetValue" { consumed = push(consumed, "EventType") }
+      if eid == 10 && exists(ocsf.actual_permissions) { consumed = push(consumed, "GrantedAccess") }
+      if eid == 7 && downcase(string(ed.Signed) ?? "") == "true" && is_string(ed.Signed) {
+          consumed = append(consumed, ["Signed"])
+          if is_string(ed.Signature) { consumed = push(consumed, "Signature") }
+          if is_string(ed.SignatureStatus) { consumed = push(consumed, "SignatureStatus") }
+      }
+      # A SHA256 extraction alone does not consume a multi-hash source string.
+      if sha != "" && eid != 10 && match(hs, r'^SHA256=[0-9A-Fa-f]+$') { consumed = push(consumed, "Hashes") }
+
+      # Image-based process context. EID 10 uses separate Source/Target fields.
+      if eid != 10 {
+          process_path = if class_uid == 1007 { ["process"] } else { ["actor", "process"] }
+          string_fields = { "IntegrityLevel": ["integrity"], "CurrentDirectory": ["working_directory"] }
+          for_each(string_fields) -> |key, path| {
+              value = get!(ed, [key])
+              if is_string(value) {
+                  ocsf = set!(ocsf, append(process_path, array!(path)), value)
+                  consumed = push(consumed, key)
+              }
+          }
+          if is_string(ed.IntegrityLevel) {
+              levels = { "untrusted": 1, "low": 2, "medium": 3, "high": 4, "system": 5, "protected": 6, "unknown": 0 }
+              level = int(get!(levels, [downcase(string!(ed.IntegrityLevel))])) ?? 99
+              ocsf = set!(ocsf, append(process_path, ["integrity_id"]), level)
+          }
+          # On module loads these attributes describe the DLL, not its loader.
+          file_path = if eid == 7 { ["module", "file"] } else { append(process_path, ["file"]) }
+          file_fields = { "OriginalFileName": ["internal_name"], "Company": ["company_name"], "Product": ["product", "name"], "Description": ["desc"], "FileVersion": ["version"] }
+          for_each(file_fields) -> |key, path| {
+              value = get!(ed, [key])
+              if is_string(value) {
+                  ocsf = set!(ocsf, append(file_path, array!(path)), value)
+                  consumed = push(consumed, key)
+              }
+          }
+      }
+      for_each({ "LogonId": "uid", "LogonGuid": "uuid" }) -> |key, attribute| {
+          value = get!(ed, [key])
+          if is_string(value) {
+              ocsf = set!(ocsf, ["actor", "session", attribute], value)
+              consumed = push(consumed, key)
+          }
+      }
+      # Windows TerminalSessionId is not OCSF's pseudo-terminal (tty/pts).
+      if eid == 10 {
+          thread_id, thread_err = to_int(ed.SourceThreadId)
+          if thread_err == null && (is_string(ed.SourceThreadId) || is_integer(ed.SourceThreadId)) {
+              ocsf.actor.process.ptid = thread_id
+              consumed = push(consumed, "SourceThreadId")
+          }
+          if is_string(ed.SourceUser) { ocsf.actor.process.user = { "name": ed.SourceUser }; consumed = push(consumed, "SourceUser") }
+          if is_string(ed.TargetUser) { ocsf.process.user = { "name": ed.TargetUser }; consumed = push(consumed, "TargetUser") }
+      }
+      if eid == 3 {
+          if includes(["tcp", "udp"], downcase(string(ed.Protocol) ?? "")) { consumed = push(consumed, "Protocol") }
+          initiated = downcase(to_string(ed.Initiated) ?? "")
+          if initiated == "true" { ocsf.connection_info.direction_id = 2; consumed = push(consumed, "Initiated") }
+          if initiated == "false" { ocsf.connection_info.direction_id = 1; consumed = push(consumed, "Initiated") }
+          if is_string(ed.SourcePortName) { ocsf.src_endpoint.svc_name = ed.SourcePortName; consumed = push(consumed, "SourcePortName") }
+          if is_string(ed.DestinationPortName) { ocsf.dst_endpoint.svc_name = ed.DestinationPortName; consumed = push(consumed, "DestinationPortName") }
+      }
+      if eid == 11 {
+          created_raw = string(ed.CreationUtcTime) ?? ""
+          created, created_err = parse_timestamp(created_raw, "%+")
+          if created_err != null { created, created_err = parse_timestamp(replace(created_raw, " ", "T") + "Z", "%+") }
+          if created_err == null {
+              ocsf.file.created_time = to_unix_timestamp(created, unit: "milliseconds")
+              consumed = push(consumed, "CreationUtcTime")
+          }
+      }
+      # QueryStatus is Win32 DNS_STATUS. Only success and DNS_ERROR_RCODE_*
+      # translate to RFC response codes; other Windows errors remain residual.
+      if eid == 22 {
+          query_status, query_status_err = to_int(ed.QueryStatus)
+          rcodes = { "0": "NoError", "1": "FormError", "2": "ServError", "3": "NXDomain", "4": "NotImp", "5": "Refused", "6": "YXDomain", "7": "YXRRSet", "8": "NXRRSet", "9": "NotAuth", "10": "NotZone", "17": "BADKEY", "18": "BADTIME" }
+          code = if query_status == 0 { 0 } else { query_status - 9000 }
+          caption = get!(rcodes, [to_string(code)])
+          if query_status_err == null && query_status != 9000 && caption != null && (is_string(ed.QueryStatus) || is_integer(ed.QueryStatus)) {
+              ocsf.rcode_id = code
+              ocsf.rcode = caption
+              consumed = push(consumed, "QueryStatus")
+          }
+      }
+
+      # Merge residuals with branch-specific unmapped evidence. Scalars retain
+      # their source type; arrays/objects become JSON strings for spill storage.
+      residual = object(ocsf.unmapped) ?? {}
+      for_each(ed) -> |key, value| {
+          if !includes(consumed, key) {
+              spill_key = snakecase(key)
+              spill_value = if is_array(value) || is_object(value) { encode_json(value) } else { value }
+              # Snake-case collisions must not overwrite earlier source values.
+              if includes(keys(residual), spill_key) {
+                  base_key = spill_key
+                  suffix = 2
+                  for_each(ed) -> |_other_key, _other_value| {
+                      if includes(keys(residual), spill_key) {
+                          spill_key = base_key + "_" + to_string(suffix)
+                          suffix = suffix + 1
+                      }
+                  }
+              }
+              residual = set!(residual, [spill_key], spill_value)
+          }
+      }
+      if !is_empty(residual) { ocsf.unmapped = residual }
 
       # ---- common envelope ----
       ocsf.class_uid = class_uid
@@ -392,6 +546,24 @@ samples:
     expect:
       "class_uid": 1007
       "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":1,\"record_id\":91246,\"computer\":\"WKS-01\",\"time_created\":\"2026-08-18T10:26:00.123Z\",\"event_data\":{\"UtcTime\":\"2026-08-18 10:20:00.000\",\"Image\":\"C:\\\\Windows\\\\System32\\\\cmd.exe\",\"ProcessId\":\"4322\",\"ProcessGuid\":\"{aaaa-2222}\",\"ParentImage\":\"C:\\\\Windows\\\\explorer.exe\",\"ParentProcessId\":\"1200\",\"User\":\"CORP\\\\alice\"}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "time": 1787048760123
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":1,\"record_id\":91247,\"computer\":\"WKS-01\",\"event_data\":{\"UtcTime\":\"2026-08-18 10:27:00.456\",\"Image\":\"C:\\\\Windows\\\\System32\\\\cmd.exe\",\"ProcessId\":\"4323\",\"ProcessGuid\":\"{aaaa-3333}\",\"ParentImage\":\"C:\\\\Windows\\\\explorer.exe\",\"ParentProcessId\":\"1200\",\"User\":\"CORP\\\\alice\"}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "time": 1787048820456
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":1,\"record_id\":91248,\"computer\":\"WKS-01\",\"timestamp\":\"not-a-time\",\"event_data\":{\"UtcTime\":\"2026-08-18 10:28:00.789\",\"Image\":\"C:\\\\Windows\\\\System32\\\\cmd.exe\",\"ProcessId\":\"4324\",\"ProcessGuid\":\"{aaaa-4444}\",\"ParentImage\":\"C:\\\\Windows\\\\explorer.exe\",\"ParentProcessId\":\"1200\",\"User\":\"CORP\\\\alice\"}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "time": 1787048880789
       "metadata.version": "1.9.0"
   - raw: "not json at all"
     expect:
