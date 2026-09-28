@@ -1,6 +1,6 @@
 name: squid_proxy
 display_name: Squid Proxy
-version: "1.2.0"
+version: "1.3.0"
 description: "Parses Squid proxy access logs with cache hit/miss status, URL extraction, and HTTP metadata"
 match_values:
   - squid_proxy
@@ -65,8 +65,8 @@ parser_vrl: |
           .metadata.squid_result_code = squid_result
       }
 
-      # Field 4: Response size in bytes
-      .udm.bytes_out = to_int(parts[4]) ?? 0
+      # Field 4: Response size in bytes. NAN-2995: server -> client = bytes_in.
+      .udm.bytes_in = to_int(parts[4]) ?? 0
 
       # Field 5: HTTP method
       http_method = to_string(parts[5])
@@ -164,3 +164,11 @@ parser_vrl: |
   }
 
   .message = raw_log
+
+# Runtime samples (NAN-2327).
+samples:
+  # NAN-2995: OCSF 1.9 direction (UDM bytes_* = traffic.*): bytes_in = destination -> source, bytes_out = source -> destination; the reply size is bytes_in.
+  - raw: "1786000530.881 5012 10.20.1.56 TCP_TUNNEL/200 48210 CONNECT secure.example.org:443 - HIER_DIRECT/203.0.113.20 -"
+    expect:
+      "udm.bytes_in": 48210
+      "udm.bytes_out": "<missing>"

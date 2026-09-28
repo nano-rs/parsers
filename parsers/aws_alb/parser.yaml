@@ -1,6 +1,6 @@
 name: aws_alb
 display_name: AWS ALB Access Logs
-version: "1.0.0"
+version: "1.1.0"
 description: "Parses AWS Application Load Balancer access logs including request routing, target processing, and SSL details"
 match_values:
   - aws_alb
@@ -91,11 +91,14 @@ parser_vrl: |
       # --- Bytes ---
       recv = string!(matched.received_bytes)
       if recv != "-" {
-          .udm.bytes_in = recv
+          # NAN-2995: OCSF 1.9 direction (UDM bytes_* map 1:1 to traffic.*): bytes_in = destination -> source, bytes_out = source -> destination.
+          # received_bytes = client -> ALB (request) is bytes_out.
+          .udm.bytes_out = recv
       }
       sent = string!(matched.sent_bytes)
       if sent != "-" {
-          .udm.bytes_out = sent
+          # sent_bytes = ALB -> client (response) is bytes_in.
+          .udm.bytes_in = sent
       }
 
       # --- Domain Name ---
@@ -181,3 +184,11 @@ parser_vrl: |
 
   # Preserve raw log
   .message = raw_log
+
+# Runtime samples (NAN-2327).
+samples:
+  # NAN-2995: OCSF 1.9 direction (UDM bytes_* = traffic.*): bytes_in = destination -> source, bytes_out = source -> destination; sent_bytes is bytes_in, received_bytes is bytes_out.
+  - raw: "http 2026-08-18T20:00:00.123456Z app/my-loadbalancer/50dc6c495c0c9188 192.0.2.10:2817 10.0.0.5:80 0.000 0.001 0.000 200 200 34 366 \"GET http://www.example.com:80/index.html HTTP/1.1\" \"curl/7.68.0\" - - arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/my-targets/73e2d6bc24d8a067 \"Root=1-58337262-36d228ad5d99923122bbe354\" \"-\" \"-\" 0 2026-08-18T20:00:00.000000Z \"forward\" \"-\" \"-\""
+    expect:
+      "udm.bytes_in": "366"
+      "udm.bytes_out": "34"
