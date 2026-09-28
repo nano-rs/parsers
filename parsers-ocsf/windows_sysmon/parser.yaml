@@ -1,6 +1,6 @@
 name: windows_sysmon_ocsf
 display_name: Microsoft Sysmon (OCSF)
-version: "1.3.0"
+version: "1.4.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses Windows Sysmon events in JSON form (top-level event_id + event_data)
@@ -396,6 +396,16 @@ parser_vrl: |
               consumed = push(consumed, "SourceThreadId")
           }
           if is_string(ed.SourceUser) { ocsf.actor.process.user = { "name": ed.SourceUser }; consumed = push(consumed, "SourceUser") }
+          # NAN-2986: Process Access carries no `User`; the accessing
+          # principal is SourceUser. Without this actor.user.name was "".
+          if actor_user == "" && is_string(ed.SourceUser) {
+              su_parts = split(string!(ed.SourceUser), "\\")
+              if length(su_parts) >= 2 {
+                  ocsf.actor.user = { "name": string(su_parts[1]) ?? "", "domain": string(su_parts[0]) ?? "" }
+              } else {
+                  ocsf.actor.user = { "name": string!(ed.SourceUser) }
+              }
+          }
           if is_string(ed.TargetUser) { ocsf.process.user = { "name": ed.TargetUser }; consumed = push(consumed, "TargetUser") }
       }
       if eid == 3 {
@@ -403,8 +413,20 @@ parser_vrl: |
           initiated = downcase(to_string(ed.Initiated) ?? "")
           if initiated == "true" { ocsf.connection_info.direction_id = 2; consumed = push(consumed, "Initiated") }
           if initiated == "false" { ocsf.connection_info.direction_id = 1; consumed = push(consumed, "Initiated") }
-          if is_string(ed.SourcePortName) { ocsf.src_endpoint.svc_name = ed.SourcePortName; consumed = push(consumed, "SourcePortName") }
-          if is_string(ed.DestinationPortName) { ocsf.dst_endpoint.svc_name = ed.DestinationPortName; consumed = push(consumed, "DestinationPortName") }
+          # NAN-2986: Sysmon writes "-" when it could not resolve a hostname or
+          # service name. "-" is not a hostname; emitting it made
+          # dst_endpoint.hostname="-" the most common destination on the
+          # blaster mix. Leave it unconsumed so it stays visible in unmapped.
+          if is_string(ed.SourcePortName) && ed.SourcePortName != "-" { ocsf.src_endpoint.svc_name = ed.SourcePortName; consumed = push(consumed, "SourcePortName") }
+          if is_string(ed.DestinationPortName) && ed.DestinationPortName != "-" { ocsf.dst_endpoint.svc_name = ed.DestinationPortName; consumed = push(consumed, "DestinationPortName") }
+          if ed.SourceHostname == "-" {
+              ocsf.src_endpoint = remove!(object!(ocsf.src_endpoint), ["hostname"])
+              consumed = filter(consumed) -> |_i, k| { k != "SourceHostname" }
+          }
+          if ed.DestinationHostname == "-" {
+              ocsf.dst_endpoint = remove!(object!(ocsf.dst_endpoint), ["hostname"])
+              consumed = filter(consumed) -> |_i, k| { k != "DestinationHostname" }
+          }
       }
       if eid == 11 {
           created_raw = string(ed.CreationUtcTime) ?? ""
@@ -451,6 +473,13 @@ parser_vrl: |
           }
       }
       if !is_empty(residual) { ocsf.unmapped = residual }
+
+      # NAN-2986: never emit an empty actor.user.name ("" matched every
+      # `actor.user.name=*` hunt). Drop the empty user when the actor still
+      # carries its process; a class that requires `actor` keeps the object.
+      if is_object(ocsf.actor) && (string(ocsf.actor.user.name) ?? "") == "" && is_object(ocsf.actor.process) {
+          ocsf.actor = remove!(object!(ocsf.actor), ["user"])
+      }
 
       # Reuse the reference implementation's branch-specific consumption rules.
       __reference_consumed = map_values(consumed) -> |key| { "event_data." + string!(key) }
@@ -765,3 +794,23 @@ samples:
       "class_uid": 1007
       "activity_id": 99
       "metadata.version": "1.9.0"
+  # NAN-2986: log-blaster EID 3 with Sysmon's "-" for an unresolved
+  # destination hostname and service names. "-" is not a hostname; it must
+  # not land in the promoted dst_endpoint.hostname column (it stays in
+  # unmapped as event_data.destination_hostname).
+  - raw: "{\"channel\":\"Microsoft-Windows-Sysmon/Operational\",\"computer\":\"WS-SALES-016.corp.local\",\"event_data\":{\"DestinationHostname\":\"-\",\"DestinationIp\":\"105.240.28.169\",\"DestinationIsIpv6\":\"false\",\"DestinationPort\":\"53\",\"DestinationPortName\":\"-\",\"Image\":\"C:\\\\ProgramData\\\\Microsoft\\\\Windows Defender\\\\Platform\\\\4.18.26020.6-0\\\\MpCmdRun.exe\",\"Initiated\":\"true\",\"ProcessGuid\":\"{01a0e965-f15a-7ca2-ac47-7fea08422567}\",\"ProcessId\":\"4699\",\"Protocol\":\"tcp\",\"RuleName\":\"NetworkConnect\",\"SourceHostname\":\"WS-SALES-016.corp.local\",\"SourceIp\":\"10.1.1.152\",\"SourceIsIpv6\":\"false\",\"SourcePort\":\"57028\",\"SourcePortName\":\"-\",\"User\":\"CORP.LOCAL\\\\mbrown\",\"UtcTime\":\"2026-09-28 17:00:00.000\"},\"event_id\":3,\"host\":\"WS-SALES-016.corp.local\",\"keywords\":\"0x8000000000000000\",\"level\":\"Information\",\"level_value\":4,\"process_id\":5999,\"provider_guid\":\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\",\"provider_name\":\"Microsoft-Windows-Sysmon\",\"record_id\":1790622167378291,\"task\":3,\"task_name\":\"Network connection detected\",\"thread_id\":5639,\"timestamp\":\"2026-09-28T17:00:00.000220Z\",\"user_id\":\"S-1-5-18\",\"user_name\":\"NT AUTHORITY\\\\SYSTEM\",\"version\":3}"
+    expect:
+      "class_uid": 4001
+      "connection_info.direction_id": 2
+      "dst_endpoint.hostname": "<missing>"
+      "dst_endpoint.svc_name": "<missing>"
+      "src_endpoint.svc_name": "<missing>"
+  # NAN-2986: log-blaster EID 10. Process Access has no User; the actor is
+  # SourceUser, split into name + domain (was actor.user.name = "").
+  - raw: "{\"channel\":\"Microsoft-Windows-Sysmon/Operational\",\"computer\":\"WS-ENG-086.corp.local\",\"event_data\":{\"CallTrace\":\"C:\\\\Windows\\\\SYSTEM32\\\\ntdll.dll+9d4c4\",\"GrantedAccess\":\"0x1000\",\"RuleName\":\"ProcessAccess\",\"SourceImage\":\"C:\\\\Windows\\\\System32\\\\dsregcmd.exe\",\"SourceProcessGUID\":\"{01a0e965-f152-7f11-a56f-417d659b45b2}\",\"SourceProcessId\":\"5734\",\"SourceThreadId\":\"7787\",\"SourceUser\":\"CORP.LOCAL\\\\jmoore\",\"TargetImage\":\"C:\\\\Windows\\\\System32\\\\svchost.exe\",\"TargetProcessGUID\":\"{01a0e965-f152-7f11-a56f-418161bd201a}\",\"TargetProcessId\":\"26677\",\"TargetUser\":\"NT AUTHORITY\\\\SYSTEM\",\"UtcTime\":\"2026-09-28 17:00:00.000\"},\"event_id\":10,\"host\":\"WS-ENG-086.corp.local\",\"keywords\":\"0x8000000000000000\",\"level\":\"Information\",\"level_value\":4,\"process_id\":1036,\"provider_guid\":\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\",\"provider_name\":\"Microsoft-Windows-Sysmon\",\"record_id\":1790622167378092,\"task\":10,\"task_name\":\"Process accessed\",\"thread_id\":9444,\"timestamp\":\"2026-09-28T17:00:00.000021Z\",\"user_id\":\"S-1-5-18\",\"user_name\":\"NT AUTHORITY\\\\SYSTEM\",\"version\":3}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 3
+      "actor.user.name": "jmoore"
+      "actor.user.domain": "CORP.LOCAL"
+      "actor.process.user.name": "CORP.LOCAL\\jmoore"

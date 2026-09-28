@@ -1,6 +1,6 @@
 name: windows_event_ocsf
 display_name: Windows Event Log (OCSF)
-version: "1.2.0"
+version: "1.2.1"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses Windows Security Event Log records (JSON; top-level event_id +
@@ -172,8 +172,11 @@ parser_vrl: |
           ocsf.severity_id = severity_id
           ocsf.severity = severity
           ocsf.user = { "name": downcase(uname), "domain": downcase(udom), "uid": usid }
-          logon_id = string(ed.TargetLogonId) ?? string(ed.SubjectLogonId) ?? ""
-          if logon_id != "" { ocsf.session = { "uid": logon_id } }
+          # NAN-2986: the session is the TARGET logon's. A failed 4625 has no
+          # TargetLogonId, and falling back to SubjectLogonId stamped the
+          # caller's (usually 0x0 = no session) id as the failed logon's session.
+          logon_id = string(ed.TargetLogonId) ?? ""
+          if logon_id != "" && logon_id != "0x0" { ocsf.session = { "uid": logon_id } }
           if auth_protocol_id != 0 {
               ocsf.auth_protocol_id = auth_protocol_id
               ocsf.auth_protocol = pkg
@@ -253,6 +256,15 @@ parser_vrl: |
           "log_name": string(p.channel) ?? "Security",
           "log_provider": string(p.provider_name) ?? "Microsoft-Windows-Security-Auditing",
           "product": { "name": "Windows", "vendor_name": "Microsoft" }
+      }
+
+      # NAN-2986: drop empty user identifiers (a 4625 for an unknown account
+      # has no TargetUserSid). "" is not an identifier and matched every
+      # `user.uid=*` hunt. `user` itself stays: 3002/3003 require it.
+      if is_object(ocsf.user) {
+          for_each(["uid", "domain"]) -> |_i, attr| {
+              if (string(get!(ocsf.user, [attr])) ?? "") == "" { ocsf.user = remove!(object!(ocsf.user), [attr]) }
+          }
       }
 
       . = ocsf
@@ -465,3 +477,13 @@ samples:
       "class_uid": 3002
       "activity_id": 99
       "metadata.version": "1.9.0"
+  # NAN-2986: log-blaster 4625 for an account with no TargetUserSid and no
+  # TargetLogonId. No empty user.uid, and no session borrowed from the
+  # caller's SubjectLogonId (0x0).
+  - raw: "{\"channel\":\"Security\",\"computer\":\"WS-HR-049.corp.local\",\"event_data\":{\"AuthenticationPackageName\":\"NTLM\",\"FailureReason\":\"Account locked out.\",\"IpAddress\":\"10.1.2.230\",\"IpPort\":\"53395\",\"LogonType\":\"2\",\"Status\":\"%%2304\",\"SubStatus\":\"0xC000006A\",\"SubjectDomainName\":\"-\",\"SubjectLogonId\":\"0x0\",\"SubjectUserName\":\"-\",\"TargetDomainName\":\"CORP.LOCAL\",\"TargetUserName\":\"smartinez\",\"WorkstationName\":\"WS-FIN-049\"},\"event_id\":4625,\"host\":\"WS-HR-049.corp.local\",\"keyword_names\":[\"Audit Failure\"],\"keywords\":\"0x8020000000000000\",\"level\":\"Information\",\"level_value\":0,\"message\":\"An account failed to log on.\",\"process_id\":1899,\"provider_guid\":\"{54849625-5478-4994-a5ba-3e3b0328c30d}\",\"provider_name\":\"Microsoft-Windows-Security-Auditing\",\"record_id\":1790622167378497,\"task\":12544,\"task_name\":\"Logon\",\"thread_id\":4302,\"timestamp\":\"2026-09-28T17:00:00.000426Z\",\"version\":2}"
+    expect:
+      "class_uid": 3002
+      "status": "Failure"
+      "user.name": "smartinez"
+      "user.uid": "<missing>"
+      "session.uid": "<missing>"
