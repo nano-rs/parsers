@@ -1,6 +1,6 @@
 name: suricata
 display_name: Suricata IDS/IPS
-version: "1.0.0"
+version: "1.1.0"
 description: "Parses Suricata EVE JSON logs including alert, flow, dns, http, tls, fileinfo, smtp, ssh, stats, and anomaly events"
 match_values:
   - suricata
@@ -669,10 +669,11 @@ parser_vrl: |
           if exists(parsed.netflow) {
               nf = parsed.netflow
               if exists(nf.bytes) {
-                  .udm.bytes_in = to_int(nf.bytes) ?? null
+                  # NAN-2995: a NetFlow record is one direction, source -> destination.
+                  .udm.bytes_out = to_int(nf.bytes) ?? null
               }
               if exists(nf.pkts) {
-                  .udm.packets_in = to_int(nf.pkts) ?? null
+                  .udm.packets_out = to_int(nf.pkts) ?? null
               }
               if exists(nf.start) {
                   .ext.netflow_start = to_string(nf.start) ?? ""
@@ -974,3 +975,12 @@ parser_vrl: |
       .udm.product = "Suricata"
       .udm.vendor_product = "OISF Suricata"
   }
+
+# Runtime samples (NAN-2327).
+samples:
+  # NAN-2995: OCSF 1.9 direction (UDM bytes_* = traffic.*): bytes_in = destination -> source, bytes_out = source -> destination; a NetFlow record is one direction, source -> destination.
+  - raw: "{\"timestamp\":\"2026-09-28T17:00:00.000000+0000\",\"flow_id\":1234567,\"event_type\":\"netflow\",\"src_ip\":\"10.0.0.5\",\"src_port\":51000,\"dest_ip\":\"93.184.216.34\",\"dest_port\":443,\"proto\":\"TCP\",\"netflow\":{\"pkts\":12,\"bytes\":3456,\"start\":\"2026-09-28T16:59:50.000000+0000\",\"end\":\"2026-09-28T17:00:00.000000+0000\",\"age\":10}}"
+    expect:
+      "udm.bytes_out": 3456
+      "udm.packets_out": 12
+      "udm.bytes_in": "<missing>"

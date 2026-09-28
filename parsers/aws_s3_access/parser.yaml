@@ -1,6 +1,6 @@
 name: aws_s3_access
 display_name: AWS S3 Access Logs
-version: "1.0.0"
+version: "1.1.0"
 description: "Parses AWS S3 server access logs including bucket operations, requester identity, and object details"
 match_values:
   - aws_s3_access
@@ -103,7 +103,9 @@ parser_vrl: |
       # --- Bytes Sent ---
       bytes_sent = string!(matched.bytes_sent)
       if bytes_sent != "-" {
-          .udm.bytes_out = bytes_sent
+          # NAN-2995: OCSF 1.9 direction (UDM bytes_* map 1:1 to traffic.*): bytes_in = destination -> source, bytes_out = source -> destination.
+          # Bytes Sent is S3 -> requester (src = requester), i.e. bytes_in.
+          .udm.bytes_in = bytes_sent
       }
 
       # --- Object Size ---
@@ -169,3 +171,11 @@ parser_vrl: |
 
   # Preserve raw log
   .message = raw_log
+
+# Runtime samples (NAN-2327).
+samples:
+  # NAN-2995: OCSF 1.9 direction (UDM bytes_* = traffic.*): bytes_in = destination -> source, bytes_out = source -> destination; Bytes Sent (S3 -> requester) is bytes_in.
+  - raw: "79a59df900b949e55d96a1e698fbacedfd6e09d98eacf8f8d5218e7cd47ef2be awsexamplebucket1 [06/Feb/2019:00:00:38 +0000] 192.0.2.3 79a59df900b949e55d96a1e698fbacedfd6e09d98eacf8f8d5218e7cd47ef2be 3E57427F3EXAMPLE REST.GET.OBJECT report.csv \"GET /awsexamplebucket1/report.csv HTTP/1.1\" 200 - 113 113 7 - \"-\" \"S3Console/0.4\" - s9lzHYrFp76ZVxRcpX9+5cjAnEH2ROuNkd2BHfIa6UkFVdtjf5mKR3/eTPFvsiP/XV/VLi31234= SigV4 ECDHE-RSA-AES128-GCM-SHA256 AuthHeader awsexamplebucket1.s3.us-west-1.amazonaws.com TLSV1.2 - -"
+    expect:
+      "udm.bytes_in": "113"
+      "udm.bytes_out": "<missing>"

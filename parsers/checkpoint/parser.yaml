@@ -1,6 +1,6 @@
 name: checkpoint
 display_name: Check Point
-version: "1.0.0"
+version: "1.1.0"
 description: "Parses Check Point firewall logs including RFC 5424 syslog with bracketed key:\"value\" pairs and LEA pipe-delimited format. Covers firewall accept/drop, NAT, VPN, identity awareness, threat prevention, and system monitor events with full UDM mapping."
 match_values:
   - checkpoint
@@ -121,7 +121,8 @@ parser_vrl: |
       if exists(parsed.src_user_name) { .udm.user = string!(parsed.src_user_name) }
 
       # --- Bytes ---
-      if exists(parsed.bytes) { .udm.bytes_out = to_int(parsed.bytes) ?? null }
+      # NAN-2995: Check Point `bytes` is the two-way total, not source -> destination.
+      if exists(parsed.bytes) { .udm.bytes = to_int(parsed.bytes) ?? null }
       if exists(parsed.sent_bytes) { .udm.bytes_out = to_int(parsed.sent_bytes) ?? null }
       if exists(parsed.received_bytes) { .udm.bytes_in = to_int(parsed.received_bytes) ?? null }
 
@@ -405,7 +406,8 @@ parser_vrl: |
       if exists(parsed.confidence_level) { .ext.confidence_level = to_int(parsed.confidence_level) ?? null }
 
       # --- Bytes ---
-      if exists(parsed.bytes) { .udm.bytes_out = to_int(parsed.bytes) ?? null }
+      # NAN-2995: Check Point `bytes` is the two-way total, not source -> destination.
+      if exists(parsed.bytes) { .udm.bytes = to_int(parsed.bytes) ?? null }
       if exists(parsed.sent_bytes) { .udm.bytes_out = to_int(parsed.sent_bytes) ?? null }
       if exists(parsed.received_bytes) { .udm.bytes_in = to_int(parsed.received_bytes) ?? null }
       if exists(parsed.client_inbound_bytes) { .udm.bytes_in = to_int(parsed.client_inbound_bytes) ?? null }
@@ -543,3 +545,11 @@ parser_vrl: |
 
   # --- Final: set .message to raw log ---
   .message = raw_log
+
+# Runtime samples (NAN-2327).
+samples:
+  # NAN-2995: Check Point 'bytes' is the two-way total: udm.bytes, not bytes_out.
+  - raw: "loc=1234|filename=fw.log|fileid=1730281572|time=26Sep2017 20:18:31|action=accept|orig=192.168.1.1|i/f_dir=inbound|i/f_name=eth0|has_accounting=0|product=VPN-1 & FireWall-1|src=203.0.113.5|s_port=51422|dst=10.10.1.20|service=443|proto=tcp|rule=7|rule_name=allow-web|bytes=4210|user=jsmith"
+    expect:
+      "udm.bytes": 4210
+      "udm.bytes_out": "<missing>"

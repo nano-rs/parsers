@@ -1,6 +1,6 @@
 name: conduit_proxy
 display_name: Conduit MITM Proxy
-version: "1.1.1"
+version: "1.2.0"
 description: "Parses Conduit MITM proxy logs. Captures HTTP/HTTPS requests with TLS interception status, threat scoring, DLP matches, and upstream connection details."
 match_values:
   - conduit_proxy
@@ -74,8 +74,10 @@ parser_vrl: |
       .udm.uri_path = string(parsed.path) ?? null
       .udm.http_method = string(parsed.method) ?? null
       .udm.http_status_code = to_int(parsed.status_code) ?? null
-      .udm.bytes_in = to_int(parsed.request_bytes) ?? null
-      .udm.bytes_out = to_int(parsed.response_bytes) ?? null
+      # NAN-2995: OCSF 1.9 direction (UDM bytes_* map 1:1 to traffic.*): bytes_in = destination -> source, bytes_out = source -> destination.
+      # src = client: response_bytes is bytes_in, request_bytes is bytes_out.
+      .udm.bytes_in = to_int(parsed.response_bytes) ?? null
+      .udm.bytes_out = to_int(parsed.request_bytes) ?? null
       .udm.duration = to_int(parsed.duration_ms) ?? null
       .udm.protocol = string(parsed.scheme) ?? null
 
@@ -208,3 +210,11 @@ parser_vrl: |
   }
 
   .message = raw_log
+
+# Runtime samples (NAN-2327).
+samples:
+  # NAN-2995: OCSF 1.9 direction (UDM bytes_* = traffic.*): bytes_in = destination -> source, bytes_out = source -> destination; response_bytes is bytes_in, request_bytes is bytes_out.
+  - raw: "{\"id\":\"01J8ZR\",\"timestamp\":\"2026-08-12T09:15:25.000000000Z\",\"client_ip\":\"10.10.4.32\",\"method\":\"CONNECT\",\"scheme\":\"https\",\"host\":\"api.github.com\",\"port\":443,\"path\":\"/\",\"full_url\":\"https://api.github.com/\",\"status_code\":200,\"request_bytes\":420,\"response_bytes\":15320,\"duration_ms\":88,\"action\":\"allow\",\"threat_score\":0.02,\"threat_tier\":\"tier0\",\"threat_blocked\":false,\"threat_signals\":[]}"
+    expect:
+      "udm.bytes_in": 15320
+      "udm.bytes_out": 420

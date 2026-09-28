@@ -1,6 +1,6 @@
 name: f5_waf
 display_name: F5 BIG-IP ASM
-version: "1.2.0"
+version: "1.3.0"
 description: "Parses F5 BIG-IP ASM (Web Application Firewall) logs with attack detection, violations, and security events"
 match_values:
   - f5_waf
@@ -113,8 +113,18 @@ parser_vrl: |
   if exists(parsed.x_forwarded_for) { .ext.x_forwarded_for = string!(parsed.x_forwarded_for) }
   if exists(parsed.geo_location) { .ext.geo_location = string!(parsed.geo_location) }
   if exists(parsed.country) { .ext.country = string!(parsed.country) }
-  if exists(parsed.bytes_in) { .udm.bytes_in = to_int(parsed.bytes_in) ?? null }
-  if exists(parsed.bytes_out) { .udm.bytes_out = to_int(parsed.bytes_out) ?? null }
+  # NAN-2995: OCSF 1.9 direction (UDM bytes_* map 1:1 to traffic.*): bytes_in = destination -> source, bytes_out = source -> destination.
+  # F5's bytes_in is bytes INTO the BIG-IP from the client (the request) = bytes_out.
+  if exists(parsed.bytes_in) { .udm.bytes_out = to_int(parsed.bytes_in) ?? null }
+  if exists(parsed.bytes_out) { .udm.bytes_in = to_int(parsed.bytes_out) ?? null }
   if exists(parsed.duration) { .udm.duration = to_int(parsed.duration) ?? null }
 
   .message = raw_log
+
+# Runtime samples (NAN-2327).
+samples:
+  # NAN-2995: OCSF 1.9 direction (UDM bytes_* = traffic.*): bytes_in = destination -> source, bytes_out = source -> destination; F5 bytes_in (the request) is bytes_out.
+  - raw: "Jan 15 14:32:01 bigip1.corp.local ASM:unit_hostname=\"bigip1\",attack_type=\"SQL-Injection\",policy_name=\"/Common/prod_policy\",src_ip=\"203.0.113.9\",dest_ip=\"10.10.5.20\",dest_port=\"443\",method=\"POST\",uri=\"/login.php?next=/admin\",violations=\"Attack signature detected\",severity=\"Critical\",action=\"blocked\",response_code=\"403\",user_agent=\"sqlmap/1.5\",support_id=\"4023498273\",violation_rating=\"5\",sig_set_names=\"{SQL Injection Signatures}\",bytes_in=\"512\",bytes_out=\"128\""
+    expect:
+      "udm.bytes_in": 128
+      "udm.bytes_out": 512
