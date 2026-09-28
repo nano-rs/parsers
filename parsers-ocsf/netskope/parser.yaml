@@ -1,6 +1,6 @@
 name: netskope_ocsf
 display_name: Netskope (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -13,8 +13,9 @@ description: >
     * network / connection    -> Network Activity  (class_uid 4001)
     * infrastructure / endpoint / unknown
                               -> Base Event        (class_uid 0)
-  Netskope names bytes from the client's point of view, so client_bytes is
-  traffic.bytes_in (client -> server) and server_bytes is traffic.bytes_out.
+  OCSF 1.9 network_traffic defines bytes_out as source -> destination and
+  bytes_in as destination -> source (NAN-2995). With src = the client,
+  client_bytes (upload) is traffic.bytes_out and server_bytes is traffic.bytes_in.
   Mirrors the UDM netskope parser (../parsers/parsers/netskope/parser.yaml).
 match_values:
   - netskope
@@ -124,8 +125,10 @@ parser_vrl: |
   has_src = exists(src_endpoint.ip) || exists(src_endpoint.hostname)
   has_dst = exists(dst_endpoint.ip) || exists(dst_endpoint.hostname)
 
-  bytes_in = to_int(e.client_bytes) ?? 0
-  bytes_out = to_int(e.server_bytes) ?? 0
+  # NAN-2995: OCSF 1.9 network_traffic: bytes_in = destination -> source, bytes_out = source -> destination.
+  # client_bytes = sent by the client (upload), server_bytes = sent by the server.
+  bytes_in = to_int(e.server_bytes) ?? 0
+  bytes_out = to_int(e.client_bytes) ?? 0
 
   metadata = {
       "version": "1.9.0",
@@ -610,3 +613,8 @@ samples:
     expect:
       class_uid: 4002
       activity_id: 99
+  # NAN-2995: OCSF 1.9 bytes_in = destination -> source, bytes_out = source -> destination; server_bytes is bytes_in, client_bytes (upload) is bytes_out.
+  - raw: "{\"_id\":\"66ab12d0\",\"record_type\":\"network\",\"timestamp\":1786000540,\"user\":\"dan@corp.example\",\"srcip\":\"203.0.113.13\",\"dstip\":\"198.51.100.44\",\"srcport\":52000,\"dstport\":443,\"protocol\":\"tcp\",\"client_bytes\":8000,\"server_bytes\":32000,\"action\":\"allow\",\"app\":\"Zoom\"}"
+    expect:
+      "traffic.bytes_in": 32000
+      "traffic.bytes_out": 8000

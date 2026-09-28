@@ -1,6 +1,6 @@
 name: f5_waf_ocsf
 display_name: F5 BIG-IP ASM (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -258,9 +258,12 @@ parser_vrl: |
   # ---- volumes / duration ----
   traffic = {}
   bin = to_string(kv.bytes_in) ?? ""
-  if bin != "" { traffic.bytes_in = to_int(bin) ?? 0 }
+  # NAN-2995: OCSF 1.9 network_traffic: bytes_in = destination -> source, bytes_out = source -> destination.
+  # F5's bytes_in is bytes INTO the BIG-IP from the client (the request,
+  # src -> dst = OCSF bytes_out); its bytes_out is the response (OCSF bytes_in).
+  if bin != "" { traffic.bytes_out = to_int(bin) ?? 0 }
   bout = to_string(kv.bytes_out) ?? ""
-  if bout != "" { traffic.bytes_out = to_int(bout) ?? 0 }
+  if bout != "" { traffic.bytes_in = to_int(bout) ?? 0 }
   if length(traffic) > 0 { .traffic = traffic }
 
   dur = to_string(kv.duration) ?? ""
@@ -545,3 +548,8 @@ samples:
     dst_endpoint.ip: 10.10.5.20
     http_request.url.path: /search
     disposition_id: 19
+# NAN-2995: OCSF 1.9 bytes_in = destination -> source, bytes_out = source -> destination; F5 bytes_in (into the BIG-IP = request) is OCSF bytes_out.
+- raw: "Jan 15 14:32:01 bigip1.corp.local ASM:unit_hostname=\"bigip1\",attack_type=\"SQL-Injection\",policy_name=\"/Common/prod_policy\",src_ip=\"203.0.113.9\",dest_ip=\"10.10.5.20\",dest_port=\"443\",method=\"POST\",uri=\"/login.php?next=/admin\",violations=\"Attack signature detected\",severity=\"Critical\",action=\"blocked\",response_code=\"403\",user_agent=\"sqlmap/1.5\",support_id=\"4023498273\",violation_rating=\"5\",sig_set_names=\"{SQL Injection Signatures}\",bytes_in=\"512\",bytes_out=\"128\""
+  expect:
+    "traffic.bytes_in": 128
+    "traffic.bytes_out": 512

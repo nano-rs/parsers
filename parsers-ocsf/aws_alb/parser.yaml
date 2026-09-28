@@ -1,6 +1,6 @@
 name: aws_alb_ocsf
 display_name: AWS ALB Access Logs (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed columns in redacted, dotted snake_case unmapped keys.
@@ -156,7 +156,9 @@ parser_vrl: |
               "product": { "name": "AWS Application Load Balancer", "vendor_name": "Amazon" }
           },
           "cloud": { "provider": "AWS" },
-          "traffic": { "bytes_in": recv, "bytes_out": sent },
+          # NAN-2995: OCSF 1.9 network_traffic: bytes_in = destination -> source, bytes_out = source -> destination.
+          # received_bytes = client -> ALB (request), sent_bytes = ALB -> client (response).
+          "traffic": { "bytes_in": sent, "bytes_out": recv },
           "http_response": http_response
       }
       if length(keys(http_request)) > 0 { ocsf.http_request = http_request }
@@ -404,3 +406,10 @@ parser_vrl: |
   if !is_empty(__residual) { .unmapped = __residual }
   .
   # END NAN-2421 residual spill
+
+samples:
+  # NAN-2995: OCSF 1.9 bytes_in = destination -> source, bytes_out = source -> destination; sent_bytes (ALB -> client) is bytes_in, received_bytes is bytes_out.
+  - raw: "http 2026-08-18T20:00:00.123456Z app/my-loadbalancer/50dc6c495c0c9188 192.0.2.10:2817 10.0.0.5:80 0.000 0.001 0.000 200 200 34 366 \"GET http://www.example.com:80/index.html HTTP/1.1\" \"curl/7.68.0\" - - arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/my-targets/73e2d6bc24d8a067 \"Root=1-58337262-36d228ad5d99923122bbe354\" \"-\" \"-\" 0 2026-08-18T20:00:00.000000Z \"forward\" \"-\" \"-\""
+    expect:
+      "traffic.bytes_in": 366
+      "traffic.bytes_out": 34
