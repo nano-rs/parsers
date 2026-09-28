@@ -1,6 +1,6 @@
 name: routeros
 display_name: MikroTik RouterOS
-version: "1.0.0"
+version: "1.1.0"
 description: "Parses MikroTik RouterOS remote syslog: DNS queries and answers, user login/logout/failure, firewall connection tracking, and DHCP lease events"
 match_values:
   - routeros
@@ -301,7 +301,8 @@ parser_vrl: |
           if proto_err == null { .udm.protocol = string!(proto_match.proto) }
 
           len_match, len_err = parse_regex(body, r'\blen\s+(?P<len>\d+)')
-          if len_err == null { .udm.bytes_in = to_int(string!(len_match.len)) ?? null }
+          # NAN-2995: `len` is the logged packet's length, sent source -> destination.
+          if len_err == null { .udm.bytes_out = to_int(string!(len_match.len)) ?? null }
       }
   }
 
@@ -398,3 +399,8 @@ samples:
   - raw: '<30>Aug  5 12:00:00 edge-rtr ssh,debug auth req: admin ssh-connection publickey'
     expect:
       ext.unparsed: 'true'
+  # NAN-2995: OCSF 1.9 direction (UDM bytes_* = traffic.*): bytes_in = destination -> source, bytes_out = source -> destination; the logged packet length (src -> dst) is bytes_out.
+  - raw: "<30>Aug  5 12:00:00 edge-rtr firewall,info forward: in:ether1 out:ether2, src-mac 00:16:3e:aa:bb:cc, proto TCP (SYN), 10.20.0.8:51000->192.0.2.20:443, len 60"
+    expect:
+      "udm.bytes_out": 60
+      "udm.bytes_in": "<missing>"

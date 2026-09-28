@@ -1,6 +1,6 @@
 name: cisco_asa
 display_name: Cisco ASA
-version: "1.0.0"
+version: "1.1.0"
 description: "Parses Cisco ASA firewall logs including connection built/teardown (302013-302021), ACL deny/permit (106001-106100), NAT translation (305011-305012), AAA authentication (113004-113005), VPN (713228), IPS events (400027), failover (105003-105004), and TCP access (710003) with full UDM mapping"
 match_values:
   - cisco_asa
@@ -173,7 +173,9 @@ parser_vrl: |
               seconds = to_int(tear_match.seconds) ?? 0
               .udm.duration = (hours * 3600) + (minutes * 60) + seconds
 
-              .udm.bytes_out = to_int(tear_match.bytes) ?? null
+              # NAN-2995: the teardown byte count is the connection's two-way total, not
+              # source -> destination, so it is `bytes`, not bytes_out.
+              .udm.bytes = to_int(tear_match.bytes) ?? null
 
               reason = to_string!(tear_match.reason)
               if reason != "" {
@@ -734,3 +736,11 @@ parser_vrl: |
 
   # --- Final: set .message to raw log ---
   .message = raw_log
+
+# Runtime samples (NAN-2327).
+samples:
+  # NAN-2995: the 302014 teardown byte count is the two-way total: udm.bytes, not bytes_out.
+  - raw: "<166>Sep 28 2026 17:00:00 asa-fw01 : %ASA-6-302014: Teardown TCP connection 4711 for outside:203.0.113.5/443 to inside:10.1.1.10/51000 duration 0:01:23 bytes 45678 TCP FINs"
+    expect:
+      "udm.bytes": 45678
+      "udm.bytes_out": "<missing>"
