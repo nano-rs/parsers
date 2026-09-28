@@ -70,6 +70,9 @@ def mappings(source):
             try: value = int(value)
             except ValueError: continue
         elif not isinstance(value,str): continue
+        # NAN-2986: Sysmon's "-" means unresolved; it is not a hostname or
+        # service name and must stay in unmapped, not the endpoint column.
+        if eid == 3 and value == '-' and key.endswith(('Hostname', 'PortName')): continue
         if key == 'User': value = value.split('\\')[1] if '\\' in value else value
         if key in ('SourceIp','DestinationIp','SourceHostname','DestinationHostname','QueryName'): value = value.lower()
         if key == 'SignatureStatus' and value.lower() in ('valid','expired','revoked','untrusted'): value = value.capitalize()

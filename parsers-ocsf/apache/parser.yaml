@@ -359,3 +359,46 @@ samples:
     expect:
       class_uid: 4002
       activity_id: 6
+  # NAN-2986: the live-tenant HEC canary (sourcetype apache_access). Common
+  # log with a "-" referrer; every HTTP field must populate and the row must
+  # NOT carry the parse-failure log_level.
+  - raw: '10.9.8.1 - - [28/Sep/2026:17:00:00 +0000] "GET /claude-canary-20260928T170713Z/1 HTTP/1.1" 200 512 "-" "canary"'
+    expect:
+      class_uid: 4002
+      activity_id: 3
+      severity: Informational
+      status: Success
+      src_endpoint.ip: 10.9.8.1
+      http_request.http_method: GET
+      http_request.url.path: /claude-canary-20260928T170713Z/1
+      http_request.user_agent: canary
+      http_request.referrer: <missing>
+      http_response.code: 200
+      http_response.length: 512
+      http_response.status: Success
+      metadata.log_level: <missing>
+  # NAN-2986: log-blaster apache_access generator output — full combined
+  # format with a referrer and a browser user agent, 4xx outcome.
+  - raw: '11.14.181.116 - - [28/Sep/2026:17:00:00 +0000] "POST /login HTTP/1.1" 404 1568 "https://www.google.com/" "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"'
+    expect:
+      class_uid: 4002
+      activity_id: 6
+      severity: Informational
+      status: Failure
+      src_endpoint.ip: 11.14.181.116
+      http_request.referrer: https://www.google.com/
+      http_request.user_agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36
+      http_request.url.path: /login
+      http_response.code: 404
+      http_response.length: 1568
+      metadata.log_level: <missing>
+  # NAN-2986: what the "thin" live rows actually were. The Worker roll's
+  # post-promote data-plane probe posts this non-Apache body on the
+  # apache_access source token; it is correctly a Base Event, not HTTP
+  # Activity, and is the only apache_access input that sets log_level.
+  - raw: 'nano source cutover probe'
+    expect:
+      class_uid: 0
+      activity_id: 99
+      metadata.log_level: error
+      raw_data: nano source cutover probe
