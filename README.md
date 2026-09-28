@@ -135,6 +135,7 @@ alternatives: deploy the UDM parser or the OCSF one for a given source, never bo
 | [Conduit MITM Proxy (OCSF)](parsers-ocsf/conduit_proxy) | `conduit_proxy` | [conduit_proxy](parsers/conduit_proxy) |
 | [Microsoft Sysmon (OCSF)](parsers-ocsf/windows_sysmon) | `windows_sysmon` | [windows_sysmon](parsers/windows_sysmon) |
 | [Windows Event Log (OCSF)](parsers-ocsf/windows_event) | `windows_event` | [windows_event](parsers/windows_event) |
+| [OpenTelemetry Logs (OCSF)](parsers-ocsf/opentelemetry_logs) | `otlp_log` | — (OCSF only) |
 
 ## Structure
 
