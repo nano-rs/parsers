@@ -1,6 +1,6 @@
 name: conduit_proxy_ocsf
 display_name: Conduit MITM Proxy (OCSF)
-version: "2.1.0"
+version: "2.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -241,8 +241,10 @@ parser_vrl: |
           "http_response": http_response,
           # OCSF: bytes_in = source(client)->destination, bytes_out = destination->source.
           "traffic": {
-              "bytes_in": to_int(p.request_bytes) ?? 0,
-              "bytes_out": to_int(p.response_bytes) ?? 0
+              # NAN-2995: OCSF 1.9 network_traffic: bytes_in = destination -> source, bytes_out = source -> destination.
+              # src = client: response_bytes is bytes_in, request_bytes is bytes_out.
+              "bytes_in": to_int(p.response_bytes) ?? 0,
+              "bytes_out": to_int(p.request_bytes) ?? 0
           }
       }
 
@@ -478,3 +480,8 @@ samples:
     expect:
       class_uid: 0
       activity_id: 99
+  # NAN-2995: OCSF 1.9 bytes_in = destination -> source, bytes_out = source -> destination; response_bytes is bytes_in, request_bytes is bytes_out.
+  - raw: "{\"id\":\"01J8ZR\",\"timestamp\":\"2026-08-12T09:15:25.000000000Z\",\"client_ip\":\"10.10.4.32\",\"method\":\"CONNECT\",\"scheme\":\"https\",\"host\":\"api.github.com\",\"port\":443,\"path\":\"/\",\"full_url\":\"https://api.github.com/\",\"status_code\":200,\"request_bytes\":420,\"response_bytes\":15320,\"duration_ms\":88,\"action\":\"allow\",\"threat_score\":0.02,\"threat_tier\":\"tier0\",\"threat_blocked\":false,\"threat_signals\":[]}"
+    expect:
+      "traffic.bytes_in": 15320
+      "traffic.bytes_out": 420

@@ -1,6 +1,6 @@
 name: cisco_umbrella_ocsf
 display_name: Cisco Umbrella (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -276,7 +276,9 @@ parser_vrl: |
           "metadata": metadata,
           "http_request": http_request,
           "http_response": { "code": code, "status": status_str },
-          "traffic": { "bytes_in": req_bytes, "bytes_out": resp_bytes }
+          # NAN-2995: OCSF 1.9 network_traffic: bytes_in = destination -> source, bytes_out = source -> destination.
+          # src = client: the request is bytes_out, the response is bytes_in.
+          "traffic": { "bytes_in": resp_bytes, "bytes_out": req_bytes }
       }
       if exists(src_endpoint.ip) || exists(src_endpoint.hostname) { .src_endpoint = src_endpoint }
       if identity != "" { .actor = { "user": { "name": identity } } }
@@ -500,3 +502,8 @@ samples:
     expect:
       class_uid: 0
       activity_id: 99
+  # NAN-2995: OCSF 1.9 bytes_in = destination -> source, bytes_out = source -> destination; Response Size is bytes_in, Request Size is bytes_out.
+  - raw: "\"2026-08-12 09:15:31\",\"alice@corp.example\",\"LAPTOP-4471\",\"10.40.1.22\",\"198.51.100.4\",\"https://files.example.org/setup.exe\",\"https://portal.example.org/\",\"Allowed\",\"200\",\"512\",\"58213\",\"\",\"files.example.org\",\"Software Downloads\",\"\",\"\",\"\",\"Default Policy\""
+    expect:
+      "traffic.bytes_in": 58213
+      "traffic.bytes_out": 512

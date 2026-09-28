@@ -1,6 +1,6 @@
 name: cloudflare_ocsf
 display_name: Cloudflare (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -277,7 +277,9 @@ parser_vrl: |
               "metadata": metadata,
               "http_request": http_request,
               "http_response": http_response,
-              "traffic": { "bytes_in": req_bytes, "bytes_out": resp_bytes }
+              # NAN-2995: OCSF 1.9 network_traffic: bytes_in = destination -> source, bytes_out = source -> destination.
+              # src = client: the request is bytes_out, the response is bytes_in.
+              "traffic": { "bytes_in": resp_bytes, "bytes_out": req_bytes }
           }
           if exists(src_endpoint.ip) || exists(src_endpoint.port) { .src_endpoint = src_endpoint }
           dst_endpoint = {}
@@ -520,3 +522,8 @@ samples:
     expect:
       class_uid: 4002
       activity_id: 6
+  # NAN-2995: OCSF 1.9 bytes_in = destination -> source, bytes_out = source -> destination; EdgeResponseBytes is bytes_in, ClientRequestBytes is bytes_out.
+  - raw: "{\"EdgeStartTimestamp\":1786000522123000000,\"ClientIP\":\"203.0.113.88\",\"ClientSrcPort\":51422,\"ClientASN\":64512,\"ClientASNDescription\":\"EXAMPLE-AS\",\"ClientCountry\":\"de\",\"ClientRequestHost\":\"shop.example.com\",\"ClientRequestURI\":\"/checkout?step=2\",\"ClientRequestMethod\":\"POST\",\"ClientRequestProtocol\":\"HTTP/2\",\"ClientRequestUserAgent\":\"Mozilla/5.0\",\"ClientRequestReferer\":\"https://shop.example.com/cart\",\"ClientRequestBytes\":2048,\"EdgeResponseStatus\":200,\"EdgeResponseBytes\":10240,\"EdgeServerIP\":\"198.51.100.1\",\"OriginIP\":\"192.0.2.55\",\"RayID\":\"8f2c1a9b4d0e1234\",\"CacheCacheStatus\":\"dynamic\",\"ZoneName\":\"example.com\",\"EdgeColoCode\":\"FRA\",\"BotScore\":34,\"BotScoreSrc\":\"Machine Learning\",\"JA3Hash\":\"e7d705a3286e19ea42f587b344ee6865\",\"ClientSSLProtocol\":\"TLSv1.3\",\"SecurityLevel\":\"medium\",\"WAFAction\":\"unknown\",\"FirewallMatchesActions\":[],\"FirewallMatchesRuleIDs\":[]}"
+    expect:
+      "traffic.bytes_in": 10240
+      "traffic.bytes_out": 2048

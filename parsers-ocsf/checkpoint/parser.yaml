@@ -1,6 +1,6 @@
 name: checkpoint_ocsf
 display_name: Check Point (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -145,7 +145,8 @@ parser_vrl: |
 
   bytes_out = to_int(to_string(kv.client_outbound_bytes) ?? "") ?? 0
   if bytes_out == 0 { bytes_out = to_int(to_string(kv.sent_bytes) ?? "") ?? 0 }
-  if bytes_out == 0 { bytes_out = to_int(to_string(kv.bytes) ?? "") ?? 0 }
+  # NAN-2995: `bytes` is Check Point's TOTAL (both directions), not
+  # source -> destination; it no longer fills bytes_out and stays in unmapped.
   bytes_in = to_int(to_string(kv.client_inbound_bytes) ?? "") ?? 0
   if bytes_in == 0 { bytes_in = to_int(to_string(kv.received_bytes) ?? "") ?? 0 }
   pkts_out = to_int(to_string(kv.client_outbound_packets) ?? "") ?? 0
@@ -774,3 +775,7 @@ samples:
     actor.user.name: jsmith
     http_request.url.path: /feed
     disposition_id: 2
+# NAN-2995: Check Point 'bytes' is the two-way TOTAL; it no longer fills the source -> destination bytes_out.
+- raw: "loc=1234|filename=fw.log|fileid=1730281572|time=26Sep2017 20:18:31|action=accept|orig=192.168.1.1|i/f_dir=inbound|i/f_name=eth0|has_accounting=0|product=VPN-1 & FireWall-1|src=203.0.113.5|s_port=51422|dst=10.10.1.20|service=443|proto=tcp|rule=7|rule_name=allow-web|bytes=4210|user=jsmith"
+  expect:
+    "traffic.bytes_out": "<missing>"

@@ -1,6 +1,6 @@
 name: zscaler_zia_ocsf
 display_name: Zscaler Internet Access (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -199,7 +199,9 @@ parser_vrl: |
           "metadata": metadata,
           "http_request": http_request,
           "http_response": http_response,
-          "traffic": { "bytes_in": reqsize, "bytes_out": respsize }
+          # NAN-2995: OCSF 1.9 network_traffic: bytes_in = destination -> source, bytes_out = source -> destination.
+          # src = client: respsize is bytes_in, reqsize is bytes_out.
+          "traffic": { "bytes_in": respsize, "bytes_out": reqsize }
       }
       cip = string(e.cltip) ?? ""
       se = {}
@@ -265,8 +267,11 @@ parser_vrl: |
       bytes_in = to_int(e.inbytes) ?? 0
       bytes_out = to_int(e.outbytes) ?? 0
       if is_tunnel {
-          bytes_in = to_int(e.rxbytes) ?? 0
-          bytes_out = to_int(e.txbytes) ?? 0
+          # Tunnel logs: src = the customer tunnel endpoint, dst = the ZIA node.
+          # rxbytes = received BY ZIA from the tunnel (src -> dst = bytes_out),
+          # txbytes = transmitted BY ZIA into the tunnel (dst -> src = bytes_in).
+          bytes_in = to_int(e.txbytes) ?? 0
+          bytes_out = to_int(e.rxbytes) ?? 0
       }
 
       proto = upcase(string(e.proto) ?? "")
@@ -710,3 +715,18 @@ samples:
     expect:
       class_uid: 4002
       activity_id: 3
+  # NAN-2995: OCSF 1.9 bytes_in = destination -> source, bytes_out = source -> destination; web respsize is bytes_in, reqsize is bytes_out.
+  - raw: "{\"sourcetype\":\"zscalernss-web\",\"event\":{\"epochtime\":1786000522,\"login\":\"alice@corp.example\",\"dept\":\"Finance\",\"location\":\"HQ\",\"cltip\":\"10.70.1.10\",\"serverip\":\"93.184.216.34\",\"host\":\"downloads.example.com\",\"reqmethod\":\"GET\",\"respcode\":200,\"reqsize\":900,\"respsize\":48000,\"contenttype\":\"application/octet-stream\",\"useragent\":\"Mozilla/5.0\",\"referrer\":\"https://portal.example.com/\",\"b64url\":\"aHR0cHM6Ly9kb3dubG9hZHMuZXhhbXBsZS5jb20vc2V0dXAuZXhl\",\"action\":\"Allowed\",\"reason\":\"Malware\",\"threatname\":\"Win32.Trojan.Generic\",\"threatseverity\":\"Critical\",\"urlsupercat\":\"Software Downloads\",\"urlclass\":\"Business Use\",\"riskscore\":88,\"filename\":\"setup.exe\",\"sha256\":\"9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08\",\"devicehostname\":\"LAP-4471\",\"deviceostype\":\"Windows\",\"dlprulename\":\"\",\"recordid\":\"771122\"}}"
+    expect:
+      "traffic.bytes_in": 48000
+      "traffic.bytes_out": 900
+  # NAN-2995: OCSF 1.9 bytes_in = destination -> source, bytes_out = source -> destination; tunnel rxbytes (received BY ZIA from the source) is bytes_out.
+  - raw: "{\"sourcetype\":\"zscalernss-tunnel\",\"event\":{\"datetime\":\"Wed Aug 12 09:15:24 2026\",\"sourceip\":\"203.0.113.40\",\"destinationip\":\"165.225.0.10\",\"sourceport\":500,\"destinationport\":4500,\"protocol\":\"UDP\",\"rxbytes\":102400,\"txbytes\":51200,\"user\":\"branch-fw\",\"tunneltype\":\"IPSEC\",\"ikeversion\":\"IKEv2\",\"event\":\"TUNNEL_UP\"}}"
+    expect:
+      "traffic.bytes_in": 51200
+      "traffic.bytes_out": 102400
+  # NAN-2995: OCSF 1.9 bytes_in = destination -> source, bytes_out = source -> destination; firewall inbytes (server -> client) is bytes_in, unchanged.
+  - raw: "{\"sourcetype\":\"zscalernss-fw\",\"event\":{\"datetime\":\"Wed Aug 12 09:15:22 2026\",\"csip\":\"10.70.1.11\",\"cdip\":\"198.51.100.7\",\"csport\":51000,\"cdport\":445,\"proto\":\"TCP\",\"inbytes\":4096,\"outbytes\":8192,\"duration\":12,\"user\":\"bob@corp.example\",\"action\":\"Drop\",\"rule\":\"Block SMB Egress\",\"devicehostname\":\"LAP-9001\",\"threatname\":\"None\"}}"
+    expect:
+      "traffic.bytes_in": 4096
+      "traffic.bytes_out": 8192

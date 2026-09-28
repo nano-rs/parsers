@@ -1,6 +1,6 @@
 name: broadcom_proxy_ocsf
 display_name: Broadcom ProxySG (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -238,7 +238,9 @@ parser_vrl: |
           "http_response": http_response,
           # OCSF: bytes_in = client -> server, bytes_out = server -> client.
           # ELFF cs-bytes is client->server, sc-bytes is server->client.
-          "traffic": { "bytes_in": cs_bytes, "bytes_out": sc_bytes },
+          # NAN-2995: OCSF 1.9 network_traffic: bytes_in = destination -> source, bytes_out = source -> destination.
+          # cs-bytes = client -> proxy (request), sc-bytes = proxy -> client (response).
+          "traffic": { "bytes_in": sc_bytes, "bytes_out": cs_bytes },
           "unmapped": unmapped
       }
 
@@ -474,3 +476,8 @@ samples:
     expect:
       class_uid: 4002
       activity_id: 3
+  # NAN-2995: OCSF 1.9 bytes_in = destination -> source, bytes_out = source -> destination; sc-bytes is bytes_in, cs-bytes is bytes_out.
+  - raw: "<134>Aug 12 09:15:30 proxysg01 bcreportermain: 2026-08-12 09:15:30 12 10.30.2.90 403 TCP_DENIED 1024 700 GET http gambling.example.net 80 / - - - DIRECT - text/html \"curl/8.4.0\" DENIED \"Gambling\" - 10.30.0.5"
+    expect:
+      "traffic.bytes_in": 1024
+      "traffic.bytes_out": 700

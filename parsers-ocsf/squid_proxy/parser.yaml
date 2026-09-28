@@ -1,6 +1,6 @@
 name: squid_proxy_ocsf
 display_name: Squid Proxy (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -199,7 +199,9 @@ parser_vrl: |
           "http_response": http_response,
           "unmapped": unmapped
       }
-      if resp_bytes != 0 { .traffic = { "bytes_out": resp_bytes } }
+      # NAN-2995: OCSF 1.9 network_traffic: bytes_in = destination -> source, bytes_out = source -> destination.
+      # src = client, so the response size is bytes_in.
+      if resp_bytes != 0 { .traffic = { "bytes_in": resp_bytes } }
       if match(client, ip_re) {
           .src_endpoint = { "ip": client }
       } else if client != "" && client != "-" {
@@ -421,3 +423,8 @@ samples:
     expect:
       class_uid: 0
       activity_id: 99
+  # NAN-2995: OCSF 1.9 bytes_in = destination -> source, bytes_out = source -> destination; the reply size is bytes_in.
+  - raw: "1786000530.881 5012 10.20.1.56 TCP_TUNNEL/200 48210 CONNECT secure.example.org:443 - HIER_DIRECT/203.0.113.20 -"
+    expect:
+      "traffic.bytes_in": 48210
+      "traffic.bytes_out": "<missing>"
