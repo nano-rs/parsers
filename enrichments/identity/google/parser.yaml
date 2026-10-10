@@ -1,6 +1,6 @@
 name: google_identity
 display_name: Google Workspace Identity
-version: "1.0.0"
+version: "1.1.0"
 category: identity
 description: >-
   Normalizes pushed Google Workspace Admin SDK Directory user records
@@ -97,10 +97,11 @@ normalize_vrl: |
   archived = to_bool(.archived) ?? false
   account_enabled = if suspended || archived { 0 } else { 1 }
 
-  # account_status: Google distinguishes suspended/archived; user_registry enum
-  # only allows active/disabled/deleted/anonymized, so suspended -> disabled.
+  # account_status: Google distinguishes suspended/archived. NAN-3483: the
+  # directory enum is active/disabled/suspended/deleted/anonymized across the
+  # lane, the coordinator and lean, so suspended stays suspended.
   account_status = if suspended { "suspended" } else if archived { "disabled" } else { "active" }
-  if !includes(["active", "disabled", "deleted", "anonymized"], account_status) {
+  if !includes(["active", "disabled", "suspended", "deleted", "anonymized"], account_status) {
       account_status = "disabled"
   }
 
