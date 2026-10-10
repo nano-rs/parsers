@@ -1,6 +1,6 @@
 name: okta_identity
 display_name: Okta Identity
-version: "1.0.0"
+version: "1.1.0"
 category: identity
 description: >-
   Normalizes pushed Okta identity records (nano_enrich, kind=identity,
@@ -61,7 +61,9 @@ normalize_vrl: |
   # status defaults to enabled (1).
   status = to_string(.status) ?? ""
   account_enabled = if status == "" { 1 } else if status == "ACTIVE" { 1 } else { 0 }
-  account_status = if account_enabled == 0 { "disabled" } else { "active" }
+  # NAN-3483: SUSPENDED keeps its own status (directory enum is
+  # active/disabled/suspended/deleted/anonymized); other non-ACTIVE -> disabled.
+  account_status = if status == "SUSPENDED" { "suspended" } else if account_enabled == 0 { "disabled" } else { "active" }
 
   . = {
       "provider_id": to_string(.provider_id) ?? "",
