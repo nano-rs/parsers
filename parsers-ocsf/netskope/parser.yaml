@@ -1,6 +1,6 @@
 name: netskope_ocsf
 display_name: Netskope (OCSF)
-version: "1.2.0"
+version: "1.3.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -130,14 +130,22 @@ parser_vrl: |
   bytes_in = to_int(e.server_bytes) ?? 0
   bytes_out = to_int(e.client_bytes) ?? 0
 
+  # NAN-3490: metadata.uid is deterministic. The lake drops a later row that
+  # reuses an earlier row's uid, so a page Netskope re-serves (operation=resend
+  # after a crash or a 5xx) must map to the same uid, never a fresh uuid_v4.
+  # Netskope's own `_id` identifies a record within its event type, so the
+  # uid hashes (record_type, _id); a record without `_id` hashes its raw body,
+  # which a re-served page repeats byte for byte.
+  nsid = to_string(e._id) ?? ""
+  uid_src = "netskope|raw|" + raw_log
+  if nsid != "" { uid_src = join!(["netskope", record_type, nsid], "|") }
   metadata = {
       "version": "1.9.0",
-      "uid": uuid_v4(),
+      "uid": sha2(uid_src, variant: "SHA-256"),
       "profiles": ["host", "security_control"],
       "log_name": "netskope-" + record_type,
       "product": { "name": "SSE", "vendor_name": "Netskope" }
   }
-  nsid = to_string(e._id) ?? ""
   if nsid != "" { metadata.original_event_uid = nsid }
   txid = to_string(e.transaction_id) ?? ""
   if txid != "" { metadata.correlation_uid = txid }
@@ -171,7 +179,7 @@ parser_vrl: |
       finding_uid = to_string(e.alert_id) ?? ""
       if finding_uid == "" { finding_uid = to_string(e.dlp_incident_id) ?? "" }
       if finding_uid == "" { finding_uid = nsid }
-      if finding_uid == "" { finding_uid = uuid_v4() }
+      if finding_uid == "" { finding_uid = metadata.uid }
 
       title = to_string(e.alert_name) ?? ""
       if title == "" { title = to_string(e.malware_name) ?? "" }
@@ -388,7 +396,7 @@ parser_vrl: |
       if !ok {
           .metadata = {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": metadata.uid,
               "log_level": "error",
               "log_name": "netskope",
               "product": { "name": "SSE", "vendor_name": "Netskope" }
@@ -589,10 +597,14 @@ samples:
     expect:
       class_uid: 2004
       activity_id: 1
+      # NAN-3490: deterministic uid = sha256("netskope|<record_type>|<_id>"), so a
+      # re-served page lands on the same lake identity instead of a new row.
+      "metadata.uid": "70fc76df165be6e13949d5b62d32769a5756f19700b5c8f93bdf2f7b008d684a"
   - raw: '{"_id":"66ab12cf","record_type":"application","timestamp":1786000535,"user":"carol@corp.example","srcip":"203.0.113.12","app":"Salesforce","appcategory":"CRM","activity":"Download","action":"allow","object":"Q3-pipeline.csv","object_type":"File","instance_name":"corp-prod","access_method":"Reverse Proxy","organization_unit":"Sales"}'
     expect:
       class_uid: 6003
       activity_id: 99
+      "metadata.uid": "e10293c1e5536143d0dfd6f07ed32f8cfc2ecb557e14b2f62c2b2f48279262fe"
   - raw: '{"_id":"66ab12d1","record_type":"audit","timestamp":1786000545,"user":"admin@corp.example","audit_log_event":"Policy Modified","audit_type":"Admin","supporting_data":{"data_type":"policy","data_values":["Block PII Upload"]},"srcip":"198.51.100.251"}'
     expect:
       class_uid: 6003
