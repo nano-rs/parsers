@@ -581,6 +581,13 @@ parser_vrl: |
   __residual = {}
   for_each(__flat) -> |key, value| {
       key = replace(replace(key, "~1", "."), "~0", "~")
+      # flatten stops at arrays, so objects inside an array still carry the
+      # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+      if is_array(value) || is_object(value) {
+          value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+              replace(replace(inner, "~1", "."), "~0", "~")
+          }, ["v"])
+      }
       __same = includes(__represented, encode_json(value))
       if !is_object(value) && !is_array(value) && !is_null(value) {
           __same = __same || includes(__represented, to_string(value) ?? "")
