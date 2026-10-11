@@ -62,6 +62,7 @@ A collection of VRL parsers for nano log source ingestion.
 | [AWS S3 Access Logs](parsers/aws_s3_access) | `aws_s3_access` | Amazon | Space-delimited | S3 server access logs: bucket operations, requester identity |
 | [Azure Activity Log](parsers/azure_activity) | `azure_activity` | Microsoft | JSON | Operations, status, caller identity, resources |
 | [Azure Sign-in Logs](parsers/azure_signin) | `azure_signin` | Microsoft | JSON | Entra ID sign-ins: interactive, non-interactive, service principal |
+| [Azure Monitor diagnostic export](parsers-ocsf/azure_monitor) | `azure_monitor` | Microsoft | JSON (Diagnostic Settings → Event Hubs / storage) | One lane for a mixed hub, dispatched on `category`: Activity Log (all 8 categories; Defender for Cloud alerts as Detection Finding), Entra ID sign-ins (interactive, non-interactive, service principal, managed identity) and Entra ID audit (user / group / role management). Unknown categories kept whole as Base Event. OCSF only |
 | [Azure Firewall](parsers/azure_firewall) | `azure_firewall` | Microsoft | JSON | Network rules, application rules, threat intel, DNS proxy |
 | [GCP Audit Log](parsers/gcp_audit) | `gcp_audit` | Google | JSON | IAM changes, API calls, resource operations, authorization |
 | [Kubernetes Audit](parsers/kubernetes_audit) | `kubernetes_audit` | CNCF | JSON | API server audit: resource operations, RBAC, user identity |

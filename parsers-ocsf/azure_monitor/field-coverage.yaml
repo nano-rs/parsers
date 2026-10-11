@@ -1,0 +1,138 @@
+source: json
+transforms:
+- source: time
+  kind: epoch_ms
+  target: time
+  reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+- source: properties.createdDateTime
+  kind: epoch_ms
+  target: time
+  reason: Sign-in event clock, preferred over the record time; verified against the emitted clock.
+- source: properties.activityDateTime
+  kind: epoch_ms
+  target: time
+  reason: Audit event clock, preferred over the record time; verified against the emitted clock.
+- source: level
+  kind: enum
+  target: severity_id
+  values:
+    informational: 1
+    information: 1
+    warning: 3
+    error: 4
+    critical: 5
+  reason: Azure record level normalized to OCSF severity; consume only when the expected ID is emitted.
+- source: Level
+  kind: enum
+  target: severity_id
+  values:
+    '4': 1
+    '3': 3
+    '2': 4
+    '1': 5
+  reason: Windows-style numeric record level normalized to OCSF severity; consume only when the expected ID is emitted.
+- source: properties.Severity
+  kind: enum
+  target: severity_id
+  values:
+    informational: 1
+    low: 2
+    medium: 3
+    high: 4
+  reason: Defender for Cloud alert severity drives the finding severity; consume only when the expected ID is emitted.
+- source: properties.riskLevelDuringSignIn
+  kind: enum
+  target: risk_level
+  values:
+    low: Low
+    medium: Medium
+    high: High
+  reason: Parser normalizes the caption case; verify the emitted caption.
+- source: properties.result
+  kind: enum
+  target: status
+  values:
+    success: Success
+    failure: Failure
+  reason: Entra audit result normalized to the OCSF status caption; verify the emitted caption.
+- source: resultType
+  kind: enum
+  target: status
+  values:
+    success: Success
+    failure: Failure
+  reason: Activity Log result normalized to the OCSF status caption; verify the emitted caption.
+- source: callerIpAddress
+  kind: lowercase
+  reason: Parser lowercases IPs (nano lowercases at ingest); consume only when the normalized value is emitted.
+- source: properties.ipAddress
+  kind: lowercase
+  reason: Parser lowercases IPs (nano lowercases at ingest); consume only when the normalized value is emitted.
+consumed_reason: Only source keys read by this parser are eligible for exact-value
+  consumption; the selected branch must emit the value. Unknown keys always spill,
+  even when their value equals an OCSF default.
+consumed_candidates:
+- time
+- resourceId
+- operationName
+- category
+- tenantId
+- resultType
+- resultSignature
+- resultDescription
+- callerIpAddress
+- correlationId
+- level
+- Level
+- identity.claims.http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn
+- identity.claims.http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name
+- identity.claims.http://schemas.microsoft.com/identity/claims/objectidentifier
+- identity.claims.http://schemas.microsoft.com/identity/claims/tenantid
+- identity.claims.name
+- identity.claims.appid
+- identity.claims.ipaddr
+- identity.authorization.evidence.principalType
+- properties.eventCategory
+- properties.statusCode
+- properties.statusMessage
+- properties.operationId
+- properties.eventName
+- properties.alertDisplayName
+- properties.alertId
+- properties.id
+- properties.correlationId
+- properties.createdDateTime
+- properties.userPrincipalName
+- properties.userDisplayName
+- properties.userId
+- properties.servicePrincipalName
+- properties.servicePrincipalId
+- properties.resourceDisplayName
+- properties.appDisplayName
+- properties.resourceId
+- properties.ipAddress
+- properties.location.countryOrRegion
+- properties.location.city
+- properties.location.state
+- properties.autonomousSystemNumber
+- properties.status.errorCode
+- properties.status.failureReason
+- properties.status.additionalDetails
+- properties.isInteractive
+- properties.deviceDetail.displayName
+- properties.deviceDetail.deviceId
+- properties.deviceDetail.operatingSystem
+- properties.userAgent
+- properties.activityDisplayName
+- properties.activityDateTime
+- properties.category
+- properties.result
+- properties.resultReason
+- properties.loggedByService
+- properties.initiatedBy.user.id
+- properties.initiatedBy.user.userPrincipalName
+- properties.initiatedBy.user.displayName
+- properties.initiatedBy.user.ipAddress
+- properties.initiatedBy.app.displayName
+- properties.initiatedBy.app.servicePrincipalId
+- properties.initiatedBy.app.appId
