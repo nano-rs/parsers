@@ -213,19 +213,22 @@ Two gates per sample:
    - `class_uid` is a real, **non-deprecated** class — OCSF 1.9 deprecated
      Account Change (3001) and User Access Management (3005) in favour of
      User Management (3007) and Group Management (3006)
-   - every OCSF path written is either promoted (queryable) or under `unmapped.*`;
-     anything else is reported as silently unqueryable
+   - every path written is a canonical OCSF 1.9 attribute of the event's class,
+     or sits under `unmapped.*`. nano's lake stores every canonical path as its own
+     column and search serves it (indexed or not); a non-canonical path is refused
+     by search ("Unknown canonical OCSF field"), so it is reported
 
 The contract check needs nano's `ocsf_event_validate` binary, which is a nano build
 artifact and is not vendored here. Point `OCSF_VALIDATOR` at it, or put it on
 `PATH`; without it that half reports SKIPPED and every rule above still runs.
 
-The reference data the script checks against lives next to it and is regenerated
-from `https://schema.ocsf.io/api/1.9.0/`:
+The reference data the script checks against lives next to it:
 
-- `scripts/ocsf-1.9.0-classes.json` — every class uid, caption and `@deprecated` flag
-- `scripts/ocsf-1.9.0-promoted-fields.txt` — the OCSF field paths nano promotes to
-  queryable columns
+- `scripts/ocsf-1.9.0-classes.json` — every class uid, caption and `@deprecated` flag,
+  regenerated from `https://schema.ocsf.io/api/1.9.0/`
+- `scripts/ocsf-1.9.0-contract.json.gz` — nano's embedded OCSF 1.9 contract
+  (classes, objects, attribute types), copied verbatim from nanosiem
+  `nanosiem-core/src/parsers/ocsf-1.9.0-contract.json.gz`; rule 5 walks it
 
 CI runs both `scripts/validate-vrl.sh` and `scripts/validate-ocsf.sh` over the whole
 repository on every PR (`.github/workflows/validate-parsers.yml`).
@@ -233,7 +236,7 @@ repository on every PR (`.github/workflows/validate-parsers.yml`).
 ### Writing an OCSF parser
 
 - Emit the **complete OCSF object on the root** (`. = ocsf`) so it lands in
-  `ocsf_logs.event` and the promoted columns materialize.
+  the lake and every canonical path is stored as its own queryable column.
 - UDM names do not exist in OCSF. `src_ip` is `src_endpoint.ip`, `user` is
   `actor.user.name` (the actor) or `user.name` (the subject, class-dependent),
   `timestamp` is `time`, `id` is `metadata.uid`, `ext.foo` is `unmapped.foo`.

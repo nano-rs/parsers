@@ -20,6 +20,8 @@ dozens of bogus "required attribute missing" errors.
 """
 
 import argparse
+import functools
+import gzip
 import json
 import os
 import pathlib
@@ -30,7 +32,11 @@ import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
 CLASS_CATALOG = HERE / "ocsf-1.9.0-classes.json"
-PROMOTED_FIELDS = HERE / "ocsf-1.9.0-promoted-fields.txt"
+# nano's embedded OCSF 1.9 contract (classes + objects + attribute types), a
+# verbatim copy of nanosiem `nanosiem-core/src/parsers/ocsf-1.9.0-contract.json.gz`.
+# Rule 5 walks emitted paths against it; refresh it from nanosiem when nano
+# re-pins its contract.
+OCSF_CONTRACT = HERE / "ocsf-1.9.0-contract.json.gz"
 
 # nano's OCSF contract validator. Not vendored — it is a nano build artifact, so
 # the schema gate runs wherever it is available and is reported as SKIPPED where
@@ -84,17 +90,61 @@ def leaf_paths(obj, prefix=""):
         yield prefix
 
 
-def promoted_set():
-    entries = set()
-    for line in PROMOTED_FIELDS.read_text().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        entries.add(line)
-        # `resources[].name` and `enrichments[name=x].value` address the same
-        # column as `resources.name` / `enrichments.value`.
-        entries.add(re.sub(r"\[[^\]]*\]", "", line))
-    return entries
+@functools.lru_cache(maxsize=1)
+def ocsf_contract():
+    with gzip.open(OCSF_CONTRACT, "rt", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _free_form(attribute):
+    """`json_t` and the untyped `object` carry producer-defined keys."""
+    return attribute.get("type") == "json_t" or (
+        attribute.get("type") == "object_t" and attribute.get("object_type") in (None, "object")
+    )
+
+
+def noncanonical_paths(event, class_uid):
+    """Written paths that are not OCSF 1.9 attributes of the event's class.
+
+    The lean lake stores every leaf a parser writes as its own column and search
+    accepts any stored path, so a canonical path is queryable whether or not it
+    has an index. What breaks queries is a path outside OCSF: nano search refuses
+    it ("Unknown canonical OCSF field") unless it lives under `unmapped.*`.
+
+    The walk starts at the class's attributes and follows each object reference,
+    so recursive objects (`process.parent_process.parent_process...`) cost
+    O(depth). Profile binding is not checked here; gate 2 owns it. An unknown
+    class (rule 4 already fails it) falls back to the attributes of every class.
+    """
+    contract = ocsf_contract()
+    objects = contract["objects"]
+    classes = [c for c in contract["classes"].values() if c.get("uid") == class_uid]
+    if not classes:
+        classes = list(contract["classes"].values())
+    top = {}
+    for cls in classes:
+        top.update(cls["attributes"])
+
+    found = set()
+
+    def walk(value, attributes, path):
+        if not isinstance(value, dict):
+            return
+        for key, child in value.items():
+            child_path = f"{path}.{key}" if path else key
+            attribute = attributes.get(key)
+            if attribute is None:
+                found.update(leaf_paths(child, child_path))
+                continue
+            if _free_form(attribute) or attribute.get("type") != "object_t":
+                continue
+            nested = objects.get(attribute["object_type"], {}).get("attributes", {})
+            items = child if isinstance(child, list) else [child]
+            for item in items:
+                walk(item, nested, child_path)
+
+    walk({k: v for k, v in event.items() if k != "unmapped"}, top, "")
+    return sorted(found)
 
 
 def check(args):
@@ -149,18 +199,15 @@ def check(args):
                 "(3001/3005 -> 3007 User Management, 3001 group edits -> 3006 Group Management)"
             )
 
-    # ---- rule 5: every written path is promoted, or under unmapped.*
-    promoted = promoted_set()
-    unqueryable = []
-    for path in sorted(set(leaf_paths(event))):
-        if not path or path.startswith("unmapped."):
-            continue
-        if path in promoted:
-            continue
-        unqueryable.append(path)
-    if unqueryable:
+    # ---- rule 5: every written path is a canonical OCSF 1.9 attribute of the
+    # event's class, or sits under unmapped.*. The lean lake stores and serves
+    # every canonical path (indexed or not); only a non-canonical one is refused
+    # by search.
+    noncanonical = noncanonical_paths(event, class_uid)
+    if noncanonical:
         warns.append(
-            "written but NOT promoted (silently unqueryable): " + ", ".join(unqueryable)
+            "written outside OCSF 1.9 and not under unmapped.* (search refuses these): "
+            + ", ".join(noncanonical)
         )
 
     # ---- gate 2: the official OCSF contract, when the validator is present
