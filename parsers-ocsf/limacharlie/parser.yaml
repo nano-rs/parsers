@@ -1,6 +1,6 @@
 name: limacharlie_ocsf
 display_name: LimaCharlie EDR (OCSF)
-version: "1.2.0"
+version: "1.2.1"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses LimaCharlie EDR sensor telemetry (routing + event envelope) into
@@ -645,11 +645,17 @@ parser_vrl: |
           "version": "1.9.0",
           "profiles": profiles,
           "uid": record_uid,
-          "original_event_uid": record_uid,
           "event_code": event_type,
           "log_source": "limacharlie",
           "product": { "name": "LimaCharlie EDR", "vendor_name": "LimaCharlie" }
       }
+      # NAN-3718: original_event_uid holds the vendor's own per-event id and is
+      # omitted when the record has none; a composite or hash belongs only in
+      # metadata.uid.
+      # LimaCharlie: routing.event_id. routing.this names the event's primary
+      # object (e.g. the process), so it is not an event id.
+      lc_event_id = to_string(routing.event_id) ?? ""
+      if lc_event_id != "" { ocsf.metadata.original_event_uid = lc_event_id }
 
       . = ocsf
   }
@@ -1049,10 +1055,19 @@ samples:
     expect:
       "metadata.uid": "f1c84ff634a75163aa296e4ce753cdbb096cf90062bf36c5a1b0086bf6995507"
       "finding_info.uid": "f1c84ff634a75163aa296e4ce753cdbb096cf90062bf36c5a1b0086bf6995507"
-      "metadata.original_event_uid": "f1c84ff634a75163aa296e4ce753cdbb096cf90062bf36c5a1b0086bf6995507"
+      "metadata.original_event_uid": "<missing>"
   # NAN-3702 (natural id removed): metadata.uid is sha256("limacharlie|raw|" + raw), so the
   # same record parsed twice gets the same uid (a random uid could never match).
   - raw: "{\"routing\":{\"event_type\":\"BAD_LOGON\",\"event_time\":1787050000000,\"hostname\":\"WKS-11.corp.local\",\"int_ip\":\"10.4.5.6\",\"ext_ip\":\"203.0.113.44\",\"oid\":\"oid-1\",\"sid\":\"sid-abc\",\"iid\":\"iid-1\",\"parent\":\"atom-parent\",\"plat\":268435456,\"arch\":2},\"event\":{\"USER_NAME\":\"administrator\",\"LOGON_TYPE\":\"3\",\"SOURCE_IP\":\"203.0.113.9\",\"ERROR\":\"STATUS_LOGON_FAILURE\"}}"
     expect:
       "metadata.uid": "0230e2c0d9789fe4b1d8d074f117bef86c1d2e1afd24b7459b1a7a62d7a99211"
-      "metadata.original_event_uid": "0230e2c0d9789fe4b1d8d074f117bef86c1d2e1afd24b7459b1a7a62d7a99211"
+      "metadata.original_event_uid": "<missing>"
+  # NAN-3718: routing.event_id is the native per-event id
+  - raw: "{\"routing\": {\"event_type\": \"BAD_LOGON\", \"event_time\": 1787050000000, \"hostname\": \"WKS-11.corp.local\", \"int_ip\": \"10.4.5.6\", \"ext_ip\": \"203.0.113.44\", \"oid\": \"oid-1\", \"sid\": \"sid-abc\", \"iid\": \"iid-1\", \"event_id\": \"evt-bad_logon\", \"this\": \"atom-this\", \"parent\": \"atom-parent\", \"plat\": 268435456, \"arch\": 2}, \"event\": {\"USER_NAME\": \"administrator\", \"LOGON_TYPE\": \"3\", \"SOURCE_IP\": \"203.0.113.9\", \"ERROR\": \"STATUS_LOGON_FAILURE\"}}"
+    expect:
+      "metadata.original_event_uid": "evt-bad_logon"
+  # NAN-3718: routing.this names the primary object, not the event: no original_event_uid (metadata.uid unchanged)
+  - raw: "{\"routing\":{\"event_type\":\"BAD_LOGON\",\"event_time\":1787050000000,\"hostname\":\"WKS-11.corp.local\",\"int_ip\":\"10.4.5.6\",\"ext_ip\":\"203.0.113.44\",\"oid\":\"oid-1\",\"sid\":\"sid-abc\",\"iid\":\"iid-1\",\"this\":\"atom-this\",\"parent\":\"atom-parent\",\"plat\":268435456,\"arch\":2},\"event\":{\"USER_NAME\":\"administrator\",\"LOGON_TYPE\":\"3\",\"SOURCE_IP\":\"203.0.113.9\",\"ERROR\":\"STATUS_LOGON_FAILURE\"}}"
+    expect:
+      "metadata.uid": "atom-this"
+      "metadata.original_event_uid": "<missing>"

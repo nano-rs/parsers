@@ -1,6 +1,6 @@
 name: google_workspace_ocsf
 display_name: Google Workspace Audit (OCSF)
-version: "1.3.0"
+version: "1.3.1"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -373,13 +373,19 @@ parser_vrl: |
       ocsf.metadata = {
           "version": "1.9.0",
           "uid": record_uid,
-          "original_event_uid": record_uid,
           "event_code": event_name,
           "log_name": "Google Workspace Reports",
           "log_provider": "Google Workspace",
           "tenant_uid": customer,
           "product": { "name": "Google Workspace", "vendor_name": "Google" }
       }
+      # NAN-3718: original_event_uid holds the vendor's own per-event id and is
+      # omitted when the record has none; a composite or hash belongs only in
+      # metadata.uid.
+      # Google: id.uniqueQualifier. Google's full activity key is the
+      # time/uniqueQualifier/applicationName/customerId tuple, which is
+      # the composite in metadata.uid.
+      if uniq != "" { ocsf.metadata.original_event_uid = uniq }
 
       cand = {
           "application": app,
@@ -619,7 +625,7 @@ samples:
       "message": "edit"
       "unmapped.event_names": "edit,rename"
       "metadata.uid": "gws|drive|C01ab2cd3|-1234567890123456780|2026-08-18T18:25:30.000Z"
-      "metadata.original_event_uid": "gws|drive|C01ab2cd3|-1234567890123456780|2026-08-18T18:25:30.000Z"
+      "metadata.original_event_uid": "-1234567890123456780"
   # drive_multi_event_upload_primary.json
   - raw: "{\"kind\":\"admin#reports#activity\",\"id\":{\"time\":\"2026-08-18T18:20:11.401Z\",\"uniqueQualifier\":\"-1134567890123456789\",\"applicationName\":\"drive\",\"customerId\":\"C01ab2cd3\"},\"actor\":{\"email\":\"jane.doe@example.com\",\"profileId\":\"114511223344556677889\"},\"ipAddress\":\"203.0.113.55\",\"networkInfo\":{\"regionCode\":\"US\"},\"events\":[{\"type\":\"access\",\"name\":\"edit\",\"parameters\":[{\"name\":\"primary_event\",\"boolValue\":false},{\"name\":\"doc_id\",\"value\":\"1SyNtHeTiCdOcIdUpLoAd0000000\"},{\"name\":\"doc_type\",\"value\":\"pdf\"},{\"name\":\"doc_title\",\"value\":\"Synthetic Quarterly Report.pdf\"},{\"name\":\"owner\",\"value\":\"jane.doe@example.com\"},{\"name\":\"visibility\",\"value\":\"private\"}]},{\"type\":\"access\",\"name\":\"upload\",\"parameters\":[{\"name\":\"primary_event\",\"boolValue\":true},{\"name\":\"doc_id\",\"value\":\"1SyNtHeTiCdOcIdUpLoAd0000000\"},{\"name\":\"doc_type\",\"value\":\"pdf\"},{\"name\":\"doc_title\",\"value\":\"Synthetic Quarterly Report.pdf\"},{\"name\":\"owner\",\"value\":\"jane.doe@example.com\"},{\"name\":\"visibility\",\"value\":\"private\"}]},{\"type\":\"acl_change\",\"name\":\"change_user_access\",\"parameters\":[{\"name\":\"target_user\",\"value\":\"bob.smith@example.com\"},{\"name\":\"old_value\",\"multiValue\":[\"none\"]},{\"name\":\"new_value\",\"multiValue\":[\"can_edit\"]},{\"name\":\"doc_id\",\"value\":\"1SyNtHeTiCdOcIdUpLoAd0000000\"},{\"name\":\"doc_type\",\"value\":\"pdf\"},{\"name\":\"doc_title\",\"value\":\"Synthetic Quarterly Report.pdf\"},{\"name\":\"owner\",\"value\":\"jane.doe@example.com\"},{\"name\":\"visibility\",\"value\":\"private\"}]},{\"type\":\"acl_change\",\"name\":\"change_acl_editors\",\"parameters\":[{\"name\":\"old_value\",\"multiValue\":[\"owner_only\"]},{\"name\":\"new_value\",\"multiValue\":[\"owner_and_editors\"]},{\"name\":\"doc_id\",\"value\":\"1SyNtHeTiCdOcIdUpLoAd0000000\"},{\"name\":\"doc_type\",\"value\":\"pdf\"},{\"name\":\"doc_title\",\"value\":\"Synthetic Quarterly Report.pdf\"},{\"name\":\"owner\",\"value\":\"jane.doe@example.com\"},{\"name\":\"visibility\",\"value\":\"private\"}]},{\"type\":\"access\",\"name\":\"add_to_folder\",\"parameters\":[{\"name\":\"destination_folder_id\",\"value\":\"0SyNtHeTiCfOlDeR000000000\"},{\"name\":\"destination_folder_title\",\"value\":\"Synthetic Shared Folder\"},{\"name\":\"doc_id\",\"value\":\"1SyNtHeTiCdOcIdUpLoAd0000000\"},{\"name\":\"doc_type\",\"value\":\"pdf\"},{\"name\":\"doc_title\",\"value\":\"Synthetic Quarterly Report.pdf\"},{\"name\":\"owner\",\"value\":\"jane.doe@example.com\"},{\"name\":\"visibility\",\"value\":\"private\"}]}]}"
     expect:
@@ -634,7 +640,7 @@ samples:
       "file.uid": "1SyNtHeTiCdOcIdUpLoAd0000000"
       "file.name": "Synthetic Quarterly Report.pdf"
       "metadata.uid": "gws|drive|C01ab2cd3|-1134567890123456789|2026-08-18T18:20:11.401Z"
-      "metadata.original_event_uid": "gws|drive|C01ab2cd3|-1134567890123456789|2026-08-18T18:20:11.401Z"
+      "metadata.original_event_uid": "-1134567890123456789"
   # drive_share.json
   - raw: "{\"kind\":\"admin#reports#activity\",\"id\":{\"time\":\"2026-08-18T18:15:40.101Z\",\"uniqueQualifier\":\"-1034567890123456789\",\"applicationName\":\"drive\",\"customerId\":\"C01ab2cd3\"},\"actor\":{\"email\":\"jane.doe@example.com\",\"profileId\":\"114511223344556677889\"},\"ipAddress\":\"203.0.113.55\",\"events\":[{\"type\":\"acl_change\",\"name\":\"change_user_access\",\"parameters\":[{\"name\":\"doc_id\",\"value\":\"1AbCdEfGhIjKlMnOpQrStUvWxYz\"},{\"name\":\"doc_type\",\"value\":\"spreadsheet\"},{\"name\":\"doc_title\",\"value\":\"Q3 Customer List\"},{\"name\":\"owner\",\"value\":\"finance@example.com\"},{\"name\":\"target_user\",\"value\":\"external@partner.example\"},{\"name\":\"old_value\",\"multiValue\":[\"none\"]},{\"name\":\"new_value\",\"multiValue\":[\"can_edit\"]}]}]}"
     expect:
@@ -692,4 +698,8 @@ samples:
   - raw: "{\"kind\":\"admin#reports#activity\",\"id\":{\"time\":\"2026-08-18T17:03:55.907Z\",\"applicationName\":\"admin\",\"customerId\":\"C01ab2cd3\"},\"actor\":{\"email\":\"admin@example.com\",\"profileId\":\"114500000000000000001\",\"callerType\":\"USER\"},\"ipAddress\":\"192.0.2.77\",\"events\":[{\"type\":\"GROUP_SETTINGS\",\"name\":\"ADD_GROUP_MEMBER\",\"parameters\":[{\"name\":\"GROUP_EMAIL\",\"value\":\"security-team@example.com\"},{\"name\":\"USER_EMAIL\",\"value\":\"bob.smith@example.com\"},{\"name\":\"NEW_VALUE\",\"value\":\"MEMBER\"}]}]}"
     expect:
       "metadata.uid": "71214abbee3cc8689b74c9238a8cf3d2adaa8e698d502a8280af0fe71f83bf25"
-      "metadata.original_event_uid": "71214abbee3cc8689b74c9238a8cf3d2adaa8e698d502a8280af0fe71f83bf25"
+      "metadata.original_event_uid": "<missing>"
+  # NAN-3718: id.uniqueQualifier is the native event id
+  - raw: "{\"kind\":\"admin#reports#activity\",\"id\":{\"time\":\"2026-08-18T17:03:55.907Z\",\"uniqueQualifier\":\"-6234567890123456789\",\"applicationName\":\"admin\",\"customerId\":\"C01ab2cd3\"},\"actor\":{\"email\":\"admin@example.com\",\"profileId\":\"114500000000000000001\",\"callerType\":\"USER\"},\"ipAddress\":\"192.0.2.77\",\"events\":[{\"type\":\"GROUP_SETTINGS\",\"name\":\"ADD_GROUP_MEMBER\",\"parameters\":[{\"name\":\"GROUP_EMAIL\",\"value\":\"security-team@example.com\"},{\"name\":\"USER_EMAIL\",\"value\":\"bob.smith@example.com\"},{\"name\":\"NEW_VALUE\",\"value\":\"MEMBER\"}]}]}"
+    expect:
+      "metadata.original_event_uid": "-6234567890123456789"

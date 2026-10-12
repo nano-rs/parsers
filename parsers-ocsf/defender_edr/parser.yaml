@@ -1,6 +1,6 @@
 name: defender_edr_ocsf
 display_name: Microsoft Defender for Endpoint (OCSF)
-version: "1.2.0"
+version: "1.2.1"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses Microsoft Defender for Endpoint (Advanced Hunting JSON) into
@@ -605,11 +605,18 @@ parser_vrl: |
           "version": "1.9.0",
           "profiles": profiles,
           "uid": record_uid,
-          "original_event_uid": record_uid,
           "event_code": action_type,
           "log_source": "defender_edr",
           "product": { "name": "Microsoft Defender for Endpoint", "vendor_name": "Microsoft" }
       }
+      # NAN-3718: original_event_uid holds the vendor's own per-event id and is
+      # omitted when the record has none; a composite or hash belongs only in
+      # metadata.uid.
+      # Defender: ReportId (Microsoft's event identifier), else the AlertId
+      # of an alert record.
+      native_uid = report_id
+      if native_uid == "" { native_uid = to_string(p.AlertId) ?? "" }
+      if native_uid != "" { ocsf.metadata.original_event_uid = native_uid }
 
       . = ocsf
   }
@@ -892,4 +899,12 @@ samples:
     expect:
       "metadata.uid": "3b92a349a9cf30f7ec30177c0212b18052b6b9f1de7d727b171cb9d9c84a47c2"
       "finding_info.uid": "3b92a349a9cf30f7ec30177c0212b18052b6b9f1de7d727b171cb9d9c84a47c2"
-      "metadata.original_event_uid": "3b92a349a9cf30f7ec30177c0212b18052b6b9f1de7d727b171cb9d9c84a47c2"
+      "metadata.original_event_uid": "<missing>"
+  # NAN-3718: ReportId is Microsoft's event identifier
+  - raw: "{\"Timestamp\": \"2026-08-18T12:00:00.1234567Z\", \"DeviceId\": \"a1b2c3d4e5f6\", \"DeviceName\": \"wks-11.corp.local\", \"ReportId\": 88123, \"ActionType\": \"ConnectionFailed\", \"RemoteIP\": \"203.0.113.9\", \"RemotePort\": 4444, \"LocalIP\": \"10.1.2.3\", \"LocalPort\": 51235, \"Protocol\": \"Tcp\", \"InitiatingProcessId\": 999, \"InitiatingProcessFileName\": \"rundll32.exe\", \"InitiatingProcessAccountName\": \"alice\"}"
+    expect:
+      "metadata.original_event_uid": "88123"
+  # NAN-3718: an alert record without ReportId: its AlertId
+  - raw: "{\"Timestamp\":\"2026-08-18T12:00:00.1234567Z\",\"DeviceId\":\"a1b2c3d4e5f6\",\"DeviceName\":\"wks-11.corp.local\",\"ActionType\":\"AntivirusDetection\",\"AlertId\":\"da637123456789\",\"Title\":\"Suspicious PowerShell command line\",\"Severity\":\"High\",\"Category\":\"Execution\",\"DetectionSource\":\"WindowsDefenderAv\",\"ThreatFamilyName\":\"Trojan:Win32/Emotet\",\"ThreatName\":\"Trojan:Win32/Emotet.A\",\"RemediationAction\":\"Quarantine\",\"AlertState\":\"New\",\"AttackTechniques\":[\"T1059.001 (PowerShell)\",\"T1204 (User Execution)\"],\"FileName\":\"payload.exe\",\"FolderPath\":\"C:\\\\Users\\\\alice\\\\Downloads\",\"SHA256\":\"DEADBEEF\",\"InitiatingProcessId\":4321,\"InitiatingProcessFileName\":\"powershell.exe\",\"InitiatingProcessFolderPath\":\"C:\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\",\"InitiatingProcessCommandLine\":\"powershell.exe -enc SQBFAFgA\",\"InitiatingProcessAccountName\":\"alice\",\"InitiatingProcessAccountDomain\":\"CORP\"}"
+    expect:
+      "metadata.original_event_uid": "da637123456789"
