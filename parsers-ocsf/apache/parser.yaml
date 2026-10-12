@@ -1,6 +1,6 @@
 name: apache_ocsf
 display_name: Apache HTTP Server (OCSF)
-version: "1.0.0"
+version: "1.1.0"
 description: >
   Parses Apache combined/common log format into a complete OCSF 1.8.0
   "HTTP Activity" (class_uid 4002) record. The whole OCSF object is emitted
@@ -21,6 +21,12 @@ parser_vrl: |
   # gets written to ocsf_logs.event; the MATERIALIZED columns derive from it.
 
   raw_log = string!(.message)
+
+  # NAN-3702: the lake drops a row whose (event hour, metadata.uid) it already
+  # stored, so the uid must be the same every time the same line arrives.
+  # Apache lines carry no record id, so the raw line is hashed. The "apache|"
+  # prefix keeps an identical line from another source from sharing the uid.
+  record_uid = sha2("apache|raw|" + raw_log, variant: "SHA-256")
 
   parsed, err = parse_apache_log(raw_log, "combined")
 
@@ -97,7 +103,7 @@ parser_vrl: |
           "message": raw_log,
           "metadata": {
               "version": "1.8.0",
-              "uid": uuid_v4(),
+              "uid": record_uid,
               "product": {
                   "name": "Apache HTTP Server",
                   "vendor_name": "Apache Software Foundation"
@@ -133,7 +139,7 @@ parser_vrl: |
           "message": raw_log,
           "metadata": {
               "version": "1.8.0",
-              "uid": uuid_v4(),
+              "uid": record_uid,
               "product": {
                   "name": "Apache HTTP Server",
                   "vendor_name": "Apache Software Foundation"
@@ -142,3 +148,14 @@ parser_vrl: |
           }
       }
   }
+samples:
+  # NAN-3702: existing-format line: no record id, so the raw line is hashed.
+  - raw: "127.0.0.1 - frank [10/Oct/2000:13:55:36 -0700] \"GET /apache_pb.gif HTTP/1.0\" 200 2326 \"http://www.example.com/start.html\" \"Mozilla/4.08 [en] (Win98; I ;Nav)\""
+    expect:
+      "class_uid": 4002
+      "metadata.uid": "60e849949f4a65a058099c583ab2bc565f064e0b3999d1849a47f07e3b9f7fb4"
+  # NAN-3702: unparseable line (error branch).
+  - raw: "this is not an apache log line at all"
+    expect:
+      "metadata.log_level": "error"
+      "metadata.uid": "651db76fee7cabea4a0d4863e63cfbe1687a530476d8045711360396f45861b5"

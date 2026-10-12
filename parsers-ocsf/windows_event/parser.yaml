@@ -1,6 +1,6 @@
 name: windows_event_ocsf
 display_name: Windows Event Log (OCSF)
-version: "1.0.0"
+version: "1.1.0"
 description: >
   Parses Windows Security Event Log records (JSON; top-level event_id +
   event_data) into complete OCSF 1.8.0 records, routed by EventID:
@@ -34,7 +34,9 @@ parser_vrl: |
           "message": raw_log,
           "metadata": {
               "version": "1.8.0",
-              "uid": uuid_v4(),
+              # NAN-3702: deterministic, so a redelivered unparseable record
+              # dedupes in the lake instead of landing as a second row.
+              "uid": sha2("windows_event|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "product": { "name": "Windows", "vendor_name": "Microsoft" }
           }
@@ -196,11 +198,26 @@ parser_vrl: |
       ocsf.time = time_ms
       ocsf.message = msg
       # NAN-1403: record_id arrives as an integer and string() errors on
-      # integers, so string(p.record_id) ?? uuid_v4() randomized every uid.
-      # to_string coerces int → decimal string, string → itself, null/absent
-      # → "" — the guard routes "" to the genuinely-absent uuid_v4 fallback.
-      record_uid = to_string(p.record_id) ?? ""
-      if record_uid == "" { record_uid = uuid_v4() }
+      # integers; to_string coerces int → decimal string, string → itself,
+      # null/absent → "".
+      # NAN-3702: the lake drops a row whose (event hour, metadata.uid) it
+      # already stored, so the uid must be the same every time the same record
+      # arrives and must differ between records. A bare record_id is neither:
+      # it is a per-host, per-channel sequence, so two hosts (or channels) emit
+      # the same number in the same hour and all but one were dropped, and it
+      # restarts after a log reset. The uid is therefore the host/channel/
+      # provider/record/time composite (the same form as the ocsf-1.9 parser),
+      # and record_id itself moves to original_event_uid. Without the parts of
+      # the composite, the raw record is hashed, which a redelivery repeats
+      # byte for byte.
+      record_id = to_string(p.record_id) ?? ""
+      log_name = downcase(string(p.channel) ?? "Security")
+      log_provider = downcase(string(p.provider_name) ?? "Microsoft-Windows-Security-Auditing")
+      record_uid = ""
+      if record_id != "" && computer != "" && ts_str != "" {
+          record_uid = join!(["windows_event", computer, log_name, log_provider, record_id, ts_str], "|")
+      }
+      if record_uid == "" { record_uid = sha2("windows_event|raw|" + raw_log, variant: "SHA-256") }
       ocsf.metadata = {
           "version": "1.8.0",
           "uid": record_uid,
@@ -209,5 +226,30 @@ parser_vrl: |
           "product": { "name": "Windows", "vendor_name": "Microsoft" }
       }
 
+      if record_id != "" { ocsf.metadata.original_event_uid = record_id }
+
       . = ocsf
   }
+samples:
+  # NAN-3702: host/channel/provider/record/time composite; record_id moves to original_event_uid.
+  - raw: "{\"event_id\":4624,\"record_id\":12345,\"channel\":\"Security\",\"provider_name\":\"Microsoft-Windows-Security-Auditing\",\"computer\":\"DC-01.corp.local\",\"timestamp\":\"2026-08-18T11:00:00Z\",\"event_data\":{\"TargetUserName\":\"alice\",\"TargetDomainName\":\"CORP\",\"TargetUserSid\":\"S-1-5-21-1-2-3-1001\",\"TargetLogonId\":\"0x3e7abc\",\"LogonType\":\"10\",\"IpAddress\":\"10.2.3.4\",\"IpPort\":\"49152\",\"WorkstationName\":\"WKS-09\"}}"
+    expect:
+      "class_uid": 3002
+      "metadata.uid": "windows_event|dc-01.corp.local|security|microsoft-windows-security-auditing|12345|2026-08-18T11:00:00Z"
+      "metadata.original_event_uid": "12345"
+  # NAN-3702: same record_id and hour on another host: a different uid, so it is not dropped as a duplicate.
+  - raw: "{\"event_id\":4624,\"record_id\":12345,\"channel\":\"Security\",\"provider_name\":\"Microsoft-Windows-Security-Auditing\",\"computer\":\"DC-02.corp.local\",\"timestamp\":\"2026-08-18T11:00:00Z\",\"event_data\":{\"TargetUserName\":\"alice\",\"TargetDomainName\":\"CORP\",\"TargetUserSid\":\"S-1-5-21-1-2-3-1001\",\"TargetLogonId\":\"0x3e7abc\",\"LogonType\":\"10\",\"IpAddress\":\"10.2.3.4\",\"IpPort\":\"49152\",\"WorkstationName\":\"WKS-09\"}}"
+    expect:
+      "metadata.uid": "windows_event|dc-02.corp.local|security|microsoft-windows-security-auditing|12345|2026-08-18T11:00:00Z"
+      "metadata.original_event_uid": "12345"
+  # NAN-3702: no record_id: the raw record is hashed.
+  - raw: "{\"event_id\":4624,\"channel\":\"Security\",\"provider_name\":\"Microsoft-Windows-Security-Auditing\",\"computer\":\"DC-01.corp.local\",\"timestamp\":\"2026-08-18T11:00:00Z\",\"event_data\":{\"TargetUserName\":\"alice\",\"TargetDomainName\":\"CORP\",\"TargetUserSid\":\"S-1-5-21-1-2-3-1001\",\"TargetLogonId\":\"0x3e7abc\",\"LogonType\":\"10\",\"IpAddress\":\"10.2.3.4\",\"IpPort\":\"49152\",\"WorkstationName\":\"WKS-09\"}}"
+    expect:
+      "class_uid": 3002
+      "metadata.uid": "25d863b1c0098ba565cc4564709e98f8beb9705d00f2eaa51339ccf3bd72bb1a"
+      "metadata.original_event_uid": "<missing>"
+  # NAN-3702: unparseable record (error branch).
+  - raw: "<Event xmlns=not-json/>"
+    expect:
+      "metadata.log_level": "error"
+      "metadata.uid": "e5591ec6df8f7d202c9cc670f84216a0db177d70d3d56a26835322e8f52490f1"

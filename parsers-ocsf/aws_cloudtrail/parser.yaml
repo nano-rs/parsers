@@ -1,6 +1,6 @@
 name: aws_cloudtrail_ocsf
 display_name: AWS CloudTrail (OCSF)
-version: "1.0.0"
+version: "1.1.0"
 description: >
   Parses AWS CloudTrail management events into complete OCSF 1.8.0
   "API Activity" (class_uid 6003) records. The whole OCSF object is emitted on
@@ -29,7 +29,9 @@ parser_vrl: |
           "message": raw_log,
           "metadata": {
               "version": "1.8.0",
-              "uid": uuid_v4(),
+              # NAN-3702: deterministic, so a redelivered unparseable record
+              # dedupes in the lake instead of landing as a second row.
+              "uid": sha2("aws_cloudtrail|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "product": { "name": "AWS CloudTrail", "vendor_name": "Amazon" }
           }
@@ -96,6 +98,14 @@ parser_vrl: |
 
       mfa = if is_boolean(nano.mfaAuthenticated) { bool(nano.mfaAuthenticated) ?? false } else { false }
 
+      # NAN-3702: the lake drops a row whose (event hour, metadata.uid) it has
+      # already stored, so the uid must be the same every time the same record
+      # arrives (S3/SQS redelivery, Pub/Sub retry, overlapping pulls). eventID
+      # stays the uid when present, unchanged; a record without one (or with an
+      # empty one) hashes its raw body, which a redelivery repeats byte for byte.
+      event_uid = string(p.eventID) ?? ""
+      if event_uid == "" { event_uid = sha2("aws_cloudtrail|raw|" + raw_log, variant: "SHA-256") }
+
       ocsf = {
           "class_uid": class_uid,
           "class_name": "API Activity",
@@ -112,7 +122,7 @@ parser_vrl: |
           "message": raw_log,
           "metadata": {
               "version": "1.8.0",
-              "uid": string(p.eventID) ?? uuid_v4(),
+              "uid": event_uid,
               "log_name": "CloudTrail",
               "log_provider": "AWS CloudTrail",
               "correlation_uid": string(p.requestID) ?? "",
@@ -157,3 +167,24 @@ parser_vrl: |
 
       . = ocsf
   }
+samples:
+  # NAN-3702: eventID stays the uid when present, so existing uids do not move.
+  - raw: "{\"eventVersion\":\"1.08\",\"eventID\":\"3f1c2a4e-8d4b-4c59-9a1e-0f6b7c8d9e01\",\"eventTime\":\"2026-09-28T17:00:00Z\",\"eventSource\":\"secretsmanager.amazonaws.com\",\"eventName\":\"CreateSecret\",\"awsRegion\":\"us-east-1\",\"sourceIPAddress\":\"10.0.1.10\",\"userAgent\":\"aws-cli/2.15\",\"readOnly\":false,\"recipientAccountId\":\"456789012345\",\"requestID\":\"req-1\",\"eventType\":\"AwsApiCall\",\"userIdentity\":{\"type\":\"AssumedRole\",\"principalId\":\"AROAEXAMPLE:session-1\",\"arn\":\"arn:aws:sts::456789012345:assumed-role/app/session-1\",\"accountId\":\"456789012345\"}}"
+    expect:
+      "class_uid": 6003
+      "metadata.uid": "3f1c2a4e-8d4b-4c59-9a1e-0f6b7c8d9e01"
+  # NAN-3702: no eventID: the raw record is hashed.
+  - raw: "{\"eventVersion\":\"1.08\",\"eventTime\":\"2026-09-28T17:00:00Z\",\"eventSource\":\"secretsmanager.amazonaws.com\",\"eventName\":\"CreateSecret\",\"awsRegion\":\"us-east-1\",\"sourceIPAddress\":\"10.0.1.10\",\"userAgent\":\"aws-cli/2.15\",\"readOnly\":false,\"recipientAccountId\":\"456789012345\",\"requestID\":\"req-1\",\"eventType\":\"AwsApiCall\",\"userIdentity\":{\"type\":\"AssumedRole\",\"principalId\":\"AROAEXAMPLE:session-1\",\"arn\":\"arn:aws:sts::456789012345:assumed-role/app/session-1\",\"accountId\":\"456789012345\"}}"
+    expect:
+      "class_uid": 6003
+      "metadata.uid": "06cc283969029b80dbdee5ed61387867fc0734862e5a9e58f10e06a58b86f456"
+  # NAN-3702: empty eventID counts as missing: the raw record is hashed.
+  - raw: "{\"eventVersion\":\"1.08\",\"eventID\":\"\",\"eventTime\":\"2026-09-28T17:00:00Z\",\"eventSource\":\"secretsmanager.amazonaws.com\",\"eventName\":\"CreateSecret\",\"awsRegion\":\"us-east-1\",\"sourceIPAddress\":\"10.0.1.10\",\"userAgent\":\"aws-cli/2.15\",\"readOnly\":false,\"recipientAccountId\":\"456789012345\",\"requestID\":\"req-1\",\"eventType\":\"AwsApiCall\",\"userIdentity\":{\"type\":\"AssumedRole\",\"principalId\":\"AROAEXAMPLE:session-1\",\"arn\":\"arn:aws:sts::456789012345:assumed-role/app/session-1\",\"accountId\":\"456789012345\"}}"
+    expect:
+      "class_uid": 6003
+      "metadata.uid": "8707073894de6de9772aecf121b6a55cd22ec2145280b402299e764bfc4d2c2c"
+  # NAN-3702: unparseable record (error branch).
+  - raw: "not json at all"
+    expect:
+      "metadata.log_level": "error"
+      "metadata.uid": "58351a9c5d9ceedc418d3c559220e83bb5f573f63120432664543d2c06616225"

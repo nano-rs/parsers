@@ -1,6 +1,6 @@
 name: opentelemetry_logs_ocsf
 display_name: OpenTelemetry Logs (OCSF)
-version: "1.0.0"
+version: "1.1.0"
 description: >
   Parses OpenTelemetry LogRecords (the OTLP/HTTP `/v1/logs` lane, source type
   `otlp_log`) into OCSF 1.9.0 "API Activity" (class_uid 6003) with the OCSF
@@ -199,6 +199,34 @@ parser_vrl: |
   # Same contract as `actor`: at least one identifying attribute is REQUIRED.
   if src_endpoint == {} { src_endpoint = {"svc_name": "unknown"} }
 
+  # ---- metadata.uid (NAN-3702) ----
+  # The lake drops a row whose (event hour, metadata.uid) it already stored, so
+  # an OTLP retry of the same LogRecord must map to the same uid. This lane gets
+  # a structured event, not a raw line, so the identity is the LogRecord itself:
+  # body, severity, trace context, flags, scope, resource + log attributes and
+  # the record's own time. Pipeline plumbing (routing_timestamp, observed time,
+  # ext) is left out because it is stamped per delivery.
+  # With NO record time the content alone cannot tell a retry from a second,
+  # identical log line in the same hour (a periodic "heartbeat ok"), and the
+  # only clock left is ingest time, so that case keeps a random uid: a retry
+  # there may duplicate, but distinct records are never collapsed.
+  otlp_uid = uuid_v4()
+  if time_from_record {
+      otlp_identity = {
+          "body": body,
+          "time_ms": time_ms,
+          "severity": sev_text,
+          "severity_number": sev_num,
+          "trace_id": trace_uid,
+          "span_id": span_uid,
+          "flags": .flags,
+          "scope": .scope,
+          "resources": resources,
+          "attributes": attributes
+      }
+      otlp_uid = sha2("opentelemetry_logs|" + encode_json(otlp_identity), variant: "SHA-256")
+  }
+
   # ---- assemble the OCSF record on the root ----
   . = {
       "class_uid": 6003,
@@ -217,7 +245,7 @@ parser_vrl: |
       "message": body,
       "metadata": {
           "version": "1.9.0",
-          "uid": uuid_v4(),
+          "uid": otlp_uid,
           # REQUIRED for the `trace` object to be admitted. OCSF binds `trace` to
           # the "trace" profile, and the strict admission validator
           # (nanosiem-core/src/parsers/ocsf_validation.rs, `attribute_allowed`)
