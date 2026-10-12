@@ -20,8 +20,10 @@
 #   - class_uid is a real, NON-DEPRECATED class in that OCSF version
 #     (1.9 deprecated 3001 Account Change and 3005 User Access Management in
 #      favour of 3007 User Management / 3006 Group Management)
-#   - every OCSF path written is promoted (queryable) or under `unmapped.*`;
-#     anything else is reported as silently unqueryable
+#   - every path written is a canonical OCSF 1.9 attribute of the event's class
+#     or sits under `unmapped.*`; anything else is reported, because nano search
+#     refuses non-canonical paths (the lean lake stores and serves every
+#     canonical one, indexed or not)
 #
 # Samples live BESIDE the parser:  parsers-ocsf/<source>/samples/*.json
 # Each file is a raw log line, or a {"message": "<raw line>"} wrapper. Cover
@@ -188,7 +190,7 @@ for parser_file in "${PARSERS[@]}"; do
                 echo "      FAIL $label: [checker] exited $check_rc without a verdict — the sample was NOT validated"
                 parser_failed=1
             fi
-            if echo "$check_out" | grep -q "WARN .*NOT promoted"; then
+            if echo "$check_out" | grep -q "WARN .*written outside OCSF 1.9"; then
                 UNQUERYABLE=$((UNQUERYABLE + 1))
             fi
         fi
@@ -208,7 +210,7 @@ done
 echo ""
 echo "═══════════════════════════════════════"
 echo "Results: $PASS passed, $FAIL failed, $UNVALIDATED unvalidated (no samples)"
-echo "Samples writing non-promoted OCSF paths: $UNQUERYABLE"
+echo "Samples writing non-canonical paths outside unmapped.*: $UNQUERYABLE"
 echo "═══════════════════════════════════════"
 
 # A parser with no samples is not "fine" — it is unproven. Name them so the gap
