@@ -1,19 +1,21 @@
 name: google_workspace_ocsf
 display_name: Google Workspace Audit (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses Google Workspace Admin SDK Reports API activities into complete OCSF
-  1.9.0 records, routed by id.applicationName and the first event name:
+  1.9.0 records, routed by id.applicationName and the primary event name:
     login                              -> Authentication 3002
     admin + user-lifecycle event names -> User Management 3007
     admin + group event names          -> Group Management 3006
     admin (everything else) and token  -> API Activity 6003
     drive                              -> File Hosting Activity 6006
-  One activity carries an `events[]` array; as in the UDM parser the FIRST
-  event drives the mapping and the whole array stays available, so the nano row
-  count still matches the Google audit-record count.
+  One activity carries an `events[]` array; the PRIMARY event (the one whose
+  parameters carry `primary_event: true`) drives the mapping, falling back to
+  `events[0]` when no event is flagged. Every event name is listed, comma-joined
+  in order, in `unmapped.event_names`, and the whole array stays available, so
+  the nano row count still matches the Google audit-record count.
   `events[].parameters[]` is flattened into `unmapped.params` with dots in
   parameter names replaced by underscores — dotted keys under `unmapped` wedge
   lake publication.
@@ -86,15 +88,37 @@ parser_vrl: |
           }
       }
 
-      # ---- first event + flattened parameters ----
+      # ---- primary event + flattened parameters ----
+      # One activity often carries several events (a Drive upload arrives as
+      # edit, upload, change_user_access, change_acl_editors, add_to_folder).
+      # Google flags the one the user actually performed with the parameter
+      # primary_event=true; it drives the mapping. With no primary flag (or a
+      # single event) events[0] does, as before. Every event name stays
+      # visible in unmapped.event_names.
       events_arr = array(p.events) ?? []
-      first = {}
-      if length(events_arr) > 0 { first = object(events_arr[0]) ?? {} }
-      event_name = string(first.name) ?? ""
-      event_kind = string(first.type) ?? ""
+      chosen = {}
+      if length(events_arr) > 0 { chosen = object(events_arr[0]) ?? {} }
+      have_primary = false
+      event_names = []
+      for_each(events_arr) -> |_ei, ev| {
+          eo = object(ev) ?? {}
+          ev_name = string(eo.name) ?? ""
+          if ev_name != "" { event_names = push(event_names, ev_name) }
+          if !have_primary {
+              for_each(array(eo.parameters) ?? []) -> |_pi, eprm| {
+                  epo = object(eprm) ?? {}
+                  if (string(epo.name) ?? "") == "primary_event" && downcase(to_string(epo.boolValue) ?? "") == "true" {
+                      have_primary = true
+                  }
+              }
+              if have_primary { chosen = eo }
+          }
+      }
+      event_name = string(chosen.name) ?? ""
+      event_kind = string(chosen.type) ?? ""
 
       params = {}
-      for_each(array(first.parameters) ?? []) -> |_i, prm| {
+      for_each(array(chosen.parameters) ?? []) -> |_i, prm| {
           po = object(prm) ?? {}
           pname = to_string(po.name) ?? ""
           if pname != "" {
@@ -259,7 +283,7 @@ parser_vrl: |
           if en == "untrash" { activity_id = 8; activity_name = "Restore" }
           if en == "preview" { activity_id = 9; activity_name = "Preview" }
           if en == "view" { activity_id = 14; activity_name = "Open" }
-          if starts_with(en, "change_user_access") || starts_with(en, "change_document_access") || starts_with(en, "change_acl_editors") || en == "add_to_shared_drive" { activity_id = 12; activity_name = "Share" }
+          if starts_with(en, "change_user_access") || starts_with(en, "change_document_access") || starts_with(en, "change_document_visibility") || starts_with(en, "change_acl_editors") || en == "add_to_shared_drive" { activity_id = 12; activity_name = "Share" }
           if starts_with(en, "sheets_import_range") { activity_id = 15; activity_name = "Sync" }
 
           ocsf.class_uid = 6006
@@ -374,6 +398,7 @@ parser_vrl: |
           if v != "" { unmapped = set!(unmapped, [k], v) }
       }
       unmapped = set!(unmapped, ["event_count"], length(events_arr))
+      if length(event_names) > 0 { unmapped = set!(unmapped, ["event_names"], join!(event_names, ",")) }
       if length(params) > 0 { unmapped = set!(unmapped, ["params"], params) }
       if length(events_arr) > 1 { unmapped = set!(unmapped, ["events_json"], encode_json(events_arr)) }
       ocsf.unmapped = unmapped
@@ -405,7 +430,7 @@ parser_vrl: |
   # id.time: Successful ISO timestamp conversion to the selected event clock in milliseconds.
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
   __candidates = ["actor", "actor.applicationInfo", "actor.applicationInfo.applicationName", "actor.applicationInfo.impersonation", "actor.applicationInfo.oauthClientId", "actor.callerType", "actor.email", "actor.profileId", "events", "id", "id.applicationName", "id.customerId", "id.time", "id.uniqueQualifier", "ipAddress", "networkInfo", "networkInfo.regionCode", "networkInfo.subdivisionCode", "ownerDomain"]
-  __preserve = []
+  __preserve = ["event_names"]
   __rules = array!(parse_json!("[{\"source\":\"id.applicationName\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"id.time\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Successful ISO timestamp conversion to the selected event clock in milliseconds.\"}]"))
   __source_flat = flatten(__source_kv)
   for_each(__rules) -> |_index, rule| {
@@ -582,12 +607,51 @@ samples:
       "class_uid": 6006
       "activity_id": 2
       "metadata.version": "1.9.0"
+  # drive_multi_event_no_primary.json
+  - raw: "{\"kind\":\"admin#reports#activity\",\"id\":{\"time\":\"2026-08-18T18:25:30.000Z\",\"uniqueQualifier\":\"-1234567890123456780\",\"applicationName\":\"drive\",\"customerId\":\"C01ab2cd3\"},\"actor\":{\"email\":\"jane.doe@example.com\",\"profileId\":\"114511223344556677889\"},\"ipAddress\":\"203.0.113.55\",\"networkInfo\":{\"regionCode\":\"US\"},\"events\":[{\"type\":\"access\",\"name\":\"edit\",\"parameters\":[{\"name\":\"doc_id\",\"value\":\"1SyNtHeTiCdOcIdUpLoAd0000000\"},{\"name\":\"doc_type\",\"value\":\"pdf\"},{\"name\":\"doc_title\",\"value\":\"Synthetic Quarterly Report.pdf\"},{\"name\":\"owner\",\"value\":\"jane.doe@example.com\"},{\"name\":\"visibility\",\"value\":\"private\"}]},{\"type\":\"access\",\"name\":\"rename\",\"parameters\":[{\"name\":\"old_value\",\"multiValue\":[\"Draft Report.pdf\"]},{\"name\":\"new_value\",\"multiValue\":[\"Synthetic Quarterly Report.pdf\"]},{\"name\":\"doc_id\",\"value\":\"1SyNtHeTiCdOcIdUpLoAd0000000\"},{\"name\":\"doc_type\",\"value\":\"pdf\"},{\"name\":\"doc_title\",\"value\":\"Synthetic Quarterly Report.pdf\"},{\"name\":\"owner\",\"value\":\"jane.doe@example.com\"},{\"name\":\"visibility\",\"value\":\"private\"}]}]}"
+    expect:
+      "class_uid": 6006
+      "metadata.version": "1.9.0"
+      "activity_id": 3
+      "activity_name": "Update"
+      "type_uid": 600603
+      "metadata.event_code": "edit"
+      "message": "edit"
+      "unmapped.event_names": "edit,rename"
+      "metadata.uid": "gws|drive|C01ab2cd3|-1234567890123456780|2026-08-18T18:25:30.000Z"
+      "metadata.original_event_uid": "gws|drive|C01ab2cd3|-1234567890123456780|2026-08-18T18:25:30.000Z"
+  # drive_multi_event_upload_primary.json
+  - raw: "{\"kind\":\"admin#reports#activity\",\"id\":{\"time\":\"2026-08-18T18:20:11.401Z\",\"uniqueQualifier\":\"-1134567890123456789\",\"applicationName\":\"drive\",\"customerId\":\"C01ab2cd3\"},\"actor\":{\"email\":\"jane.doe@example.com\",\"profileId\":\"114511223344556677889\"},\"ipAddress\":\"203.0.113.55\",\"networkInfo\":{\"regionCode\":\"US\"},\"events\":[{\"type\":\"access\",\"name\":\"edit\",\"parameters\":[{\"name\":\"primary_event\",\"boolValue\":false},{\"name\":\"doc_id\",\"value\":\"1SyNtHeTiCdOcIdUpLoAd0000000\"},{\"name\":\"doc_type\",\"value\":\"pdf\"},{\"name\":\"doc_title\",\"value\":\"Synthetic Quarterly Report.pdf\"},{\"name\":\"owner\",\"value\":\"jane.doe@example.com\"},{\"name\":\"visibility\",\"value\":\"private\"}]},{\"type\":\"access\",\"name\":\"upload\",\"parameters\":[{\"name\":\"primary_event\",\"boolValue\":true},{\"name\":\"doc_id\",\"value\":\"1SyNtHeTiCdOcIdUpLoAd0000000\"},{\"name\":\"doc_type\",\"value\":\"pdf\"},{\"name\":\"doc_title\",\"value\":\"Synthetic Quarterly Report.pdf\"},{\"name\":\"owner\",\"value\":\"jane.doe@example.com\"},{\"name\":\"visibility\",\"value\":\"private\"}]},{\"type\":\"acl_change\",\"name\":\"change_user_access\",\"parameters\":[{\"name\":\"target_user\",\"value\":\"bob.smith@example.com\"},{\"name\":\"old_value\",\"multiValue\":[\"none\"]},{\"name\":\"new_value\",\"multiValue\":[\"can_edit\"]},{\"name\":\"doc_id\",\"value\":\"1SyNtHeTiCdOcIdUpLoAd0000000\"},{\"name\":\"doc_type\",\"value\":\"pdf\"},{\"name\":\"doc_title\",\"value\":\"Synthetic Quarterly Report.pdf\"},{\"name\":\"owner\",\"value\":\"jane.doe@example.com\"},{\"name\":\"visibility\",\"value\":\"private\"}]},{\"type\":\"acl_change\",\"name\":\"change_acl_editors\",\"parameters\":[{\"name\":\"old_value\",\"multiValue\":[\"owner_only\"]},{\"name\":\"new_value\",\"multiValue\":[\"owner_and_editors\"]},{\"name\":\"doc_id\",\"value\":\"1SyNtHeTiCdOcIdUpLoAd0000000\"},{\"name\":\"doc_type\",\"value\":\"pdf\"},{\"name\":\"doc_title\",\"value\":\"Synthetic Quarterly Report.pdf\"},{\"name\":\"owner\",\"value\":\"jane.doe@example.com\"},{\"name\":\"visibility\",\"value\":\"private\"}]},{\"type\":\"access\",\"name\":\"add_to_folder\",\"parameters\":[{\"name\":\"destination_folder_id\",\"value\":\"0SyNtHeTiCfOlDeR000000000\"},{\"name\":\"destination_folder_title\",\"value\":\"Synthetic Shared Folder\"},{\"name\":\"doc_id\",\"value\":\"1SyNtHeTiCdOcIdUpLoAd0000000\"},{\"name\":\"doc_type\",\"value\":\"pdf\"},{\"name\":\"doc_title\",\"value\":\"Synthetic Quarterly Report.pdf\"},{\"name\":\"owner\",\"value\":\"jane.doe@example.com\"},{\"name\":\"visibility\",\"value\":\"private\"}]}]}"
+    expect:
+      "class_uid": 6006
+      "metadata.version": "1.9.0"
+      "activity_id": 1
+      "activity_name": "Upload"
+      "type_uid": 600601
+      "metadata.event_code": "upload"
+      "message": "upload"
+      "unmapped.event_names": "edit,upload,change_user_access,change_acl_editors,add_to_folder"
+      "file.uid": "1SyNtHeTiCdOcIdUpLoAd0000000"
+      "file.name": "Synthetic Quarterly Report.pdf"
+      "metadata.uid": "gws|drive|C01ab2cd3|-1134567890123456789|2026-08-18T18:20:11.401Z"
+      "metadata.original_event_uid": "gws|drive|C01ab2cd3|-1134567890123456789|2026-08-18T18:20:11.401Z"
   # drive_share.json
   - raw: "{\"kind\":\"admin#reports#activity\",\"id\":{\"time\":\"2026-08-18T18:15:40.101Z\",\"uniqueQualifier\":\"-1034567890123456789\",\"applicationName\":\"drive\",\"customerId\":\"C01ab2cd3\"},\"actor\":{\"email\":\"jane.doe@example.com\",\"profileId\":\"114511223344556677889\"},\"ipAddress\":\"203.0.113.55\",\"events\":[{\"type\":\"acl_change\",\"name\":\"change_user_access\",\"parameters\":[{\"name\":\"doc_id\",\"value\":\"1AbCdEfGhIjKlMnOpQrStUvWxYz\"},{\"name\":\"doc_type\",\"value\":\"spreadsheet\"},{\"name\":\"doc_title\",\"value\":\"Q3 Customer List\"},{\"name\":\"owner\",\"value\":\"finance@example.com\"},{\"name\":\"target_user\",\"value\":\"external@partner.example\"},{\"name\":\"old_value\",\"multiValue\":[\"none\"]},{\"name\":\"new_value\",\"multiValue\":[\"can_edit\"]}]}]}"
     expect:
       "class_uid": 6006
       "activity_id": 12
       "metadata.version": "1.9.0"
+  # drive_single_event_upload.json
+  - raw: "{\"kind\":\"admin#reports#activity\",\"id\":{\"time\":\"2026-08-18T18:30:05.250Z\",\"uniqueQualifier\":\"-1334567890123456789\",\"applicationName\":\"drive\",\"customerId\":\"C01ab2cd3\"},\"actor\":{\"email\":\"jane.doe@example.com\",\"profileId\":\"114511223344556677889\"},\"ipAddress\":\"203.0.113.55\",\"networkInfo\":{\"regionCode\":\"US\"},\"events\":[{\"type\":\"access\",\"name\":\"upload\",\"parameters\":[{\"name\":\"primary_event\",\"boolValue\":true},{\"name\":\"doc_id\",\"value\":\"1SyNtHeTiCdOcIdUpLoAd0000000\"},{\"name\":\"doc_type\",\"value\":\"pdf\"},{\"name\":\"doc_title\",\"value\":\"Synthetic Quarterly Report.pdf\"},{\"name\":\"owner\",\"value\":\"jane.doe@example.com\"},{\"name\":\"visibility\",\"value\":\"private\"}]}]}"
+    expect:
+      "class_uid": 6006
+      "metadata.version": "1.9.0"
+      "activity_id": 1
+      "activity_name": "Upload"
+      "type_uid": 600601
+      "metadata.event_code": "upload"
+      "unmapped.event_names": "upload"
+      "metadata.uid": "gws|drive|C01ab2cd3|-1334567890123456789|2026-08-18T18:30:05.250Z"
   # login_failure.json
   - raw: "{\"kind\":\"admin#reports#activity\",\"id\":{\"time\":\"2026-08-18T14:07:52.882Z\",\"uniqueQualifier\":\"-2234567890123456789\",\"applicationName\":\"login\",\"customerId\":\"C01ab2cd3\"},\"actor\":{\"email\":\"jane.doe@example.com\",\"profileId\":\"114511223344556677889\"},\"ipAddress\":\"198.51.100.201\",\"networkInfo\":{\"regionCode\":\"NL\"},\"events\":[{\"type\":\"login\",\"name\":\"login_failure\",\"parameters\":[{\"name\":\"login_type\",\"value\":\"google_password\"},{\"name\":\"login_failure_type\",\"value\":\"login_failure_invalid_password\"}]}]}"
     expect:
