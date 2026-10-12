@@ -1,6 +1,6 @@
 name: okta_ocsf
 display_name: Okta (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -54,7 +54,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("okta|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "Okta System Log",
               "log_provider": "Okta",
@@ -327,7 +327,7 @@ parser_vrl: |
       ocsf.raw_data = raw_log
 
       evt_uid = string(p.uuid) ?? ""
-      if evt_uid == "" { evt_uid = uuid_v4() }
+      if evt_uid == "" { evt_uid = sha2("okta|raw|" + raw_log, variant: "SHA-256") }
       meta = {
           "version": "1.9.0",
           "uid": evt_uid,
@@ -683,3 +683,14 @@ samples:
       "class_uid": 6003
       "activity_id": 1
       "api.operation": "application.user_membership.add"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("okta|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "this is not json at all"
+    expect:
+      "metadata.uid": "08677f52effe3ad88280c61a378f4c2be6c48b7d09c5645a11e8a609bc733c15"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("okta|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"published\":\"2026-08-18T14:22:33.451Z\",\"eventType\":\"user.authentication.sso\",\"version\":\"0\",\"severity\":\"INFO\",\"displayMessage\":\"User single sign on to app\",\"actor\":{\"id\":\"00u1a2b3c4d5e6f7g8h9\",\"type\":\"User\",\"alternateId\":\"jane.doe@example.com\",\"displayName\":\"Jane Doe\"},\"client\":{\"userAgent\":{\"rawUserAgent\":\"Mozilla/5.0 (Macintosh) Chrome/126.0.0.0\",\"os\":\"Mac OS X\",\"browser\":\"CHROME\"},\"ipAddress\":\"203.0.113.42\"},\"outcome\":{\"result\":\"SUCCESS\"},\"authenticationContext\":{\"credentialType\":\"SAML\",\"externalSessionId\":\"102Yz1aBcDeFgHiJkLmNoPqRs\"},\"target\":[{\"id\":\"0oa1a2b3c4d5e6f7g8h9\",\"type\":\"AppInstance\",\"alternateId\":\"Salesforce\",\"displayName\":\"Salesforce\"}],\"transaction\":{\"type\":\"WEB\",\"id\":\"FhG5pXqR6s7t8u9v\"}}"
+    expect:
+      "metadata.uid": "b427962f02047c78d97fcca43a63829bcee2c8d385c6f32f79b38aa507f96f07"
+      "metadata.original_event_uid": "b427962f02047c78d97fcca43a63829bcee2c8d385c6f32f79b38aa507f96f07"

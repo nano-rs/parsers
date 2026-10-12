@@ -1,6 +1,6 @@
 name: conduit_proxy_ocsf
 display_name: Conduit MITM Proxy (OCSF)
-version: "2.3.0"
+version: "2.4.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -207,6 +207,12 @@ parser_vrl: |
       if cs != "" { unmapped.cache_status = cs }
       if is_boolean(p.tls_intercepted) { unmapped.tls_intercepted = p.tls_intercepted }
 
+      # NAN-3702: metadata.uid is deterministic so a redelivered record dedupes
+      # in the lake. Conduit's own `id` stays the uid when present (unchanged);
+      # without one (or with an empty one) the raw body is hashed.
+      conduit_uid = string(p.id) ?? ""
+      if conduit_uid == "" { conduit_uid = sha2("conduit_proxy|raw|" + raw_log, variant: "SHA-256") }
+
       . = {
           "class_uid": class_uid,
           "class_name": "HTTP Activity",
@@ -236,7 +242,7 @@ parser_vrl: |
               # "host" unlocks `actor`; "security_control" unlocks
               # action/disposition/risk_*/is_alert/firewall_rule.
               "profiles": ["host", "security_control"],
-              "uid": string(p.id) ?? uuid_v4(),
+              "uid": conduit_uid,
               "log_name": "conduit-proxy",
               "product": {
                   "name": "Conduit Proxy",
@@ -289,7 +295,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("conduit_proxy|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "conduit-proxy",
               "product": {
@@ -485,6 +491,8 @@ samples:
     expect:
       class_uid: 4002
       activity_id: 1
+      # NAN-3702: Conduit's own id stays the uid when present.
+      metadata.uid: "01J8ZR"
   - raw: '{"id":"01J8ZQ","timestamp":"2026-08-12T09:15:22.123456789Z","client_ip":"10.10.4.31","username":"bsmith","method":"GET","scheme":"https","host":"malware-cdn.example","port":443,"path":"/payload.bin","full_url":"https://malware-cdn.example/payload.bin","status_code":403,"request_bytes":812,"response_bytes":0,"duration_ms":14,"upstream_addr":"198.51.100.77:443","content_type":"application/octet-stream","cache_status":"MISS","auth_method":"ntlm","tls_intercepted":true,"action":"block","category":"malware","threat_score":0.93,"threat_tier":"tier4","threat_blocked":true,"rule_id":"RULE-118","threat_signals":[{"name":"dga_entropy","score":0.81,"tier":"tier3"},{"name":"newly_seen_domain","score":0.95,"tier":"tier4"}]}'
     expect:
       class_uid: 4002
@@ -502,3 +510,13 @@ samples:
     expect:
       "traffic.bytes_in": 15320
       "traffic.bytes_out": 420
+  # NAN-3702 (natural id removed): metadata.uid is sha256("conduit_proxy|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"timestamp\":\"2026-08-12T09:15:25.000000000Z\",\"client_ip\":\"10.10.4.32\",\"method\":\"CONNECT\",\"scheme\":\"https\",\"host\":\"api.github.com\",\"port\":443,\"path\":\"/\",\"full_url\":\"https://api.github.com/\",\"status_code\":200,\"request_bytes\":420,\"response_bytes\":15320,\"duration_ms\":88,\"action\":\"allow\",\"threat_score\":0.02,\"threat_tier\":\"tier0\",\"threat_blocked\":false,\"threat_signals\":[]}"
+    expect:
+      "metadata.uid": "5f29ca551a610220ae4d27b83c5096b749135119cb05a78be579407fb5e01012"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("conduit_proxy|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "2026-08-12T09:15:30Z conduit-proxy INFO reload complete, 4 workers"
+    expect:
+      "metadata.uid": "569e40aadeb8695f656e7a0614a5c6cbde21c7110880f3d714b0e49fb908f7a2"

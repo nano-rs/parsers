@@ -1,6 +1,6 @@
 name: slack_access_ocsf
 display_name: Slack Access Logs (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -50,7 +50,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("slack_access|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "Slack Access Logs",
               "log_provider": "Slack",
@@ -343,3 +343,8 @@ samples:
       "class_uid": 3002
       "activity_id": 1
       "metadata.version": "1.9.0"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("slack_access|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "slack access not json"
+    expect:
+      "metadata.uid": "4af6414774a7c8959f43f98f1f41b131f806a90bef173788c24c8b59426da0d6"

@@ -1,6 +1,6 @@
 name: qualys_ocsf
 display_name: Qualys (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -189,7 +189,7 @@ parser_vrl: |
   }
 
   if ok && shape != "unknown" {
-      if finding_uid == "" { finding_uid = uuid_v4() }
+      if finding_uid == "" { finding_uid = sha2("qualys|raw|" + raw_log, variant: "SHA-256") }
       if title == "" { title = "Qualys finding " + finding_uid }
 
       finding_info = { "uid": finding_uid, "title": title, "data_sources": ["qualys"] }
@@ -213,7 +213,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("qualys|raw|" + raw_log, variant: "SHA-256"),
               "log_name": "qualys-" + shape,
               "product": { "name": "VMDR", "vendor_name": "Qualys" }
           },
@@ -290,7 +290,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("qualys|raw|" + raw_log, variant: "SHA-256"),
               "log_name": "qualys",
               "product": { "name": "VMDR", "vendor_name": "Qualys" }
           }
@@ -498,3 +498,19 @@ samples:
     expect:
       class_uid: 2004
       activity_id: 1
+  # NAN-3702 (natural id removed): metadata.uid is sha256("qualys|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"IP\":\"10.90.4.21\",\"DNS\":\"web01.corp.example\",\"NETBIOS\":\"WEB01\",\"OS\":\"Red Hat Enterprise Linux 9\",\"TRACKING_METHOD\":\"IP\",\"LAST_SCAN_DATETIME\":\"2026-08-12T09:00:00Z\",\"DETECTION_LIST\":[{\"TYPE\":\"Confirmed\",\"SEVERITY\":\"4\",\"PORT\":\"443\",\"PROTOCOL\":\"tcp\",\"STATUS\":\"Active\",\"RESULTS\":\"TLSv1.0 supported\",\"FIRST_FOUND_DATETIME\":\"2026-06-01T00:00:00Z\",\"LAST_FOUND_DATETIME\":\"2026-08-12T09:00:00Z\",\"TIMES_FOUND\":\"11\"}]}"
+    expect:
+      "metadata.uid": "3bf720f76dcbac346f5650eb51bc015ae9c4a7067a779038c2d6cddf5fb443bb"
+      "finding_info.uid": "3bf720f76dcbac346f5650eb51bc015ae9c4a7067a779038c2d6cddf5fb443bb"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("qualys|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"controlId\":\"1234\",\"title\":\"Ensure SSH root login is disabled\",\"policyName\":\"CIS RHEL9 Benchmark\",\"status\":\"FAIL\",\"severity\":\"High\",\"hostIp\":\"10.90.4.22\",\"hostName\":\"db01.corp.example\",\"os\":\"Red Hat Enterprise Linux 9\",\"technology\":\"OpenSSH\",\"rationale\":\"Direct root login weakens accountability\",\"evidence\":\"PermitRootLogin yes\",\"lastEvaluated\":\"2026-08-12T08:00:00Z\"}"
+    expect:
+      "metadata.uid": "76d61aaf803827efe4c3d553289ae2d1d9f16e7ad12dbc5273d907ea4aba3f72"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("qualys|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"TITLE\":\"Microsoft Windows Remote Code Execution Vulnerability\",\"VULN_TYPE\":\"Vulnerability\",\"SEVERITY\":\"5\",\"CATEGORY\":\"Windows\",\"CVSS_BASE\":\"9.8\",\"CVSS_V3_BASE\":\"9.8\",\"CVE_LIST\":[\"CVE-2026-1234\",\"CVE-2026-1235\"],\"SOLUTION\":\"Apply the vendor patch KB5051234.\",\"CONSEQUENCE\":\"Remote code execution\",\"DISCOVERY_METHOD\":\"Remote\",\"PATCHABLE\":\"1\",\"PUBLISHED_DATETIME\":\"2026-07-14T00:00:00Z\"}"
+    expect:
+      "metadata.uid": "2c8df54a1ff343d3d60f289f1f52f0db472068d04aad590d3bdf5ab65674466c"

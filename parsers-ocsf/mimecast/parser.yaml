@@ -1,6 +1,6 @@
 name: mimecast_ocsf
 display_name: Mimecast (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -47,7 +47,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("mimecast|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "Mimecast Email Security",
               "log_provider": "Mimecast",
@@ -288,13 +288,20 @@ parser_vrl: |
       ocsf.message = msg
       ocsf.raw_data = raw_log
 
-      evt_uid = string(p.MsgId) ?? string(p.messageId) ?? ""
-      if evt_uid == "" { evt_uid = uuid_v4() }
+      # NAN-3702: metadata.uid is the lake's dedup key. MsgId names the MESSAGE,
+      # and one message yields several events (receipt, delivery, URL / attachment
+      # protection), so keying on it kept only the first. Mimecast has no per-event
+      # id, so the uid hashes the raw record (a redelivery repeats it byte for
+      # byte); MsgId stays the original/correlation id.
+      msg_uid = string(p.MsgId) ?? string(p.messageId) ?? ""
+      evt_uid = sha2("mimecast|raw|" + raw_log, variant: "SHA-256")
+      orig_uid = msg_uid
+      if orig_uid == "" { orig_uid = evt_uid }
       ocsf.metadata = {
           "version": "1.9.0",
           "profiles": profiles,
           "uid": evt_uid,
-          "original_event_uid": evt_uid,
+          "original_event_uid": orig_uid,
           "event_code": event_type,
           "log_name": "Mimecast Email Security",
           "log_provider": "Mimecast",
@@ -561,3 +568,13 @@ samples:
       "class_uid": 4009
       "activity_id": 3
       "metadata.version": "1.9.0"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("mimecast|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "mimecast not json"
+    expect:
+      "metadata.uid": "b9fcb557bfd7bbbd68591e5eaca79f0b3953947f283052a3f93d0951764a4bde"
+  # NAN-3702 (existing sample): metadata.uid is sha256("mimecast|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"type\":\"attachment_protect\",\"datetime\":\"2026-08-18T12:41:19+0000\",\"acc\":\"C1A2B3\",\"fileName\":\"payroll.doc\",\"fileHash\":\"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\",\"fileExt\":\"doc\",\"result\":\"malicious\",\"actionTriggered\":\"Hold for review\",\"details\":\"Macro detected: AutoOpen\",\"definition\":\"Default Attachment Protect\",\"senderAddress\":\"attacker@evil.example\",\"recipientAddress\":\"bob.smith@example.com\",\"subject\":\"Payroll update\",\"messageId\":\"<CA+evil999@mail.evil.example>\",\"route\":\"inbound\"}"
+    expect:
+      "metadata.uid": "792d51bbe10f41ddab36a23c87169bdac5bddb9407c60dc40faaef0a285a0786"

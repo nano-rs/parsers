@@ -1,6 +1,6 @@
 name: azure_firewall_ocsf
 display_name: Azure Firewall (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -44,7 +44,7 @@ parser_vrl: |
           "metadata": {
               "version": "1.9.0",
               "profiles": ["cloud", "security_control"],
-              "uid": uuid_v4(),
+              "uid": sha2("azure_firewall|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "AzureFirewall",
               "product": { "name": "Azure Firewall", "vendor_name": "Microsoft" }
@@ -147,7 +147,7 @@ parser_vrl: |
       metadata = {
           "version": "1.9.0",
           "profiles": ["cloud", "security_control"],
-          "uid": uuid_v4(),
+          "uid": sha2("azure_firewall|raw|" + raw_log, variant: "SHA-256"),
           "log_name": "AzureFirewall",
           "log_provider": "Azure Firewall",
           "product": { "name": "Azure Firewall", "vendor_name": "Microsoft" }
@@ -524,3 +524,15 @@ parser_vrl: |
   if !is_empty(__residual) { .unmapped = __residual }
   .
   # END NAN-2421 residual spill
+
+samples:
+  # NAN-3702 (unparseable record, error branch): metadata.uid is sha256("azure_firewall|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "NAN-3702 determinism probe: not a azure_firewall record"
+    expect:
+      "metadata.uid": "144f9fbd3d1b5ba1381f2f361ba57fa33b32116fae9fb3936ead7338b9e366b8"
+  # NAN-3702 (existing sample): metadata.uid is sha256("azure_firewall|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"time\": \"2026-08-18T20:01:00.0000000Z\", \"category\": \"AzureFirewallApplicationRule\", \"resourceId\": \"/SUBSCRIPTIONS/AAAA-BBBB/RESOURCEGROUPS/RG/PROVIDERS/MICROSOFT.NETWORK/AZUREFIREWALLS/FW1\", \"operationName\": \"AzureFirewallApplicationRuleLog\", \"properties\": {\"SourceIP\": \"10.0.0.4\", \"SourcePort\": 51235, \"Protocol\": \"HTTPS\", \"Fqdn\": \"www.example.com\", \"TargetUrl\": \"www.example.com/path/page.html\", \"Action\": \"Deny\", \"Rule\": \"BlockSocial\", \"RuleCollection\": \"Coll2\", \"Policy\": \"Pol1\", \"DestinationPort\": 443, \"WebCategory\": \"SocialNetworking\"}}"
+    expect:
+      "metadata.uid": "e2fc5ac7b9f251d0fb343bcc03644625ea32244b01c95aa9796510a55bda9d89"

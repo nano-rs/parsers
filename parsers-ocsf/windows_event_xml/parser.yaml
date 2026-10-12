@@ -1,6 +1,6 @@
 name: windows_event_xml_ocsf
 display_name: Windows Event Log (XML, OCSF)
-version: "1.1.0"
+version: "1.2.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses Windows Event Log records in NATIVE XML (WEF, EVTX export, wevtutil)
@@ -60,7 +60,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("windows_event_xml|raw|" + raw_log, variant: "SHA-256"),
               "log_name": "Security",
               "log_provider": "Microsoft-Windows-Security-Auditing",
               "event_code": "unparsed",
@@ -557,7 +557,7 @@ parser_vrl: |
       if record_id != "" && computer != "" && ts_str != "" {
           record_uid = join!(["windows_event_xml", computer, downcase(channel), downcase(provider), record_id, ts_str], "|")
       }
-      if record_uid == "" { record_uid = uuid_v4() }
+      if record_uid == "" { record_uid = sha2("windows_event_xml|raw|" + raw_log, variant: "SHA-256") }
 
       md = {
           "version": "1.9.0",
@@ -754,3 +754,16 @@ parser_vrl: |
   if !is_empty(__residual) { .unmapped = __residual }
   .
   # END NAN-2421 residual spill
+
+samples:
+  # NAN-3702 (existing sample): metadata.uid is sha256("windows_event_xml|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "<Event><System><EventID>4624</EventID></Syste"
+    expect:
+      "metadata.uid": "8870c3b8285def6da97e8f8a738dff94a6b2ca379fe9b8643957a78cb1f36a10"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("windows_event_xml|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Eventlog\" Guid=\"{54849625-5478-4994-A5BA-3E3B0328C30D}\"/><EventID>1102</EventID><Version>2</Version><Level>0</Level><Task>12544</Task><Opcode>0</Opcode><Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:00:00.1234567Z\"/><Correlation/><Execution ProcessID=\"4\" ThreadID=\"8\"/><Channel>Security</Channel><Computer>DC01.corp.example</Computer><Security/></System><UserData><LogFileCleared xmlns=\"http://manifests.microsoft.com/win/2004/08/windows/eventlog\"><SubjectUserSid>S-1-5-21-100-500</SubjectUserSid><SubjectUserName>administrator</SubjectUserName><SubjectDomainName>CORP</SubjectDomainName><SubjectLogonId>0x3e7</SubjectLogonId></LogFileCleared></UserData></Event>"
+    expect:
+      "metadata.uid": "8c5fa2ef3933ad1597378c583f0bd5e1bf8d90ccd8a90d90a0ef535ff2e5eda3"
+      "metadata.original_event_uid": "8c5fa2ef3933ad1597378c583f0bd5e1bf8d90ccd8a90d90a0ef535ff2e5eda3"

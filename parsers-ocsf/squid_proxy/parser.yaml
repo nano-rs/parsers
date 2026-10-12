@@ -1,6 +1,6 @@
 name: squid_proxy_ocsf
 display_name: Squid Proxy (OCSF)
-version: "1.2.0"
+version: "1.3.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -190,7 +190,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("squid_proxy|raw|" + raw_log, variant: "SHA-256"),
               "profiles": ["host", "security_control"],
               "log_name": "squid-access",
               "product": { "name": "Squid Proxy", "vendor_name": "Squid Project" }
@@ -230,7 +230,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("squid_proxy|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "squid-access",
               "product": { "name": "Squid Proxy", "vendor_name": "Squid Project" }
@@ -435,3 +435,13 @@ samples:
     expect:
       "traffic.bytes_in": 48210
       "traffic.bytes_out": "<missing>"
+  # NAN-3702 (existing sample): metadata.uid is sha256("squid_proxy|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "1786000530.881 5012 10.20.1.56 TCP_TUNNEL/200 48210 CONNECT secure.example.org:443 - HIER_DIRECT/203.0.113.20 -"
+    expect:
+      "metadata.uid": "0288c8d148e38f6e8a0ad434f04638ee9708940866b5e5006ac04f1e60e181e7"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("squid_proxy|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "1786000541.002 0 10.20.1.99 TCP_DENIED/403"
+    expect:
+      "metadata.uid": "3501539939d4b3bcc5483f977c16731308b7d7cf2cb47800ee56db811e5ba80d"

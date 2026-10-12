@@ -1,6 +1,6 @@
 name: aws_cloudtrail_ocsf
 display_name: AWS CloudTrail (OCSF)
-version: "1.3.0"
+version: "1.4.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -35,7 +35,9 @@ parser_vrl: |
           "metadata": {
               "version": "1.9.0",
               "profiles": ["cloud"],
-              "uid": uuid_v4(),
+              # NAN-3702: deterministic, so a redelivered unparseable record
+              # dedupes in the lake instead of landing as a second row.
+              "uid": sha2("aws_cloudtrail|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "product": { "name": "AWS CloudTrail", "vendor_name": "Amazon" }
           },
@@ -142,6 +144,14 @@ parser_vrl: |
           if mfa_attr == "false" || (mfa_attr == "" && mfa_used == "no") { mfa = false }
       }
 
+      # NAN-3702: the lake drops a row whose (event hour, metadata.uid) it has
+      # already stored, so the uid must be the same every time the same record
+      # arrives (S3/SQS redelivery, Pub/Sub retry, overlapping pulls). eventID
+      # stays the uid when present, unchanged; a record without one (or with an
+      # empty one) hashes its raw body, which a redelivery repeats byte for byte.
+      event_uid = string(p.eventID) ?? ""
+      if event_uid == "" { event_uid = sha2("aws_cloudtrail|raw|" + raw_log, variant: "SHA-256") }
+
       ocsf = {
           "class_uid": class_uid,
           "class_name": "API Activity",
@@ -159,7 +169,7 @@ parser_vrl: |
           "metadata": {
               "version": "1.9.0",
               "profiles": ["cloud"],
-              "uid": string(p.eventID) ?? uuid_v4(),
+              "uid": event_uid,
               "log_name": "CloudTrail",
               "log_provider": "AWS CloudTrail",
               "correlation_uid": string(p.requestID) ?? "",
@@ -413,6 +423,8 @@ samples:
       "actor.user.type": "AssumedRole"
       "api.operation": "CreateSecret"
       "api.request.uid": "req-assumed-1"
+      # NAN-3702: eventID stays the uid when present, so existing uids do not move.
+      "metadata.uid": "evt-assumed-1"
       "cloud.account.uid": "456789012345"
       "cloud.account.name": "<missing>"
       "actor.session.is_mfa": true
@@ -430,3 +442,13 @@ samples:
       "activity_id": 2
       "actor.user.name": "cloudtrail.amazonaws.com"
       "src_endpoint.hostname": "cloudtrail.amazonaws.com"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("aws_cloudtrail|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "not json at all"
+    expect:
+      "metadata.uid": "58351a9c5d9ceedc418d3c559220e83bb5f573f63120432664543d2c06616225"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("aws_cloudtrail|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"eventVersion\":\"1.09\",\"eventTime\":\"2026-09-28T17:00:00Z\",\"eventSource\":\"secretsmanager.amazonaws.com\",\"eventName\":\"CreateSecret\",\"awsRegion\":\"us-east-1\",\"sourceIPAddress\":\"10.0.1.10\",\"userAgent\":\"aws-cli/2.15\",\"readOnly\":false,\"recipientAccountId\":\"456789012345\",\"requestID\":\"req-assumed-1\",\"eventType\":\"AwsApiCall\",\"managementEvent\":true,\"eventCategory\":\"Management\",\"requestParameters\":{\"name\":\"prod/db\"},\"responseElements\":null,\"userIdentity\":{\"type\":\"AssumedRole\",\"principalId\":\"AROAEXAMPLE:session-1\",\"arn\":\"arn:aws:sts::456789012345:assumed-role/eks-node-role/session-1\",\"accountId\":\"456789012345\",\"accessKeyId\":\"ASIAEXAMPLE\",\"sessionContext\":{\"sessionIssuer\":{\"type\":\"Role\",\"principalId\":\"AROAEXAMPLE\",\"arn\":\"arn:aws:iam::456789012345:role/eks-node-role\",\"accountId\":\"456789012345\",\"userName\":\"eks-node-role\"},\"attributes\":{\"creationDate\":\"2026-09-28T13:00:00Z\",\"mfaAuthenticated\":\"true\"}}}}"
+    expect:
+      "metadata.uid": "614bb40efe8b3d8e8ab1f7e55d3ed862313fdb62328c3c84e15c514f79cc4603"

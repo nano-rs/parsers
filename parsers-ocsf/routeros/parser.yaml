@@ -1,6 +1,6 @@
 name: routeros_ocsf
 display_name: MikroTik RouterOS (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -523,7 +523,7 @@ parser_vrl: |
 
   metadata = {
       "version": "1.9.0",
-      "uid": uuid_v4(),
+      "uid": sha2("routeros|raw|" + raw_log, variant: "SHA-256"),
       "log_source": "routeros",
       "log_provider": "RouterOS",
       "profiles": ["host", "security_control"],
@@ -968,3 +968,8 @@ samples:
   expect:
     class_uid: 0
     activity_id: 99
+# NAN-3702 (existing sample): metadata.uid is sha256("routeros|raw|" + raw), so the
+# same record parsed twice gets the same uid (a random uid could never match).
+- raw: "<30>Aug  5 12:00:00 edge-rtr dhcp,info dhcp1 assigned 10.20.0.9 to 00:16:3E:AA:BB:CC"
+  expect:
+    "metadata.uid": "a6b289f38c36805dcee8bdee583beb0a1a623c7147ae1494552ba234087ded78"

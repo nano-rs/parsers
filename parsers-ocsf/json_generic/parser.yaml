@@ -1,6 +1,6 @@
 name: json_generic_ocsf
 display_name: Generic JSON (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -132,7 +132,7 @@ parser_vrl: |
 
   metadata = {
       "version": "1.9.0",
-      "uid": uuid_v4(),
+      "uid": sha2("json_generic|raw|" + raw_log, variant: "SHA-256"),
       "profiles": ["host"],
       "log_name": "json_generic",
       "product": { "name": "JSON Parser", "vendor_name": "nano" }
@@ -500,3 +500,8 @@ samples:
     expect:
       class_uid: 4002
       activity_id: 6
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("json_generic|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"@timestamp\":\"2026-08-12T09:15:30.123Z\",\"level\":\"ERROR\",\"message\":\"failed to write checkpoint\",\"service\":\"ingest-worker\",\"pid\":8811,\"process_name\":\"ingestd\",\"hostname\":\"worker-03\",\"attempt\":4,\"queue_depth\":19233}"
+    expect:
+      "metadata.uid": "9b633bd986c2107b8042abcfac0cce9111572661cab77b4d0f34cb3beca22051"

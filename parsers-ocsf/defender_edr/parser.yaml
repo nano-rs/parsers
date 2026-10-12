@@ -1,6 +1,6 @@
 name: defender_edr_ocsf
 display_name: Microsoft Defender for Endpoint (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses Microsoft Defender for Endpoint (Advanced Hunting JSON) into
@@ -65,7 +65,7 @@ parser_vrl: |
           "metadata": {
               "version": "1.9.0",
               "profiles": ["host"],
-              "uid": uuid_v4(),
+              "uid": sha2("defender_edr|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_source": "defender_edr",
               "product": { "name": "Microsoft Defender for Endpoint", "vendor_name": "Microsoft" }
@@ -182,7 +182,7 @@ parser_vrl: |
 
           finding_uid = to_string(p.AlertId) ?? ""
           if finding_uid == "" { finding_uid = to_string(p.ReportId) ?? "" }
-          if finding_uid == "" { finding_uid = uuid_v4() }
+          if finding_uid == "" { finding_uid = sha2("defender_edr|raw|" + raw_log, variant: "SHA-256") }
           title = to_string(p.Title) ?? ""
           if title == "" { title = to_string(p.ThreatName) ?? "" }
           if title == "" { title = action_type }
@@ -599,7 +599,7 @@ parser_vrl: |
           record_uid = join!(["defender_edr", device_id, report_id, ts_str], "|")
       }
       if record_uid == "" { record_uid = to_string(p.AlertId) ?? "" }
-      if record_uid == "" { record_uid = uuid_v4() }
+      if record_uid == "" { record_uid = sha2("defender_edr|raw|" + raw_log, variant: "SHA-256") }
 
       ocsf.metadata = {
           "version": "1.9.0",
@@ -881,3 +881,15 @@ samples:
       "class_uid": 201002
       "activity_id": 2
       "metadata.version": "1.9.0"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("defender_edr|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "2026-08-18 12:00:00 defender edr plain text line"
+    expect:
+      "metadata.uid": "2c44c5834d7c83b6fdbc2d7366931678463f04414674f6fb48d748161d5daeb0"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("defender_edr|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"Timestamp\":\"2026-08-18T12:00:00.1234567Z\",\"DeviceId\":\"a1b2c3d4e5f6\",\"DeviceName\":\"wks-11.corp.local\",\"ActionType\":\"AntivirusDetection\",\"Title\":\"Suspicious PowerShell command line\",\"Severity\":\"High\",\"Category\":\"Execution\",\"DetectionSource\":\"WindowsDefenderAv\",\"ThreatFamilyName\":\"Trojan:Win32/Emotet\",\"ThreatName\":\"Trojan:Win32/Emotet.A\",\"RemediationAction\":\"Quarantine\",\"AlertState\":\"New\",\"AttackTechniques\":[\"T1059.001 (PowerShell)\",\"T1204 (User Execution)\"],\"FileName\":\"payload.exe\",\"FolderPath\":\"C:\\\\Users\\\\alice\\\\Downloads\",\"SHA256\":\"DEADBEEF\",\"InitiatingProcessId\":4321,\"InitiatingProcessFileName\":\"powershell.exe\",\"InitiatingProcessFolderPath\":\"C:\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\",\"InitiatingProcessCommandLine\":\"powershell.exe -enc SQBFAFgA\",\"InitiatingProcessAccountName\":\"alice\",\"InitiatingProcessAccountDomain\":\"CORP\"}"
+    expect:
+      "metadata.uid": "3b92a349a9cf30f7ec30177c0212b18052b6b9f1de7d727b171cb9d9c84a47c2"
+      "finding_info.uid": "3b92a349a9cf30f7ec30177c0212b18052b6b9f1de7d727b171cb9d9c84a47c2"
+      "metadata.original_event_uid": "3b92a349a9cf30f7ec30177c0212b18052b6b9f1de7d727b171cb9d9c84a47c2"

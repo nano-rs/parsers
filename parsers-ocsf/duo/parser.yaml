@@ -1,6 +1,6 @@
 name: duo_ocsf
 display_name: Duo Security (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -47,7 +47,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("duo|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "Duo Admin API",
               "log_provider": "Duo Security",
@@ -246,7 +246,7 @@ parser_vrl: |
       ocsf.raw_data = raw_log
 
       evt_uid = string(p.txid) ?? ""
-      if evt_uid == "" { evt_uid = uuid_v4() }
+      if evt_uid == "" { evt_uid = sha2("duo|raw|" + raw_log, variant: "SHA-256") }
       event_code = action
       if event_code == "" { event_code = event_type }
       ocsf.metadata = {
@@ -513,3 +513,14 @@ samples:
       "class_uid": 6003
       "activity_id": 99
       "metadata.version": "1.9.0"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("duo|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "duo plain text, not json"
+    expect:
+      "metadata.uid": "b58bbf62b77ecbda3a5abd6cd4a8eb761b0c4af0c60be2cab6877fdfed2060d0"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("duo|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"access_device\":{\"browser\":\"Unknown\",\"hostname\":null,\"ip\":\"198.51.100.201\",\"location\":{\"city\":\"Amsterdam\",\"country\":\"Netherlands\",\"state\":\"North Holland\"},\"os\":\"Unknown\"},\"application\":{\"key\":\"DIY8ZQOFZBLMBHXYZ123\",\"name\":\"Corporate VPN\"},\"auth_device\":{\"ip\":null,\"location\":{},\"name\":\"iPhone (555-0142)\"},\"email\":\"jane.doe@example.com\",\"eventtype\":\"authentication\",\"factor\":\"duo_push\",\"isotimestamp\":\"2026-08-18T14:09:41.000000+00:00\",\"reason\":\"user_marked_fraud\",\"result\":\"fraud\",\"timestamp\":1787062181,\"user\":{\"groups\":[\"VPN Users\"],\"key\":\"DUXYZ123ABC456DEF789\",\"name\":\"jane.doe@example.com\"},\"username\":\"jane.doe@example.com\"}"
+    expect:
+      "metadata.uid": "6849e9a8c272c7624856eb40c63d5c55bfa7cc7ddc54794cfa49fad0b10b3f0d"
+      "metadata.original_event_uid": "6849e9a8c272c7624856eb40c63d5c55bfa7cc7ddc54794cfa49fad0b10b3f0d"

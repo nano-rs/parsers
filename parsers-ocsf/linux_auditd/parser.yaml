@@ -1,6 +1,6 @@
 name: linux_auditd_ocsf
 display_name: Linux Audit Daemon (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses Linux auditd text records into complete OCSF 1.9.0 records,
@@ -90,7 +90,7 @@ parser_vrl: |
           "metadata": {
               "version": "1.9.0",
               "profiles": ["host"],
-              "uid": uuid_v4(),
+              "uid": sha2("linux_auditd|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_source": "linux_auditd",
               "product": { "name": "auditd", "vendor_name": "Linux" }
@@ -520,10 +520,15 @@ parser_vrl: |
       ocsf.severity = severity
       ocsf.time = time_ms
       ocsf.raw_data = raw_log
+      # NAN-3702: metadata.uid is the lake's dedup key, so it must be unique per
+      # RECORD, not per logical event. One auditd event is several lines (SYSCALL,
+      # EXECVE, CWD, PATH...) sharing audit_id; keying on it kept only the first
+      # line and dropped the rest. Hash the raw line instead (a redelivery repeats
+      # it byte for byte); audit_id stays the correlation/original id.
       ocsf.metadata = {
           "version": "1.9.0",
           "profiles": profiles,
-          "uid": audit_id,
+          "uid": sha2("linux_auditd|raw|" + raw_log, variant: "SHA-256"),
           "original_event_uid": audit_id,
           # Every record of one logical auditd event shares this id.
           "correlation_uid": audit_id,
@@ -810,3 +815,13 @@ samples:
       "class_uid": 3002
       "activity_id": 2
       "metadata.version": "1.9.0"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("linux_auditd|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "Aug 18 10:15:00 web-01 kernel: something entirely unrelated"
+    expect:
+      "metadata.uid": "3216c212deeedd0aca67b372ae16a95894bdade7e5247bdf47f1157b450f0677"
+  # NAN-3702 (existing sample): metadata.uid is sha256("linux_auditd|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "type=ADD_GROUP msg=audit(1787043802.600:4652): pid=3302 uid=0 auid=1000 ses=5 msg='op=adding-group grp=\"docker\" acct=\"alice\" id=999 exe=\"/usr/sbin/groupadd\" hostname=? addr=? terminal=pts/2 res=success'"
+    expect:
+      "metadata.uid": "c924e302eb90d03f0a983574c7e9cdc7e36b9507677ea32a128224a576908626"

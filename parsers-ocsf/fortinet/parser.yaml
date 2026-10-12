@@ -1,6 +1,6 @@
 name: fortinet_ocsf
 display_name: Fortinet FortiGate (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -276,7 +276,7 @@ parser_vrl: |
 
   metadata = {
       "version": "1.9.0",
-      "uid": uuid_v4(),
+      "uid": sha2("fortinet|raw|" + raw_log, variant: "SHA-256"),
       "log_source": "fortinet",
       "log_provider": "FortiGate",
       "profiles": ["host", "security_control"],
@@ -848,3 +848,8 @@ samples:
     actor.user.name: jsmith
     http_request.url.path: /payload.exe
     disposition_id: 2
+# NAN-3702 (existing sample): metadata.uid is sha256("fortinet|raw|" + raw), so the
+# same record parsed twice gets the same uid (a random uid could never match).
+- raw: "<189>date=2024-10-30 time=09:54:00 devname=\"FGT-EDGE\" logid=\"0100032002\" type=\"event\" subtype=\"system\" level=\"information\" vd=\"root\" logdesc=\"Admin login successful\" user=\"admin\" ui=\"ssh(10.0.0.9)\" action=\"login\" status=\"success\" reason=\"none\" msg=\"Administrator admin logged in successfully from ssh(10.0.0.9)\""
+  expect:
+    "metadata.uid": "b368b9fe408f04b5d423d2c27d68c106c1d7c26ae57c7b78d0856502244205f0"

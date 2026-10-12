@@ -1,6 +1,6 @@
 name: microsoft_365_ocsf
 display_name: Microsoft 365 (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -53,7 +53,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("microsoft_365|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "Microsoft 365 Management Activity",
               "log_provider": "Microsoft 365",
@@ -380,7 +380,7 @@ parser_vrl: |
       ocsf.raw_data = raw_log
 
       evt_uid = string(p.Id) ?? ""
-      if evt_uid == "" { evt_uid = uuid_v4() }
+      if evt_uid == "" { evt_uid = sha2("microsoft_365|raw|" + raw_log, variant: "SHA-256") }
       ocsf.metadata = {
           "version": "1.9.0",
           "profiles": profiles,
@@ -697,3 +697,14 @@ samples:
       "class_uid": 6003
       "activity_id": 1
       "metadata.version": "1.9.0"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("microsoft_365|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "m365 not json"
+    expect:
+      "metadata.uid": "8de83a9401b222f8911a8de5d6d3be0a6bfd48d7acdb652c7ad250b7229c430f"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("microsoft_365|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"CreationTime\":\"2026-08-18T17:03:55\",\"Operation\":\"Add member to group.\",\"OrganizationId\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"RecordType\":8,\"ResultStatus\":\"Success\",\"UserKey\":\"10032000AAAAAAAA\",\"UserType\":2,\"Workload\":\"AzureActiveDirectory\",\"ClientIP\":\"192.0.2.77\",\"ObjectId\":\"Global Administrators\",\"UserId\":\"admin@example.com\",\"Target\":[{\"ID\":\"Global Administrators\",\"Type\":1},{\"ID\":\"bob.smith@example.com\",\"Type\":5}],\"ModifiedProperties\":[{\"Name\":\"Group.DisplayName\",\"NewValue\":\"Global Administrators\"}]}"
+    expect:
+      "metadata.uid": "bf41bd2cda0a52fb6bfa434c07bad58e3011c0a5398e7b113c060b7e0da65577"
+      "metadata.original_event_uid": "bf41bd2cda0a52fb6bfa434c07bad58e3011c0a5398e7b113c060b7e0da65577"

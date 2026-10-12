@@ -1,6 +1,6 @@
 name: azure_activity_ocsf
 display_name: Azure Activity Log (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -43,7 +43,7 @@ parser_vrl: |
           "metadata": {
               "version": "1.9.0",
               "profiles": ["cloud"],
-              "uid": uuid_v4(),
+              "uid": sha2("azure_activity|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "AzureActivity",
               "product": { "name": "Azure Activity Log", "vendor_name": "Microsoft" }
@@ -200,7 +200,7 @@ parser_vrl: |
           "metadata": {
               "version": "1.9.0",
               "profiles": ["cloud"],
-              "uid": uuid_v4(),
+              "uid": sha2("azure_activity|raw|" + raw_log, variant: "SHA-256"),
               "log_name": "AzureActivity",
               "log_provider": "Azure Monitor",
               "product": { "name": "Azure Activity Log", "vendor_name": "Microsoft" }
@@ -413,3 +413,15 @@ parser_vrl: |
   if !is_empty(__residual) { .unmapped = __residual }
   .
   # END NAN-2421 residual spill
+
+samples:
+  # NAN-3702 (unparseable record, error branch): metadata.uid is sha256("azure_activity|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "NAN-3702 determinism probe: not a azure_activity record"
+    expect:
+      "metadata.uid": "8e5737465577efb9b9747f74fc0ae434629950d7205a82d7825fe1fb348115eb"
+  # NAN-3702 (existing sample): metadata.uid is sha256("azure_activity|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"time\": \"2026-08-18T20:00:00.0000000Z\", \"eventTimestamp\": \"2026-08-18T20:00:00.0000000Z\", \"resourceId\": \"/SUBSCRIPTIONS/AAAA-BBBB/RESOURCEGROUPS/RG1/PROVIDERS/MICROSOFT.COMPUTE/VIRTUALMACHINES/VM1\", \"operationName\": {\"value\": \"Microsoft.Storage/storageAccounts/delete\"}, \"category\": {\"value\": \"Administrative\"}, \"resultType\": \"Success\", \"status\": {\"value\": \"Succeeded\"}, \"subStatus\": {\"value\": \"Created\"}, \"caller\": \"alice@contoso.com\", \"callerType\": \"User\", \"correlationId\": \"c0000000-0000-0000-0000-000000000001\", \"level\": \"Informational\", \"resourceGroupName\": \"RG1\", \"resourceProviderName\": {\"value\": \"Microsoft.Compute\"}, \"resourceType\": {\"value\": \"Microsoft.Compute/virtualMachines\"}, \"resourceName\": \"VM1\", \"subscriptionId\": \"AAAA-BBBB\", \"subscriptionName\": \"Prod\", \"tenantId\": \"TTTT\", \"resourceLocation\": \"eastus\", \"httpRequest\": {\"clientIpAddress\": \"203.0.113.9\", \"method\": \"PUT\", \"uri\": \"https://management.azure.com/subscriptions/AAAA-BBBB/resourceGroups/RG1/providers/Microsoft.Compute/virtualMachines/VM1?api-version=2023-03-01\", \"clientRequestId\": \"r1\"}, \"claims\": {\"appid\": \"11111111-2222-3333-4444-555555555555\", \"ipaddr\": \"203.0.113.9\", \"iss\": \"https://sts.windows.net/TTTT/\"}, \"properties\": {\"statusCode\": \"Created\", \"statusMessage\": \"OK\", \"serviceRequestId\": \"s1\"}, \"operationId\": \"op1\", \"eventName\": {\"value\": \"EndRequest\"}}"
+    expect:
+      "metadata.uid": "c405c5d01c01e3aac51cbd994c8e1549f58840e5ab19bed268b9dfbe97bc8c1c"

@@ -1,6 +1,6 @@
 name: proofpoint_ocsf
 display_name: Proofpoint Email Security (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -54,7 +54,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("proofpoint|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "Proofpoint Email Protection",
               "log_provider": "Proofpoint",
@@ -323,13 +323,22 @@ parser_vrl: |
       ocsf.message = msg
       ocsf.raw_data = raw_log
 
-      evt_uid = string(p.guid) ?? string(p.messageID) ?? ""
-      if evt_uid == "" { evt_uid = uuid_v4() }
+      # NAN-3702: metadata.uid is the lake's dedup key. TAP's GUID is per event
+      # and stays the uid. messageID names the MESSAGE (shared by its delivery and
+      # click events), so it is no longer a uid fallback: without a GUID the raw
+      # record is hashed (a redelivery repeats it byte for byte).
+      msg_uid = string(p.messageID) ?? ""
+      tap_guid = string(p.guid) ?? ""
+      evt_uid = tap_guid
+      if evt_uid == "" { evt_uid = sha2("proofpoint|raw|" + raw_log, variant: "SHA-256") }
+      orig_uid = tap_guid
+      if orig_uid == "" { orig_uid = msg_uid }
+      if orig_uid == "" { orig_uid = evt_uid }
       ocsf.metadata = {
           "version": "1.9.0",
           "profiles": profiles,
           "uid": evt_uid,
-          "original_event_uid": evt_uid,
+          "original_event_uid": orig_uid,
           "event_code": event_type,
           "log_name": "Proofpoint Email Protection",
           "log_provider": "Proofpoint",
@@ -595,3 +604,14 @@ samples:
       "class_uid": 4009
       "activity_id": 99
       "metadata.version": "1.9.0"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("proofpoint|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "proofpoint not json"
+    expect:
+      "metadata.uid": "a4e7e78732841b60d9ad61dd8d9fbe13a86ceef18ada56b1ac5f17aa40a049da"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("proofpoint|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"type\":\"message\",\"ts\":\"2026-08-18T12:40:02.000000+0000\",\"connection\":{\"ip\":\"198.51.100.201\",\"host\":\"mail.evil.example\",\"protocol\":\"esmtps\",\"country\":\"nl\",\"helo\":\"mail.evil.example\"},\"envelope\":{\"from\":\"attacker@evil.example\",\"rcpts\":[\"bob.smith@example.com\",\"finance@example.com\"]},\"msg\":{\"normalizedHeader\":{\"subject\":[\"Payroll update\"],\"from\":[\"attacker@evil.example\"]},\"header\":{\"message-id\":[\"<CA+evil999@mail.evil.example>\"]},\"sizeBytes\":120043},\"filter\":{\"disposition\":\"discard\",\"routeDirection\":\"inbound\",\"modules\":{\"spam\":{\"verdict\":\"spam\",\"disposition\":\"discard\",\"scores\":{\"overall\":92,\"classifiers\":{\"phish\":88,\"malware\":10,\"spam\":92}}},\"urldefense\":{\"counts\":{\"rewritten\":3}}},\"modulesRun\":[\"spam\",\"urldefense\",\"dmarc\"]}}"
+    expect:
+      "metadata.uid": "abc45fe0450b50c4861d5048ec081e459840ff4b2e96540e07ba56c3229ac648"
+      "metadata.original_event_uid": "abc45fe0450b50c4861d5048ec081e459840ff4b2e96540e07ba56c3229ac648"

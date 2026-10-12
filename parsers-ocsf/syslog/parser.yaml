@@ -1,6 +1,6 @@
 name: syslog_ocsf
 display_name: Generic Syslog (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -174,7 +174,7 @@ parser_vrl: |
 
   metadata = {
       "version": "1.9.0",
-      "uid": uuid_v4(),
+      "uid": sha2("syslog|raw|" + raw_log, variant: "SHA-256"),
       "profiles": ["host", "security_control"],
       "log_name": "syslog",
       "log_level": syslog_severity,
@@ -715,3 +715,8 @@ samples:
     expect:
       class_uid: 3002
       activity_id: 1
+  # NAN-3702 (existing sample): metadata.uid is sha256("syslog|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "<34>1 2026-08-05T12:00:00.000Z host1 myapp 555 ID47 - structured probe"
+    expect:
+      "metadata.uid": "80c435c4afc6017138e9da850f024c94239913ccb9eb4b73ff8e64915d94920c"

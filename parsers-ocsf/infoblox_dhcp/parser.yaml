@@ -1,6 +1,6 @@
 name: infoblox_dhcp_ocsf
 display_name: Infoblox DHCP (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -287,7 +287,7 @@ parser_vrl: |
       "is_renewal": is_renewal,
       "metadata": {
           "version": "1.9.0",
-          "uid": uuid_v4(),
+          "uid": sha2("infoblox_dhcp|raw|" + raw_log, variant: "SHA-256"),
           "log_source": "infoblox_dhcp",
           "log_provider": "dhcpd",
           "profiles": ["host", "security_control"],
@@ -559,3 +559,8 @@ samples:
     activity_id: 3
     src_endpoint.ip: 10.20.30.44
     disposition_id: 1
+# NAN-3702 (existing sample): metadata.uid is sha256("infoblox_dhcp|raw|" + raw), so the
+# same record parsed twice gets the same uid (a random uid could never match).
+- raw: "Jan 25 13:13:13 infoblox02 dhcpd[1236]: DHCPACK on 10.20.30.44 to 00:0c:29:3a:1b:5f (LAPTOP-7) via eth1 lease-duration 86400"
+  expect:
+    "metadata.uid": "2540490deceab342f8c35b14700d88a0bee53f9bd875d8eeb890ba8f9df87ff5"

@@ -1,6 +1,6 @@
 name: meraki_ocsf
 display_name: Cisco Meraki (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -239,7 +239,7 @@ parser_vrl: |
 
   metadata = {
       "version": "1.9.0",
-      "uid": uuid_v4(),
+      "uid": sha2("meraki|raw|" + raw_log, variant: "SHA-256"),
       "log_source": "meraki",
       "log_provider": "Meraki",
       "profiles": ["host", "security_control"],
@@ -678,3 +678,8 @@ samples:
     class_uid: 4001
     activity_id: 99
     disposition_id: 17
+# NAN-3702 (existing sample): metadata.uid is sha256("meraki|raw|" + raw), so the
+# same record parsed twice gets the same uid (a random uid could never match).
+- raw: "<134>1 1730281900.000000000 MR33-OFFICE events type=8021x_auth radio=1 vap=2 client_mac=00:0C:29:3A:1B:5F identity=corp\\\\jsmith aid=1234"
+  expect:
+    "metadata.uid": "b19b232bba83f36a6ec38a843a13ae531ee5fe134f7ea178c13d9d345f996726"

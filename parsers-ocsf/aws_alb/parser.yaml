@@ -1,6 +1,6 @@
 name: aws_alb_ocsf
 display_name: AWS ALB Access Logs (OCSF)
-version: "1.2.0"
+version: "1.3.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed columns in redacted, dotted snake_case unmapped keys.
@@ -150,7 +150,7 @@ parser_vrl: |
           "metadata": {
               "version": "1.9.0",
               "profiles": ["cloud", "load_balancer"],
-              "uid": uuid_v4(),
+              "uid": sha2("aws_alb|raw|" + raw_log, variant: "SHA-256"),
               "log_name": "ALB Access Log",
               "log_provider": "AWS Elastic Load Balancing",
               "product": { "name": "AWS Application Load Balancer", "vendor_name": "Amazon" }
@@ -233,7 +233,7 @@ parser_vrl: |
           "metadata": {
               "version": "1.9.0",
               "profiles": ["cloud"],
-              "uid": uuid_v4(),
+              "uid": sha2("aws_alb|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "ALB Access Log",
               "product": { "name": "AWS Application Load Balancer", "vendor_name": "Amazon" }
@@ -420,3 +420,13 @@ samples:
     expect:
       "traffic.bytes_in": 366
       "traffic.bytes_out": 34
+  # NAN-3702 (existing sample): metadata.uid is sha256("aws_alb|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "http 2026-08-18T20:00:00.123456Z app/my-loadbalancer/50dc6c495c0c9188 192.0.2.10:2817 10.0.0.5:80 0.000 0.001 0.000 200 200 34 366 \"GET http://www.example.com:80/index.html HTTP/1.1\" \"curl/7.68.0\" - - arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/my-targets/73e2d6bc24d8a067 \"Root=1-58337262-36d228ad5d99923122bbe354\" \"-\" \"-\" 0 2026-08-18T20:00:00.000000Z \"forward\" \"-\" \"-\""
+    expect:
+      "metadata.uid": "f26f207ee5e7bd38dc7897f37681c9cc18994a5a603aa2afc3bde4c6ed5ee36f"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("aws_alb|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"timestamp\":\"2025-01-01T00:00:00Z\",\"severity\":\"INFO\"}"
+    expect:
+      "metadata.uid": "08369dbaa2143894bc5e657330d836fa4f1b6a831c8b3dabf1d90401b5996b1b"

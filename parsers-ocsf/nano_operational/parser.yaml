@@ -1,6 +1,6 @@
 name: nano_operational_ocsf
 display_name: nano Operational Logs (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses nano platform operational/tracing logs (Rust `tracing` JSON from
@@ -51,7 +51,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("nano_operational|raw|" + raw_log, variant: "SHA-256"),
               "log_provider": "nano",
               "log_name": "nano_operational",
               "event_code": "unparsed",
@@ -196,7 +196,7 @@ parser_vrl: |
       if is_http { event_code = "http_request" }
       md = {
           "version": "1.9.0",
-          "uid": uuid_v4(),
+          "uid": sha2("nano_operational|raw|" + raw_log, variant: "SHA-256"),
           "log_provider": "nano",
           "log_name": svc,
           "log_level": level,
@@ -378,3 +378,15 @@ parser_vrl: |
   if !is_empty(__residual) { .unmapped = __residual }
   .
   # END NAN-2421 residual spill
+
+samples:
+  # NAN-3702 (existing sample): metadata.uid is sha256("nano_operational|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "not json at all -- plain text panic line"
+    expect:
+      "metadata.uid": "516e4d7e4512a96f21a91c2a22dbf0d3a12de12ad05ba65c6d8140573f5638be"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("nano_operational|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"timestamp\": \"2026-08-18T12:30:02.500000000+00:00\", \"level\": \"ERROR\", \"message\": \"failed to publish generation to lake: ambiguous name\", \"service.name\": \"nanosiem-lake-worker\", \"target\": \"nanosiem_lake::publisher\"}"
+    expect:
+      "metadata.uid": "4a27a1c589a24134f49f6be2c3d8632c7fee3a3c6de365e8a7a20029ee9e7194"
