@@ -1,6 +1,6 @@
 name: moat_edr_ocsf
 display_name: Moat EDR (OCSF)
-version: "1.2.0"
+version: "1.2.1"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses omarchy-moat supply-chain sensor records (moat-ship NDJSON envelope)
@@ -1044,7 +1044,6 @@ parser_vrl: |
           "version": "1.9.0",
           "profiles": profiles,
           "uid": record_uid,
-          "original_event_uid": record_uid,
           "log_name": "moat_edr",
           "log_source": "moat_edr",
           "product": { "name": "Moat", "vendor_name": "Omarchy" }
@@ -1054,6 +1053,11 @@ parser_vrl: |
       # ripples into one story. Promoting it to metadata.correlation_uid is what
       # lets the lake group them without knowing about chains.
       if correlation_uid != "" { metadata.correlation_uid = correlation_uid }
+      # NAN-3718: original_event_uid holds the vendor's own per-event id and is
+      # omitted when the record has none; a composite or hash belongs only in
+      # metadata.uid.
+      # Moat: the envelope's event_id.
+      if event_id != "" { metadata.original_event_uid = event_id }
       ocsf.metadata = metadata
 
       if length(obs) > 0 { ocsf.observables = obs }
@@ -1362,25 +1366,29 @@ samples:
     expect:
       "metadata.uid": "89cdff524777bbe61593726fe078cdf8fdb20292691593176b287516e8342db9"
       "actor.process.uid": "89cdff524777bbe61593726fe078cdf8fdb20292691593176b287516e8342db9"
-      "metadata.original_event_uid": "89cdff524777bbe61593726fe078cdf8fdb20292691593176b287516e8342db9"
+      "metadata.original_event_uid": "<missing>"
   # NAN-3702 (natural id removed): metadata.uid is sha256("moat_edr|raw|" + raw), so the
   # same record parsed twice gets the same uid (a random uid could never match).
   - raw: "{\"v\":1,\"host\":\"mars\",\"class\":\"alerts\",\"kind\":\"alert\",\"moat_tier\":\"gator\",\"severity\":\"critical\",\"@timestamp\":\"2026-09-07T18:22:12.727Z\",\"moat\":{\"v\":1,\"ts\":\"2026-09-07T18:22:12.727Z\",\"severity\":\"critical\",\"rule\":\"moat-cred-cloud-credentials-read\",\"family\":\"cred\",\"title\":\"Cloud credentials read by an unexpected program\",\"summary\":\"node (pid 41233) read ~/.aws/credentials. Parent chain: systemd -> fish -> node -> sh -> node.\",\"process\":{\"pid\":41233,\"uid\":1000,\"exe\":\"/usr/bin/node\",\"args\":\"node setup.mjs\",\"cwd\":\"~/proj\",\"start_ts\":\"2026-09-07T18:22:12.727Z\",\"ancestry\":[{\"pid\":41200,\"exe\":\"/bin/sh\"},{\"pid\":41100,\"exe\":\"/usr/bin/node\"},{\"pid\":900,\"exe\":\"/usr/bin/fish\"}]},\"file\":{\"path\":\"~/.aws/credentials\",\"sha256\":null},\"explain\":{\"what\":\"node read ~/.aws/credentials.\",\"why\":\"...\",\"evidence\":[\"...\"],\"expected\":\"...\",\"next\":[\"...\"]},\"action_taken\":\"blocked\",\"actions\":[\"kill\",\"quarantine\",\"ignore\"],\"acked\":false,\"mode\":\"enforce\",\"actor\":{\"provenance\":\"user\",\"package\":null},\"context\":\"pkg-install\",\"severity_base\":\"high\",\"severity_reason\":\"high -> critical: pkg-install context\",\"surface\":\"alerts\",\"tier\":\"detection\",\"pkg_install_escalation\":true,\"suppressed_by\":null,\"rarity\":\"first_seen\",\"rarity_text\":\"first time seen here\",\"chain\":{\"v\":1,\"families\":[\"cred\",\"net\"],\"severity\":\"critical\",\"severity_base\":\"high\",\"severity_reason\":\"...\",\"steps_total\":2,\"triggers_total\":2,\"span_secs\":3,\"truncated\":false,\"first_ts\":\"2026-09-07T18:22:12.727Z\",\"last_ts\":\"2026-09-07T18:22:12.727Z\",\"summary\":\"credential read then egress\",\"ancestor\":{\"pid\":41100,\"exe\":\"/usr/bin/node\"},\"members\":[\"01A\",\"01B\"],\"steps\":[{\"alert\":\"01A\",\"ts\":\"2026-09-07T18:22:12.727Z\",\"family\":\"cred\",\"rule\":\"moat-cred-cloud-credentials-read\",\"exe\":\"/usr/bin/node\",\"pid\":41233,\"role\":\"trigger\",\"severity\":\"high\",\"title\":\"...\"}]}}}"
     expect:
       "metadata.uid": "aaccc79367801240320373e4b7624d71f846aa09c832eee18a7871e565a2a653"
       "finding_info.uid": "aaccc79367801240320373e4b7624d71f846aa09c832eee18a7871e565a2a653"
-      "metadata.original_event_uid": "aaccc79367801240320373e4b7624d71f846aa09c832eee18a7871e565a2a653"
+      "metadata.original_event_uid": "<missing>"
   # NAN-3702 (natural id removed): metadata.uid is sha256("moat_edr|raw|" + raw), so the
   # same record parsed twice gets the same uid (a random uid could never match).
   - raw: "{\"v\":1,\"host\":\"mars\",\"class\":\"alerts\",\"kind\":\"update\",\"moat_tier\":\"silt\",\"severity\":\"info\",\"@timestamp\":\"\",\"moat\":{\"v\":1,\"update\":{\"acked\":true,\"acked_by\":\"dan\",\"ts\":\"2026-09-07T18:22:12.727Z\",\"count\":3,\"surface\":\"alerts\"}}}"
     expect:
       "metadata.uid": "7af8111bea0d38b577305db99c511f1a5dada33c45e6127bb6dd90c73dacbd9e"
       "finding_info.uid": "7af8111bea0d38b577305db99c511f1a5dada33c45e6127bb6dd90c73dacbd9e"
-      "metadata.original_event_uid": "7af8111bea0d38b577305db99c511f1a5dada33c45e6127bb6dd90c73dacbd9e"
+      "metadata.original_event_uid": "<missing>"
   # NAN-3702 (natural id removed): metadata.uid is sha256("moat_edr|raw|" + raw), so the
   # same record parsed twice gets the same uid (a random uid could never match).
   - raw: "{\"v\":1,\"host\":\"mars\",\"class\":\"digest\",\"kind\":\"weekly\",\"moat_tier\":\"current\",\"severity\":\"info\",\"@timestamp\":\"2026-09-07T18:22:12.727Z\",\"moat\":{\"v\":1,\"class\":\"digest\",\"kind\":\"weekly\",\"ts\":\"2026-09-07T18:22:12.727Z\"}}"
     expect:
       "metadata.uid": "67e2b1cb86f0af4b9bd7c101b0534293db4a5f3560604251bbfb7a93809bc840"
       "finding_info.uid": "67e2b1cb86f0af4b9bd7c101b0534293db4a5f3560604251bbfb7a93809bc840"
-      "metadata.original_event_uid": "67e2b1cb86f0af4b9bd7c101b0534293db4a5f3560604251bbfb7a93809bc840"
+      "metadata.original_event_uid": "<missing>"
+  # NAN-3718: the envelope event_id is the native id
+  - raw: "{\"v\":1,\"event_id\":\"bWFycw==:1234567890:3661825.0123456789ab\",\"host\":\"mars\",\"class\":\"process\",\"kind\":\"exec\",\"moat_tier\":\"current\",\"severity\":\"info\",\"@timestamp\":\"2026-09-07T18:22:12.727Z\",\"moat\":{\"v\":1,\"class\":\"process\",\"kind\":\"exec\",\"ts\":\"2026-09-07T18:22:12.727Z\",\"exec_id\":\"bWFycw==:1234567890:3661825\",\"parent_exec_id\":\"bWFycw==:1234567000:2547388\",\"pid\":3661825,\"uid\":1000,\"auid\":1000,\"exe\":\"/usr/bin/node\",\"args\":\"node /home/dan/proj/node_modules/.bin/setup.mjs\",\"cwd\":\"~/proj\",\"start_time\":\"2026-09-07T18:22:12.723Z\"}}"
+    expect:
+      "metadata.original_event_uid": "bWFycw==:1234567890:3661825.0123456789ab"

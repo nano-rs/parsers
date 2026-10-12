@@ -1,6 +1,6 @@
 name: sentinelone_ocsf
 display_name: SentinelOne (OCSF)
-version: "1.2.0"
+version: "1.2.1"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses SentinelOne Singularity EDR JSON into complete OCSF 1.9.0
@@ -572,11 +572,17 @@ parser_vrl: |
           "version": "1.9.0",
           "profiles": profiles,
           "uid": record_uid,
-          "original_event_uid": record_uid,
           "event_code": event_code,
           "log_source": "sentinelone",
           "product": { "name": "Singularity", "vendor_name": "SentinelOne" }
       }
+      # NAN-3718: original_event_uid holds the vendor's own per-event id and is
+      # omitted when the record has none; a composite or hash belongs only in
+      # metadata.uid.
+      # SentinelOne: `id`. threatId names a threat that many activities
+      # share, so it is not an event id.
+      s1_id = to_string(p.id) ?? ""
+      if s1_id != "" { ocsf.metadata.original_event_uid = s1_id }
 
       . = ocsf
   }
@@ -845,10 +851,19 @@ samples:
     expect:
       "metadata.uid": "c5b4b6ebe5688f5d5cd73bd8b9bdc112d3a57ea325c4b0e4970c71845e82c446"
       "finding_info.uid": "c5b4b6ebe5688f5d5cd73bd8b9bdc112d3a57ea325c4b0e4970c71845e82c446"
-      "metadata.original_event_uid": "c5b4b6ebe5688f5d5cd73bd8b9bdc112d3a57ea325c4b0e4970c71845e82c446"
+      "metadata.original_event_uid": "<missing>"
   # NAN-3702 (natural id removed): metadata.uid is sha256("sentinelone|raw|" + raw), so the
   # same record parsed twice gets the same uid (a random uid could never match).
   - raw: "{\"activityType\":90,\"createdAt\":\"2026-08-18T13:10:00.000000Z\",\"primaryDescription\":\"The management user Dan Lussier logged in to the management console.\",\"secondaryDescription\":\"IP: 203.0.113.44\",\"userId\":\"55511\",\"data\":{\"computerName\":\"\",\"username\":\"dan@nano.rs\",\"ipAddress\":\"203.0.113.44\",\"role\":\"Admin\",\"source\":\"console\"},\"siteName\":\"HQ\",\"accountName\":\"Acme\",\"accountId\":\"55501\"}"
     expect:
       "metadata.uid": "167a3fbc7065d8cda882fa1758520252f9bc50ff40050074fe053fea8a87ea1d"
-      "metadata.original_event_uid": "167a3fbc7065d8cda882fa1758520252f9bc50ff40050074fe053fea8a87ea1d"
+      "metadata.original_event_uid": "<missing>"
+  # NAN-3718: the record's `id` is its native id
+  - raw: "{\"id\": \"9988776655\", \"activityType\": 90, \"createdAt\": \"2026-08-18T13:10:00.000000Z\", \"primaryDescription\": \"The management user Dan Lussier logged in to the management console.\", \"secondaryDescription\": \"IP: 203.0.113.44\", \"userId\": \"55511\", \"data\": {\"computerName\": \"\", \"username\": \"dan@nano.rs\", \"ipAddress\": \"203.0.113.44\", \"role\": \"Admin\", \"source\": \"console\"}, \"siteName\": \"HQ\", \"accountName\": \"Acme\", \"accountId\": \"55501\"}"
+    expect:
+      "metadata.original_event_uid": "9988776655"
+  # NAN-3718: threatId alone names a threat, not this record: no original_event_uid (metadata.uid unchanged)
+  - raw: "{\"threatId\":\"1234567890123456789\",\"createdAt\":\"2026-08-18T13:00:00.000000Z\",\"threatName\":\"mimikatz.exe\",\"classification\":\"Malware\",\"classificationSource\":\"Static\",\"confidenceLevel\":\"malicious\",\"cloudVerdict\":\"black\",\"fileContentHash\":\"9f914d42706fe215501044acd85a32d58aaef1419d404fddfa5d3b48f66ccd9f\",\"filePath\":\"C:\\\\Users\\\\alice\\\\Downloads\\\\mimikatz.exe\",\"fileSize\":1258291,\"agentComputerName\":\"WKS-21\",\"agentIp\":\"10.4.5.6\",\"agentId\":\"987654321\",\"agentDomain\":\"CORP\",\"agentOsType\":\"windows\",\"agentVersion\":\"23.4.2.350\",\"agentIsActive\":true,\"agentMachineType\":\"laptop\",\"agentNetworkStatus\":\"connected\",\"mitigationStatus\":\"mitigated\",\"mitigationStatusDescription\":\"Quarantined and killed\",\"initiatedBy\":\"agent_policy\",\"engines\":[\"Behavioral AI\",\"Static AI\"],\"description\":\"Malicious credential dumping tool detected\",\"indicators\":[{\"techniques\":[\"T1003.001 OS Credential Dumping: LSASS Memory\"],\"tactics\":[\"Credential Access\"]}],\"siteName\":\"HQ\",\"groupName\":\"Workstations\",\"accountName\":\"Acme\",\"accountId\":\"55501\"}"
+    expect:
+      "metadata.uid": "1234567890123456789"
+      "metadata.original_event_uid": "<missing>"

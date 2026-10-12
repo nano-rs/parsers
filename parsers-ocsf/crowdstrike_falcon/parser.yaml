@@ -1,6 +1,6 @@
 name: crowdstrike_falcon_ocsf
 display_name: CrowdStrike Falcon (OCSF)
-version: "1.2.0"
+version: "1.2.1"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses CrowdStrike Falcon events in both FDR (flat JSON, dispatched on
@@ -823,13 +823,21 @@ parser_vrl: |
           "version": "1.9.0",
           "profiles": profiles,
           "uid": record_uid,
-          "original_event_uid": record_uid,
           "event_code": event_name,
           "log_source": "crowdstrike_falcon",
           "log_provider": "CrowdStrike Falcon",
           "product": { "name": "Falcon", "vendor_name": "CrowdStrike" }
       }
       if stream_offset != null { ocsf.metadata.correlation_uid = to_string(stream_offset) }
+      # NAN-3718: original_event_uid holds the vendor's own per-event id and is
+      # omitted when the record has none; a composite or hash belongs only in
+      # metadata.uid.
+      # Falcon: DetectId on a detection, else EventUUID, else the per-event
+      # `id` UUID that FDR records carry.
+      native_uid = to_string(ev.DetectId) ?? ""
+      if native_uid == "" { native_uid = to_string(ev.EventUUID) ?? "" }
+      if native_uid == "" && !is_streaming { native_uid = to_string(ev.id) ?? "" }
+      if native_uid != "" { ocsf.metadata.original_event_uid = native_uid }
 
       . = ocsf
   }
@@ -1215,4 +1223,20 @@ samples:
   - raw: "{\"cid\":\"ffeeddccbbaa99887766554433221100\",\"aip\":\"203.0.113.44\",\"ComputerName\":\"WKS-EDR-01\",\"event_platform\":\"Win\",\"ConfigBuild\":\"1007.3.0016606.11\",\"timestamp\":\"1787043600000\",\"event_simpleName\":\"AsepValueUpdate\",\"ContextTimeStamp\":\"1787043985.5\",\"TargetObjectPath\":\"\\\\REGISTRY\\\\MACHINE\\\\SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run\",\"TargetObjectName\":\"Updater\",\"TargetObjectData\":\"C:\\\\ProgramData\\\\evil\\\\payload.exe\",\"AsepClass\":\"12\",\"ContextProcessId\":\"128472361926\"}"
     expect:
       "metadata.uid": "521ef26b8d0dc5a9ff19d47ea583a966b04759976fd7394fa54348497f164448"
-      "metadata.original_event_uid": "521ef26b8d0dc5a9ff19d47ea583a966b04759976fd7394fa54348497f164448"
+      "metadata.original_event_uid": "<missing>"
+  # NAN-3718: a detection's DetectId is its native id
+  - raw: "{\"metadata\": {\"customerIDHash\": \"ffeeddcc\", \"offset\": 42315, \"eventType\": \"DetectionSummaryEvent\", \"eventCreationTime\": 1787044050000, \"version\": \"1.0\"}, \"event\": {\"ProcessStartTime\": 1787044040, \"ProcessEndTime\": 0, \"ProcessId\": 128472361926, \"ParentProcessId\": 128472361100, \"ComputerName\": \"WKS-EDR-01\", \"UserName\": \"alice\", \"DetectName\": \"Credential Theft via LSASS Access\", \"DetectDescription\": \"A process accessed LSASS memory.\", \"Severity\": 4, \"SeverityName\": \"High\", \"FileName\": \"mimikatz.exe\", \"FilePath\": \"\\\\Device\\\\HarddiskVolume2\\\\temp\\\\\", \"CommandLine\": \"mimikatz.exe sekurlsa::logonpasswords\", \"SHA256String\": \"4444444444444444444444444444444444444444444444444444444444444444\", \"MD5String\": \"55555555555555555555555555555555\", \"MachineDomain\": \"CORP\", \"FalconHostLink\": \"https://falcon.crowdstrike.com/activity/detections/detail/x\", \"SensorId\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"DetectId\": \"ldt:1a2b3c:4455667788\", \"LocalIP\": \"10.20.30.40\", \"Tactic\": \"Credential Access\", \"Technique\": \"OS Credential Dumping\", \"Objective\": \"Gain Access\", \"PatternDispositionDescription\": \"Prevention, process killed.\", \"PatternDispositionValue\": 2176, \"IOCType\": \"hash_sha256\", \"IOCValue\": \"4444444444444444444444444444444444444444444444444444444444444444\", \"ParentImageFileName\": \"\\\\Device\\\\HarddiskVolume2\\\\Windows\\\\explorer.exe\", \"ParentCommandLine\": \"explorer.exe\", \"State\": \"open\"}}"
+    expect:
+      "metadata.original_event_uid": "ldt:1a2b3c:4455667788"
+  # NAN-3718: an FDR record's per-event `id` UUID is its native id
+  - raw: "{\"aid\":\"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\",\"cid\":\"ffeeddccbbaa99887766554433221100\",\"aip\":\"203.0.113.44\",\"ComputerName\":\"WKS-EDR-01\",\"event_platform\":\"Win\",\"ConfigBuild\":\"1007.3.0016606.11\",\"timestamp\":\"1787043600000\",\"event_simpleName\":\"ProcessRollup2\",\"ContextTimeStamp\":\"1787043600.451\",\"ImageFileName\":\"\\\\Device\\\\HarddiskVolume2\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\",\"CommandLine\":\"powershell.exe -NoP -W Hidden -Enc SQBFAFgA\",\"RawProcessId\":\"4812\",\"TargetProcessId\":\"128472361926\",\"ParentProcessId\":\"128472361100\",\"ParentBaseFileName\":\"explorer.exe\",\"SHA256HashData\":\"9f914d42706fe215501044acd85a32d58aaef1419d404fddfa5d3b48f66ccd9f\",\"MD5HashData\":\"7353f60b1739074eb17c5f4dddefe239\",\"SHA1HashData\":\"0000000000000000000000000000000000000000\",\"UserSid\":\"S-1-5-21-1004336348-1177238915-682003330-1001\",\"AuthenticationId\":\"999123\",\"IntegrityLevel\":\"12288\",\"TokenType\":\"1\",\"ProcessStartTime\":\"1787043600.451\",\"ProcessGroupId\":\"128472361926\",\"id\":\"ffffffff-1111-11eb-8dd4-061759968cdf\"}"
+    expect:
+      "metadata.original_event_uid": "ffffffff-1111-11eb-8dd4-061759968cdf"
+  # NAN-3718: an FDR record without `id` has no native id
+  - raw: "{\"aid\": \"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\", \"cid\": \"ffeeddccbbaa99887766554433221100\", \"aip\": \"203.0.113.44\", \"ComputerName\": \"WKS-EDR-01\", \"event_platform\": \"Win\", \"ConfigBuild\": \"1007.3.0016606.11\", \"timestamp\": \"1787043600000\", \"event_simpleName\": \"ProcessRollup2\", \"ContextTimeStamp\": \"1787043600.451\", \"ImageFileName\": \"\\\\Device\\\\HarddiskVolume2\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\", \"CommandLine\": \"powershell.exe -NoP -W Hidden -Enc SQBFAFgA\", \"RawProcessId\": \"4812\", \"TargetProcessId\": \"128472361926\", \"ParentProcessId\": \"128472361100\", \"ParentBaseFileName\": \"explorer.exe\", \"SHA256HashData\": \"9f914d42706fe215501044acd85a32d58aaef1419d404fddfa5d3b48f66ccd9f\", \"MD5HashData\": \"7353f60b1739074eb17c5f4dddefe239\", \"SHA1HashData\": \"0000000000000000000000000000000000000000\", \"UserSid\": \"S-1-5-21-1004336348-1177238915-682003330-1001\", \"AuthenticationId\": \"999123\", \"IntegrityLevel\": \"12288\", \"TokenType\": \"1\", \"ProcessStartTime\": \"1787043600.451\", \"ProcessGroupId\": \"128472361926\"}"
+    expect:
+      "metadata.original_event_uid": "<missing>"
+  # NAN-3718: a streaming audit event carries no per-event id
+  - raw: "{\"metadata\": {\"customerIDHash\": \"ffeeddcc\", \"offset\": 42318, \"eventType\": \"AuthActivityAuditEvent\", \"eventCreationTime\": 1787044080000, \"version\": \"1.0\"}, \"event\": {\"UserId\": \"soc.analyst@corp.example\", \"UserIp\": \"198.51.100.20\", \"OperationName\": \"userAuthenticate\", \"ServiceName\": \"CrowdStrike Authentication\", \"Success\": \"true\", \"UTCTimestamp\": \"2026-08-18T12:01:20Z\"}}"
+    expect:
+      "metadata.original_event_uid": "<missing>"

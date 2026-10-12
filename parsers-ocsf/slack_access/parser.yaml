@@ -1,6 +1,6 @@
 name: slack_access_ocsf
 display_name: Slack Access Logs (OCSF)
-version: "1.2.0"
+version: "1.2.1"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -112,11 +112,13 @@ parser_vrl: |
 
       # A team.accessLogs record is identified by (user, ip, user-agent); the
       # window end makes each redelivered copy idempotent on replay.
+      # NAN-3718: no original_event_uid. A team.accessLogs entry has no id of
+      # its own (Slack collates it by user, IP and user agent), and a composite
+      # belongs only in metadata.uid.
       record_uid = join!(["slack_access", uid, ip, ua, to_string(ts_epoch)], "|")
       ocsf.metadata = {
           "version": "1.9.0",
           "uid": record_uid,
-          "original_event_uid": record_uid,
           "event_code": "login",
           "log_name": "Slack Access Logs",
           "log_provider": "Slack",
@@ -348,3 +350,7 @@ samples:
   - raw: "slack access not json"
     expect:
       "metadata.uid": "4af6414774a7c8959f43f98f1f41b131f806a90bef173788c24c8b59426da0d6"
+  # NAN-3718: an access-log entry has no native id
+  - raw: "{\"user_id\":\"U012ABCDEF\",\"username\":\"jane.doe\",\"date_first\":1787060000,\"date_last\":1787062182,\"count\":7,\"ip\":\"203.0.113.55\",\"user_agent\":\"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\",\"isp\":\"Verizon Business\",\"country\":\"US\",\"region\":\"MA\"}"
+    expect:
+      "metadata.original_event_uid": "<missing>"
