@@ -36,8 +36,9 @@
 #
 # The OCSF contract binary is a nano build artifact and is not vendored here.
 # Point OCSF_VALIDATOR at it (or put `ocsf_event_validate` on PATH) to run
-# gate 2's schema half; without it that half reports SKIPPED and every static
-# rule above still runs.
+# gate 2's schema half. In CI (or with OCSF_VALIDATOR_REQUIRED=1) a missing
+# validator FAILS the gate (NAN-3680); locally it reports SKIPPED loudly.
+# scripts/fetch-ocsf-validator.sh fetches the pinned binary.
 
 set -euo pipefail
 
@@ -72,11 +73,30 @@ if [ "${#PARSERS[@]}" -eq 0 ]; then
     exit 0
 fi
 
-if [ -n "${OCSF_VALIDATOR:-}" ] || command -v ocsf_event_validate >/dev/null 2>&1; then
+if { [ -n "${OCSF_VALIDATOR:-}" ] && [ -x "${OCSF_VALIDATOR}" ]; } || command -v ocsf_event_validate >/dev/null 2>&1; then
     echo "OCSF contract validator: available (gate 2 schema check ENABLED)"
+elif [ "${OCSF_VALIDATOR_SKIP_REASON:-}" = "fork" ]; then
+    # A fork PR cannot read the private validator secret. Its gate 2 schema half
+    # is skipped, loudly, and the merge to main/ocsf-1.9 re-runs it with the
+    # secret (validate-parsers.yml `push`), so nothing lands unchecked.
+    echo "OCSF contract validator: SKIPPED (fork) — fork PRs cannot read the pinned"
+    echo "validator; the post-merge run on main/ocsf-1.9 enforces it."
+    if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+        echo "⚠️ Gate 2 OCSF schema check: skipped (fork). Enforced on the post-merge run." >> "$GITHUB_STEP_SUMMARY"
+    fi
+elif [ -n "${CI:-}" ] || [ "${OCSF_VALIDATOR_REQUIRED:-}" = "1" ]; then
+    # NAN-3680: without the schema half, a parser can emit rows nano's lake
+    # refuses (azure_monitor 1.0.0 lost every unregistered-device sign-in).
+    # CI must never pass gate 2 with it skipped.
+    echo "ERROR: OCSF contract validator not found (OCSF_VALIDATOR unset or not executable)." >&2
+    echo "Gate 2's schema half is mandatory in CI: it is the same check nano's lake" >&2
+    echo "enforces, and a parser that fails it loses rows silently. See" >&2
+    echo "scripts/fetch-ocsf-validator.sh." >&2
+    exit 1
 else
-    echo "OCSF contract validator: not found — set OCSF_VALIDATOR to enable the"
-    echo "schema half of gate 2. Static consistency rules still run."
+    echo "WARNING: OCSF contract validator not found — gate 2's schema half is SKIPPED."
+    echo "Rows that fail it are REFUSED by nano's lake. Set OCSF_VALIDATOR (see"
+    echo "scripts/fetch-ocsf-validator.sh) before trusting a local pass. CI requires it."
 fi
 echo ""
 
@@ -156,9 +176,18 @@ for parser_file in "${PARSERS[@]}"; do
                 | grep -v "INFO vector" | grep -v '^\s*$' | head -3 | sed 's/^/             /'
             parser_failed=1
         else
-            check_out=$(python3 "$CHECKS" check --parser "$parser_file" --event "$out_file" --label "$label" || true)
+            # The checker's own exit status matters: `|| true` here once hid a
+            # JSONDecodeError traceback on four moat_edr samples while the
+            # parser still reported PASS (NAN-3680). A crash is an unchecked
+            # sample, so it fails the parser.
+            check_rc=0
+            check_out=$(python3 "$CHECKS" check --parser "$parser_file" --event "$out_file" --label "$label" 2>&1) || check_rc=$?
             echo "$check_out"
             if echo "$check_out" | grep -q "FAIL "; then parser_failed=1; fi
+            if [ "$check_rc" -ne 0 ] && ! echo "$check_out" | grep -q "FAIL "; then
+                echo "      FAIL $label: [checker] exited $check_rc without a verdict — the sample was NOT validated"
+                parser_failed=1
+            fi
             if echo "$check_out" | grep -q "WARN .*NOT promoted"; then
                 UNQUERYABLE=$((UNQUERYABLE + 1))
             fi
