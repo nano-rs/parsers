@@ -1,6 +1,6 @@
 name: windows_event_ocsf
 display_name: Windows Event Log (OCSF)
-version: "1.3.0"
+version: "1.3.1"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses Windows Security Event Log records (JSON; top-level event_id +
@@ -251,12 +251,16 @@ parser_vrl: |
           "version": "1.9.0",
           "profiles": ["host"],
           "uid": record_uid,
-          "original_event_uid": record_uid,
           "event_code": to_string(eid),
           "log_name": string(p.channel) ?? "Security",
           "log_provider": string(p.provider_name) ?? "Microsoft-Windows-Security-Auditing",
           "product": { "name": "Windows", "vendor_name": "Microsoft" }
       }
+
+      # NAN-3713: original_event_uid carries the vendor's bare record number
+      # (the per-host, per-channel sequence), not the composite uid above, so
+      # it stays searchable as the number Windows shows. Omitted when absent.
+      if record_id != "" { ocsf.metadata.original_event_uid = record_id }
 
       # NAN-2986: drop empty user identifiers (a 4625 for an unknown account
       # has no TargetUserSid). "" is not an identifier and matched every
@@ -504,4 +508,9 @@ samples:
   - raw: "{\"event_id\":4624,\"channel\":\"Security\",\"provider_name\":\"Microsoft-Windows-Security-Auditing\",\"computer\":\"DC-01.corp.local\",\"timestamp\":\"2026-08-18T11:00:00Z\",\"message\":\"An account was successfully logged on.\",\"event_data\":{\"TargetUserName\":\"alice\",\"TargetDomainName\":\"CORP\",\"TargetUserSid\":\"S-1-5-21-1-2-3-1001\",\"TargetLogonId\":\"0x3e7abc\",\"SubjectUserName\":\"DC-01$\",\"LogonType\":\"10\",\"AuthenticationPackageName\":\"Kerberos\",\"IpAddress\":\"10.2.3.4\",\"IpPort\":\"49152\",\"WorkstationName\":\"WKS-09\",\"LogonProcessName\":\"Kerberos\"}}"
     expect:
       "metadata.uid": "86d88cc2cbc4ab87a875f930d33064dd162b24b7c7256bc1cdf7da0c6c6d85cf"
-      "metadata.original_event_uid": "86d88cc2cbc4ab87a875f930d33064dd162b24b7c7256bc1cdf7da0c6c6d85cf"
+      "metadata.original_event_uid": "<missing>"
+  # NAN-3713: original_event_uid is the bare record number; metadata.uid stays the composite
+  - raw: "{\"event_id\":4624,\"record_id\":5001,\"channel\":\"Security\",\"provider_name\":\"Microsoft-Windows-Security-Auditing\",\"computer\":\"DC-01.corp.local\",\"timestamp\":\"2026-08-18T11:00:00Z\",\"message\":\"An account was successfully logged on.\",\"event_data\":{\"TargetUserName\":\"alice\",\"TargetDomainName\":\"CORP\",\"TargetUserSid\":\"S-1-5-21-1-2-3-1001\",\"TargetLogonId\":\"0x3e7abc\",\"SubjectUserName\":\"DC-01$\",\"LogonType\":\"10\",\"AuthenticationPackageName\":\"Kerberos\",\"IpAddress\":\"10.2.3.4\",\"IpPort\":\"49152\",\"WorkstationName\":\"WKS-09\",\"LogonProcessName\":\"Kerberos\"}}"
+    expect:
+      "metadata.uid": "windows_event|dc-01.corp.local|security|microsoft-windows-security-auditing|5001|2026-08-18T11:00:00Z"
+      "metadata.original_event_uid": "5001"

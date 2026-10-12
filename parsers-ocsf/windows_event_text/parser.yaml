@@ -1,6 +1,6 @@
 name: windows_event_text_ocsf
 display_name: Windows Event Log (Rendered Text, OCSF)
-version: "1.2.0"
+version: "1.2.1"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses Windows Event Logs in RENDERED TEXT form - as sent by Splunk
@@ -913,13 +913,17 @@ parser_vrl: |
       "version": "1.9.0",
       "profiles": profiles,
       "uid": record_uid,
-      "original_event_uid": record_uid,
       "event_code": to_string(event_id),
       "log_name": channel,
       "log_provider": provider_name,
       "log_source": "windows_event_text",
       "product": { "name": "Windows", "vendor_name": "Microsoft" }
   }
+
+  # NAN-3713: original_event_uid carries the vendor's bare record number
+  # (the per-host, per-channel sequence), not the composite uid above, so
+  # it stays searchable as the number Windows shows. Omitted when absent.
+  if record_number != "" { ocsf.metadata.original_event_uid = record_number }
 
   . = ocsf
 
@@ -1284,4 +1288,8 @@ samples:
   - raw: "10/15/2023 02:23:45 PM\nLogName=System\nSourceName=Service Control Manager\nEventCode=7045\nEventType=0\nType=Information\nComputerName=WKS-09.corp.local\nTaskCategory=None\nOpCode=Info\nKeywords=Audit Success\nMessage=A service was installed in the system.\nService Name:  PSEXESVC\nService File Name:  C:\\Windows\\PSEXESVC.exe\nService Type:  user mode service\nService Start Type:  demand start\nService Account:  LocalSystem"
     expect:
       "metadata.uid": "7de461c59eb3fa43ba9cbacf9b86677e89b9603c7011cd6d17c2431d3aef1ccb"
-      "metadata.original_event_uid": "7de461c59eb3fa43ba9cbacf9b86677e89b9603c7011cd6d17c2431d3aef1ccb"
+      "metadata.original_event_uid": "<missing>"
+  # NAN-3713: original_event_uid is the bare record number; metadata.uid stays the composite
+  - raw: "10/15/2023 02:23:45 PM\nLogName=Security\nSourceName=Microsoft-Windows-Eventlog\nEventCode=1102\nEventType=0\nType=Information\nComputerName=DC-01.corp.local\nTaskCategory=Log clear\nOpCode=Info\nRecordNumber=91234\nKeywords=Audit Success\nMessage=The audit log was cleared.\nSubject:\n\tSecurity ID:\t\tS-1-5-21-1-2-3-500\n\tAccount Name:\t\tadmin\n\tAccount Domain:\t\tCORP\n\tLogon ID:\t\t0x3E7ABD\n"
+    expect:
+      "metadata.original_event_uid": "91234"

@@ -1,6 +1,6 @@
 name: windows_sysmon_ocsf
 display_name: Microsoft Sysmon (OCSF)
-version: "1.5.0"
+version: "1.5.1"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses Windows Sysmon events in JSON form (top-level event_id + event_data)
@@ -514,15 +514,18 @@ parser_vrl: |
           "version": "1.9.0",
           "profiles": ["host"],
           "uid": record_uid,
-          "original_event_uid": record_uid,
           "event_code": to_string(eid),
           "log_name": string(p.channel) ?? "Microsoft-Windows-Sysmon/Operational",
           "log_provider": string(p.provider_name) ?? "Microsoft-Windows-Sysmon",
           "product": { "name": "Sysmon", "vendor_name": "Microsoft" }
       }
 
-      if record_id != "" && computer != "" && ts_str != "" {
-          # Record ID is represented in the host/channel/time composite UID.
+      # NAN-3713: original_event_uid carries the vendor's bare record number
+      # (the per-host, per-channel sequence), not the composite uid above, so
+      # it stays searchable as the number Windows shows. Omitted when absent.
+      if record_id != "" {
+          ocsf.metadata.original_event_uid = record_id
+          # Record ID is represented in original_event_uid (and the composite UID).
           __reference_consumed = push(__reference_consumed, "record_id")
       }
       . = ocsf
@@ -831,4 +834,9 @@ samples:
   - raw: "{\"event_id\":1,\"channel\":\"Microsoft-Windows-Sysmon/Operational\",\"provider_name\":\"Microsoft-Windows-Sysmon\",\"computer\":\"WKS-01.corp.local\",\"timestamp\":\"2026-08-18T10:15:00.123Z\",\"event_data\":{\"Image\":\"C:\\\\Windows\\\\System32\\\\cmd.exe\",\"CommandLine\":\"cmd.exe /c whoami\",\"ProcessId\":\"4321\",\"ProcessGuid\":\"{aaaa-1111}\",\"ParentImage\":\"C:\\\\Windows\\\\explorer.exe\",\"ParentCommandLine\":\"explorer.exe\",\"ParentProcessId\":\"1200\",\"User\":\"CORP\\\\alice\",\"Hashes\":\"SHA256=ABCD1234EF,MD5=00112233\"}}"
     expect:
       "metadata.uid": "ab7de99dd3553cc8057ad59973186d7a60b2f12ac6d28e3ffb73dab992061d5a"
-      "metadata.original_event_uid": "ab7de99dd3553cc8057ad59973186d7a60b2f12ac6d28e3ffb73dab992061d5a"
+      "metadata.original_event_uid": "<missing>"
+  # NAN-3713: original_event_uid is the bare record number; metadata.uid stays the composite
+  - raw: "{\"event_id\":1,\"record_id\":91234,\"channel\":\"Microsoft-Windows-Sysmon/Operational\",\"provider_name\":\"Microsoft-Windows-Sysmon\",\"computer\":\"WKS-01.corp.local\",\"timestamp\":\"2026-08-18T10:15:00.123Z\",\"event_data\":{\"Image\":\"C:\\\\Windows\\\\System32\\\\cmd.exe\",\"CommandLine\":\"cmd.exe /c whoami\",\"ProcessId\":\"4321\",\"ProcessGuid\":\"{aaaa-1111}\",\"ParentImage\":\"C:\\\\Windows\\\\explorer.exe\",\"ParentCommandLine\":\"explorer.exe\",\"ParentProcessId\":\"1200\",\"User\":\"CORP\\\\alice\",\"Hashes\":\"SHA256=ABCD1234EF,MD5=00112233\"}}"
+    expect:
+      "metadata.uid": "windows_sysmon|wks-01.corp.local|microsoft-windows-sysmon/operational|microsoft-windows-sysmon|91234|2026-08-18T10:15:00.123Z"
+      "metadata.original_event_uid": "91234"

@@ -1,6 +1,6 @@
 name: sysmon_xml_ocsf
 display_name: Microsoft Sysmon (XML, OCSF)
-version: "1.2.0"
+version: "1.2.1"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses raw Windows Sysmon EVTX **XML** records into complete OCSF 1.9.0
@@ -669,13 +669,17 @@ parser_vrl: |
           "version": "1.9.0",
           "profiles": profiles,
           "uid": record_uid,
-          "original_event_uid": record_uid,
           "event_code": to_string(eid),
           "log_name": channel,
           "log_provider": log_provider,
           "log_source": "windows_sysmon",
           "product": { "name": "Sysmon", "vendor_name": "Microsoft" }
       }
+
+      # NAN-3713: original_event_uid carries the vendor's bare record number
+      # (the per-host, per-channel sequence), not the composite uid above, so
+      # it stays searchable as the number Windows shows. Omitted when absent.
+      if record_id != "" { ocsf.metadata.original_event_uid = record_id }
 
       . = ocsf
   }
@@ -1005,4 +1009,8 @@ samples:
   - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>1</EventID><Version>5</Version><Level>4</Level><Task>1</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:01:00.1234567Z\"/><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">technique_id=T1059.001,technique_name=PowerShell</Data><Data Name=\"UtcTime\">2026-08-18 12:00:00.123</Data><Data Name=\"ProcessGuid\">{aaaaaaaa-0001-0000-0000-000000000001}</Data><Data Name=\"ProcessId\">4444</Data><Data Name=\"Image\">C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe</Data><Data Name=\"FileVersion\">10.0.19041.1</Data><Data Name=\"Description\">Windows PowerShell</Data><Data Name=\"Product\">Microsoft Windows Operating System</Data><Data Name=\"Company\">Microsoft Corporation</Data><Data Name=\"OriginalFileName\">PowerShell.EXE</Data><Data Name=\"CommandLine\">powershell.exe -nop -w hidden -enc SQBFAFgA</Data><Data Name=\"CurrentDirectory\">C:\\Users\\alice\\</Data><Data Name=\"User\">CORP\\alice</Data><Data Name=\"LogonGuid\">{aaaaaaaa-0002-0000-0000-000000000002}</Data><Data Name=\"LogonId\">0x3e7abc</Data><Data Name=\"TerminalSessionId\">1</Data><Data Name=\"IntegrityLevel\">High</Data><Data Name=\"Hashes\">SHA1=AABBCC,MD5=00112233445566778899AABBCCDDEEFF,SHA256=9F914D42706FE215501044ACD85A32D58AAEF1419D404FDDFA5D3B48F66CCD9F,IMPHASH=DEAD</Data><Data Name=\"ParentProcessGuid\">{aaaaaaaa-0003-0000-0000-000000000003}</Data><Data Name=\"ParentProcessId\">1200</Data><Data Name=\"ParentImage\">C:\\Windows\\explorer.exe</Data><Data Name=\"ParentCommandLine\">C:\\Windows\\Explorer.EXE</Data><Data Name=\"ParentUser\">CORP\\alice</Data></EventData></Event>"
     expect:
       "metadata.uid": "506d32600ffc8104279c18d539b5bbd173ff14eae93f2952e4147a5bfde88cd3"
-      "metadata.original_event_uid": "506d32600ffc8104279c18d539b5bbd173ff14eae93f2952e4147a5bfde88cd3"
+      "metadata.original_event_uid": "<missing>"
+  # NAN-3713: original_event_uid is the bare record number; metadata.uid stays the composite
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Sysmon\" Guid=\"{5770385f-c22a-43e0-bf4c-06f5698ffbd9}\"/><EventID>1</EventID><Version>5</Version><Level>4</Level><Task>1</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:01:00.1234567Z\"/><EventRecordID>1001</EventRecordID><Correlation/><Execution ProcessID=\"2456\" ThreadID=\"3820\"/><Channel>Microsoft-Windows-Sysmon/Operational</Channel><Computer>WKS-11.corp.local</Computer><Security UserID=\"S-1-5-18\"/></System><EventData><Data Name=\"RuleName\">technique_id=T1059.001,technique_name=PowerShell</Data><Data Name=\"UtcTime\">2026-08-18 12:00:00.123</Data><Data Name=\"ProcessGuid\">{aaaaaaaa-0001-0000-0000-000000000001}</Data><Data Name=\"ProcessId\">4444</Data><Data Name=\"Image\">C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe</Data><Data Name=\"FileVersion\">10.0.19041.1</Data><Data Name=\"Description\">Windows PowerShell</Data><Data Name=\"Product\">Microsoft Windows Operating System</Data><Data Name=\"Company\">Microsoft Corporation</Data><Data Name=\"OriginalFileName\">PowerShell.EXE</Data><Data Name=\"CommandLine\">powershell.exe -nop -w hidden -enc SQBFAFgA</Data><Data Name=\"CurrentDirectory\">C:\\Users\\alice\\</Data><Data Name=\"User\">CORP\\alice</Data><Data Name=\"LogonGuid\">{aaaaaaaa-0002-0000-0000-000000000002}</Data><Data Name=\"LogonId\">0x3e7abc</Data><Data Name=\"TerminalSessionId\">1</Data><Data Name=\"IntegrityLevel\">High</Data><Data Name=\"Hashes\">SHA1=AABBCC,MD5=00112233445566778899AABBCCDDEEFF,SHA256=9F914D42706FE215501044ACD85A32D58AAEF1419D404FDDFA5D3B48F66CCD9F,IMPHASH=DEAD</Data><Data Name=\"ParentProcessGuid\">{aaaaaaaa-0003-0000-0000-000000000003}</Data><Data Name=\"ParentProcessId\">1200</Data><Data Name=\"ParentImage\">C:\\Windows\\explorer.exe</Data><Data Name=\"ParentCommandLine\">C:\\Windows\\Explorer.EXE</Data><Data Name=\"ParentUser\">CORP\\alice</Data></EventData></Event>"
+    expect:
+      "metadata.original_event_uid": "1001"
