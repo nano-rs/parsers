@@ -1,6 +1,17 @@
 name: Validate & Auto-Merge Parsers
 
 on:
+  # NAN-3680: the merge to main/ocsf-1.9 re-runs validation with the private
+  # OCSF contract validator, so a fork PR (which cannot read it) is still
+  # schema-checked before its content is trusted.
+  push:
+    branches: [main, ocsf-1.9]
+    paths:
+      - "parsers/**"
+      - "parsers-ocsf/**"
+      - "enrichments/**"
+      - "scripts/**"
+      - ".github/workflows/validate-parsers.yml"
   pull_request:
     # `ocsf-1.9` is the OCSF 1.9 line; `main` keeps the OCSF 1.8 content for
     # tenants still running OCSF on ClickHouse. Both need the same gates, and a
@@ -51,6 +62,8 @@ jobs:
 
       - name: Find changed parsers
         id: changed
+        # PR-only: a push has no base ref. The whole-repo pass below covers it.
+        if: github.event_name == 'pull_request'
         run: |
           base="origin/${{ github.event.pull_request.base.ref }}"
           changed=$(git diff --name-only "$base"...HEAD -- 'parsers/*/parser.yaml' 'enrichments/**/parser.yaml')
@@ -91,7 +104,7 @@ jobs:
 
   validate-ocsf:
     name: Validate OCSF
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # validator binary needs glibc >= 2.34
     steps:
       - uses: actions/checkout@v4
 
@@ -114,11 +127,35 @@ jobs:
       # ocsf_version, type_uid arithmetic, no .udm.*/source_type, no deprecated
       # class_uid) plus gate 1 against each parser's samples/ corpus.
       #
-      # The OCSF *contract* half of gate 2 needs nano's `ocsf_event_validate`
-      # binary, which is a nano build artifact and is not vendored into this
-      # public repo. Where it is absent the script reports the schema check as
-      # SKIPPED and still enforces everything above. Set OCSF_VALIDATOR (or put
-      # the binary on PATH) on a runner that has it to turn the schema half on.
+      # The OCSF *contract* half of gate 2 runs nano's `ocsf_event_validate`:
+      # the exact check nano's lake enforces at admission. NAN-3680: it is
+      # MANDATORY here. azure_monitor 1.0.0 passed this job with it skipped and
+      # then lost every unregistered-device sign-in in the lake. The binary is
+      # pinned (url + sha256) in scripts/ocsf-validator.lock; validate-ocsf.sh
+      # fails under CI when it is missing.
+      #
+      # The binary is a private nano build artifact: a release asset on the
+      # private, binary-only nano-rs/ocsf-validator-dist repo, read with
+      # OCSF_VALIDATOR_TOKEN (fine-grained, Contents read-only, that repo only,
+      # so a leaked token exposes the validator binary and nothing else). A fork PR cannot read
+      # repository secrets, so its schema half reports "skipped (fork)"; the
+      # push run after merge to main/ocsf-1.9 enforces it with the secret.
+      - name: Fetch nano OCSF contract validator
+        if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) }}
+        env:
+          OCSF_VALIDATOR_TOKEN: ${{ secrets.OCSF_VALIDATOR_TOKEN }}
+        # Assign first: `echo "...$(fetch)"` masks the fetch's exit status, so a
+        # 401/404 or sha mismatch would show this step green.
+        run: |
+          set -euo pipefail
+          validator="$(bash scripts/fetch-ocsf-validator.sh "$RUNNER_TEMP/ocsf")"
+          sha256sum "$validator"
+          echo "OCSF_VALIDATOR=$validator" >> "$GITHUB_ENV"
+
+      - name: Mark fork PR (schema half skipped, enforced post-merge)
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
+        run: echo "OCSF_VALIDATOR_SKIP_REASON=fork" >> "$GITHUB_ENV"
+
       - name: Validate OCSF parser tree
         run: bash scripts/validate-ocsf.sh
 
@@ -143,7 +180,7 @@ jobs:
     # PR, but it surfaces as a failed check, which is indistinguishable at a
     # glance from a real problem. Combined with the ready_for_review trigger
     # above, a draft now shows no auto-merge result until it is marked ready.
-    if: success() && github.event.pull_request.draft == false
+    if: success() && github.event_name == 'pull_request' && github.event.pull_request.draft == false
     steps:
       - name: Enable auto-merge
         uses: actions/github-script@v7

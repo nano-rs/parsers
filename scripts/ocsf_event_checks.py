@@ -68,7 +68,10 @@ def read_event(path):
     """
     raw = pathlib.Path(path).read_text()
     # `--print-object` renders timestamps as VRL literals t'…', not JSON.
-    raw = re.sub(r"t'([^']*)'", r'"\1"', raw)
+    # Only a real timestamp literal: a bare `t'` also matches prose such as
+    # "the host's ..." inside a string, and rewriting that corrupted the JSON
+    # (four moat_edr samples crashed this checker, NAN-3680).
+    raw = re.sub(r"(?<![\w\\])t'(\d{4}-\d{2}-\d{2}T[^']*)'", r'"\1"', raw)
     return json.loads(raw, strict=False)
 
 
