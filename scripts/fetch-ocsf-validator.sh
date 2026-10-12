@@ -22,9 +22,9 @@ mkdir -p "$DEST"
 out="$DEST/ocsf_event_validate"
 if [ -n "${OCSF_VALIDATOR_TOKEN:-}" ]; then
     curl -fsSL -H "Authorization: Bearer ${OCSF_VALIDATOR_TOKEN}" -H "Accept: application/octet-stream" -o "$out" "$url"
-elif [[ "$url" == https://api.github.com/repos/nano-rs/nanosiem/* ]]; then
-    echo "OCSF_VALIDATOR_TOKEN is not set: the pinned validator is a private nano-rs/nanosiem" >&2
-    echo "release asset. Set it to a read-only token for that repo (CI: repo secret)." >&2
+elif [[ "$url" == https://api.github.com/repos/nano-rs/ocsf-validator-dist/* ]]; then
+    echo "OCSF_VALIDATOR_TOKEN is not set: the pinned validator is a private nano-rs/ocsf-validator-dist" >&2
+    echo "release asset. Set it to the read-only token for that repo only (CI: repo secret)." >&2
     exit 1
 else
     curl -fsSL -o "$out" "$url"
