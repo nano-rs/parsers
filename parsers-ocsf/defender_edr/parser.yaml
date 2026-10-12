@@ -1,6 +1,6 @@
 name: defender_edr_ocsf
 display_name: Microsoft Defender for Endpoint (OCSF)
-version: "1.2.1"
+version: "1.2.2"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses Microsoft Defender for Endpoint (Advanced Hunting JSON) into
@@ -598,8 +598,12 @@ parser_vrl: |
       if report_id != "" && device_id != "" && ts_str != "" {
           record_uid = join!(["defender_edr", device_id, report_id, ts_str], "|")
       }
-      if record_uid == "" { record_uid = to_string(p.AlertId) ?? "" }
+      # NAN-3721: never AlertId as the uid. One alert has many AlertEvidence
+      # rows that share its AlertId, and as a uid fallback it collapsed them
+      # into one row. Without the ReportId composite the raw record is hashed,
+      # and AlertId stays as correlation_uid (and finding_info.uid).
       if record_uid == "" { record_uid = sha2("defender_edr|raw|" + raw_log, variant: "SHA-256") }
+      def_alert_id = to_string(p.AlertId) ?? ""
 
       ocsf.metadata = {
           "version": "1.9.0",
@@ -617,6 +621,7 @@ parser_vrl: |
       native_uid = report_id
       if native_uid == "" { native_uid = to_string(p.AlertId) ?? "" }
       if native_uid != "" { ocsf.metadata.original_event_uid = native_uid }
+      if def_alert_id != "" { ocsf.metadata.correlation_uid = def_alert_id }
 
       . = ocsf
   }
@@ -908,3 +913,13 @@ samples:
   - raw: "{\"Timestamp\":\"2026-08-18T12:00:00.1234567Z\",\"DeviceId\":\"a1b2c3d4e5f6\",\"DeviceName\":\"wks-11.corp.local\",\"ActionType\":\"AntivirusDetection\",\"AlertId\":\"da637123456789\",\"Title\":\"Suspicious PowerShell command line\",\"Severity\":\"High\",\"Category\":\"Execution\",\"DetectionSource\":\"WindowsDefenderAv\",\"ThreatFamilyName\":\"Trojan:Win32/Emotet\",\"ThreatName\":\"Trojan:Win32/Emotet.A\",\"RemediationAction\":\"Quarantine\",\"AlertState\":\"New\",\"AttackTechniques\":[\"T1059.001 (PowerShell)\",\"T1204 (User Execution)\"],\"FileName\":\"payload.exe\",\"FolderPath\":\"C:\\\\Users\\\\alice\\\\Downloads\",\"SHA256\":\"DEADBEEF\",\"InitiatingProcessId\":4321,\"InitiatingProcessFileName\":\"powershell.exe\",\"InitiatingProcessFolderPath\":\"C:\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\",\"InitiatingProcessCommandLine\":\"powershell.exe -enc SQBFAFgA\",\"InitiatingProcessAccountName\":\"alice\",\"InitiatingProcessAccountDomain\":\"CORP\"}"
     expect:
       "metadata.original_event_uid": "da637123456789"
+  # NAN-3721: an evidence row of an alert, no ReportId: the raw record is hashed and AlertId is correlation_uid
+  - raw: "{\"Timestamp\":\"2026-08-18T12:00:00.1234567Z\",\"DeviceId\":\"a1b2c3d4e5f6\",\"DeviceName\":\"wks-11.corp.local\",\"ActionType\":\"AntivirusDetection\",\"AlertId\":\"da637123456789\",\"Title\":\"Suspicious PowerShell command line\",\"Severity\":\"High\",\"Category\":\"Execution\",\"DetectionSource\":\"WindowsDefenderAv\",\"ThreatFamilyName\":\"Trojan:Win32/Emotet\",\"ThreatName\":\"Trojan:Win32/Emotet.A\",\"RemediationAction\":\"Quarantine\",\"AlertState\":\"New\",\"AttackTechniques\":[\"T1059.001 (PowerShell)\",\"T1204 (User Execution)\"],\"FileName\":\"payload.exe\",\"FolderPath\":\"C:\\\\Users\\\\alice\\\\Downloads\",\"SHA256\":\"DEADBEEF\",\"InitiatingProcessId\":4321,\"InitiatingProcessFileName\":\"powershell.exe\",\"InitiatingProcessFolderPath\":\"C:\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\",\"InitiatingProcessCommandLine\":\"powershell.exe -enc SQBFAFgA\",\"InitiatingProcessAccountName\":\"alice\",\"InitiatingProcessAccountDomain\":\"CORP\",\"EntityType\":\"File\",\"EvidenceRole\":\"Impacted\"}"
+    expect:
+      "metadata.uid": "d7407ced5e3d567e87677af3c4471bdfa2902c399ef17cf26187066e9437e0f6"
+      "metadata.correlation_uid": "da637123456789"
+  # NAN-3721: a second evidence row of the SAME alert (same AlertId): a distinct uid, so it is not dropped
+  - raw: "{\"Timestamp\":\"2026-08-18T12:00:00.1234567Z\",\"DeviceId\":\"a1b2c3d4e5f6\",\"DeviceName\":\"wks-11.corp.local\",\"ActionType\":\"AntivirusDetection\",\"AlertId\":\"da637123456789\",\"Title\":\"Suspicious PowerShell command line\",\"Severity\":\"High\",\"Category\":\"Execution\",\"DetectionSource\":\"WindowsDefenderAv\",\"ThreatFamilyName\":\"Trojan:Win32/Emotet\",\"ThreatName\":\"Trojan:Win32/Emotet.A\",\"RemediationAction\":\"Quarantine\",\"AlertState\":\"New\",\"AttackTechniques\":[\"T1059.001 (PowerShell)\",\"T1204 (User Execution)\"],\"FileName\":\"powershell.exe\",\"FolderPath\":\"C:\\\\Users\\\\alice\\\\Downloads\",\"SHA256\":\"DEADBEEF\",\"InitiatingProcessId\":4321,\"InitiatingProcessFileName\":\"powershell.exe\",\"InitiatingProcessFolderPath\":\"C:\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\",\"InitiatingProcessCommandLine\":\"powershell.exe -enc SQBFAFgA\",\"InitiatingProcessAccountName\":\"alice\",\"InitiatingProcessAccountDomain\":\"CORP\",\"EntityType\":\"Process\",\"EvidenceRole\":\"Related\"}"
+    expect:
+      "metadata.uid": "01ba8743f25322c9f778442fe457fef2650f58a5584a498fb837159503543636"
+      "metadata.correlation_uid": "da637123456789"

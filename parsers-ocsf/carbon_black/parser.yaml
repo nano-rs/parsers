@@ -1,6 +1,6 @@
 name: carbon_black_ocsf
 display_name: VMware Carbon Black (OCSF)
-version: "1.2.0"
+version: "1.2.1"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses VMware Carbon Black Cloud / EDR JSON into complete OCSF 1.9.0
@@ -335,6 +335,14 @@ parser_vrl: |
       # redelivery repeats it byte for byte). process_guid stays the original id.
       record_uid = to_string(p.id) ?? ""
       orig_uid = record_uid
+      # NAN-3721: an alert id names the ALERT, and the Carbon Black Alerts
+      # Service re-forwards the same id each time it updates the alert (up to
+      # ~60 times), always with a newer last_update_time; as the uid it dropped
+      # every update. The uid is the id plus last_update_time: a duplicate
+      # forward (identical last_update_time) still dedupes, an update does not.
+      cb_updated = to_string(p.last_update_time) ?? ""
+      if cb_updated == "" { cb_updated = to_string(p.backend_update_timestamp) ?? "" }
+      if record_uid != "" && cb_updated != "" { record_uid = record_uid + "|" + cb_updated }
       if orig_uid == "" { orig_uid = to_string(p.process_guid) ?? "" }
       if record_uid == "" { record_uid = sha2("carbon_black|raw|" + raw_log, variant: "SHA-256") }
       if orig_uid == "" { orig_uid = record_uid }
@@ -573,3 +581,13 @@ samples:
     expect:
       "metadata.uid": "51af53eced793cb39c0101595dfb5db38510079e4706b3d20e8076aa380e527f"
       "metadata.original_event_uid": "PG-123"
+  # NAN-3721: the uid is the alert id plus last_update_time
+  - raw: "{\"type\":\"CB_ANALYTICS\",\"id\":\"a1b2c3\",\"org_key\":\"ABCD1234\",\"backend_timestamp\":\"2026-08-18T09:00:00.000Z\",\"first_event_timestamp\":\"2026-08-18T08:59:00.000Z\",\"severity\":8,\"reason\":\"The application powershell.exe invoked another application (rundll32.exe).\",\"reason_code\":\"R_ATTACK\",\"threat_id\":\"T-9999\",\"device_id\":102345,\"device_name\":\"WKS-07\",\"device_internal_ip\":\"10.5.6.7\",\"device_external_ip\":\"203.0.113.5\",\"device_username\":\"CORP\\\\alice\",\"device_os\":\"WINDOWS\",\"device_os_version\":\"Windows 10 x64\",\"device_location\":\"OFFSITE\",\"process_name\":\"c:\\\\windows\\\\system32\\\\windowspowershell\\\\v1.0\\\\powershell.exe\",\"process_pid\":4444,\"process_guid\":\"ABCD-0000-1111\",\"process_sha256\":\"9F914D42706FE215501044ACD85A32D58AAEF1419D404FDDFA5D3B48F66CCD9F\",\"process_cmdline\":\"powershell.exe -enc SQBFAFgA\",\"parent_name\":\"c:\\\\windows\\\\explorer.exe\",\"parent_pid\":1200,\"parent_guid\":\"ABCD-0000-0001\",\"parent_cmdline\":\"explorer.exe\",\"parent_sha256\":\"AA11BB22\",\"sensor_action\":\"DENY\",\"run_state\":\"RAN\",\"target_value\":\"MEDIUM\",\"policy_name\":\"Standard\",\"policy_id\":6997287,\"report_name\":\"Suspicious PowerShell\",\"report_id\":\"RPT-1\",\"alert_url\":\"https://defense.conferdeploy.net/alerts?s[c][id]=a1b2c3\",\"ml_classification_final_verdict\":\"ANOMALOUS\",\"ml_classification_global_prevalence\":\"LOW\",\"workflow\":{\"state\":\"OPEN\",\"remediation\":\"None\"},\"ttps\":[\"MITRE_T1059_001_PowerShell\",\"POLICY_DENY\"],\"last_update_time\":\"2026-08-18T09:00:05.000Z\"}"
+    expect:
+      "metadata.uid": "a1b2c3|2026-08-18T09:00:05.000Z"
+      "metadata.original_event_uid": "a1b2c3"
+  # NAN-3721: an updated forward of the SAME alert (newer last_update_time): a distinct uid, so it is not dropped
+  - raw: "{\"type\":\"CB_ANALYTICS\",\"id\":\"a1b2c3\",\"org_key\":\"ABCD1234\",\"backend_timestamp\":\"2026-08-18T09:00:00.000Z\",\"first_event_timestamp\":\"2026-08-18T08:59:00.000Z\",\"severity\":9,\"reason\":\"The application powershell.exe invoked another application (rundll32.exe).\",\"reason_code\":\"R_ATTACK\",\"threat_id\":\"T-9999\",\"device_id\":102345,\"device_name\":\"WKS-07\",\"device_internal_ip\":\"10.5.6.7\",\"device_external_ip\":\"203.0.113.5\",\"device_username\":\"CORP\\\\alice\",\"device_os\":\"WINDOWS\",\"device_os_version\":\"Windows 10 x64\",\"device_location\":\"OFFSITE\",\"process_name\":\"c:\\\\windows\\\\system32\\\\windowspowershell\\\\v1.0\\\\powershell.exe\",\"process_pid\":4444,\"process_guid\":\"ABCD-0000-1111\",\"process_sha256\":\"9F914D42706FE215501044ACD85A32D58AAEF1419D404FDDFA5D3B48F66CCD9F\",\"process_cmdline\":\"powershell.exe -enc SQBFAFgA\",\"parent_name\":\"c:\\\\windows\\\\explorer.exe\",\"parent_pid\":1200,\"parent_guid\":\"ABCD-0000-0001\",\"parent_cmdline\":\"explorer.exe\",\"parent_sha256\":\"AA11BB22\",\"sensor_action\":\"DENY\",\"run_state\":\"RAN\",\"target_value\":\"MEDIUM\",\"policy_name\":\"Standard\",\"policy_id\":6997287,\"report_name\":\"Suspicious PowerShell\",\"report_id\":\"RPT-1\",\"alert_url\":\"https://defense.conferdeploy.net/alerts?s[c][id]=a1b2c3\",\"ml_classification_final_verdict\":\"ANOMALOUS\",\"ml_classification_global_prevalence\":\"LOW\",\"workflow\":{\"state\":\"OPEN\",\"remediation\":\"None\"},\"ttps\":[\"MITRE_T1059_001_PowerShell\",\"POLICY_DENY\"],\"last_update_time\":\"2026-08-18T09:03:00.000Z\"}"
+    expect:
+      "metadata.uid": "a1b2c3|2026-08-18T09:03:00.000Z"
+      "metadata.original_event_uid": "a1b2c3"

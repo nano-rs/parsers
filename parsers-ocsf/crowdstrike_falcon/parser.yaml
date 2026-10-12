@@ -1,6 +1,6 @@
 name: crowdstrike_falcon_ocsf
 display_name: CrowdStrike Falcon (OCSF)
-version: "1.2.1"
+version: "1.2.2"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses CrowdStrike Falcon events in both FDR (flat JSON, dispatched on
@@ -809,14 +809,16 @@ parser_vrl: |
       ocsf.time = time_ms
       ocsf.raw_data = raw_log
 
-      # Falcon has no single event id. aid+ContextTimeStamp+event name is the
-      # closest stable identity. Without it, hash the raw record (NAN-3702): a
-      # replay of the same record must dedupe in the lake, so never a random uid.
+      # NAN-3721: metadata.uid is the lake's dedup key, so it must name ONE
+      # record: DetectId, EventUUID, or the per-event `id` UUID FDR records
+      # carry. The old aid+event_simpleName+millisecond fallback named a group:
+      # one host emits many events of one type in the same millisecond (DNS,
+      # network, image loads), and they collapsed into one row. Without a
+      # per-event id the raw record is hashed (a redelivery repeats it byte for
+      # byte, so it still dedupes).
       record_uid = to_string(ev.DetectId) ?? ""
       if record_uid == "" { record_uid = to_string(ev.EventUUID) ?? "" }
-      if record_uid == "" && agent_id != "" && event_name != "" && time_ms > 0 {
-          record_uid = join!(["crowdstrike_falcon", agent_id, event_name, to_string(time_ms)], "|")
-      }
+      if record_uid == "" && !is_streaming { record_uid = to_string(ev.id) ?? "" }
       if record_uid == "" { record_uid = sha2("crowdstrike_falcon|raw|" + raw_log, variant: "SHA-256") }
 
       ocsf.metadata = {
@@ -1240,3 +1242,16 @@ samples:
   - raw: "{\"metadata\": {\"customerIDHash\": \"ffeeddcc\", \"offset\": 42318, \"eventType\": \"AuthActivityAuditEvent\", \"eventCreationTime\": 1787044080000, \"version\": \"1.0\"}, \"event\": {\"UserId\": \"soc.analyst@corp.example\", \"UserIp\": \"198.51.100.20\", \"OperationName\": \"userAuthenticate\", \"ServiceName\": \"CrowdStrike Authentication\", \"Success\": \"true\", \"UTCTimestamp\": \"2026-08-18T12:01:20Z\"}}"
     expect:
       "metadata.original_event_uid": "<missing>"
+  # NAN-3721: an FDR record without `id`: the raw record is hashed (no aid+event+ms composite)
+  - raw: "{\"aid\":\"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\",\"cid\":\"ffeeddccbbaa99887766554433221100\",\"aip\":\"203.0.113.44\",\"ComputerName\":\"WKS-EDR-01\",\"event_platform\":\"Win\",\"ConfigBuild\":\"1007.3.0016606.11\",\"timestamp\":\"1787043600000\",\"event_simpleName\":\"DnsRequest\",\"ContextTimeStamp\":\"1787043960.5\",\"DomainName\":\"a.example.com\",\"RequestType\":\"1\",\"IP4Records\":\"93.184.216.34;93.184.216.35;\",\"FirstIP4Record\":\"93.184.216.34\",\"QueryStatus\":\"0\",\"DnsRequestCount\":\"1\",\"ContextProcessId\":\"128472361926\"}"
+    expect:
+      "metadata.uid": "e02cd2915b3f335898915a4001a0353d3fbc4a624d56b915d8d0abfaf0657245"
+  # NAN-3721: a second DnsRequest from the same host in the same millisecond: a distinct uid, so it is not dropped
+  - raw: "{\"aid\":\"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\",\"cid\":\"ffeeddccbbaa99887766554433221100\",\"aip\":\"203.0.113.44\",\"ComputerName\":\"WKS-EDR-01\",\"event_platform\":\"Win\",\"ConfigBuild\":\"1007.3.0016606.11\",\"timestamp\":\"1787043600000\",\"event_simpleName\":\"DnsRequest\",\"ContextTimeStamp\":\"1787043960.5\",\"DomainName\":\"b.example.com\",\"RequestType\":\"1\",\"IP4Records\":\"93.184.216.34;93.184.216.35;\",\"FirstIP4Record\":\"93.184.216.34\",\"QueryStatus\":\"0\",\"DnsRequestCount\":\"1\",\"ContextProcessId\":\"128472361926\"}"
+    expect:
+      "metadata.uid": "2c6b4a86c74637bacfc2ef3bc70c486efcefbb668598c931f1a16893bac7bdad"
+  # NAN-3721: an FDR record's per-event `id` is the uid
+  - raw: "{\"aid\":\"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\",\"cid\":\"ffeeddccbbaa99887766554433221100\",\"aip\":\"203.0.113.44\",\"ComputerName\":\"WKS-EDR-01\",\"event_platform\":\"Win\",\"ConfigBuild\":\"1007.3.0016606.11\",\"timestamp\":\"1787043600000\",\"event_simpleName\":\"DnsRequest\",\"ContextTimeStamp\":\"1787043960.5\",\"DomainName\":\"malicious.example.com\",\"RequestType\":\"1\",\"IP4Records\":\"93.184.216.34;93.184.216.35;\",\"FirstIP4Record\":\"93.184.216.34\",\"QueryStatus\":\"0\",\"DnsRequestCount\":\"1\",\"ContextProcessId\":\"128472361926\",\"id\":\"ffffffff-1111-11eb-9d75-02bcf3ade03b\"}"
+    expect:
+      "metadata.uid": "ffffffff-1111-11eb-9d75-02bcf3ade03b"
+      "metadata.original_event_uid": "ffffffff-1111-11eb-9d75-02bcf3ade03b"

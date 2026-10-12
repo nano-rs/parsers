@@ -1,6 +1,6 @@
 name: sentinelone_ocsf
 display_name: SentinelOne (OCSF)
-version: "1.2.1"
+version: "1.2.2"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses SentinelOne Singularity EDR JSON into complete OCSF 1.9.0
@@ -560,9 +560,14 @@ parser_vrl: |
       ocsf.time = time_ms
       ocsf.raw_data = raw_log
 
+      # NAN-3721: metadata.uid is the lake's dedup key, so it must name ONE
+      # record. threatId names a threat that many records share (its
+      # activities and its updates); as a uid fallback it collapsed them into
+      # one row. Without `id` the raw record is hashed, and threatId stays as
+      # correlation_uid.
       record_uid = to_string(p.id) ?? ""
-      if record_uid == "" { record_uid = to_string(p.threatId) ?? "" }
       if record_uid == "" { record_uid = sha2("sentinelone|raw|" + raw_log, variant: "SHA-256") }
+      s1_threat_id = to_string(p.threatId) ?? ""
 
       event_code = to_string(p.EventType) ?? ""
       if event_code == "" { event_code = to_string(p.activityType) ?? "" }
@@ -583,6 +588,7 @@ parser_vrl: |
       # share, so it is not an event id.
       s1_id = to_string(p.id) ?? ""
       if s1_id != "" { ocsf.metadata.original_event_uid = s1_id }
+      if s1_threat_id != "" { ocsf.metadata.correlation_uid = s1_threat_id }
 
       . = ocsf
   }
@@ -865,5 +871,11 @@ samples:
   # NAN-3718: threatId alone names a threat, not this record: no original_event_uid (metadata.uid unchanged)
   - raw: "{\"threatId\":\"1234567890123456789\",\"createdAt\":\"2026-08-18T13:00:00.000000Z\",\"threatName\":\"mimikatz.exe\",\"classification\":\"Malware\",\"classificationSource\":\"Static\",\"confidenceLevel\":\"malicious\",\"cloudVerdict\":\"black\",\"fileContentHash\":\"9f914d42706fe215501044acd85a32d58aaef1419d404fddfa5d3b48f66ccd9f\",\"filePath\":\"C:\\\\Users\\\\alice\\\\Downloads\\\\mimikatz.exe\",\"fileSize\":1258291,\"agentComputerName\":\"WKS-21\",\"agentIp\":\"10.4.5.6\",\"agentId\":\"987654321\",\"agentDomain\":\"CORP\",\"agentOsType\":\"windows\",\"agentVersion\":\"23.4.2.350\",\"agentIsActive\":true,\"agentMachineType\":\"laptop\",\"agentNetworkStatus\":\"connected\",\"mitigationStatus\":\"mitigated\",\"mitigationStatusDescription\":\"Quarantined and killed\",\"initiatedBy\":\"agent_policy\",\"engines\":[\"Behavioral AI\",\"Static AI\"],\"description\":\"Malicious credential dumping tool detected\",\"indicators\":[{\"techniques\":[\"T1003.001 OS Credential Dumping: LSASS Memory\"],\"tactics\":[\"Credential Access\"]}],\"siteName\":\"HQ\",\"groupName\":\"Workstations\",\"accountName\":\"Acme\",\"accountId\":\"55501\"}"
     expect:
-      "metadata.uid": "1234567890123456789"
+      "metadata.uid": "af578bc695ec49ad462a39207bfd9e64d9992bad1715739cb2c24c67993578a6"
+      "metadata.correlation_uid": "1234567890123456789"
       "metadata.original_event_uid": "<missing>"
+  # NAN-3721: a second record of the same threat (same threatId), no id: a distinct uid, so it is not dropped
+  - raw: "{\"threatId\":\"1234567890123456789\",\"createdAt\":\"2026-08-18T13:05:00.000000Z\",\"threatName\":\"mimikatz.exe\",\"classification\":\"Malware\",\"classificationSource\":\"Static\",\"confidenceLevel\":\"malicious\",\"cloudVerdict\":\"black\",\"fileContentHash\":\"9f914d42706fe215501044acd85a32d58aaef1419d404fddfa5d3b48f66ccd9f\",\"filePath\":\"C:\\\\Users\\\\alice\\\\Downloads\\\\mimikatz.exe\",\"fileSize\":1258291,\"agentComputerName\":\"WKS-21\",\"agentIp\":\"10.4.5.6\",\"agentId\":\"987654321\",\"agentDomain\":\"CORP\",\"agentOsType\":\"windows\",\"agentVersion\":\"23.4.2.350\",\"agentIsActive\":true,\"agentMachineType\":\"laptop\",\"agentNetworkStatus\":\"connected\",\"mitigationStatus\":\"mitigated\",\"mitigationStatusDescription\":\"Quarantined and killed\",\"initiatedBy\":\"agent_policy\",\"engines\":[\"Behavioral AI\",\"Static AI\"],\"description\":\"Malicious credential dumping tool detected\",\"indicators\":[{\"techniques\":[\"T1003.001 OS Credential Dumping: LSASS Memory\"],\"tactics\":[\"Credential Access\"]}],\"siteName\":\"HQ\",\"groupName\":\"Workstations\",\"accountName\":\"Acme\",\"accountId\":\"55501\"}"
+    expect:
+      "metadata.uid": "1fbaa0dba9965d1f15ad87ae21ff62ac908e3c1f481b226e7247bf0e2cd86482"
+      "metadata.correlation_uid": "1234567890123456789"

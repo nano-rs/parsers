@@ -1,6 +1,6 @@
 name: aws_guardduty_ocsf
 display_name: AWS GuardDuty (OCSF)
-version: "1.2.0"
+version: "1.2.1"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -90,6 +90,16 @@ parser_vrl: |
       if updated_ms > created_ms { activity_id = 2; activity_name = "Update" }
       time_ms = created_ms
       if updated_ms > 0 { time_ms = updated_ms }
+
+      # NAN-3721: metadata.uid is the lake's dedup key, so it must name ONE
+      # record. The finding id names the finding, and GuardDuty re-publishes
+      # the same id each time it updates the finding (count++, new updatedAt),
+      # so as the uid it dropped every update that landed in the same event
+      # hour. The uid is the finding id plus updatedAt: a redelivered copy
+      # still dedupes, a real update does not. finding_info.uid stays the id.
+      gd_id = to_string(p.id) ?? ""
+      record_uid = finding_id
+      if gd_id != "" && updated_str != "" { record_uid = gd_id + "|" + updated_str }
 
       first_seen_ms = 0
       fs_str = to_string(service.eventFirstSeen) ?? ""
@@ -324,7 +334,7 @@ parser_vrl: |
           "metadata": {
               "version": "1.9.0",
               "profiles": ["cloud", "security_control"],
-              "uid": finding_id,
+              "uid": record_uid,
               "log_name": "GuardDuty",
               "log_provider": "AWS GuardDuty",
               "product": { "name": "AWS GuardDuty", "vendor_name": "Amazon" }
@@ -332,6 +342,7 @@ parser_vrl: |
           "cloud": cloud,
           "finding_info": finding_info
       }
+      if gd_id != "" { ocsf.metadata.original_event_uid = gd_id }
       schema_ver = to_string(p.schemaVersion) ?? ""
       if schema_ver != "" { unmapped.guardduty_schema_version = schema_ver }
       cnt = to_int(service.count) ?? 0
@@ -555,3 +566,15 @@ samples:
     expect:
       "metadata.uid": "524939459a6aa68da5b7c0b21c304c2a75b01a8013b05abe5d291fa837d6bc66"
       "finding_info.uid": "524939459a6aa68da5b7c0b21c304c2a75b01a8013b05abe5d291fa837d6bc66"
+  # NAN-3721: the uid is the finding id plus updatedAt; original_event_uid is the finding id
+  - raw: "{\"schemaVersion\":\"2.0\",\"accountId\":\"123456789012\",\"region\":\"us-east-1\",\"partition\":\"aws\",\"arn\":\"arn:aws:guardduty:us-east-1:123456789012:detector/abc/finding/aabb\",\"createdAt\":\"2026-08-18T20:00:00.000Z\",\"updatedAt\":\"2026-08-18T20:05:00.000Z\",\"type\":\"UnauthorizedAccess:IAMUser/MaliciousIPCaller.Custom\",\"severity\":8.0,\"title\":\"API GetObject was invoked from a known malicious IP address.\",\"description\":\"API GetObject was invoked from IP address 198.51.100.5 which is on a custom threat list.\",\"resource\":{\"resourceType\":\"AccessKey\",\"accessKeyDetails\":{\"accessKeyId\":\"AKIAIOSFODNN7EXAMPLE\",\"principalId\":\"AIDACKCEVSQ6C2EXAMPLE\",\"userType\":\"IAMUser\",\"userName\":\"alice\"}},\"service\":{\"serviceName\":\"guardduty\",\"detectorId\":\"abc123\",\"count\":3,\"eventFirstSeen\":\"2026-08-18T19:50:00Z\",\"eventLastSeen\":\"2026-08-18T20:00:00Z\",\"action\":{\"actionType\":\"AWS_API_CALL\",\"awsApiCallAction\":{\"api\":\"GetObject\",\"serviceName\":\"s3.amazonaws.com\",\"callerType\":\"Remote IP\",\"remoteIpDetails\":{\"ipAddressV4\":\"198.51.100.5\",\"organization\":{\"asn\":\"64512\",\"asnOrg\":\"EvilNet\",\"isp\":\"EvilNet\",\"org\":\"EvilNet\"},\"country\":{\"countryName\":\"Russia\"},\"city\":{\"cityName\":\"Moscow\"}}}},\"evidence\":{\"threatIntelligenceDetails\":[{\"threatListName\":\"CustomList\",\"threatNames\":[\"BadActor\"]}]},\"additionalInfo\":{\"sample\":false}},\"id\":\"7cc5f0b1c4d6e8a9b0c1d2e3f4a5b6c7\"}"
+    expect:
+      "metadata.uid": "7cc5f0b1c4d6e8a9b0c1d2e3f4a5b6c7|2026-08-18T20:05:00.000Z"
+      "metadata.original_event_uid": "7cc5f0b1c4d6e8a9b0c1d2e3f4a5b6c7"
+      "finding_info.uid": "7cc5f0b1c4d6e8a9b0c1d2e3f4a5b6c7"
+  # NAN-3721: a later update of the SAME finding in the same hour: a distinct uid, so it is not dropped
+  - raw: "{\"schemaVersion\":\"2.0\",\"accountId\":\"123456789012\",\"region\":\"us-east-1\",\"partition\":\"aws\",\"arn\":\"arn:aws:guardduty:us-east-1:123456789012:detector/abc/finding/aabb\",\"createdAt\":\"2026-08-18T20:00:00.000Z\",\"updatedAt\":\"2026-08-18T20:20:00.000Z\",\"type\":\"UnauthorizedAccess:IAMUser/MaliciousIPCaller.Custom\",\"severity\":8.0,\"title\":\"API GetObject was invoked from a known malicious IP address.\",\"description\":\"API GetObject was invoked from IP address 198.51.100.5 which is on a custom threat list.\",\"resource\":{\"resourceType\":\"AccessKey\",\"accessKeyDetails\":{\"accessKeyId\":\"AKIAIOSFODNN7EXAMPLE\",\"principalId\":\"AIDACKCEVSQ6C2EXAMPLE\",\"userType\":\"IAMUser\",\"userName\":\"alice\"}},\"service\":{\"serviceName\":\"guardduty\",\"detectorId\":\"abc123\",\"count\":4,\"eventFirstSeen\":\"2026-08-18T19:50:00Z\",\"eventLastSeen\":\"2026-08-18T20:00:00Z\",\"action\":{\"actionType\":\"AWS_API_CALL\",\"awsApiCallAction\":{\"api\":\"GetObject\",\"serviceName\":\"s3.amazonaws.com\",\"callerType\":\"Remote IP\",\"remoteIpDetails\":{\"ipAddressV4\":\"198.51.100.5\",\"organization\":{\"asn\":\"64512\",\"asnOrg\":\"EvilNet\",\"isp\":\"EvilNet\",\"org\":\"EvilNet\"},\"country\":{\"countryName\":\"Russia\"},\"city\":{\"cityName\":\"Moscow\"}}}},\"evidence\":{\"threatIntelligenceDetails\":[{\"threatListName\":\"CustomList\",\"threatNames\":[\"BadActor\"]}]},\"additionalInfo\":{\"sample\":false}},\"id\":\"7cc5f0b1c4d6e8a9b0c1d2e3f4a5b6c7\"}"
+    expect:
+      "metadata.uid": "7cc5f0b1c4d6e8a9b0c1d2e3f4a5b6c7|2026-08-18T20:20:00.000Z"
+      "metadata.original_event_uid": "7cc5f0b1c4d6e8a9b0c1d2e3f4a5b6c7"
+      "finding_info.uid": "7cc5f0b1c4d6e8a9b0c1d2e3f4a5b6c7"
