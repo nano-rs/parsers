@@ -1,6 +1,6 @@
 name: palo_alto_ocsf
 display_name: Palo Alto Networks PAN-OS (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -435,7 +435,7 @@ parser_vrl: |
 
   metadata = {
       "version": "1.9.0",
-      "uid": uuid_v4(),
+      "uid": sha2("palo_alto|raw|" + raw_log, variant: "SHA-256"),
       "log_source": "palo_alto",
       "log_provider": "PAN-OS",
       "profiles": ["host", "security_control"],
@@ -978,3 +978,8 @@ samples:
     user.name: corp\jsmith
     actor.user.name: corp\jsmith
     disposition_id: 1
+# NAN-3702 (existing sample): metadata.uid is sha256("palo_alto|raw|" + raw), so the
+# same record parsed twice gets the same uid (a random uid could never match).
+- raw: "1,2024/10/30 09:54:00,013101000123,AUTHENTICATION,authentication-failed,2561,2024/10/30 09:54:00,vsys1,203.0.113.5,corp\\jsmith,jsmith,mgmt,auth-policy-1,1,42,PAN-OS,LogForward,ldap-profile,Invalid credentials,Web,failure,1,987654328,0x0"
+  expect:
+    "metadata.uid": "c9a4ff8464948c4b1ee76e495f43b48d00400f060f9c9a50e48d5d401e5c1a98"

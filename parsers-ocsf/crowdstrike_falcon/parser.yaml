@@ -1,6 +1,6 @@
 name: crowdstrike_falcon_ocsf
 display_name: CrowdStrike Falcon (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses CrowdStrike Falcon events in both FDR (flat JSON, dispatched on
@@ -64,7 +64,7 @@ parser_vrl: |
           "metadata": {
               "version": "1.9.0",
               "profiles": ["host"],
-              "uid": uuid_v4(),
+              "uid": sha2("crowdstrike_falcon|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_source": "crowdstrike_falcon",
               "product": { "name": "Falcon", "vendor_name": "CrowdStrike" }
@@ -655,7 +655,7 @@ parser_vrl: |
           finding_uid = to_string(ev.DetectId) ?? ""
           if finding_uid == "" { finding_uid = to_string(ev.IncidentId) ?? "" }
           if finding_uid == "" { finding_uid = to_string(ev.CompositeId) ?? "" }
-          if finding_uid == "" { finding_uid = uuid_v4() }
+          if finding_uid == "" { finding_uid = sha2("crowdstrike_falcon|raw|" + raw_log, variant: "SHA-256") }
           title = to_string(ev.DetectName) ?? ""
           if title == "" { title = to_string(ev.IncidentType) ?? "" }
           if title == "" { title = event_name }
@@ -810,13 +810,14 @@ parser_vrl: |
       ocsf.raw_data = raw_log
 
       # Falcon has no single event id. aid+ContextTimeStamp+event name is the
-      # closest stable identity; fall back to a uuid so replays stay distinct.
+      # closest stable identity. Without it, hash the raw record (NAN-3702): a
+      # replay of the same record must dedupe in the lake, so never a random uid.
       record_uid = to_string(ev.DetectId) ?? ""
       if record_uid == "" { record_uid = to_string(ev.EventUUID) ?? "" }
       if record_uid == "" && agent_id != "" && event_name != "" && time_ms > 0 {
           record_uid = join!(["crowdstrike_falcon", agent_id, event_name, to_string(time_ms)], "|")
       }
-      if record_uid == "" { record_uid = uuid_v4() }
+      if record_uid == "" { record_uid = sha2("crowdstrike_falcon|raw|" + raw_log, variant: "SHA-256") }
 
       ocsf.metadata = {
           "version": "1.9.0",
@@ -1197,3 +1198,21 @@ samples:
       "class_uid": 1007
       "activity_id": 1
       "metadata.version": "1.9.0"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("crowdstrike_falcon|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "Aug 18 12:00:00 falcon-collector: dropped frame, not json at all"
+    expect:
+      "metadata.uid": "ed953339509ffaa601de5d9f469f370550bf7db47c3157b17bd7fb5c2c9680d6"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("crowdstrike_falcon|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"metadata\":{\"customerIDHash\":\"ffeeddcc\",\"offset\":42315,\"eventType\":\"DetectionSummaryEvent\",\"eventCreationTime\":1787044050000,\"version\":\"1.0\"},\"event\":{\"ProcessStartTime\":1787044040,\"ProcessEndTime\":0,\"ProcessId\":128472361926,\"ParentProcessId\":128472361100,\"ComputerName\":\"WKS-EDR-01\",\"UserName\":\"alice\",\"DetectName\":\"Credential Theft via LSASS Access\",\"DetectDescription\":\"A process accessed LSASS memory.\",\"Severity\":4,\"SeverityName\":\"High\",\"FileName\":\"mimikatz.exe\",\"FilePath\":\"\\\\Device\\\\HarddiskVolume2\\\\temp\\\\\",\"CommandLine\":\"mimikatz.exe sekurlsa::logonpasswords\",\"SHA256String\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"MD5String\":\"55555555555555555555555555555555\",\"MachineDomain\":\"CORP\",\"FalconHostLink\":\"https://falcon.crowdstrike.com/activity/detections/detail/x\",\"SensorId\":\"1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d\",\"LocalIP\":\"10.20.30.40\",\"Tactic\":\"Credential Access\",\"Technique\":\"OS Credential Dumping\",\"Objective\":\"Gain Access\",\"PatternDispositionDescription\":\"Prevention, process killed.\",\"PatternDispositionValue\":2176,\"IOCType\":\"hash_sha256\",\"IOCValue\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"ParentImageFileName\":\"\\\\Device\\\\HarddiskVolume2\\\\Windows\\\\explorer.exe\",\"ParentCommandLine\":\"explorer.exe\",\"State\":\"open\"}}"
+    expect:
+      "metadata.uid": "3514c5567d59789dddc05b59ba996d0016278778e07612b5017e688d91d8ced2"
+      "finding_info.uid": "3514c5567d59789dddc05b59ba996d0016278778e07612b5017e688d91d8ced2"
+      "finding_info.analytic.uid": "3514c5567d59789dddc05b59ba996d0016278778e07612b5017e688d91d8ced2"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("crowdstrike_falcon|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"cid\":\"ffeeddccbbaa99887766554433221100\",\"aip\":\"203.0.113.44\",\"ComputerName\":\"WKS-EDR-01\",\"event_platform\":\"Win\",\"ConfigBuild\":\"1007.3.0016606.11\",\"timestamp\":\"1787043600000\",\"event_simpleName\":\"AsepValueUpdate\",\"ContextTimeStamp\":\"1787043985.5\",\"TargetObjectPath\":\"\\\\REGISTRY\\\\MACHINE\\\\SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run\",\"TargetObjectName\":\"Updater\",\"TargetObjectData\":\"C:\\\\ProgramData\\\\evil\\\\payload.exe\",\"AsepClass\":\"12\",\"ContextProcessId\":\"128472361926\"}"
+    expect:
+      "metadata.uid": "521ef26b8d0dc5a9ff19d47ea583a966b04759976fd7394fa54348497f164448"
+      "metadata.original_event_uid": "521ef26b8d0dc5a9ff19d47ea583a966b04759976fd7394fa54348497f164448"

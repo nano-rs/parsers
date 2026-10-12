@@ -1,6 +1,6 @@
 name: sentinelone_ocsf
 display_name: SentinelOne (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses SentinelOne Singularity EDR JSON into complete OCSF 1.9.0
@@ -65,7 +65,7 @@ parser_vrl: |
           "metadata": {
               "version": "1.9.0",
               "profiles": ["host"],
-              "uid": uuid_v4(),
+              "uid": sha2("sentinelone|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_source": "sentinelone",
               "product": { "name": "Singularity", "vendor_name": "SentinelOne" }
@@ -206,7 +206,7 @@ parser_vrl: |
 
           finding_uid = to_string(p.threatId) ?? ""
           if finding_uid == "" { finding_uid = to_string(p.id) ?? "" }
-          if finding_uid == "" { finding_uid = uuid_v4() }
+          if finding_uid == "" { finding_uid = sha2("sentinelone|raw|" + raw_log, variant: "SHA-256") }
           title = to_string(p.threatName) ?? ""
           if title == "" { title = to_string(p.description) ?? "" }
           if title == "" { title = "SentinelOne threat" }
@@ -562,7 +562,7 @@ parser_vrl: |
 
       record_uid = to_string(p.id) ?? ""
       if record_uid == "" { record_uid = to_string(p.threatId) ?? "" }
-      if record_uid == "" { record_uid = uuid_v4() }
+      if record_uid == "" { record_uid = sha2("sentinelone|raw|" + raw_log, variant: "SHA-256") }
 
       event_code = to_string(p.EventType) ?? ""
       if event_code == "" { event_code = to_string(p.activityType) ?? "" }
@@ -834,3 +834,21 @@ samples:
       "class_uid": 1007
       "activity_id": 99
       "metadata.version": "1.9.0"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("sentinelone|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "2026-08-18 sentinelone plain syslog line"
+    expect:
+      "metadata.uid": "cdf4224fb794ed53257176c46ca6a3702206b20cba7937011b4294bcf7a879f8"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("sentinelone|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"createdAt\":\"2026-08-18T13:00:00.000000Z\",\"threatName\":\"mimikatz.exe\",\"classification\":\"Malware\",\"classificationSource\":\"Static\",\"confidenceLevel\":\"malicious\",\"cloudVerdict\":\"black\",\"fileContentHash\":\"9f914d42706fe215501044acd85a32d58aaef1419d404fddfa5d3b48f66ccd9f\",\"filePath\":\"C:\\\\Users\\\\alice\\\\Downloads\\\\mimikatz.exe\",\"fileSize\":1258291,\"agentComputerName\":\"WKS-21\",\"agentIp\":\"10.4.5.6\",\"agentId\":\"987654321\",\"agentDomain\":\"CORP\",\"agentOsType\":\"windows\",\"agentVersion\":\"23.4.2.350\",\"agentIsActive\":true,\"agentMachineType\":\"laptop\",\"agentNetworkStatus\":\"connected\",\"mitigationStatus\":\"mitigated\",\"mitigationStatusDescription\":\"Quarantined and killed\",\"initiatedBy\":\"agent_policy\",\"engines\":[\"Behavioral AI\",\"Static AI\"],\"description\":\"Malicious credential dumping tool detected\",\"indicators\":[{\"techniques\":[\"T1003.001 OS Credential Dumping: LSASS Memory\"],\"tactics\":[\"Credential Access\"]}],\"siteName\":\"HQ\",\"groupName\":\"Workstations\",\"accountName\":\"Acme\",\"accountId\":\"55501\"}"
+    expect:
+      "metadata.uid": "c5b4b6ebe5688f5d5cd73bd8b9bdc112d3a57ea325c4b0e4970c71845e82c446"
+      "finding_info.uid": "c5b4b6ebe5688f5d5cd73bd8b9bdc112d3a57ea325c4b0e4970c71845e82c446"
+      "metadata.original_event_uid": "c5b4b6ebe5688f5d5cd73bd8b9bdc112d3a57ea325c4b0e4970c71845e82c446"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("sentinelone|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"activityType\":90,\"createdAt\":\"2026-08-18T13:10:00.000000Z\",\"primaryDescription\":\"The management user Dan Lussier logged in to the management console.\",\"secondaryDescription\":\"IP: 203.0.113.44\",\"userId\":\"55511\",\"data\":{\"computerName\":\"\",\"username\":\"dan@nano.rs\",\"ipAddress\":\"203.0.113.44\",\"role\":\"Admin\",\"source\":\"console\"},\"siteName\":\"HQ\",\"accountName\":\"Acme\",\"accountId\":\"55501\"}"
+    expect:
+      "metadata.uid": "167a3fbc7065d8cda882fa1758520252f9bc50ff40050074fe053fea8a87ea1d"
+      "metadata.original_event_uid": "167a3fbc7065d8cda882fa1758520252f9bc50ff40050074fe053fea8a87ea1d"

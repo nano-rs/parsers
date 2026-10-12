@@ -1,6 +1,6 @@
 name: windows_event_text_ocsf
 display_name: Windows Event Log (Rendered Text, OCSF)
-version: "1.1.1"
+version: "1.2.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses Windows Event Logs in RENDERED TEXT form - as sent by Splunk
@@ -907,7 +907,7 @@ parser_vrl: |
   if record_number != "" && computer != "" {
       record_uid = join!(["windows_event_text", computer, log_name_l, log_provider_l, record_number, to_string(time_ms)], "|")
   }
-  if record_uid == "" { record_uid = uuid_v4() }
+  if record_uid == "" { record_uid = sha2("windows_event_text|raw|" + raw_log, variant: "SHA-256") }
 
   ocsf.metadata = {
       "version": "1.9.0",
@@ -1279,3 +1279,9 @@ samples:
       "class_uid": 1008
       "activity_id": 99
       "metadata.version": "1.9.0"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("windows_event_text|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "10/15/2023 02:23:45 PM\nLogName=System\nSourceName=Service Control Manager\nEventCode=7045\nEventType=0\nType=Information\nComputerName=WKS-09.corp.local\nTaskCategory=None\nOpCode=Info\nKeywords=Audit Success\nMessage=A service was installed in the system.\nService Name:  PSEXESVC\nService File Name:  C:\\Windows\\PSEXESVC.exe\nService Type:  user mode service\nService Start Type:  demand start\nService Account:  LocalSystem"
+    expect:
+      "metadata.uid": "7de461c59eb3fa43ba9cbacf9b86677e89b9603c7011cd6d17c2431d3aef1ccb"
+      "metadata.original_event_uid": "7de461c59eb3fa43ba9cbacf9b86677e89b9603c7011cd6d17c2431d3aef1ccb"

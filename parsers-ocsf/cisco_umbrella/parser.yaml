@@ -1,6 +1,6 @@
 name: cisco_umbrella_ocsf
 display_name: Cisco Umbrella (OCSF)
-version: "1.2.0"
+version: "1.3.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -163,7 +163,7 @@ parser_vrl: |
 
   metadata = {
       "version": "1.9.0",
-      "uid": uuid_v4(),
+      "uid": sha2("cisco_umbrella|raw|" + raw_log, variant: "SHA-256"),
       "profiles": ["host", "security_control"],
       "log_name": "umbrella",
       "product": { "name": "Umbrella", "vendor_name": "Cisco" }
@@ -303,7 +303,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("cisco_umbrella|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "umbrella",
               "product": { "name": "Umbrella", "vendor_name": "Cisco" }
@@ -514,3 +514,13 @@ samples:
     expect:
       "traffic.bytes_in": 58213
       "traffic.bytes_out": 512
+  # NAN-3702 (existing sample): metadata.uid is sha256("cisco_umbrella|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "\"2026-08-12 09:15:25\",\"alice@corp.example\",\"LAPTOP-4471\",\"10.40.1.22\",\"198.51.100.4\",\"Allowed\",\"AAAA\",\"NOERROR\",\"www.example.com.\",\"Business Services\",\"\",\"\",\"\",\"0123abcd\",\"Default Policy\""
+    expect:
+      "metadata.uid": "3c8f04950bda43c584039caefea84173d67646abfd7e492cd2763391faa42425"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("cisco_umbrella|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "\"2026-08-12 09:15:44\",\"x\",\"y\""
+    expect:
+      "metadata.uid": "c2266c597cac6cf46ebb92407bcc65df6859bc369db95c806f72fa71ad95d77b"

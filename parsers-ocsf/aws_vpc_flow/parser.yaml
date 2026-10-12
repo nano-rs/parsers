@@ -1,6 +1,6 @@
 name: aws_vpc_flow_ocsf
 display_name: AWS VPC Flow Logs (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -249,7 +249,7 @@ parser_vrl: |
       "metadata": {
           "version": "1.9.0",
           "profiles": ["cloud", "security_control"],
-          "uid": uuid_v4(),
+          "uid": sha2("aws_vpc_flow|raw|" + raw_log, variant: "SHA-256"),
           "log_name": "VPC Flow Logs",
           "log_provider": "AWS VPC Flow Logs",
           "product": { "name": "AWS VPC Flow Logs", "vendor_name": "Amazon" }
@@ -461,3 +461,10 @@ parser_vrl: |
   if !is_empty(__residual) { .unmapped = __residual }
   .
   # END NAN-2421 residual spill
+
+samples:
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("aws_vpc_flow|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"timestamp\":\"2025-01-01T00:00:00Z\",\"severity\":\"INFO\"}"
+    expect:
+      "metadata.uid": "bab78707278463ad3b0596a73485e9e5c47cf03709ba51a041deaf47107cb18a"

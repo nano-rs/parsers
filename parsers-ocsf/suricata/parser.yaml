@@ -1,6 +1,6 @@
 name: suricata_ocsf
 display_name: Suricata IDS/IPS (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -194,7 +194,7 @@ parser_vrl: |
 
   metadata = {
       "version": "1.9.0",
-      "uid": uuid_v4(),
+      "uid": sha2("suricata|raw|" + raw_log, variant: "SHA-256"),
       "log_source": "suricata",
       "log_provider": "Suricata EVE",
       "profiles": ["host", "security_control"],
@@ -885,3 +885,8 @@ samples:
     traffic.bytes_in: 6789
     traffic.packets_out: 3
     traffic.packets_in: 4
+# NAN-3702 (existing sample): metadata.uid is sha256("suricata|raw|" + raw), so the
+# same record parsed twice gets the same uid (a random uid could never match).
+- raw: "{\"timestamp\":\"2024-10-30T09:46:12.123456+0000\",\"flow_id\":1234567890,\"in_iface\":\"eth0\",\"event_type\":\"alert\",\"src_ip\":\"203.0.113.9\",\"src_port\":44001,\"dest_ip\":\"10.10.1.7\",\"dest_port\":445,\"proto\":\"TCP\",\"community_id\":\"1:abc=\",\"alert\":{\"action\":\"blocked\",\"gid\":1,\"signature_id\":2001219,\"rev\":5,\"signature\":\"ET EXPLOIT SMB MS17-010\",\"category\":\"Attempted Administrator Privilege Gain\",\"severity\":1,\"metadata\":{\"mitre_technique_id\":[\"T1210\"]}},\"flow\":{\"pkts_toserver\":12,\"pkts_toclient\":3,\"bytes_toserver\":2048,\"bytes_toclient\":512,\"start\":\"2024-10-30T09:46:10.000000+0000\"},\"host\":\"ids-sensor-1\"}"
+  expect:
+    "metadata.uid": "50cc3850179f0cef305277e309bddf22bed880e90183aecb09dee520295a84d9"

@@ -1,6 +1,6 @@
 name: zscaler_zia_ocsf
 display_name: Zscaler Internet Access (OCSF)
-version: "1.2.0"
+version: "1.3.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -98,7 +98,7 @@ parser_vrl: |
 
   metadata = {
       "version": "1.9.0",
-      "uid": uuid_v4(),
+      "uid": sha2("zscaler_zia|raw|" + raw_log, variant: "SHA-256"),
       "profiles": ["host", "security_control"],
       "log_name": sourcetype,
       "product": { "name": "Internet Access", "vendor_name": "Zscaler" }
@@ -364,7 +364,7 @@ parser_vrl: |
       engine = string(e.dlpeng) ?? ""
       finding_uid = recid
       if finding_uid == "" { finding_uid = to_string(e.dlpidentifier) ?? "" }
-      if finding_uid == "" { finding_uid = uuid_v4() }
+      if finding_uid == "" { finding_uid = sha2("zscaler_zia|raw|" + raw_log, variant: "SHA-256") }
 
       finding_info = { "uid": finding_uid }
       if rule_name != "" { finding_info.title = rule_name }
@@ -485,7 +485,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("zscaler_zia|raw|" + raw_log, variant: "SHA-256"),
               "profiles": ["host"],
               "log_name": "zscaler-zia",
               "product": { "name": "Internet Access", "vendor_name": "Zscaler" }
@@ -737,3 +737,19 @@ samples:
     expect:
       "traffic.bytes_in": 4096
       "traffic.bytes_out": 8192
+  # NAN-3702 (natural id removed): metadata.uid is sha256("zscaler_zia|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"sourcetype\":\"zscalernss-audit\",\"event\":{\"datetime\":\"Wed Aug 12 09:15:26 2026\",\"adminid\":\"admin@corp.example\",\"action\":\"UPDATE\",\"category\":\"URL Filtering Policy\",\"subcategory\":\"Rule\",\"result\":\"SUCCESS\",\"resource\":\"Block Gambling\",\"resourcetype\":\"UrlFilteringRule\",\"clientip\":\"198.51.100.250\"}}"
+    expect:
+      "metadata.uid": "aa918a8c183e9bdd60862cbebd83b5c8a3a9a9d3d8577fb727a80089c31a2268"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("zscaler_zia|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"sourcetype\":\"zscalernss-edlp\",\"event\":{\"datetime\":\"Wed Aug 12 09:15:25 2026\",\"user\":\"dan@corp.example\",\"actiontaken\":\"Block\",\"dlpeng\":\"PCI Engine\",\"dlpdict\":\"Credit Card\",\"dlpdicthitcount\":14,\"dlprulename\":\"Block PCI Upload\",\"filename\":\"cards.csv\",\"sha256\":\"AA86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08\",\"severity\":\"High\",\"devicehostname\":\"LAP-7788\",\"channel\":\"Web\"}}"
+    expect:
+      "metadata.uid": "057cc6286b7a66b223254f1a71f236d00ed8fd3003b852e07ef5aa296a2ff0d3"
+      "finding_info.uid": "057cc6286b7a66b223254f1a71f236d00ed8fd3003b852e07ef5aa296a2ff0d3"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("zscaler_zia|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "NOT JSON"
+    expect:
+      "metadata.uid": "3f90d0a733e53eae4931d449175f8bba1e6aea0c21e4e6b962efee6239d81044"

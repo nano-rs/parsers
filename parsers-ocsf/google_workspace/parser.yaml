@@ -58,7 +58,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("google_workspace|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "Google Workspace Reports",
               "log_provider": "Google Workspace",
@@ -369,7 +369,7 @@ parser_vrl: |
       if uniq != "" && time_raw != "" {
           record_uid = join!(["gws", app, customer, uniq, time_raw], "|")
       }
-      if record_uid == "" { record_uid = uuid_v4() }
+      if record_uid == "" { record_uid = sha2("google_workspace|raw|" + raw_log, variant: "SHA-256") }
       ocsf.metadata = {
           "version": "1.9.0",
           "uid": record_uid,
@@ -682,3 +682,14 @@ samples:
       "class_uid": 6003
       "activity_id": 1
       "metadata.version": "1.9.0"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("google_workspace|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "gws not json"
+    expect:
+      "metadata.uid": "9b6d30831cd06773b4b94477653d7cece6aa8cec8f9fb82561b2ec223c53fc2c"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("google_workspace|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"kind\":\"admin#reports#activity\",\"id\":{\"time\":\"2026-08-18T17:03:55.907Z\",\"applicationName\":\"admin\",\"customerId\":\"C01ab2cd3\"},\"actor\":{\"email\":\"admin@example.com\",\"profileId\":\"114500000000000000001\",\"callerType\":\"USER\"},\"ipAddress\":\"192.0.2.77\",\"events\":[{\"type\":\"GROUP_SETTINGS\",\"name\":\"ADD_GROUP_MEMBER\",\"parameters\":[{\"name\":\"GROUP_EMAIL\",\"value\":\"security-team@example.com\"},{\"name\":\"USER_EMAIL\",\"value\":\"bob.smith@example.com\"},{\"name\":\"NEW_VALUE\",\"value\":\"MEMBER\"}]}]}"
+    expect:
+      "metadata.uid": "71214abbee3cc8689b74c9238a8cf3d2adaa8e698d502a8280af0fe71f83bf25"
+      "metadata.original_event_uid": "71214abbee3cc8689b74c9238a8cf3d2adaa8e698d502a8280af0fe71f83bf25"

@@ -1,6 +1,6 @@
 name: rapid7_insightvm_ocsf
 display_name: Rapid7 InsightVM (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -131,7 +131,7 @@ parser_vrl: |
   risk = to_float(e.risk_score) ?? -1.0
 
   if ok && shape != "unknown" {
-      if finding_uid == "" { finding_uid = uuid_v4() }
+      if finding_uid == "" { finding_uid = sha2("rapid7_insightvm|raw|" + raw_log, variant: "SHA-256") }
       if title == "" { title = "InsightVM finding " + finding_uid }
 
       finding_info = { "uid": finding_uid, "title": title, "data_sources": ["rapid7_insightvm"] }
@@ -155,7 +155,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("rapid7_insightvm|raw|" + raw_log, variant: "SHA-256"),
               "log_name": "insightvm-" + shape,
               "product": { "name": "InsightVM", "vendor_name": "Rapid7" }
           },
@@ -233,7 +233,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("rapid7_insightvm|raw|" + raw_log, variant: "SHA-256"),
               "log_name": "insightvm",
               "product": { "name": "InsightVM", "vendor_name": "Rapid7" }
           }
@@ -437,3 +437,14 @@ samples:
     expect:
       class_uid: 2004
       activity_id: 1
+  # NAN-3702 (natural id removed): metadata.uid is sha256("rapid7_insightvm|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"type\":\"asset\",\"ip\":\"10.95.2.8\",\"hostname\":\"db03.corp.example\",\"fqdn\":\"db03.corp.example\",\"os_name\":\"Windows Server 2022\",\"mac_address\":\"00:11:22:33:44:55\",\"site_name\":\"Prod DMZ\",\"risk_score\":15230.5,\"vulnerabilities\":{\"total\":47,\"critical\":3,\"severe\":19,\"moderate\":21,\"low\":4},\"tags\":[\"pci\",\"prod\"],\"last_assessed_for_vulnerabilities\":\"2026-08-12T06:00:00Z\",\"last_scan_id\":\"scan-771\"}"
+    expect:
+      "metadata.uid": "dc509906e9b96e21b0b4240c426e73c4ca14a9824a272d4cea47eaec323a4b32"
+      "finding_info.uid": "dc509906e9b96e21b0b4240c426e73c4ca14a9824a272d4cea47eaec323a4b32"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("rapid7_insightvm|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"type\":\"vulnerability\",\"title\":\"OpenSSL Remote Code Execution\",\"severity\":\"Critical\",\"cvss_v3_score\":9.8,\"cvss_v2_score\":10.0,\"cvss_v3_vector\":\"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H\",\"cves\":[\"CVE-2026-1234\"],\"ip\":\"10.95.2.7\",\"hostname\":\"app02.corp.example\",\"os_name\":\"Ubuntu Linux\",\"os_version\":\"24.04\",\"port\":443,\"protocol\":\"tcp\",\"service\":\"https\",\"status\":\"vulnerable-version\",\"risk_score\":892.4,\"exploits\":3,\"malware_kits\":1,\"proof\":\"Version banner reports OpenSSL 3.0.1\",\"solution\":\"Upgrade OpenSSL to 3.0.14 or later\",\"solution_id\":\"openssl-upgrade\",\"categories\":[\"Web\",\"Encryption\"],\"scan_id\":\"scan-771\",\"first_found\":\"2026-07-01T00:00:00Z\",\"last_found\":\"2026-08-12T06:00:00Z\",\"site_name\":\"Prod DMZ\"}"
+    expect:
+      "metadata.uid": "e4472223ed14c30a6d47c0bbeaea9f2f3d8f51b2382977cf6eab4b7e7138f21f"

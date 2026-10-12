@@ -1,6 +1,6 @@
 name: nano-platform-api_ocsf
 display_name: nano Platform API (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses nano platform API logs (pino/Node.js JSON) into complete OCSF 1.9.0
@@ -46,7 +46,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("nano-platform-api|raw|" + raw_log, variant: "SHA-256"),
               "log_provider": "nano",
               "log_name": "nano-platform-api",
               "event_code": "unparsed",
@@ -206,7 +206,7 @@ parser_vrl: |
       if is_http { event_code = "http_request" }
       md = {
           "version": "1.9.0",
-          "uid": uuid_v4(),
+          "uid": sha2("nano-platform-api|raw|" + raw_log, variant: "SHA-256"),
           "log_provider": "nano",
           "log_name": "nano-platform-api",
           "log_level": level_name,
@@ -388,3 +388,15 @@ parser_vrl: |
   if !is_empty(__residual) { .unmapped = __residual }
   .
   # END NAN-2421 residual spill
+
+samples:
+  # NAN-3702 (existing sample): metadata.uid is sha256("nano-platform-api|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "[emerg] node: bad JSON on stdout"
+    expect:
+      "metadata.uid": "91d1304c5321ab293fbd1c852771253d711ae94079ecfc2fa81d5afb3ed80f90"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("nano-platform-api|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"level\": 50, \"time\": 1787083150000, \"msg\": \"postgres pool acquire failed\", \"replica\": \"platform-api-7d9c8b6f5-x2kqz\", \"err\": {\"message\": \"connection timed out\"}}"
+    expect:
+      "metadata.uid": "de0de80edefc008645e95bc46cd50934833a0e664cefcd8d7674d19051df47d2"

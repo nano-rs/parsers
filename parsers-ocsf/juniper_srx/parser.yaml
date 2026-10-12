@@ -1,6 +1,6 @@
 name: juniper_srx_ocsf
 display_name: Juniper SRX (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -228,7 +228,7 @@ parser_vrl: |
 
   metadata = {
       "version": "1.9.0",
-      "uid": uuid_v4(),
+      "uid": sha2("juniper_srx|raw|" + raw_log, variant: "SHA-256"),
       "log_source": "juniper_srx",
       "log_provider": "JUNOS",
       "profiles": ["host", "security_control"],
@@ -630,3 +630,8 @@ samples:
     actor.user.name: jsmith
     http_request.url.path: /payload.exe
     disposition_id: 2
+# NAN-3702 (existing sample): metadata.uid is sha256("juniper_srx|raw|" + raw), so the
+# same record parsed twice gets the same uid (a random uid could never match).
+- raw: "<14>1 2024-10-30T09:47:12.123Z srx-edge-01 RT_FLOW - RT_FLOW_SESSION_CLOSE [junos@2636.1.1.1.2.26 reason=\"TCP FIN\" source-address=\"10.10.1.55\" source-port=\"51422\" destination-address=\"93.184.216.34\" destination-port=\"443\" service-name=\"junos-https\" protocol-id=\"6\" policy-name=\"trust-to-untrust\" source-zone-name=\"trust\" destination-zone-name=\"untrust\" session-id-32=\"84732\" packets-from-client=\"14\" bytes-from-client=\"4210\" packets-from-server=\"10\" bytes-from-server=\"11111\" elapsed-time=\"60\" username=\"jsmith\" application=\"HTTPS\"]"
+  expect:
+    "metadata.uid": "0f8cb7dca5981acc75a02756f08db47b3e7640212056612c2078885451a951b5"

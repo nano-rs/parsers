@@ -1,6 +1,6 @@
 name: windows_sysmon_ocsf
 display_name: Microsoft Sysmon (OCSF)
-version: "1.4.0"
+version: "1.5.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses Windows Sysmon events in JSON form (top-level event_id + event_data)
@@ -53,7 +53,7 @@ parser_vrl: |
           "metadata": {
               "version": "1.9.0",
               "profiles": ["host"],
-              "uid": uuid_v4(),
+              "uid": sha2("windows_sysmon|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "product": { "name": "Sysmon", "vendor_name": "Microsoft" }
           }
@@ -508,7 +508,7 @@ parser_vrl: |
       if record_id != "" && computer != "" && ts_str != "" {
           record_uid = join!(["windows_sysmon", computer, log_name, log_provider, record_id, ts_str], "|")
       }
-      if record_uid == "" { record_uid = uuid_v4() }
+      if record_uid == "" { record_uid = sha2("windows_sysmon|raw|" + raw_log, variant: "SHA-256") }
       if is_object(ocsf.device) { ocsf.device.type_id = 0 }
       ocsf.metadata = {
           "version": "1.9.0",
@@ -821,3 +821,14 @@ samples:
       "actor.user.name": "jmoore"
       "actor.user.domain": "CORP.LOCAL"
       "actor.process.user.name": "CORP.LOCAL\\jmoore"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("windows_sysmon|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "not json at all"
+    expect:
+      "metadata.uid": "8dd389bdb82e1de5d776ad51758db5e01fbc919f03546210ab1634702ec6be48"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("windows_sysmon|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"event_id\":1,\"channel\":\"Microsoft-Windows-Sysmon/Operational\",\"provider_name\":\"Microsoft-Windows-Sysmon\",\"computer\":\"WKS-01.corp.local\",\"timestamp\":\"2026-08-18T10:15:00.123Z\",\"event_data\":{\"Image\":\"C:\\\\Windows\\\\System32\\\\cmd.exe\",\"CommandLine\":\"cmd.exe /c whoami\",\"ProcessId\":\"4321\",\"ProcessGuid\":\"{aaaa-1111}\",\"ParentImage\":\"C:\\\\Windows\\\\explorer.exe\",\"ParentCommandLine\":\"explorer.exe\",\"ParentProcessId\":\"1200\",\"User\":\"CORP\\\\alice\",\"Hashes\":\"SHA256=ABCD1234EF,MD5=00112233\"}}"
+    expect:
+      "metadata.uid": "ab7de99dd3553cc8057ad59973186d7a60b2f12ac6d28e3ffb73dab992061d5a"
+      "metadata.original_event_uid": "ab7de99dd3553cc8057ad59973186d7a60b2f12ac6d28e3ffb73dab992061d5a"

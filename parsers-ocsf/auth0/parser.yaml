@@ -1,6 +1,6 @@
 name: auth0_ocsf
 display_name: Auth0 (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -46,7 +46,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("auth0|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "Auth0 Logs",
               "log_provider": "Auth0",
@@ -231,7 +231,7 @@ parser_vrl: |
       ocsf.raw_data = raw_log
 
       evt_uid = string(p.log_id) ?? ""
-      if evt_uid == "" { evt_uid = uuid_v4() }
+      if evt_uid == "" { evt_uid = sha2("auth0|raw|" + raw_log, variant: "SHA-256") }
       ocsf.metadata = {
           "version": "1.9.0",
           "uid": evt_uid,
@@ -492,3 +492,14 @@ samples:
       "class_uid": 6003
       "activity_id": 99
       "metadata.version": "1.9.0"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("auth0|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "auth0 raw text line, not json"
+    expect:
+      "metadata.uid": "d9e1512a6a84b61e0d53c9466c3ef0aef456ff9462814e02c6136aec28c0402b"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("auth0|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"date\":\"2026-08-18T10:44:21.905Z\",\"type\":\"sci\",\"description\":\"Successful change password\",\"connection\":\"Username-Password-Authentication\",\"client_id\":\"aBcD1234EfGh5678IjKl\",\"client_name\":\"Customer Portal\",\"ip\":\"192.0.2.31\",\"user_agent\":\"Safari 17.5.0 / Mac OS X 14.5.0\",\"hostname\":\"example.us.auth0.com\",\"user_id\":\"auth0|66aa1122bb3344cc5566dd77\",\"user_name\":\"new.user@example.com\"}"
+    expect:
+      "metadata.uid": "906b4bd5cc5c58962f7878c90ccb6b3c647df4c323f48d8ee0825a8f890badf8"
+      "metadata.original_event_uid": "906b4bd5cc5c58962f7878c90ccb6b3c647df4c323f48d8ee0825a8f890badf8"

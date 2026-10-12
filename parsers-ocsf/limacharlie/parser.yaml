@@ -1,6 +1,6 @@
 name: limacharlie_ocsf
 display_name: LimaCharlie EDR (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses LimaCharlie EDR sensor telemetry (routing + event envelope) into
@@ -63,7 +63,7 @@ parser_vrl: |
           "metadata": {
               "version": "1.9.0",
               "profiles": ["host"],
-              "uid": uuid_v4(),
+              "uid": sha2("limacharlie|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_source": "limacharlie",
               "product": { "name": "LimaCharlie EDR", "vendor_name": "LimaCharlie" }
@@ -518,7 +518,7 @@ parser_vrl: |
 
           finding_uid = to_string(ev.detect_id) ?? ""
           if finding_uid == "" { finding_uid = to_string(routing.event_id) ?? "" }
-          if finding_uid == "" { finding_uid = uuid_v4() }
+          if finding_uid == "" { finding_uid = sha2("limacharlie|raw|" + raw_log, variant: "SHA-256") }
 
           rule_name = to_string(ev.cat) ?? ""
           if rule_name == "" { rule_name = to_string(ev.RULE_NAME) ?? "" }
@@ -639,7 +639,7 @@ parser_vrl: |
 
       record_uid = to_string(routing.event_id) ?? ""
       if record_uid == "" { record_uid = this_atom }
-      if record_uid == "" { record_uid = uuid_v4() }
+      if record_uid == "" { record_uid = sha2("limacharlie|raw|" + raw_log, variant: "SHA-256") }
 
       ocsf.metadata = {
           "version": "1.9.0",
@@ -1038,3 +1038,21 @@ samples:
       "class_uid": 2004
       "activity_id": 1
       "metadata.version": "1.9.0"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("limacharlie|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "2026-08-18 limacharlie sensor emitted a non-json line"
+    expect:
+      "metadata.uid": "f21d0b89e4e941ed59025b03eb72d2d3d57af7af2747b9b563326809e7447320"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("limacharlie|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"routing\":{\"event_type\":\"DETECTION\",\"event_time\":1787050000000,\"hostname\":\"WKS-11.corp.local\",\"int_ip\":\"10.4.5.6\",\"ext_ip\":\"203.0.113.44\",\"oid\":\"oid-1\",\"sid\":\"sid-abc\",\"iid\":\"iid-1\",\"parent\":\"atom-parent\",\"plat\":268435456,\"arch\":2},\"event\":{\"cat\":\"Credential Dumping\",\"source\":\"sid-abc\",\"author\":\"soc@corp\",\"summary\":\"mimikatz sekurlsa::logonpasswords observed\",\"detect\":{\"event\":{\"FILE_PATH\":\"C:\\\\tools\\\\mimikatz.exe\"}},\"FILE_PATH\":\"C:\\\\tools\\\\mimikatz.exe\",\"PROCESS_ID\":777,\"USER_NAME\":\"CORP\\\\alice\"}}"
+    expect:
+      "metadata.uid": "f1c84ff634a75163aa296e4ce753cdbb096cf90062bf36c5a1b0086bf6995507"
+      "finding_info.uid": "f1c84ff634a75163aa296e4ce753cdbb096cf90062bf36c5a1b0086bf6995507"
+      "metadata.original_event_uid": "f1c84ff634a75163aa296e4ce753cdbb096cf90062bf36c5a1b0086bf6995507"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("limacharlie|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"routing\":{\"event_type\":\"BAD_LOGON\",\"event_time\":1787050000000,\"hostname\":\"WKS-11.corp.local\",\"int_ip\":\"10.4.5.6\",\"ext_ip\":\"203.0.113.44\",\"oid\":\"oid-1\",\"sid\":\"sid-abc\",\"iid\":\"iid-1\",\"parent\":\"atom-parent\",\"plat\":268435456,\"arch\":2},\"event\":{\"USER_NAME\":\"administrator\",\"LOGON_TYPE\":\"3\",\"SOURCE_IP\":\"203.0.113.9\",\"ERROR\":\"STATUS_LOGON_FAILURE\"}}"
+    expect:
+      "metadata.uid": "0230e2c0d9789fe4b1d8d074f117bef86c1d2e1afd24b7459b1a7a62d7a99211"
+      "metadata.original_event_uid": "0230e2c0d9789fe4b1d8d074f117bef86c1d2e1afd24b7459b1a7a62d7a99211"

@@ -1,6 +1,6 @@
 name: kubernetes_audit_ocsf
 display_name: Kubernetes Audit Log (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -42,7 +42,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("kubernetes_audit|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "kubernetes-audit",
               "product": { "name": "Kubernetes", "vendor_name": "CNCF" }
@@ -207,7 +207,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("kubernetes_audit|raw|" + raw_log, variant: "SHA-256"),
               "log_name": "kubernetes-audit",
               "log_provider": "Kubernetes API Server",
               "product": { "name": "Kubernetes", "vendor_name": "CNCF" }
@@ -216,7 +216,12 @@ parser_vrl: |
           "actor": actor,
           "src_endpoint": src_endpoint
       }
-      if audit_id != "" { ocsf.metadata.uid = audit_id; ocsf.metadata.correlation_uid = audit_id }
+      # NAN-3702: the API server writes one record per STAGE (RequestReceived,
+      # ResponseStarted, ResponseComplete, Panic) under the same auditID, and the
+      # lake dedupes on metadata.uid, so the uid is auditID + stage. auditID alone
+      # kept only the first stage's row. auditID stays the correlation id.
+      k8s_stage = to_string(p.stage) ?? ""
+      if audit_id != "" { ocsf.metadata.uid = audit_id + "|" + k8s_stage; ocsf.metadata.correlation_uid = audit_id }
       if code > 0 { ocsf.status_code = to_string(code) }
       if resp_msg != "" { ocsf.status_detail = resp_msg }
       if length(resources) > 0 { ocsf.resources = resources }
@@ -417,3 +422,21 @@ parser_vrl: |
   if !is_empty(__residual) { .unmapped = __residual }
   .
   # END NAN-2421 residual spill
+
+samples:
+  # NAN-3702 (unparseable record, error branch): metadata.uid is sha256("kubernetes_audit|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "NAN-3702 determinism probe: not a kubernetes_audit record"
+    expect:
+      "metadata.uid": "e6aaef7cee841ec86f1bbfa0e026565280c5f6e8d1744609547fa8f1ab747939"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("kubernetes_audit|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"kind\":\"Event\",\"apiVersion\":\"audit.k8s.io/v1\",\"level\":\"RequestResponse\",\"stage\":\"ResponseComplete\",\"requestURI\":\"/api/v1/namespaces/default/pods\",\"verb\":\"create\",\"user\":{\"username\":\"system:serviceaccount:kube-system:deploy\",\"uid\":\"u1\",\"groups\":[\"system:serviceaccounts\"]},\"sourceIPs\":[\"10.0.0.7\"],\"userAgent\":\"kubectl/v1.29.0\",\"objectRef\":{\"resource\":\"pods\",\"namespace\":\"default\",\"name\":\"nginx-1\",\"apiVersion\":\"v1\"},\"responseStatus\":{\"metadata\":{},\"code\":201},\"requestReceivedTimestamp\":\"2026-08-18T20:00:00.000000Z\",\"stageTimestamp\":\"2026-08-18T20:00:00.100000Z\",\"annotations\":{\"authorization.k8s.io/decision\":\"allow\",\"authorization.k8s.io/reason\":\"RBAC: allowed by ClusterRoleBinding\"}}"
+    expect:
+      "metadata.uid": "04c3f8707941e1670c543c12bdc151ae79662aef80efd4cb0b8d32504b851a12"
+  # NAN-3702: one API request is audited once per stage under the same auditID,
+  # so the uid is auditID + stage (auditID alone kept only the first stage).
+  - raw: "{\"kind\": \"Event\", \"apiVersion\": \"audit.k8s.io/v1\", \"level\": \"RequestResponse\", \"auditID\": \"a-1\", \"stage\": \"ResponseComplete\", \"requestURI\": \"/api/v1/namespaces/default/pods\", \"verb\": \"create\", \"user\": {\"username\": \"system:serviceaccount:kube-system:deploy\", \"uid\": \"u1\", \"groups\": [\"system:serviceaccounts\"]}, \"sourceIPs\": [\"10.0.0.7\"], \"userAgent\": \"kubectl/v1.29.0\", \"objectRef\": {\"resource\": \"pods\", \"namespace\": \"default\", \"name\": \"nginx-1\", \"apiVersion\": \"v1\"}, \"responseStatus\": {\"metadata\": {}, \"code\": 201}, \"requestReceivedTimestamp\": \"2026-08-18T20:00:00.000000Z\", \"stageTimestamp\": \"2026-08-18T20:00:00.100000Z\", \"annotations\": {\"authorization.k8s.io/decision\": \"allow\", \"authorization.k8s.io/reason\": \"RBAC: allowed by ClusterRoleBinding\"}}"
+    expect:
+      "metadata.uid": "a-1|ResponseComplete"
+      "metadata.correlation_uid": "a-1"

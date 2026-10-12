@@ -1,6 +1,6 @@
 name: f5_waf_ocsf
 display_name: F5 BIG-IP ASM (OCSF)
-version: "1.2.0"
+version: "1.3.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -157,7 +157,7 @@ parser_vrl: |
       "is_alert": is_alert,
       "metadata": {
           "version": "1.9.0",
-          "uid": uuid_v4(),
+          "uid": sha2("f5_waf|raw|" + raw_log, variant: "SHA-256"),
           "log_source": "f5_waf",
           "log_provider": "ASM",
           "profiles": ["host", "security_control"],
@@ -560,3 +560,8 @@ samples:
   expect:
     "traffic.bytes_in": 128
     "traffic.bytes_out": 512
+# NAN-3702 (existing sample): metadata.uid is sha256("f5_waf|raw|" + raw), so the
+# same record parsed twice gets the same uid (a random uid could never match).
+- raw: "Jan 15 14:34:00 bigip1.corp.local ASM:policy_name=\"/Common/prod_policy\",src_ip=\"192.0.2.77\",dest_ip=\"10.10.5.21\",dest_port=\"443\",method=\"GET\",uri=\"/health\",action=\"passed\",response_code=\"200\",request_status=\"passed\",user_agent=\"kube-probe/1.29\",username=\"svc_probe\",session_id=\"abc123\",duration=\"12\""
+  expect:
+    "metadata.uid": "28541efe1527c7bf6a1c3398f46233c96c600f9b500f28670d074451ead53f41"

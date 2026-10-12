@@ -1,6 +1,6 @@
 name: linux_journald_ocsf
 display_name: systemd-journald (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -216,7 +216,7 @@ parser_vrl: |
 
   metadata = {
       "version": "1.9.0",
-      "uid": uuid_v4(),
+      "uid": sha2("linux_journald|raw|" + raw_log, variant: "SHA-256"),
       "log_source": "linux_journald",
       "log_provider": "systemd-journald",
       "profiles": ["host", "security_control"],
@@ -625,3 +625,8 @@ samples:
   expect:
     class_uid: 0
     activity_id: 99
+# NAN-3702 (existing sample): metadata.uid is sha256("linux_journald|raw|" + raw), so the
+# same record parsed twice gets the same uid (a random uid could never match).
+- raw: "{\"__REALTIME_TIMESTAMP\":\"1785931500000000\",\"PRIORITY\":\"4\",\"SYSLOG_IDENTIFIER\":\"kernel\",\"MESSAGE\":\"[UFW BLOCK] IN=eth0 OUT= MAC=00:16:3e:aa:bb:cc SRC=203.0.113.44 DST=10.0.0.5 LEN=60 TOS=0x00 PREC=0x00 TTL=52 ID=1234 DF PROTO=TCP SPT=44112 DPT=3389 WINDOW=1024 RES=0x00 SYN URGP=0\",\"_HOSTNAME\":\"web01\",\"_TRANSPORT\":\"kernel\",\"_BOOT_ID\":\"aaaa\"}"
+  expect:
+    "metadata.uid": "31abc283c2855073a77b24be85cd6842a5704dd668200b669871d85b02cf734c"

@@ -1,6 +1,6 @@
 name: gcp_audit_ocsf
 display_name: GCP Audit Log (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -44,7 +44,7 @@ parser_vrl: |
           "metadata": {
               "version": "1.9.0",
               "profiles": ["cloud"],
-              "uid": uuid_v4(),
+              "uid": sha2("gcp_audit|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "cloudaudit.googleapis.com",
               "product": { "name": "Google Cloud Audit Logs", "vendor_name": "Google" }
@@ -223,7 +223,7 @@ parser_vrl: |
           "metadata": {
               "version": "1.9.0",
               "profiles": ["cloud"],
-              "uid": uuid_v4(),
+              "uid": sha2("gcp_audit|raw|" + raw_log, variant: "SHA-256"),
               "log_name": "cloudaudit.googleapis.com",
               "log_provider": "Google Cloud Audit Logs",
               "product": { "name": "Google Cloud Audit Logs", "vendor_name": "Google" }
@@ -441,3 +441,15 @@ parser_vrl: |
   if !is_empty(__residual) { .unmapped = __residual }
   .
   # END NAN-2421 residual spill
+
+samples:
+  # NAN-3702 (unparseable record, error branch): metadata.uid is sha256("gcp_audit|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "NAN-3702 determinism probe: not a gcp_audit record"
+    expect:
+      "metadata.uid": "f9a8a0680be89b16f53c34b2a39e295987fa07c29762fc1dd1b3691b0e5012cf"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("gcp_audit|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"protoPayload\":{\"@type\":\"type.googleapis.com/google.cloud.audit.AuditLog\",\"authenticationInfo\":{\"principalEmail\":\"alice@example.com\",\"principalSubject\":\"user:alice@example.com\"},\"requestMetadata\":{\"callerIp\":\"203.0.113.11\",\"callerSuppliedUserAgent\":\"google-cloud-sdk/450.0.0\"},\"serviceName\":\"compute.googleapis.com\",\"methodName\":\"v1.compute.instances.insert\",\"authorizationInfo\":[{\"resource\":\"projects/p/zones/z/instances/vm1\",\"permission\":\"compute.instances.create\",\"granted\":true}],\"resourceName\":\"projects/my-project/zones/us-central1-a/instances/vm1\",\"request\":{\"name\":\"vm1\"},\"status\":{}},\"resource\":{\"type\":\"gce_instance\",\"labels\":{\"project_id\":\"my-project\",\"zone\":\"us-central1-a\",\"instance_id\":\"123\"}},\"timestamp\":\"2026-08-18T20:00:00.000Z\",\"severity\":\"NOTICE\",\"logName\":\"projects/my-project/logs/cloudaudit.googleapis.com%2Factivity\",\"receiveTimestamp\":\"2026-08-18T20:00:01.000Z\"}"
+    expect:
+      "metadata.uid": "a412b3e2d0f7f2b62ee4b47ee9108295c4e5f06cdbf4899e5f4faa06eda8e654"

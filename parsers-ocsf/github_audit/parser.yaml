@@ -1,6 +1,6 @@
 name: github_audit_ocsf
 display_name: GitHub Audit Log (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -51,7 +51,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("github_audit|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "GitHub Audit Log",
               "log_provider": "GitHub",
@@ -237,7 +237,7 @@ parser_vrl: |
       ocsf.raw_data = raw_log
 
       evt_uid = string(p._document_id) ?? ""
-      if evt_uid == "" { evt_uid = uuid_v4() }
+      if evt_uid == "" { evt_uid = sha2("github_audit|raw|" + raw_log, variant: "SHA-256") }
       ocsf.metadata = {
           "version": "1.9.0",
           "uid": evt_uid,
@@ -490,3 +490,14 @@ samples:
       "class_uid": 3002
       "activity_id": 1
       "metadata.version": "1.9.0"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("github_audit|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "github not json"
+    expect:
+      "metadata.uid": "395a85582c5008d9bb3a6a7b9a28448d11cd5d096d82fd22a5db6785c1cfd567"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("github_audit|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"@timestamp\":1787064000000,\"action\":\"oauth_application.create\",\"actor\":\"ops-admin\",\"actor_id\":1234567,\"actor_ip\":\"192.0.2.77\",\"actor_location\":{\"country_code\":\"US\"},\"created_at\":1787064000000,\"operation_type\":\"create\",\"org\":\"example-org\",\"org_id\":98765,\"oauth_application_id\":5566778899,\"name\":\"CI Deploy App\"}"
+    expect:
+      "metadata.uid": "7847e4a3795f4da060152c935f672d1d768b03a5eff510e1c435b5546d20f7de"
+      "metadata.original_event_uid": "7847e4a3795f4da060152c935f672d1d768b03a5eff510e1c435b5546d20f7de"

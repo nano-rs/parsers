@@ -1,6 +1,6 @@
 name: sonicwall_ocsf
 display_name: SonicWall (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -260,7 +260,7 @@ parser_vrl: |
 
   metadata = {
       "version": "1.9.0",
-      "uid": uuid_v4(),
+      "uid": sha2("sonicwall|raw|" + raw_log, variant: "SHA-256"),
       "log_source": "sonicwall",
       "log_provider": "SonicOS",
       "profiles": ["host", "security_control"],
@@ -707,3 +707,8 @@ samples:
     actor.user.name: jsmith
     http_request.url.path: /index.html
     disposition_id: 1
+# NAN-3702 (existing sample): metadata.uid is sha256("sonicwall|raw|" + raw), so the
+# same record parsed twice gets the same uid (a random uid could never match).
+- raw: "<134>id=firewall sn=0017C5AABBCC time=\"2024-10-30 09:47:12 UTC\" fw=198.51.100.1 pri=6 c=1024 m=537 msg=\"Connection Closed\" n=12346 src=10.10.1.55:51422:X0 dst=93.184.216.34:443:X1 proto=tcp/https sent=4210 rcvd=11111 spkt=14 rpkt=10"
+  expect:
+    "metadata.uid": "8615141c818095a87c72ae46fd89bcb45861f59377e17b89a8c3a2c92a3b877e"

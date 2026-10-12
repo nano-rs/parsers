@@ -1,6 +1,6 @@
 name: aws_guardduty_ocsf
 display_name: AWS GuardDuty (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -43,7 +43,7 @@ parser_vrl: |
           "metadata": {
               "version": "1.9.0",
               "profiles": ["cloud", "security_control"],
-              "uid": uuid_v4(),
+              "uid": sha2("aws_guardduty|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "GuardDuty",
               "product": { "name": "AWS GuardDuty", "vendor_name": "Amazon" }
@@ -59,7 +59,7 @@ parser_vrl: |
 
       finding_type = to_string(p.type) ?? ""
       finding_id = to_string(p.id) ?? ""
-      if finding_id == "" { finding_id = uuid_v4() }
+      if finding_id == "" { finding_id = sha2("aws_guardduty|raw|" + raw_log, variant: "SHA-256") }
 
       # ---- severity: GuardDuty 0.1-10 -> OCSF severity_id ----
       raw_sev = to_float(p.severity) ?? 0.0
@@ -542,3 +542,16 @@ parser_vrl: |
   if !is_empty(__residual) { .unmapped = __residual }
   .
   # END NAN-2421 residual spill
+
+samples:
+  # NAN-3702 (unparseable record, error branch): metadata.uid is sha256("aws_guardduty|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "NAN-3702 determinism probe: not a aws_guardduty record"
+    expect:
+      "metadata.uid": "88db5a2efec50526776f6d18692c1f856d74c038a0b0e9684ab5d00ac2979e6c"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("aws_guardduty|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"schemaVersion\":\"2.0\",\"accountId\":\"123456789012\",\"region\":\"us-east-1\",\"partition\":\"aws\",\"arn\":\"arn:aws:guardduty:us-east-1:123456789012:detector/abc/finding/aabb\",\"createdAt\":\"2026-08-18T20:00:00.000Z\",\"updatedAt\":\"2026-08-18T20:05:00.000Z\",\"type\":\"UnauthorizedAccess:IAMUser/MaliciousIPCaller.Custom\",\"severity\":8.0,\"title\":\"API GetObject was invoked from a known malicious IP address.\",\"description\":\"API GetObject was invoked from IP address 198.51.100.5 which is on a custom threat list.\",\"resource\":{\"resourceType\":\"AccessKey\",\"accessKeyDetails\":{\"accessKeyId\":\"AKIAIOSFODNN7EXAMPLE\",\"principalId\":\"AIDACKCEVSQ6C2EXAMPLE\",\"userType\":\"IAMUser\",\"userName\":\"alice\"}},\"service\":{\"serviceName\":\"guardduty\",\"detectorId\":\"abc123\",\"count\":3,\"eventFirstSeen\":\"2026-08-18T19:50:00Z\",\"eventLastSeen\":\"2026-08-18T20:00:00Z\",\"action\":{\"actionType\":\"AWS_API_CALL\",\"awsApiCallAction\":{\"api\":\"GetObject\",\"serviceName\":\"s3.amazonaws.com\",\"callerType\":\"Remote IP\",\"remoteIpDetails\":{\"ipAddressV4\":\"198.51.100.5\",\"organization\":{\"asn\":\"64512\",\"asnOrg\":\"EvilNet\",\"isp\":\"EvilNet\",\"org\":\"EvilNet\"},\"country\":{\"countryName\":\"Russia\"},\"city\":{\"cityName\":\"Moscow\"}}}},\"evidence\":{\"threatIntelligenceDetails\":[{\"threatListName\":\"CustomList\",\"threatNames\":[\"BadActor\"]}]},\"additionalInfo\":{\"sample\":false}}}"
+    expect:
+      "metadata.uid": "524939459a6aa68da5b7c0b21c304c2a75b01a8013b05abe5d291fa837d6bc66"
+      "finding_info.uid": "524939459a6aa68da5b7c0b21c304c2a75b01a8013b05abe5d291fa837d6bc66"

@@ -1,6 +1,6 @@
 name: aws_s3_access_ocsf
 display_name: AWS S3 Access Logs (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed columns in redacted, dotted snake_case unmapped keys.
@@ -147,7 +147,7 @@ parser_vrl: |
           "metadata": {
               "version": "1.9.0",
               "profiles": ["cloud"],
-              "uid": uuid_v4(),
+              "uid": sha2("aws_s3_access|raw|" + raw_log, variant: "SHA-256"),
               "log_name": "S3 Server Access Log",
               "log_provider": "AWS S3",
               "product": { "name": "AWS S3", "vendor_name": "Amazon" }
@@ -196,7 +196,7 @@ parser_vrl: |
           "metadata": {
               "version": "1.9.0",
               "profiles": ["cloud"],
-              "uid": uuid_v4(),
+              "uid": sha2("aws_s3_access|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "S3 Server Access Log",
               "product": { "name": "AWS S3", "vendor_name": "Amazon" }
@@ -376,3 +376,15 @@ parser_vrl: |
   if !is_empty(__residual) { .unmapped = __residual }
   .
   # END NAN-2421 residual spill
+
+samples:
+  # NAN-3702 (existing sample): metadata.uid is sha256("aws_s3_access|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "79a59df900b949e55d96a1e698fbacedfd6e09d98eacf8f8d5218e7cd47ef2be my-bucket [18/Aug/2026:20:06:00 +0000] 10.0.0.4 arn:aws:iam::123456789012:role/app 891CE47D2EXAMPLE REST.DELETE.OBJECT logs/old.log \"DELETE /logs/old.log HTTP/1.1\" 204 - - 1024 12 - \"-\" \"aws-sdk-go/1.44\" 3HL4kqtJvjVBH40Nrjfkd"
+    expect:
+      "metadata.uid": "d3f37a285b287ead0a853ef8ec08bd3ab020e73e403976c37c20b2b194839b18"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("aws_s3_access|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"timestamp\":\"2025-01-01T00:00:00Z\",\"severity\":\"INFO\"}"
+    expect:
+      "metadata.uid": "8cc4b464335e8c80ae00de5467a4826672a0d329b23a55c793a6ad8e6bcf5be0"

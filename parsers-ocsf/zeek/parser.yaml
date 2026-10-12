@@ -1,6 +1,6 @@
 name: zeek_ocsf
 display_name: Zeek Network Monitor (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -100,7 +100,7 @@ parser_vrl: |
 
   metadata = {
       "version": "1.9.0",
-      "uid": uuid_v4(),
+      "uid": sha2("zeek|raw|" + raw_log, variant: "SHA-256"),
       "log_source": "zeek",
       "log_provider": "Zeek",
       "profiles": ["host", "security_control"],
@@ -1202,3 +1202,8 @@ samples:
     activity_id: 1
     finding_info.uid: bad_HTTP_request
     disposition_id: 15
+# NAN-3702 (existing sample): metadata.uid is sha256("zeek|raw|" + raw), so the
+# same record parsed twice gets the same uid (a random uid could never match).
+- raw: "{\"_path\":\"conn\",\"ts\":1730281572.123456,\"uid\":\"CxT1234abcd\",\"id.orig_h\":\"10.10.1.55\",\"id.orig_p\":51422,\"id.resp_h\":\"93.184.216.34\",\"id.resp_p\":443,\"proto\":\"tcp\",\"service\":\"ssl\",\"duration\":60.25,\"orig_bytes\":4210,\"resp_bytes\":11111,\"conn_state\":\"SF\",\"local_orig\":true,\"local_resp\":false,\"missed_bytes\":0,\"history\":\"ShADadFf\",\"orig_pkts\":14,\"orig_ip_bytes\":4770,\"resp_pkts\":10,\"resp_ip_bytes\":11511,\"community_id\":\"1:abcd=\",\"node\":\"zeek-sensor-1\"}"
+  expect:
+    "metadata.uid": "9a86894d625e2607b79ea1b4a5060123da2b53d3a37c8ba3f54e45e8620a090e"

@@ -1,6 +1,6 @@
 name: sophos_ocsf
 display_name: Sophos Firewall (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses Sophos XG/XGS Firewall syslog (key=value) records into complete
@@ -423,7 +423,7 @@ parser_vrl: |
       finding_uid = to_string(kv.signature_id) ?? ""
       if finding_uid == "" { finding_uid = to_string(kv.eventid) ?? "" }
       if finding_uid == "" { finding_uid = to_string(kv.log_id) ?? "" }
-      if finding_uid == "" { finding_uid = uuid_v4() }
+      if finding_uid == "" { finding_uid = sha2("sophos|raw|" + raw_log, variant: "SHA-256") }
       title = threat_name
       if title == "" { title = log_type }
 
@@ -558,15 +558,23 @@ parser_vrl: |
   ocsf.raw_data = raw_log
   ocsf.unmapped = unmapped
 
-  record_uid = to_string(kv.log_id) ?? ""
-  if record_uid == "" { record_uid = connid }
-  if record_uid == "" { record_uid = uuid_v4() }
+  # NAN-3702: metadata.uid is the lake's dedup key, so it must name ONE record.
+  # Sophos `log_id` is the message-type code (every "allowed" firewall line
+  # carries the same 0101... value) and `connid` is shared by a connection's
+  # start/end lines; keying on either collapsed distinct events into one row.
+  # Sophos has no per-record id, so hash the raw line (a redelivery repeats it
+  # byte for byte).
+  record_uid = sha2("sophos|raw|" + raw_log, variant: "SHA-256")
+  # original_event_uid keeps what it carried before (log_id, else connid).
+  orig_uid = to_string(kv.log_id) ?? ""
+  if orig_uid == "" { orig_uid = connid }
+  if orig_uid == "" { orig_uid = record_uid }
 
   ocsf.metadata = {
       "version": "1.9.0",
       "profiles": profiles,
       "uid": record_uid,
-      "original_event_uid": record_uid,
+      "original_event_uid": orig_uid,
       "event_code": log_type,
       "log_source": "sophos",
       "product": { "name": "Firewall", "vendor_name": "Sophos" }
@@ -856,3 +864,22 @@ samples:
       "class_uid": 0
       "activity_id": 99
       "metadata.version": "1.9.0"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("sophos|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:35:00 timezone=\"UTC\" device_name=\"XGS2100\" log_type=\"Anti-Virus\" log_component=\"HTTP\" log_subtype=\"Denied\" status=\"Blocked\" priority=Critical user_name=\"erin\" src_ip=10.1.1.61 dst_ip=198.51.100.9 src_port=52100 dst_port=80 protocol=\"TCP\" threatname=\"EICAR-AV-Test\" threattype=\"Virus\" filename=\"/downloads/eicar.com\" url=\"http://bad.example.net/downloads/eicar.com\" quarantine=\"Yes\" quarantine_reason=\"Malware detected\""
+    expect:
+      "metadata.uid": "7f55a4ed295e41dca33f5bb8da31715a9cab862db85c2deaaa5f4c5e094dfc6c"
+      "finding_info.uid": "7f55a4ed295e41dca33f5bb8da31715a9cab862db85c2deaaa5f4c5e094dfc6c"
+      "finding_info.analytic.uid": "7f55a4ed295e41dca33f5bb8da31715a9cab862db85c2deaaa5f4c5e094dfc6c"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("sophos|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:46:00 timezone=\"UTC\" device_name=\"XGS2100\" log_type=\"Event\" log_component=\"Admin\" log_subtype=\"Admin\" status=\"Successful\" priority=Information user_name=\"admin\" message=\"Admin logged in from 10.1.1.5\" reason=\"\""
+    expect:
+      "metadata.uid": "6f8e4fb2489157e9427aadcb3976980824722a0b37421b1aa47ee11894adc97c"
+      "metadata.original_event_uid": "6f8e4fb2489157e9427aadcb3976980824722a0b37421b1aa47ee11894adc97c"
+  # NAN-3702: Sophos log_id is a message-type code shared by every line of that type, so it
+  # stays original_event_uid but is no longer the uid; the raw line is hashed.
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:46:00 timezone=\"UTC\" device_name=\"XGS2100\" log_id=062516617101 log_type=\"Event\" log_component=\"Admin\" log_subtype=\"Admin\" status=\"Successful\" priority=Information user_name=\"admin\" message=\"Admin logged in from 10.1.1.5\" reason=\"\""
+    expect:
+      "metadata.uid": "33c153115e43dd16e07597782fd33d4e5449bf239ba0e2ece538317dfcd52887"
+      "metadata.original_event_uid": "062516617101"

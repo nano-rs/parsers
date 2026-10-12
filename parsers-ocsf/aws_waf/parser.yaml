@@ -1,6 +1,6 @@
 name: aws_waf_ocsf
 display_name: AWS WAF (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -42,7 +42,7 @@ parser_vrl: |
           "metadata": {
               "version": "1.9.0",
               "profiles": ["cloud", "security_control"],
-              "uid": uuid_v4(),
+              "uid": sha2("aws_waf|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "AWS WAF",
               "product": { "name": "AWS WAF", "vendor_name": "Amazon" }
@@ -207,7 +207,7 @@ parser_vrl: |
           "src_endpoint": src_endpoint,
           "http_request": http_request
       }
-      if rid == "" { ocsf.metadata.uid = uuid_v4() }
+      if rid == "" { ocsf.metadata.uid = sha2("aws_waf|raw|" + raw_log, variant: "SHA-256") }
       if code > 0 { ocsf.http_response = { "code": code, "status": status_str } }
       if length(keys(fw)) > 0 { ocsf.firewall_rule = fw }
 
@@ -402,3 +402,15 @@ parser_vrl: |
   if !is_empty(__residual) { .unmapped = __residual }
   .
   # END NAN-2421 residual spill
+
+samples:
+  # NAN-3702 (unparseable record, error branch): metadata.uid is sha256("aws_waf|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "NAN-3702 determinism probe: not a aws_waf record"
+    expect:
+      "metadata.uid": "80c32cf7594642c70fff5c9ab9f480e9483a0d781d351329e93638d711e15c37"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("aws_waf|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"timestamp\":1787083200000,\"formatVersion\":1,\"webaclId\":\"arn:aws:wafv2:us-east-1:123456789012:regional/webacl/my-acl/abc\",\"terminatingRuleId\":\"Default_Action\",\"terminatingRuleType\":\"REGULAR\",\"action\":\"ALLOW\",\"terminatingRuleMatchDetails\":[],\"httpSourceName\":\"ALB\",\"httpSourceId\":\"123456789012-app/my-lb/abc\",\"ruleGroupList\":[],\"rateBasedRuleList\":[],\"nonTerminatingMatchingRules\":[],\"responseCodeSent\":null,\"httpRequest\":{\"clientIp\":\"203.0.113.55\",\"country\":\"US\",\"headers\":[{\"name\":\"Host\",\"value\":\"api.example.com\"},{\"name\":\"User-Agent\",\"value\":\"sqlmap/1.5\"},{\"name\":\"Referer\",\"value\":\"http://x.example/\"}],\"uri\":\"/health\",\"args\":\"\",\"httpVersion\":\"HTTP/1.1\",\"httpMethod\":\"GET\"},\"labels\":[{\"name\":\"awswaf:managed:aws:sql-database:SQLi_Body\"}]}"
+    expect:
+      "metadata.uid": "e87daf3e0fb446edbeee61a58eeb5adf286a555751fd388f2e955aaae3e87497"

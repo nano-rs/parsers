@@ -1,6 +1,6 @@
 name: slack_audit_ocsf
 display_name: Slack Audit Log (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -49,7 +49,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("slack_audit|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "Slack Audit Logs",
               "log_provider": "Slack",
@@ -276,7 +276,7 @@ parser_vrl: |
       ocsf.raw_data = raw_log
 
       evt_uid = string(p.id) ?? ""
-      if evt_uid == "" { evt_uid = uuid_v4() }
+      if evt_uid == "" { evt_uid = sha2("slack_audit|raw|" + raw_log, variant: "SHA-256") }
       ocsf.metadata = {
           "version": "1.9.0",
           "uid": evt_uid,
@@ -537,3 +537,14 @@ samples:
       "class_uid": 3006
       "activity_id": 6
       "metadata.version": "1.9.0"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("slack_audit|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "slack audit not json"
+    expect:
+      "metadata.uid": "34090079a6358564cd0779651af465e587dfcbceb1c54b473fb074681829d359"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("slack_audit|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"date_create\":1787064000,\"action\":\"app_installed\",\"actor\":{\"type\":\"user\",\"user\":{\"name\":\"jane.doe\",\"email\":\"jane.doe@example.com\"}},\"entity\":{\"type\":\"app\",\"app\":{\"name\":\"Data Exporter\",\"is_distributed\":false,\"scopes\":[\"files:read\",\"channels:history\"]}},\"context\":{\"location\":{\"type\":\"workspace\",\"name\":\"Example\",\"domain\":\"example\"},\"ip_address\":\"203.0.113.55\"}}"
+    expect:
+      "metadata.uid": "54c39ed2a45c4e659f471ff664294af7b22cabc9f943a848842e722dcaf109ec"
+      "metadata.original_event_uid": "54c39ed2a45c4e659f471ff664294af7b22cabc9f943a848842e722dcaf109ec"

@@ -1,6 +1,6 @@
 name: onepassword_ocsf
 display_name: 1Password (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -47,7 +47,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("onepassword|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "1Password Events API",
               "log_provider": "1Password",
@@ -239,7 +239,7 @@ parser_vrl: |
       ocsf.raw_data = raw_log
 
       evt_uid = string(p.uuid) ?? ""
-      if evt_uid == "" { evt_uid = uuid_v4() }
+      if evt_uid == "" { evt_uid = sha2("onepassword|raw|" + raw_log, variant: "SHA-256") }
       event_code = string(p.type) ?? ""
       if event_code == "" { event_code = action }
       meta = {
@@ -499,3 +499,14 @@ samples:
       "class_uid": 3002
       "activity_id": 1
       "metadata.version": "1.9.0"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("onepassword|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "not json 1password"
+    expect:
+      "metadata.uid": "f3065145e4398e24a3e4072d8d2edfccf66c71bad8aa997093059518bfa3a1fd"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("onepassword|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"timestamp\":\"2026-08-18T15:45:30.220000Z\",\"actor_uuid\":\"ADMIN1234567890ABCDEFGHIJK\",\"actor_details\":{\"email\":\"admin@example.com\",\"name\":\"Ops Admin\"},\"action\":\"join\",\"object_type\":\"group\",\"object_uuid\":\"GRP555444333222111000999\",\"aux_id\":12,\"aux_details\":{\"name\":\"Owners\"},\"session\":{\"device_uuid\":\"DEV999888777666555444333\",\"ip\":\"192.0.2.77\"},\"location\":{\"country\":\"US\"}}"
+    expect:
+      "metadata.uid": "ba2b98dfe7889217b83b91a1289df4b55cdda9dec8ee295bc1a6cbbe7cf80d6e"
+      "metadata.original_event_uid": "ba2b98dfe7889217b83b91a1289df4b55cdda9dec8ee295bc1a6cbbe7cf80d6e"

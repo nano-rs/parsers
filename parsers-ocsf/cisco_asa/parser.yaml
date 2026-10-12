@@ -1,6 +1,6 @@
 name: cisco_asa_ocsf
 display_name: Cisco ASA (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -899,7 +899,7 @@ parser_vrl: |
 
   metadata = {
       "version": "1.9.0",
-      "uid": uuid_v4(),
+      "uid": sha2("cisco_asa|raw|" + raw_log, variant: "SHA-256"),
       "log_source": "cisco_asa",
       "log_provider": "ASA",
       "profiles": ["host", "security_control"],
@@ -1388,3 +1388,8 @@ samples:
     user.name: jsmith
     actor.user.name: jsmith
     disposition_id: 1
+# NAN-3702 (existing sample): metadata.uid is sha256("cisco_asa|raw|" + raw), so the
+# same record parsed twice gets the same uid (a random uid could never match).
+- raw: "Apr 15 09:38:10 fw-edge-01 : %ASA-6-113005: AAA user authentication Rejected : reason = Invalid password : server = 10.1.1.5 : user = jsmith : user IP = 203.0.113.5"
+  expect:
+    "metadata.uid": "2badee33dc3da87c192b8be63b7c7b0494d722e7b003cab5a6c77337dfc9c23a"

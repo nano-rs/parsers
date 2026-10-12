@@ -1,6 +1,6 @@
 name: cyberark_ocsf
 display_name: CyberArk PAM (OCSF)
-version: "1.1.0"
+version: "1.2.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -65,7 +65,7 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": uuid_v4(),
+              "uid": sha2("cyberark|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "CyberArk PAM",
               "log_provider": "CyberArk",
@@ -275,7 +275,7 @@ parser_vrl: |
 
       meta = {
           "version": "1.9.0",
-          "uid": uuid_v4(),
+          "uid": sha2("cyberark|raw|" + raw_log, variant: "SHA-256"),
           "log_name": "CyberArk PAM",
           "log_provider": "CyberArk",
           "product": { "name": "PAM", "vendor_name": "CyberArk" }
@@ -527,3 +527,13 @@ samples:
       "class_uid": 3002
       "activity_id": 1
       "metadata.version": "1.9.0"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("cyberark|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "Aug 18 14:03:02 vault01 something entirely unstructured"
+    expect:
+      "metadata.uid": "41cfedc72a9e52d3573d3839fa7e86214db64096a5ee7ca266fe815f86a661f7"
+  # NAN-3702 (existing sample): metadata.uid is sha256("cyberark|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "CEF:0|CyberArk|Vault|12.60.0000|24|Add Member To Group|4|act=Add Member To Group suser=vaultadmin duser=contractor01 fname=Vault Admins src=192.0.2.77 dvc=10.1.1.5 externalId=24 rt=Aug 18 2026 15:14:30 msg=contractor01 added to group Vault Admins"
+    expect:
+      "metadata.uid": "48b2c934f828febac4f087f4b54f08475f00735d9cb105c1cfc68cfe12d993fb"
