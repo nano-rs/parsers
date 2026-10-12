@@ -144,7 +144,13 @@ jobs:
         if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) }}
         env:
           OCSF_VALIDATOR_TOKEN: ${{ secrets.OCSF_VALIDATOR_TOKEN }}
-        run: echo "OCSF_VALIDATOR=$(bash scripts/fetch-ocsf-validator.sh "$RUNNER_TEMP/ocsf")" >> "$GITHUB_ENV"
+        # Assign first: `echo "...$(fetch)"` masks the fetch's exit status, so a
+        # 401/404 or sha mismatch would show this step green.
+        run: |
+          set -euo pipefail
+          validator="$(bash scripts/fetch-ocsf-validator.sh "$RUNNER_TEMP/ocsf")"
+          sha256sum "$validator"
+          echo "OCSF_VALIDATOR=$validator" >> "$GITHUB_ENV"
 
       - name: Mark fork PR (schema half skipped, enforced post-merge)
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
