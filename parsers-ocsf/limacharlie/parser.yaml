@@ -1,6 +1,6 @@
 name: limacharlie_ocsf
 display_name: LimaCharlie EDR (OCSF)
-version: "1.2.1"
+version: "1.2.2"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses LimaCharlie EDR sensor telemetry (routing + event envelope) into
@@ -637,8 +637,12 @@ parser_vrl: |
       ocsf.time = time_ms
       ocsf.raw_data = raw_log
 
+      # NAN-3721: metadata.uid is the lake's dedup key, so it must name ONE
+      # record. routing.this is the atom of the event's primary object (e.g.
+      # the process), which every event about that object shares; as a uid
+      # fallback it collapsed those events into one row. Without event_id the
+      # raw record is hashed, and the atom stays as correlation_uid.
       record_uid = to_string(routing.event_id) ?? ""
-      if record_uid == "" { record_uid = this_atom }
       if record_uid == "" { record_uid = sha2("limacharlie|raw|" + raw_log, variant: "SHA-256") }
 
       ocsf.metadata = {
@@ -656,6 +660,7 @@ parser_vrl: |
       # object (e.g. the process), so it is not an event id.
       lc_event_id = to_string(routing.event_id) ?? ""
       if lc_event_id != "" { ocsf.metadata.original_event_uid = lc_event_id }
+      if this_atom != "" { ocsf.metadata.correlation_uid = this_atom }
 
       . = ocsf
   }
@@ -1069,5 +1074,11 @@ samples:
   # NAN-3718: routing.this names the primary object, not the event: no original_event_uid (metadata.uid unchanged)
   - raw: "{\"routing\":{\"event_type\":\"BAD_LOGON\",\"event_time\":1787050000000,\"hostname\":\"WKS-11.corp.local\",\"int_ip\":\"10.4.5.6\",\"ext_ip\":\"203.0.113.44\",\"oid\":\"oid-1\",\"sid\":\"sid-abc\",\"iid\":\"iid-1\",\"this\":\"atom-this\",\"parent\":\"atom-parent\",\"plat\":268435456,\"arch\":2},\"event\":{\"USER_NAME\":\"administrator\",\"LOGON_TYPE\":\"3\",\"SOURCE_IP\":\"203.0.113.9\",\"ERROR\":\"STATUS_LOGON_FAILURE\"}}"
     expect:
-      "metadata.uid": "atom-this"
+      "metadata.uid": "e2e98dde88f841c0d12c77df46e158ff34385736743310bb57ed6b89d0a1b3ec"
+      "metadata.correlation_uid": "atom-this"
       "metadata.original_event_uid": "<missing>"
+  # NAN-3721: a second event about the same object (same routing.this), no event_id: a distinct uid, so it is not dropped
+  - raw: "{\"routing\":{\"event_type\":\"BAD_LOGON\",\"event_time\":1787050001000,\"hostname\":\"WKS-11.corp.local\",\"int_ip\":\"10.4.5.6\",\"ext_ip\":\"203.0.113.44\",\"oid\":\"oid-1\",\"sid\":\"sid-abc\",\"iid\":\"iid-1\",\"this\":\"atom-this\",\"parent\":\"atom-parent\",\"plat\":268435456,\"arch\":2},\"event\":{\"USER_NAME\":\"administrator\",\"LOGON_TYPE\":\"3\",\"SOURCE_IP\":\"203.0.113.9\",\"ERROR\":\"STATUS_LOGON_FAILURE\"}}"
+    expect:
+      "metadata.uid": "d690a97d69d7eecf513f4b7313426fe7eb0e41a841545e074867a87d8b90f8f0"
+      "metadata.correlation_uid": "atom-this"
