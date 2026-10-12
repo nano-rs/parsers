@@ -1,6 +1,6 @@
 name: windows_sysmon_ocsf
 display_name: Microsoft Sysmon (OCSF)
-version: "1.0.0"
+version: "1.1.0"
 description: >
   Parses Windows Sysmon events in JSON form (top-level event_id + event_data)
   into complete OCSF 1.8.0 records, routed by Sysmon EventID:
@@ -40,7 +40,9 @@ parser_vrl: |
           "message": raw_log,
           "metadata": {
               "version": "1.8.0",
-              "uid": uuid_v4(),
+              # NAN-3702: deterministic, so a redelivered unparseable record
+              # dedupes in the lake instead of landing as a second row.
+              "uid": sha2("windows_sysmon|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "product": { "name": "Sysmon", "vendor_name": "Microsoft" }
           }
@@ -256,11 +258,26 @@ parser_vrl: |
       ocsf.time = time_ms
       ocsf.message = raw_log
       # NAN-1403: record_id arrives as an integer and string() errors on
-      # integers, so string(p.record_id) ?? uuid_v4() randomized every uid.
-      # to_string coerces int → decimal string, string → itself, null/absent
-      # → "" — the guard routes "" to the genuinely-absent uuid_v4 fallback.
-      record_uid = to_string(p.record_id) ?? ""
-      if record_uid == "" { record_uid = uuid_v4() }
+      # integers; to_string coerces int → decimal string, string → itself,
+      # null/absent → "".
+      # NAN-3702: the lake drops a row whose (event hour, metadata.uid) it
+      # already stored, so the uid must be the same every time the same record
+      # arrives and must differ between records. A bare record_id is neither:
+      # it is a per-host, per-channel sequence, so two hosts (or channels) emit
+      # the same number in the same hour and all but one were dropped, and it
+      # restarts after a log reset. The uid is therefore the host/channel/
+      # provider/record/time composite (the same form as the ocsf-1.9 parser),
+      # and record_id itself moves to original_event_uid. Without the parts of
+      # the composite, the raw record is hashed, which a redelivery repeats
+      # byte for byte.
+      record_id = to_string(p.record_id) ?? ""
+      log_name = downcase(string(p.channel) ?? "Microsoft-Windows-Sysmon/Operational")
+      log_provider = downcase(string(p.provider_name) ?? "Microsoft-Windows-Sysmon")
+      record_uid = ""
+      if record_id != "" && computer != "" && ts_str != "" {
+          record_uid = join!(["windows_sysmon", computer, log_name, log_provider, record_id, ts_str], "|")
+      }
+      if record_uid == "" { record_uid = sha2("windows_sysmon|raw|" + raw_log, variant: "SHA-256") }
       ocsf.metadata = {
           "version": "1.8.0",
           "uid": record_uid,
@@ -269,5 +286,25 @@ parser_vrl: |
           "product": { "name": "Sysmon", "vendor_name": "Microsoft" }
       }
 
+      if record_id != "" { ocsf.metadata.original_event_uid = record_id }
+
       . = ocsf
   }
+samples:
+  # NAN-3702: host/channel/provider/record/time composite; record_id moves to original_event_uid.
+  - raw: "{\"event_id\":1,\"record_id\":\"987654\",\"channel\":\"Microsoft-Windows-Sysmon/Operational\",\"provider_name\":\"Microsoft-Windows-Sysmon\",\"computer\":\"WKS-01.corp.local\",\"timestamp\":\"2026-08-18T10:15:00.123Z\",\"event_data\":{\"Image\":\"C:\\\\Windows\\\\System32\\\\cmd.exe\",\"CommandLine\":\"cmd.exe /c whoami\",\"ProcessId\":\"4321\",\"ProcessGuid\":\"{aaaa-1111}\",\"ParentImage\":\"C:\\\\Windows\\\\explorer.exe\",\"ParentCommandLine\":\"explorer.exe\",\"ParentProcessId\":\"1200\",\"User\":\"CORP\\\\alice\",\"Hashes\":\"SHA256=ABCD1234EF,MD5=00112233\"}}"
+    expect:
+      "class_uid": 1007
+      "metadata.uid": "windows_sysmon|wks-01.corp.local|microsoft-windows-sysmon/operational|microsoft-windows-sysmon|987654|2026-08-18T10:15:00.123Z"
+      "metadata.original_event_uid": "987654"
+  # NAN-3702: no record_id: the raw record is hashed.
+  - raw: "{\"event_id\":1,\"channel\":\"Microsoft-Windows-Sysmon/Operational\",\"provider_name\":\"Microsoft-Windows-Sysmon\",\"computer\":\"WKS-01.corp.local\",\"timestamp\":\"2026-08-18T10:15:00.123Z\",\"event_data\":{\"Image\":\"C:\\\\Windows\\\\System32\\\\cmd.exe\",\"CommandLine\":\"cmd.exe /c whoami\",\"ProcessId\":\"4321\",\"ProcessGuid\":\"{aaaa-1111}\",\"ParentImage\":\"C:\\\\Windows\\\\explorer.exe\",\"ParentCommandLine\":\"explorer.exe\",\"ParentProcessId\":\"1200\",\"User\":\"CORP\\\\alice\",\"Hashes\":\"SHA256=ABCD1234EF,MD5=00112233\"}}"
+    expect:
+      "class_uid": 1007
+      "metadata.uid": "ab7de99dd3553cc8057ad59973186d7a60b2f12ac6d28e3ffb73dab992061d5a"
+      "metadata.original_event_uid": "<missing>"
+  # NAN-3702: unparseable record (error branch).
+  - raw: "not json at all"
+    expect:
+      "metadata.log_level": "error"
+      "metadata.uid": "8dd389bdb82e1de5d776ad51758db5e01fbc919f03546210ab1634702ec6be48"

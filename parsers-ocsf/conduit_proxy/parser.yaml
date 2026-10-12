@@ -1,6 +1,6 @@
 name: conduit_proxy_ocsf
 display_name: Conduit MITM Proxy (OCSF)
-version: "1.3.0"
+version: "1.4.0"
 description: >
   Parses Conduit MITM proxy access logs into a complete OCSF 1.8.0
   "HTTP Activity" (class_uid 4002) record. The whole OCSF object is emitted on
@@ -147,6 +147,12 @@ parser_vrl: |
           "rule_id": p.rule_id
       }
 
+      # NAN-3702: metadata.uid is deterministic so a redelivered record dedupes
+      # in the lake. Conduit's own `id` stays the uid when present (unchanged);
+      # without one (or with an empty one) the raw body is hashed.
+      conduit_uid = string(p.id) ?? ""
+      if conduit_uid == "" { conduit_uid = sha2("conduit_proxy|raw|" + raw_log, variant: "SHA-256") }
+
       . = {
           "class_uid": class_uid,
           "class_name": "HTTP Activity",
@@ -165,7 +171,7 @@ parser_vrl: |
           "message": raw_log,
           "metadata": {
               "version": "1.8.0",
-              "uid": string(p.id) ?? uuid_v4(),
+              "uid": conduit_uid,
               "log_name": "conduit-proxy",
               "product": {
                   "name": "Conduit Proxy",
@@ -207,7 +213,7 @@ parser_vrl: |
           "message": raw_log,
           "metadata": {
               "version": "1.8.0",
-              "uid": uuid_v4(),
+              "uid": sha2("conduit_proxy|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "product": {
                   "name": "Conduit Proxy",
@@ -216,3 +222,24 @@ parser_vrl: |
           }
       }
   }
+samples:
+  # NAN-3702: Conduit's own id stays the uid when present.
+  - raw: "{\"id\":\"01J8ZR\",\"timestamp\":\"2026-08-12T09:15:25.000000000Z\",\"client_ip\":\"10.10.4.32\",\"method\":\"GET\",\"scheme\":\"https\",\"host\":\"api.github.com\",\"port\":443,\"path\":\"/\",\"full_url\":\"https://api.github.com/\",\"status_code\":200,\"request_bytes\":420,\"response_bytes\":15320,\"duration_ms\":88,\"action\":\"allow\",\"threat_score\":0.02,\"threat_tier\":\"tier0\",\"threat_blocked\":false,\"threat_signals\":[]}"
+    expect:
+      "class_uid": 4002
+      "metadata.uid": "01J8ZR"
+  # NAN-3702: no id: the raw record is hashed.
+  - raw: "{\"timestamp\":\"2026-08-12T09:15:25.000000000Z\",\"client_ip\":\"10.10.4.32\",\"method\":\"GET\",\"scheme\":\"https\",\"host\":\"api.github.com\",\"port\":443,\"path\":\"/\",\"full_url\":\"https://api.github.com/\",\"status_code\":200,\"request_bytes\":420,\"response_bytes\":15320,\"duration_ms\":88,\"action\":\"allow\",\"threat_score\":0.02,\"threat_tier\":\"tier0\",\"threat_blocked\":false,\"threat_signals\":[]}"
+    expect:
+      "class_uid": 4002
+      "metadata.uid": "5035aa3e0578e5b6adfe13429231f218b399e70883093e699c8e311e0eb7b2f4"
+  # NAN-3702: empty id counts as missing: the raw record is hashed.
+  - raw: "{\"id\":\"\",\"timestamp\":\"2026-08-12T09:15:25.000000000Z\",\"client_ip\":\"10.10.4.32\",\"method\":\"GET\",\"scheme\":\"https\",\"host\":\"api.github.com\",\"port\":443,\"path\":\"/\",\"full_url\":\"https://api.github.com/\",\"status_code\":200,\"request_bytes\":420,\"response_bytes\":15320,\"duration_ms\":88,\"action\":\"allow\",\"threat_score\":0.02,\"threat_tier\":\"tier0\",\"threat_blocked\":false,\"threat_signals\":[]}"
+    expect:
+      "class_uid": 4002
+      "metadata.uid": "0664c7b587160e66b99921d1d5fb4843f05fefb2e1e2c59ef0540d0fdb79eced"
+  # NAN-3702: non-access line (error branch).
+  - raw: "2026-08-12T09:15:30Z conduit-proxy INFO reload complete, 4 workers"
+    expect:
+      "metadata.log_level": "error"
+      "metadata.uid": "569e40aadeb8695f656e7a0614a5c6cbde21c7110880f3d714b0e49fb908f7a2"
