@@ -1,6 +1,6 @@
 name: windows_event_xml_ocsf
 display_name: Windows Event Log (XML, OCSF)
-version: "1.2.0"
+version: "1.2.1"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses Windows Event Log records in NATIVE XML (WEF, EVTX export, wevtutil)
@@ -562,13 +562,16 @@ parser_vrl: |
       md = {
           "version": "1.9.0",
           "uid": record_uid,
-          "original_event_uid": record_uid,
           "event_code": to_string(eid),
           "log_name": channel,
           "log_provider": provider,
           "product": { "name": "Windows", "vendor_name": "Microsoft" }
       }
       if wants_host_profile { md = set!(md, ["profiles"], ["host"]) }
+      # NAN-3713: original_event_uid carries the vendor's bare record number
+      # (the per-host, per-channel sequence), not the composite uid above, so
+      # it stays searchable as the number Windows shows. Omitted when absent.
+      if record_id != "" { md.original_event_uid = record_id }
       ocsf.metadata = md
 
       . = ocsf
@@ -766,4 +769,10 @@ samples:
   - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Eventlog\" Guid=\"{54849625-5478-4994-A5BA-3E3B0328C30D}\"/><EventID>1102</EventID><Version>2</Version><Level>0</Level><Task>12544</Task><Opcode>0</Opcode><Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T12:00:00.1234567Z\"/><Correlation/><Execution ProcessID=\"4\" ThreadID=\"8\"/><Channel>Security</Channel><Computer>DC01.corp.example</Computer><Security/></System><UserData><LogFileCleared xmlns=\"http://manifests.microsoft.com/win/2004/08/windows/eventlog\"><SubjectUserSid>S-1-5-21-100-500</SubjectUserSid><SubjectUserName>administrator</SubjectUserName><SubjectDomainName>CORP</SubjectDomainName><SubjectLogonId>0x3e7</SubjectLogonId></LogFileCleared></UserData></Event>"
     expect:
       "metadata.uid": "8c5fa2ef3933ad1597378c583f0bd5e1bf8d90ccd8a90d90a0ef535ff2e5eda3"
-      "metadata.original_event_uid": "8c5fa2ef3933ad1597378c583f0bd5e1bf8d90ccd8a90d90a0ef535ff2e5eda3"
+      "metadata.original_event_uid": "<missing>"
+  # NAN-3713: original_event_uid is the bare record number; metadata.uid stays the composite
+  - raw: "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Security-Auditing\" Guid=\"{54849625-5478-4994-a5ba-3e3b0328c30d}\"/><EventID>4624</EventID><Version>2</Version><Level>0</Level><Task>12544</Task><Opcode>0</Opcode><Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime=\"2026-08-18T11:00:00.1234567Z\"/><EventRecordID>77001</EventRecordID><Correlation/><Execution ProcessID=\"636\" ThreadID=\"700\"/><Channel>Security</Channel><Computer>DC-01.corp.local</Computer><Security/></System><EventData><Data Name=\"TargetUserName\">alice</Data><Data Name=\"TargetDomainName\">CORP</Data><Data Name=\"TargetUserSid\">S-1-5-21-1-2-3-1001</Data><Data Name=\"TargetLogonId\">0x3e7abc</Data><Data Name=\"LogonType\">10</Data><Data Name=\"IpAddress\">10.2.3.4</Data><Data Name=\"IpPort\">49152</Data><Data Name=\"WorkstationName\">WKS-09</Data></EventData></Event>"
+    expect:
+      "class_uid": 3002
+      "metadata.uid": "windows_event_xml|dc-01.corp.local|security|microsoft-windows-security-auditing|77001|2026-08-18T11:00:00.1234567Z"
+      "metadata.original_event_uid": "77001"
