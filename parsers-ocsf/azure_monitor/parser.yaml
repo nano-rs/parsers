@@ -1,6 +1,6 @@
 name: azure_monitor_ocsf
 display_name: Azure Monitor diagnostic export (OCSF)
-version: "1.0.0"
+version: "1.0.1"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -280,6 +280,14 @@ parser_vrl: |
               if contains(os_l, "ios") && !contains(os_l, "bios") { os_type_id = 301 }
               if contains(os_l, "ipados") { os_type_id = 302 }
               device.os = { "name": dev_os, "type_id": os_type_id }
+          }
+          # NAN-3680: an OCSF device needs at least one of ip/uid/name/hostname/...; a sign-in
+          # from an unregistered device carries only operatingSystem/browser, and a device of
+          # just `os` is refused by the lake's strict OCSF check (the whole row was lost).
+          # Identify it by the sign-in's client IP; with no identifier at all emit no device
+          # (operatingSystem then spills to unmapped, never dropped).
+          if length(keys(device)) > 0 && !exists(device.hostname) && !exists(device.uid) {
+              if ip != "" && ip != "<null>" { device.ip = downcase(ip) } else { device = {} }
           }
           if length(keys(device)) > 0 { device.type_id = 0 }
 
@@ -971,6 +979,22 @@ samples:
       "severity_id": 3
       "is_mfa": false
       "src_endpoint.ip": "198.51.100.66"
+      "metadata.version": "1.9.0"
+  # signin_unregistered_device.json (NAN-3680): deviceDetail carries only operatingSystem/browser
+  # (no deviceId/displayName). The device is identified by the client IP, never emitted as just `os`.
+  - raw: "{\"time\":\"2026-10-12T16:41:50.1234567Z\",\"resourceId\":\"/tenants/aaaabbbb-0000-cccc-1111-dddd2222eeee/providers/Microsoft.aadiam\",\"operationName\":\"Sign-in activity\",\"operationVersion\":\"1.0\",\"category\":\"SignInLogs\",\"tenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"resultType\":\"0\",\"resultSignature\":\"None\",\"resultDescription\":\"\",\"durationMs\":0,\"callerIpAddress\":\"198.51.100.23\",\"correlationId\":\"d00dfeed-1111-2222-3333-444455556666\",\"identity\":\"Bob Jones\",\"Level\":4,\"location\":\"US\",\"properties\":{\"id\":\"55d1a2b3-0000-4444-8888-000000000005\",\"createdDateTime\":\"2026-10-12T16:41:50.1234567+00:00\",\"userDisplayName\":\"Bob Jones\",\"userPrincipalName\":\"bob@contoso.com\",\"userId\":\"bbbbbbbb-0000-1111-2222-cccccccccccc\",\"appId\":\"00000003-0000-0000-c000-000000000000\",\"appDisplayName\":\"Microsoft Graph\",\"ipAddress\":\"198.51.100.23\",\"status\":{\"errorCode\":0},\"clientAppUsed\":\"Browser\",\"conditionalAccessStatus\":\"notApplied\",\"isInteractive\":true,\"deviceDetail\":{\"operatingSystem\":\"Windows10\",\"browser\":\"Edge 120.0\"},\"location\":{\"city\":\"Redmond\",\"state\":\"Washington\",\"countryOrRegion\":\"US\"},\"riskLevelAggregated\":\"none\",\"riskState\":\"none\",\"authenticationRequirement\":\"singleFactorAuthentication\"}}"
+    expect:
+      "class_uid": 3002
+      "device.ip": "198.51.100.23"
+      "device.os.name": "Windows10"
+      "src_endpoint.ip": "198.51.100.23"
+      "metadata.version": "1.9.0"
+  # signin_managed_identity_no_device_id.json (NAN-3680): no device identifier and no IP: no device
+  # object at all (operatingSystem spills to unmapped); the row stays valid OCSF.
+  - raw: "{\"time\":\"2026-10-12T16:41:50.1234567Z\",\"resourceId\":\"/tenants/aaaabbbb-0000-cccc-1111-dddd2222eeee/providers/Microsoft.aadiam\",\"operationName\":\"Sign-in activity\",\"operationVersion\":\"1.0\",\"category\":\"ManagedIdentitySignInLogs\",\"tenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"resultType\":\"0\",\"resultSignature\":\"None\",\"resultDescription\":\"\",\"durationMs\":0,\"callerIpAddress\":\"\",\"correlationId\":\"d00dfeed-1111-2222-3333-444455556666\",\"identity\":\"Bob Jones\",\"Level\":4,\"location\":\"US\",\"properties\":{\"id\":\"55d1a2b3-0000-4444-8888-000000000005\",\"createdDateTime\":\"2026-10-12T16:41:50.1234567+00:00\",\"userDisplayName\":\"\",\"userPrincipalName\":\"\",\"userId\":\"\",\"appId\":\"00000003-0000-0000-c000-000000000000\",\"appDisplayName\":\"Microsoft Graph\",\"ipAddress\":\"\",\"status\":{\"errorCode\":0},\"clientAppUsed\":\"Browser\",\"conditionalAccessStatus\":\"notApplied\",\"isInteractive\":false,\"deviceDetail\":{\"operatingSystem\":\"Windows10\",\"browser\":\"Edge 120.0\"},\"location\":{\"city\":\"Redmond\",\"state\":\"Washington\",\"countryOrRegion\":\"US\"},\"riskLevelAggregated\":\"none\",\"riskState\":\"none\",\"authenticationRequirement\":\"singleFactorAuthentication\",\"servicePrincipalName\":\"vm-web-02\",\"servicePrincipalId\":\"12345678-aaaa-bbbb-cccc-1234567890ac\"}}"
+    expect:
+      "class_uid": 3002
+      "metadata.log_name": "ManagedIdentitySignInLogs"
       "metadata.version": "1.9.0"
   # signin_noninteractive.json
   - raw: "{\"time\":\"2026-10-11T15:00:00.0000000Z\",\"resourceId\":\"/tenants/aaaabbbb-0000-cccc-1111-dddd2222eeee/providers/Microsoft.aadiam\",\"operationName\":\"Sign-in activity\",\"operationVersion\":\"1.0\",\"category\":\"NonInteractiveUserSignInLogs\",\"tenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"resultType\":\"0\",\"resultSignature\":\"None\",\"resultDescription\":\"\",\"durationMs\":0,\"callerIpAddress\":\"203.0.113.7\",\"correlationId\":\"c0ffee00-1111-2222-3333-444455556666\",\"identity\":\"Alice Smith\",\"Level\":4,\"location\":\"US\",\"properties\":{\"id\":\"22d1a2b3-0000-4444-8888-000000000002\",\"createdDateTime\":\"2026-10-11T15:00:00.0000000+00:00\",\"userDisplayName\":\"Alice Smith\",\"userPrincipalName\":\"alice@contoso.com\",\"userId\":\"aaaaaaaa-0000-1111-2222-bbbbbbbbbbbb\",\"appId\":\"00000002-0000-0ff1-ce00-000000000000\",\"appDisplayName\":\"Office 365 Exchange Online\",\"ipAddress\":\"203.0.113.7\",\"status\":{\"errorCode\":0,\"additionalDetails\":\"MFA requirement satisfied by claim in the token\"},\"clientAppUsed\":\"Mobile Apps and Desktop clients\",\"userAgent\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Edge/120.0\",\"deviceDetail\":{\"deviceId\":\"cccccccc-2222-3333-4444-dddddddddddd\",\"displayName\":\"ALICE-LAPTOP\",\"operatingSystem\":\"Windows 10\",\"browser\":\"Edge 120.0\",\"isCompliant\":true,\"isManaged\":true,\"trustType\":\"Azure AD joined\"},\"location\":{\"city\":\"Seattle\",\"state\":\"Washington\",\"countryOrRegion\":\"US\",\"geoCoordinates\":{\"latitude\":47.6,\"longitude\":-122.3}},\"correlationId\":\"c0ffee00-1111-2222-3333-444455556666\",\"conditionalAccessStatus\":\"success\",\"isInteractive\":false,\"riskDetail\":\"none\",\"riskLevelAggregated\":\"none\",\"riskLevelDuringSignIn\":\"none\",\"riskState\":\"none\",\"riskEventTypes_v2\":[],\"resourceDisplayName\":\"Office 365 Exchange Online\",\"resourceId\":\"00000002-0000-0ff1-ce00-000000000000\",\"authenticationRequirement\":\"multiFactorAuthentication\",\"authenticationProtocol\":\"none\",\"userType\":\"Member\",\"crossTenantAccessType\":\"none\",\"homeTenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"resourceTenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"tokenIssuerType\":\"AzureAD\",\"authenticationDetails\":[{\"authenticationStepDateTime\":\"2026-10-11T15:00:00Z\",\"authenticationMethod\":\"Password\",\"succeeded\":true},{\"authenticationStepDateTime\":\"2026-10-11T15:00:05Z\",\"authenticationMethod\":\"Mobile app notification\",\"succeeded\":true}],\"appliedConditionalAccessPolicies\":[{\"id\":\"77778888-9999-aaaa-bbbb-ccccddddeeee\",\"displayName\":\"Require MFA\",\"result\":\"success\"}],\"networkLocationDetails\":[],\"autonomousSystemNumber\":64500,\"processingTimeInMs\":211,\"incomingTokenType\":\"refreshToken\"}}"
