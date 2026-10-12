@@ -176,9 +176,18 @@ for parser_file in "${PARSERS[@]}"; do
                 | grep -v "INFO vector" | grep -v '^\s*$' | head -3 | sed 's/^/             /'
             parser_failed=1
         else
-            check_out=$(python3 "$CHECKS" check --parser "$parser_file" --event "$out_file" --label "$label" || true)
+            # The checker's own exit status matters: `|| true` here once hid a
+            # JSONDecodeError traceback on four moat_edr samples while the
+            # parser still reported PASS (NAN-3680). A crash is an unchecked
+            # sample, so it fails the parser.
+            check_rc=0
+            check_out=$(python3 "$CHECKS" check --parser "$parser_file" --event "$out_file" --label "$label" 2>&1) || check_rc=$?
             echo "$check_out"
             if echo "$check_out" | grep -q "FAIL "; then parser_failed=1; fi
+            if [ "$check_rc" -ne 0 ] && ! echo "$check_out" | grep -q "FAIL "; then
+                echo "      FAIL $label: [checker] exited $check_rc without a verdict — the sample was NOT validated"
+                parser_failed=1
+            fi
             if echo "$check_out" | grep -q "WARN .*NOT promoted"; then
                 UNQUERYABLE=$((UNQUERYABLE + 1))
             fi
