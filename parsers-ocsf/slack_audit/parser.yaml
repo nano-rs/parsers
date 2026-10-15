@@ -1,0 +1,550 @@
+name: slack_audit_ocsf
+display_name: Slack Audit Log (OCSF)
+version: "1.2.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Slack Enterprise Grid Audit Logs API events into complete OCSF 1.9.0
+  records, routed by `action`:
+    user_login / user_login_failed / user_logout      -> Authentication 3002
+    user_created / user_deactivated / user_reactivated /
+      user_role_changed / user_email_changed /
+      user_password_* / user_mfa_*                     -> User Management 3007
+    usergroup_* / workspace member add/remove          -> Group Management 3006
+    channel_*, file_*, app_*, workspace_*, everything
+      else                                             -> API Activity 6003
+  Distinct from slack_access (team.accessLogs) — a different endpoint and
+  schema. The Slack `actor.user` is the administrator (`actor.user` in OCSF)
+  and `entity.user` is the account acted on (`user` in OCSF).
+match_values:
+  - slack_audit
+category: cloud
+vendor: "Salesforce"
+product: "Slack"
+parser_vrl: |
+  # Slack Enterprise Grid audit event JSON -> OCSF 1.9.0.
+  raw_log = string!(.message)
+  __raw_body = raw_log
+  __source_kv = {}
+  parsed, err = parse_json(raw_log)
+  __source_kv = object(parsed) ?? {}
+
+  if err != null || !is_object(parsed) {
+      # Unparseable input is emitted as an OCSF Base Event (class_uid 0)
+      # rather than being guessed into a security class: it stays valid, and
+      # therefore visible, without fabricating a user or an outcome.
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("slack_audit|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "Slack Audit Logs",
+              "log_provider": "Slack",
+              "product": { "name": "Slack", "vendor_name": "Salesforce" }
+          },
+          "unmapped": { "parse_error": "not a JSON object" }
+      }
+  } else {
+      p = object!(parsed)
+      actor_in = object(p.actor) ?? {}
+      actor_u = object(actor_in.user) ?? {}
+      ctx = object(p.context) ?? {}
+      ctx_loc = object(ctx.location) ?? {}
+      entity = object(p.entity) ?? {}
+      entity_user = object(entity.user) ?? {}
+      entity_ws = object(entity.workspace) ?? {}
+      entity_ch = object(entity.channel) ?? {}
+      entity_file = object(entity.file) ?? {}
+      entity_ug = object(entity.usergroup) ?? {}
+      details = object(p.details) ?? {}
+
+      action = string(p.action) ?? ""
+
+      # ---- time: date_create is epoch seconds ----
+      time_ms = 0
+      ts_sec = to_int(p.date_create) ?? 0
+      if ts_sec > 0 { time_ms = ts_sec * 1000 }
+
+      # ---- acting principal ----
+      actor_email = string(actor_u.email) ?? ""
+      actor_name = actor_email
+      if actor_name == "" { actor_name = string(actor_u.name) ?? "" }
+      actor_user = { "name": downcase(actor_name) }
+      if actor_name == "" { actor_user = { "name": "unknown" } }
+      actor_uid = string(actor_u.id) ?? ""
+      if actor_uid != "" { actor_user = set!(actor_user, ["uid"], actor_uid) }
+      if match(actor_email, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') {
+          actor_user = set!(actor_user, ["email_addr"], downcase(actor_email))
+      }
+
+      # ---- subject named by entity.user ----
+      subj_email = string(entity_user.email) ?? ""
+      subj_name = subj_email
+      if subj_name == "" { subj_name = string(entity_user.name) ?? "" }
+      subject = { "name": downcase(subj_name) }
+      subj_uid = string(entity_user.id) ?? ""
+      if subj_uid != "" { subject = set!(subject, ["uid"], subj_uid) }
+      if match(subj_email, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') {
+          subject = set!(subject, ["email_addr"], downcase(subj_email))
+      }
+      have_subject = subj_name != ""
+
+      # ---- class routing ----
+      is_auth = action == "user_login" || action == "user_login_failed" || action == "user_logout"
+      is_usermgmt = action == "user_created" || action == "user_deactivated" || action == "user_reactivated" ||
+                    action == "user_role_changed" || action == "user_email_changed" || action == "user_name_changed" ||
+                    action == "user_password_changed" || action == "user_password_reset" ||
+                    action == "user_mfa_reset" || action == "user_mfa_disabled" || action == "user_mfa_enabled" ||
+                    action == "guest_created" || action == "guest_deactivated" || action == "guest_expiration_set" ||
+                    action == "owner_transferred" || action == "role_change_to_owner" || action == "role_change_to_admin" ||
+                    action == "role_change_to_user"
+      is_groupmgmt = starts_with(action, "usergroup_") || action == "workspace_member_joined" ||
+                     action == "organization_member_joined" || action == "organization_member_left" ||
+                     action == "member_added_to_workspace" || action == "member_removed_from_workspace"
+
+      class_uid = 6003
+      if is_auth { class_uid = 3002 } else if is_usermgmt { class_uid = 3007 } else if is_groupmgmt { class_uid = 3006 }
+
+      status_id = 1
+      status_str = "Success"
+      severity_id = 1
+      severity = "Informational"
+      if action == "user_login_failed" {
+          status_id = 2; status_str = "Failure"; severity_id = 2; severity = "Low"
+      }
+
+      ocsf = {}
+
+      if class_uid == 3002 {
+          activity_id = 1
+          activity_name = "Logon"
+          if action == "user_logout" { activity_id = 2; activity_name = "Logoff" }
+          ocsf.class_uid = 3002
+          ocsf.class_name = "Authentication"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          # Authentication 3002 carries the authenticating principal in `user`.
+          ocsf.user = actor_user
+          ocsf.service = { "name": "Slack" }
+          ocsf.is_remote = true
+          sid = string(ctx.session_id) ?? ""
+          if sid != "" { ocsf.session = { "uid": sid } }
+          method = string(details.method) ?? ""
+          if method != "" {
+              ml = downcase(method)
+              ap_id = 99
+              if ml == "saml" || ml == "sso" { ap_id = 5 }
+              if ml == "oauth" { ap_id = 6 }
+              ocsf.auth_protocol_id = ap_id
+              ocsf.auth_protocol = method
+          }
+          mfa = false
+          if is_boolean(details.mfa) { mfa = bool!(details.mfa) }
+          if is_string(details.mfa) { mfa = downcase(string!(details.mfa)) == "true" }
+          ocsf.is_mfa = mfa
+      } else if class_uid == 3007 {
+          activity_id = 2
+          activity_name = "Update"
+          if action == "user_created" || action == "guest_created" { activity_id = 1; activity_name = "Create" }
+          if action == "user_reactivated" { activity_id = 4; activity_name = "Enable" }
+          if action == "user_deactivated" || action == "guest_deactivated" { activity_id = 5; activity_name = "Disable" }
+          if action == "user_password_changed" { activity_id = 8; activity_name = "Password Change" }
+          if action == "user_password_reset" { activity_id = 9; activity_name = "Password Reset" }
+          if action == "user_mfa_enabled" { activity_id = 12; activity_name = "Enable MFA Factors" }
+          if action == "user_mfa_disabled" || action == "user_mfa_reset" { activity_id = 13; activity_name = "Disable MFA Factors" }
+          if action == "role_change_to_owner" || action == "role_change_to_admin" || action == "owner_transferred" { activity_id = 16; activity_name = "Assign Roles" }
+          if action == "role_change_to_user" { activity_id = 17; activity_name = "Remove Roles" }
+
+          ocsf.class_uid = 3007
+          ocsf.class_name = "User Management"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          # SUBJECT = entity.user; ACTOR = actor.user (usually a workspace admin).
+          if have_subject { ocsf.user = subject } else { ocsf.user = actor_user }
+          ocsf.actor = { "user": actor_user }
+          new_role = string(details.new_value) ?? ""
+          if new_role != "" { ocsf.status_detail = new_role }
+      } else if class_uid == 3006 {
+          activity_id = 99
+          activity_name = "Other"
+          if action == "usergroup_created" { activity_id = 6; activity_name = "Create" }
+          if action == "usergroup_deleted" || action == "usergroup_disabled" { activity_id = 5; activity_name = "Delete" }
+          if action == "usergroup_updated" { activity_id = 9; activity_name = "Update" }
+          if action == "workspace_member_joined" || action == "organization_member_joined" || action == "member_added_to_workspace" { activity_id = 3; activity_name = "Add User" }
+          if action == "organization_member_left" || action == "member_removed_from_workspace" { activity_id = 4; activity_name = "Remove User" }
+
+          ocsf.class_uid = 3006
+          ocsf.class_name = "Group Management"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          gname = string(entity_ug.name) ?? string(entity_ws.name) ?? ""
+          guid = string(entity_ug.id) ?? string(entity_ws.id) ?? ""
+          grp = {}
+          if gname != "" { grp = set!(grp, ["name"], gname) }
+          if guid != "" { grp = set!(grp, ["uid"], guid) }
+          if length(grp) == 0 { grp = { "name": "unknown" } }
+          ocsf.group = grp
+          if have_subject { ocsf.user = subject }
+          ocsf.actor = { "user": actor_user }
+      } else {
+          activity_id = 99
+          activity_name = "Other"
+          if contains(action, "created") || contains(action, "added") || contains(action, "installed") || contains(action, "uploaded") { activity_id = 1; activity_name = "Create" }
+          if contains(action, "downloaded") || contains(action, "viewed") || contains(action, "exported") { activity_id = 2; activity_name = "Read" }
+          if contains(action, "changed") || contains(action, "updated") || contains(action, "renamed") || contains(action, "converted") { activity_id = 3; activity_name = "Update" }
+          if contains(action, "deleted") || contains(action, "removed") || contains(action, "uninstalled") || contains(action, "archived") { activity_id = 4; activity_name = "Delete" }
+
+          ocsf.class_uid = 6003
+          ocsf.class_name = "API Activity"
+          ocsf.category_uid = 6
+          ocsf.category_name = "Application Activity"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          op = action
+          if op == "" { op = "unknown" }
+          ocsf.api = { "operation": op, "service": { "name": "Slack" } }
+          ocsf.actor = { "user": actor_user }
+
+          resources = []
+          ent_type = string(entity.type) ?? ""
+          ch_name = string(entity_ch.name) ?? ""
+          if ch_name != "" {
+              res = { "name": ch_name, "type": "Channel" }
+              ch_id = string(entity_ch.id) ?? ""
+              if ch_id != "" { res = set!(res, ["uid"], ch_id) }
+              resources = push(resources, res)
+          }
+          f_name = string(entity_file.name) ?? string(entity_file.title) ?? ""
+          if f_name != "" {
+              res = { "name": f_name, "type": "File" }
+              f_id = string(entity_file.id) ?? ""
+              if f_id != "" { res = set!(res, ["uid"], f_id) }
+              resources = push(resources, res)
+          }
+          ws_name = string(entity_ws.name) ?? ""
+          if ws_name != "" {
+              res = { "name": ws_name, "type": "Workspace" }
+              ws_id = string(entity_ws.id) ?? ""
+              if ws_id != "" { res = set!(res, ["uid"], ws_id) }
+              resources = push(resources, res)
+          }
+          if length(resources) == 0 && ent_type != "" {
+              resources = push(resources, { "name": ent_type, "type": ent_type })
+          }
+          if length(resources) > 0 { ocsf.resources = resources }
+      }
+
+      # ---- source endpoint ----
+      src_ip = string(ctx.ip_address) ?? ""
+      src_ep = {}
+      if src_ip != "" { src_ep = set!(src_ep, ["ip"], downcase(src_ip)) }
+      if length(src_ep) == 0 { src_ep = { "hostname": "unknown" } }
+      ocsf.src_endpoint = src_ep
+
+      ua = string(ctx.ua) ?? ""
+      if ua != "" { ocsf.http_request = { "user_agent": ua } }
+
+      # ---- common envelope ----
+      ocsf.status_id = status_id
+      ocsf.status = status_str
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.type_uid = to_int(ocsf.class_uid) * 100 + to_int(ocsf.activity_id)
+      ocsf.time = time_ms
+      msg = action
+      if msg == "" { msg = "slack_audit_event" }
+      ocsf.message = msg
+      ocsf.raw_data = raw_log
+
+      evt_uid = string(p.id) ?? ""
+      if evt_uid == "" { evt_uid = sha2("slack_audit|raw|" + raw_log, variant: "SHA-256") }
+      ocsf.metadata = {
+          "version": "1.9.0",
+          "uid": evt_uid,
+          "original_event_uid": evt_uid,
+          "event_code": action,
+          "log_name": "Slack Audit Logs",
+          "log_provider": "Slack",
+          "product": { "name": "Slack", "vendor_name": "Salesforce" }
+      }
+
+      cand = {
+          "actor_type": string(actor_in.type) ?? "",
+          "actor_team": string(actor_u.team) ?? "",
+          "entity_type": string(entity.type) ?? "",
+          "channel_id": string(entity_ch.id) ?? "",
+          "channel_name": string(entity_ch.name) ?? "",
+          "file_id": string(entity_file.id) ?? "",
+          "file_title": string(entity_file.title) ?? "",
+          "workspace_id": string(entity_ws.id) ?? "",
+          "workspace_domain": string(entity_ws.domain) ?? string(ctx_loc.domain) ?? "",
+          "location_type": string(ctx_loc.type) ?? "",
+          "location_id": string(ctx_loc.id) ?? "",
+          "location_name": string(ctx_loc.name) ?? "",
+          "target_user_id": subj_uid,
+          "target_user_email": subj_email
+      }
+      unmapped = {}
+      for_each(cand) -> |k, v| {
+          if v != "" { unmapped = set!(unmapped, [k], v) }
+      }
+      if length(details) > 0 { unmapped = set!(unmapped, ["details_json"], encode_json(details)) }
+      if length(unmapped) > 0 { ocsf.unmapped = unmapped }
+
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  __mapped = object!(parse_json!(encode_json(.)))
+  __existing = object(__mapped.unmapped) ?? {}
+  __discard = del(__mapped.raw_data)
+  __discard = del(__mapped.unmapped)
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __represented = []
+  __walk = map_values(__mapped, recursive: true) -> |value| {
+      __represented = push(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __represented = push(__represented, to_string(value) ?? "")
+      }
+      value
+  }
+  __consumed = []
+  # BEGIN parser-specific transformations
+  # date_create: Slack audit Unix seconds converted to milliseconds.
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = ["action", "actor", "actor.type", "actor.user", "actor.user.email", "actor.user.id", "actor.user.name", "actor.user.team", "context", "context.ip_address", "context.location", "context.location.domain", "context.location.id", "context.location.name", "context.location.type", "context.session_id", "context.ua", "date_create", "details", "details.method", "details.mfa", "details.new_value", "entity", "entity.channel", "entity.channel.id", "entity.channel.name", "entity.file", "entity.file.id", "entity.file.name", "entity.file.title", "entity.type", "entity.user", "entity.user.email", "entity.user.id", "entity.user.name", "entity.usergroup", "entity.usergroup.id", "entity.usergroup.name", "entity.workspace", "entity.workspace.domain", "entity.workspace.id", "entity.workspace.name", "id"]
+  __preserve = []
+  __rules = array!(parse_json!("[{\"source\":\"date_create\",\"target\":\"time\",\"kind\":\"scale\",\"reason\":\"Slack audit Unix seconds converted to milliseconds.\",\"factor\":1000}]"))
+  __source_flat = flatten(__source_kv)
+  for_each(__rules) -> |_index, rule| {
+      __source_key = string!(rule.source)
+      __value = get!(__source_flat, [__source_key])
+      __expected = null
+      __valid = false
+      if rule.kind == "lowercase" && is_string(__value) {
+          __expected = downcase(string!(__value))
+          __valid = true
+      } else if rule.kind == "epoch_ms" {
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", string(rule.format) ?? "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              __valid = true
+          }
+      } else if rule.kind == "scale" {
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * to_float!(rule.factor))
+              __valid = true
+          }
+      } else if rule.kind == "hex" {
+          __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
+          __integer, __integer_err = parse_int(__hex, base: 16)
+          __expected = __integer
+          __valid = is_string(__value) && starts_with(downcase(string(__value) ?? ""), "0x") && __integer_err == null
+      } else if rule.kind == "enum" {
+          __expected = get!(object!(rule.values), [downcase(to_string(__value) ?? "")])
+          __valid = __expected != null
+      }
+      __matches = includes(__represented, encode_json(__expected))
+      if is_string(rule.target) { __matches = get!(., split(string!(rule.target), ".")) == __expected }
+      if __valid && __matches { __consumed = push(__consumed, __source_key) }
+  }
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  __safe = map_values(object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing}))), recursive: true) -> |value| {
+      if is_object(value) {
+          # Header/parameter arrays commonly encode sensitive keys as name/value
+          # or Key/Value objects instead of using the secret name as an object key.
+          __sensitive_pair = false
+          for_each(object!(value)) -> |key, child| {
+              if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                  __sensitive_pair = true
+              }
+          }
+          for_each(object!(value)) -> |key, _child| {
+              if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                  value = set!(value, [key], "<redacted>")
+              }
+          }
+      }
+      value
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  __escaped = map_keys(object!(__safe.source), recursive: true) -> |key| {
+      replace(replace(key, "~", "~0"), ".", "~1")
+  }
+  __flat = flatten(__escaped)
+  __residual = {}
+  for_each(__flat) -> |key, value| {
+      key = replace(replace(key, "~1", "."), "~0", "~")
+      # flatten stops at arrays, so objects inside an array still carry the
+      # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+      if is_array(value) || is_object(value) {
+          value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+              replace(replace(inner, "~1", "."), "~0", "~")
+          }, ["v"])
+      }
+      __same = includes(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __same = __same || includes(__represented, to_string(value) ?? "")
+      }
+      # A scalar array is consumed only if every element is represented. Preserve
+      # partially represented arrays intact, including their ordering and repeats.
+      if is_array(value) && !is_empty(array!(value)) {
+          __all_items = true
+          for_each(array!(value)) -> |_index, item| {
+              __item_same = includes(__represented, encode_json(item))
+              if !is_object(item) && !is_array(item) && !is_null(item) {
+                  __item_same = __item_same || includes(__represented, to_string(item) ?? "")
+              }
+              if is_object(item) || is_array(item) || !__item_same { __all_items = false }
+          }
+          __same = __same || __all_items
+      }
+      if __same && includes(__candidates, key) { __consumed = push(__consumed, key) }
+      # Redacted leaves always remain visible. Do not spill a copy of the raw body.
+      if (!includes(__consumed, key) || value == "<redacted>") && value != __raw_body {
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          __base = join!(__parts, ".")
+          __key = __base
+          __suffix = 2
+          if includes(keys(__residual), __key) {
+              for_each(__flat) -> |_other_key, _other_value| {
+                  if includes(keys(__residual), __key) {
+                      __key = __base + "_" + to_string(__suffix)
+                      __suffix = __suffix + 1
+                  }
+              }
+          }
+          __complex = is_object(value)
+          if is_array(value) {
+              for_each(array!(value)) -> |_index, item| {
+                  if is_object(item) || is_array(item) { __complex = true }
+              }
+          }
+          __spill = if __complex { encode_json(value) } else { value }
+          __residual = set!(__residual, [__key], __spill)
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  __original_values = []
+  for_each(flatten(__source_kv)) -> |_key, value| {
+      __original_values = push(__original_values, encode_json(value))
+      if !is_object(value) && !is_array(value) { __original_values = push(__original_values, to_string(value) ?? "") }
+  }
+  for_each(flatten(__existing)) -> |key, value| {
+      __source_alias = includes(__original_values, encode_json(value)) || includes(__original_values, to_string(value) ?? "")
+      __mapped_alias = includes(__represented, encode_json(value)) || includes(__represented, to_string(value) ?? "")
+      __decoded, __decode_err = parse_json(string(value) ?? "")
+      __encoded_container = __decode_err == null && (is_object(__decoded) || is_array(__decoded))
+      if !is_null(value) && value != "" && !__source_alias && !__mapped_alias && !__encoded_container && value != __raw_body {
+          # Existing aggregates may contain sensitive descendants; the canonical
+          # source spill above is the authoritative representation of containers.
+          if !is_array(value) && !is_object(value) && !match(downcase(key), r'password|secret|authorization|token') {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # app_installed.json
+  - raw: "{\"id\":\"6789a01b-2334-4566-7k8l-9m0n1o2p3q4r\",\"date_create\":1787064000,\"action\":\"app_installed\",\"actor\":{\"type\":\"user\",\"user\":{\"id\":\"U012ABCDEF\",\"name\":\"jane.doe\",\"email\":\"jane.doe@example.com\"}},\"entity\":{\"type\":\"app\",\"app\":{\"id\":\"A01234ABCD\",\"name\":\"Data Exporter\",\"is_distributed\":false,\"scopes\":[\"files:read\",\"channels:history\"]}},\"context\":{\"location\":{\"type\":\"workspace\",\"id\":\"T01234ABCD\",\"name\":\"Example\",\"domain\":\"example\"},\"ip_address\":\"203.0.113.55\"}}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # channel_public_created.json
+  - raw: "{\"id\":\"7890b12c-3445-5677-8l9m-0n1o2p3q4r5s\",\"date_create\":1787064200,\"action\":\"public_channel_created\",\"actor\":{\"type\":\"user\",\"user\":{\"id\":\"U012ABCDEF\",\"name\":\"jane.doe\",\"email\":\"jane.doe@example.com\"}},\"entity\":{\"type\":\"channel\",\"channel\":{\"id\":\"C01234ABCD\",\"name\":\"incident-2026-08\",\"privacy\":\"public\",\"is_shared\":false,\"is_org_shared\":false}},\"context\":{\"location\":{\"type\":\"workspace\",\"id\":\"T01234ABCD\",\"name\":\"Example\",\"domain\":\"example\"},\"ip_address\":\"203.0.113.55\"}}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # file_downloaded.json
+  - raw: "{\"id\":\"5678f90a-1223-3455-6j7k-8l9m0n1o2p3q\",\"date_create\":1787063800,\"action\":\"file_downloaded\",\"actor\":{\"type\":\"user\",\"user\":{\"id\":\"U012ABCDEF\",\"name\":\"jane.doe\",\"email\":\"jane.doe@example.com\"}},\"entity\":{\"type\":\"file\",\"file\":{\"id\":\"F01234ABCD\",\"name\":\"q3-customers.xlsx\",\"title\":\"Q3 Customers\",\"filetype\":\"xlsx\"}},\"context\":{\"location\":{\"type\":\"workspace\",\"id\":\"T01234ABCD\",\"name\":\"Example\",\"domain\":\"example\"},\"ip_address\":\"203.0.113.55\",\"ua\":\"Slack/4.39.90\"}}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  # malformed.txt
+  - raw: "slack audit not json"
+    expect:
+      "class_uid": 0
+      "activity_id": 0
+      "metadata.version": "1.9.0"
+  # role_change_to_owner.json
+  - raw: "{\"id\":\"3456d78e-9f01-1233-4h5i-6j7k8l9m0n1o\",\"date_create\":1787063200,\"action\":\"role_change_to_owner\",\"actor\":{\"type\":\"user\",\"user\":{\"id\":\"U0ADMIN123\",\"name\":\"ops.admin\",\"email\":\"admin@example.com\"}},\"entity\":{\"type\":\"user\",\"user\":{\"id\":\"U034GHIJKL\",\"name\":\"bob.smith\",\"email\":\"bob.smith@example.com\"}},\"context\":{\"location\":{\"type\":\"workspace\",\"id\":\"T01234ABCD\",\"name\":\"Example\",\"domain\":\"example\"},\"ip_address\":\"192.0.2.77\",\"ua\":\"Mozilla/5.0\"},\"details\":{\"new_value\":\"owner\",\"previous_value\":\"admin\"}}"
+    expect:
+      "class_uid": 3007
+      "activity_id": 16
+      "metadata.version": "1.9.0"
+  # user_deactivated.json
+  - raw: "{\"id\":\"2345c67d-8e9f-0122-3g4h-5i6j7k8l9m0n\",\"date_create\":1787063000,\"action\":\"user_deactivated\",\"actor\":{\"type\":\"user\",\"user\":{\"id\":\"U0ADMIN123\",\"name\":\"ops.admin\",\"email\":\"admin@example.com\",\"team\":\"T01234ABCD\"}},\"entity\":{\"type\":\"user\",\"user\":{\"id\":\"U034GHIJKL\",\"name\":\"bob.smith\",\"email\":\"bob.smith@example.com\",\"team\":\"T01234ABCD\"}},\"context\":{\"location\":{\"type\":\"workspace\",\"id\":\"T01234ABCD\",\"name\":\"Example\",\"domain\":\"example\"},\"ua\":\"Mozilla/5.0 (Windows NT 10.0) Chrome/126.0.0.0\",\"ip_address\":\"192.0.2.77\"}}"
+    expect:
+      "class_uid": 3007
+      "activity_id": 5
+      "metadata.version": "1.9.0"
+  # user_login.json
+  - raw: "{\"id\":\"0123a45b-6c7d-8900-1e2f-3g4h5i6j7k8l\",\"date_create\":1787062182,\"action\":\"user_login\",\"actor\":{\"type\":\"user\",\"user\":{\"id\":\"U012ABCDEF\",\"name\":\"jane.doe\",\"email\":\"jane.doe@example.com\",\"team\":\"T01234ABCD\"}},\"entity\":{\"type\":\"user\",\"user\":{\"id\":\"U012ABCDEF\",\"name\":\"jane.doe\",\"email\":\"jane.doe@example.com\",\"team\":\"T01234ABCD\"}},\"context\":{\"location\":{\"type\":\"enterprise\",\"id\":\"E1234ABCD\",\"name\":\"Example Inc\",\"domain\":\"example\"},\"ua\":\"Mozilla/5.0 (Macintosh) Chrome/126.0.0.0\",\"ip_address\":\"203.0.113.55\",\"session_id\":\"1234567890.123\"},\"details\":{\"method\":\"saml\",\"mfa\":true}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # user_login_failed.json
+  - raw: "{\"id\":\"1234b56c-7d8e-9011-2f3g-4h5i6j7k8l9m\",\"date_create\":1787062300,\"action\":\"user_login_failed\",\"actor\":{\"type\":\"user\",\"user\":{\"id\":\"U012ABCDEF\",\"name\":\"jane.doe\",\"email\":\"jane.doe@example.com\",\"team\":\"T01234ABCD\"}},\"entity\":{\"type\":\"user\",\"user\":{\"id\":\"U012ABCDEF\",\"name\":\"jane.doe\",\"email\":\"jane.doe@example.com\"}},\"context\":{\"location\":{\"type\":\"workspace\",\"id\":\"T01234ABCD\",\"name\":\"Example\",\"domain\":\"example\"},\"ua\":\"python-requests/2.31.0\",\"ip_address\":\"198.51.100.201\"},\"details\":{\"reason\":\"invalid_password\"}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # usergroup_created.json
+  - raw: "{\"id\":\"4567e89f-0112-2344-5i6j-7k8l9m0n1o2p\",\"date_create\":1787063500,\"action\":\"usergroup_created\",\"actor\":{\"type\":\"user\",\"user\":{\"id\":\"U0ADMIN123\",\"name\":\"ops.admin\",\"email\":\"admin@example.com\"}},\"entity\":{\"type\":\"usergroup\",\"usergroup\":{\"id\":\"S01234ABCD\",\"name\":\"security-oncall\"}},\"context\":{\"location\":{\"type\":\"workspace\",\"id\":\"T01234ABCD\",\"name\":\"Example\",\"domain\":\"example\"},\"ip_address\":\"192.0.2.77\"}}"
+    expect:
+      "class_uid": 3006
+      "activity_id": 6
+      "metadata.version": "1.9.0"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("slack_audit|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "slack audit not json"
+    expect:
+      "metadata.uid": "34090079a6358564cd0779651af465e587dfcbceb1c54b473fb074681829d359"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("slack_audit|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"date_create\":1787064000,\"action\":\"app_installed\",\"actor\":{\"type\":\"user\",\"user\":{\"name\":\"jane.doe\",\"email\":\"jane.doe@example.com\"}},\"entity\":{\"type\":\"app\",\"app\":{\"name\":\"Data Exporter\",\"is_distributed\":false,\"scopes\":[\"files:read\",\"channels:history\"]}},\"context\":{\"location\":{\"type\":\"workspace\",\"name\":\"Example\",\"domain\":\"example\"},\"ip_address\":\"203.0.113.55\"}}"
+    expect:
+      "metadata.uid": "54c39ed2a45c4e659f471ff664294af7b22cabc9f943a848842e722dcaf109ec"
+      "metadata.original_event_uid": "54c39ed2a45c4e659f471ff664294af7b22cabc9f943a848842e722dcaf109ec"

@@ -1,0 +1,755 @@
+name: zscaler_zia_ocsf
+display_name: Zscaler Internet Access (OCSF)
+version: "1.3.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Zscaler Internet Access NSS/LSS JSON feeds into OCSF 1.9.0, routing
+  each feed to the class that actually describes it rather than flattening
+  them all into one:
+    * zscalernss-web    -> HTTP Activity      (class_uid 4002)
+    * zscalernss-fw     -> Network Activity   (class_uid 4001)
+    * zscalernss-dns    -> DNS Activity       (class_uid 4003)
+    * zscalernss-tunnel -> Network Activity   (class_uid 4001)
+    * zscalernss-edlp   -> Detection Finding  (class_uid 2004)
+    * zscalernss-audit  -> API Activity       (class_uid 6003)
+    * anything else     -> Base Event         (class_uid 0)
+  Handles both the {"sourcetype":…,"event":{…}} envelope and flat JSON.
+  Mirrors the UDM zscaler_zia parser
+  (../parsers/parsers/zscaler_zia/parser.yaml).
+match_values:
+  - zscaler_zia
+category: network
+vendor: "Zscaler"
+product: "Internet Access"
+parser_vrl: |
+  # Zscaler Internet Access -> OCSF 1.9.0 (multi-class)
+  raw_log = string!(.message)
+  __raw_body = raw_log
+  __source_kv = {}
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
+
+  top, terr = parse_json(raw_log)
+  __source_kv = object(top) ?? {}
+  ok = terr == null && is_object(top)
+
+  sourcetype = ""
+  e = {}
+  if ok {
+      t = object!(top)
+      sourcetype = downcase(string(t.sourcetype) ?? "")
+      if exists(t.event) { e = object(t.event) ?? {} } else { e = t }
+  }
+
+  # ---- timestamp: epochtime (seconds) / "time" / "datetime" -------------
+  time_ms = 0
+  ep = to_int(e.epochtime) ?? 0
+  if ep > 0 { time_ms = ep * 1000 }
+  if time_ms == 0 {
+      ts_str = string(e.time) ?? ""
+      if ts_str == "" { ts_str = string(e.datetime) ?? "" }
+      if ts_str != "" {
+          tv, tverr = parse_timestamp(ts_str, "%a %b %d %H:%M:%S %Y")
+          if tverr == null { time_ms = to_unix_timestamp(tv, unit: "milliseconds") } else {
+              tv2, tv2err = parse_timestamp(ts_str, "%+")
+              if tv2err == null { time_ms = to_unix_timestamp(tv2, unit: "milliseconds") }
+          }
+      }
+  }
+
+  # ---- Zscaler action -> security-control action/disposition ------------
+  raw_action = downcase(string(e.action) ?? "")
+  if raw_action == "" { raw_action = downcase(string(e.reqaction) ?? "") }
+  if raw_action == "" { raw_action = downcase(string(e.actiontaken) ?? "") }
+  action_id = 0
+  action_name = "Unknown"
+  disposition_id = 0
+  disposition_name = "Unknown"
+  is_alert = false
+  if contains(raw_action, "block") || contains(raw_action, "drop") || contains(raw_action, "deny") {
+      action_id = 2; action_name = "Denied"
+      disposition_id = 2; disposition_name = "Blocked"
+      is_alert = true
+  } else if contains(raw_action, "quarantin") {
+      action_id = 2; action_name = "Denied"
+      disposition_id = 5; disposition_name = "Quarantined"
+      is_alert = true
+  } else if contains(raw_action, "allow") {
+      action_id = 1; action_name = "Allowed"
+      disposition_id = 1; disposition_name = "Allowed"
+  } else if raw_action != "" {
+      action_id = 99; action_name = raw_action
+  }
+
+  # ---- severity: Zscaler threat/DLP severity ---------------------------
+  severity_id = 1
+  severity = "Informational"
+  sev_raw = downcase(string(e.threatseverity) ?? "")
+  if sev_raw == "" { sev_raw = downcase(string(e.severity) ?? "") }
+  if contains(sev_raw, "critical") { severity_id = 5; severity = "Critical" } else if contains(sev_raw, "high") { severity_id = 4; severity = "High" } else if contains(sev_raw, "medium") { severity_id = 3; severity = "Medium" } else if contains(sev_raw, "low") { severity_id = 2; severity = "Low" }
+  if is_alert && severity_id < 3 { severity_id = 3; severity = "Medium" }
+
+  user_name = string(e.login) ?? ""
+  if user_name == "" { user_name = string(e.user) ?? "" }
+  if user_name == "" { user_name = string(e.adminid) ?? "" }
+  if user_name == "" { user_name = string(e.admin) ?? "" }
+
+  device_host = string(e.devicehostname) ?? ""
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": sha2("zscaler_zia|raw|" + raw_log, variant: "SHA-256"),
+      "profiles": ["host", "security_control"],
+      "log_name": sourcetype,
+      "product": { "name": "Internet Access", "vendor_name": "Zscaler" }
+  }
+  if sourcetype == "" { metadata.log_name = "zscaler-zia" }
+  recid = to_string(e.recordid) ?? ""
+  if recid != "" { metadata.original_event_uid = recid }
+
+  unmapped = {}
+  for_each(["dept", "location", "locationname", "cloudname", "datacenter", "datacentercity", "datacentercountry", "deviceostype", "deviceowner", "devicemodel", "appname", "appclass", "urlclass", "urlsubcat", "urlcatmethod", "threatcat", "malwarecategory", "malwareclass", "ssldecrypted", "clttlsversion", "srvtlsversion", "rulelabel", "ruletype", "nwsvc", "nwapp", "tuntype", "tunneltype", "ikeversion", "channel", "reason"]) -> |_i, k| {
+      v = to_string(get(e, [k]) ?? "") ?? ""
+      if v != "" && v != "None" { unmapped = set!(unmapped, [k], v) }
+  }
+
+  threat_name = string(e.threatname) ?? ""
+  if threat_name == "None" { threat_name = "" }
+
+  if ok && contains(sourcetype, "web") {
+      # =================== HTTP Activity (4002) ===================
+      method = upcase(string(e.reqmethod) ?? "")
+      activity_id = 99
+      activity_name = "Other"
+      if method == "CONNECT" { activity_id = 1; activity_name = "Connect" }
+      if method == "DELETE"  { activity_id = 2; activity_name = "Delete" }
+      if method == "GET"     { activity_id = 3; activity_name = "Get" }
+      if method == "HEAD"    { activity_id = 4; activity_name = "Head" }
+      if method == "OPTIONS" { activity_id = 5; activity_name = "Options" }
+      if method == "POST"    { activity_id = 6; activity_name = "Post" }
+      if method == "PUT"     { activity_id = 7; activity_name = "Put" }
+      if method == "TRACE"   { activity_id = 8; activity_name = "Trace" }
+      if method == "PATCH"   { activity_id = 9; activity_name = "Patch" }
+
+      code = to_int(e.respcode) ?? 0
+      status_id = 2
+      status_str = "Failure"
+      if code >= 200 && code < 400 { status_id = 1; status_str = "Success" }
+      if code == 0 { status_id = 0; status_str = "Unknown" }
+
+      url_str = string(e.url) ?? ""
+      b64 = string(e.b64url) ?? ""
+      if b64 != "" {
+          dec = decode_base64(b64) ?? ""
+          if dec != "" { url_str = dec }
+      }
+      host = string(e.host) ?? ""
+
+      url_obj = {}
+      if url_str != "" { url_obj.url_string = url_str }
+      if host != "" { url_obj.hostname = downcase(host) }
+      supercat = string(e.urlsupercat) ?? ""
+      if supercat != "" && supercat != "None" { url_obj.categories = [supercat] }
+      pu, puerr = parse_url(url_str)
+      if puerr == null {
+          up = to_string(pu.path)
+          if up != "" { url_obj.path = up }
+          us = to_string(pu.scheme)
+          if us != "" { url_obj.scheme = us }
+          if !exists(url_obj.hostname) {
+              uh = to_string(pu.host)
+              if uh != "" { url_obj.hostname = downcase(uh) }
+          }
+      }
+      if !exists(url_obj.path) && !exists(url_obj.url_string) { url_obj.path = "/" }
+
+      http_request = { "url": url_obj }
+      if method != "" { http_request.http_method = method }
+      ua = string(e.useragent) ?? ""
+      if ua != "" { http_request.user_agent = ua }
+      rf = string(e.referrer) ?? ""
+      if rf != "" { http_request.referrer = rf }
+
+      http_response = { "code": code, "status": status_str }
+      ct = string(e.contenttype) ?? ""
+      if ct != "" { http_response.content_type = ct }
+      respsize = to_int(e.respsize) ?? 0
+      reqsize = to_int(e.reqsize) ?? 0
+      if respsize != 0 { http_response.length = respsize }
+
+      . = {
+          "class_uid": 4002,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": 400200 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "action_id": action_id,
+          "action": action_name,
+          "disposition_id": disposition_id,
+          "disposition": disposition_name,
+          "is_alert": is_alert,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "http_request": http_request,
+          "http_response": http_response,
+          # NAN-2995: OCSF 1.9 network_traffic: bytes_in = destination -> source, bytes_out = source -> destination.
+          # src = client: respsize is bytes_in, reqsize is bytes_out.
+          "traffic": { "bytes_in": respsize, "bytes_out": reqsize }
+      }
+      cip = string(e.cltip) ?? ""
+      se = {}
+      if match(cip, ip_re) { se.ip = cip }
+      if device_host != "" { se.hostname = downcase(device_host) }
+      if exists(se.ip) || exists(se.hostname) { .src_endpoint = se }
+      de = {}
+      sip = string(e.serverip) ?? ""
+      if match(sip, ip_re) { de.ip = sip }
+      if host != "" { de.hostname = downcase(host) }
+      if exists(de.ip) || exists(de.hostname) { .dst_endpoint = de }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      rsc = to_int(e.riskscore) ?? -1
+      if rsc >= 0 { .risk_score = rsc }
+      if threat_name != "" {
+          .malware = [{ "name": threat_name, "classification_ids": [0], "provider": "Zscaler" }]
+      }
+      fname = string(e.filename) ?? ""
+      fhash = downcase(string(e.sha256) ?? "")
+      if fname != "" || fhash != "" {
+          fobj = {}
+          if fname != "" { fobj.name = fname }
+          if fhash != "" { fobj.hashes = [{ "algorithm_id": 3, "value": fhash }] }
+          fobj.type_id = 1
+          .file = fobj
+      }
+      dlprule = string(e.dlprulename) ?? ""
+      if dlprule != "" { .firewall_rule = { "name": dlprule, "type": "dlp" } }
+      if length(unmapped) > 0 { .unmapped = unmapped }
+  } else if ok && (contains(sourcetype, "fw") || contains(sourcetype, "tunnel")) {
+      # =================== Network Activity (4001) ===================
+      is_tunnel = contains(sourcetype, "tunnel")
+      se = {}
+      de = {}
+      if is_tunnel {
+          s = string(e.sourceip) ?? ""
+          d = string(e.destinationip) ?? ""
+          if match(s, ip_re) { se.ip = s }
+          if match(d, ip_re) { de.ip = d }
+          sp = to_int(e.sourceport) ?? 0
+          dp = to_int(e.destinationport) ?? 0
+          if sp != 0 { se.port = sp }
+          if dp != 0 { de.port = dp }
+          sh = string(e.srciphost) ?? ""
+          dh = string(e.destinationiphost) ?? ""
+          if sh != "" { se.hostname = downcase(sh) }
+          if dh != "" { de.hostname = downcase(dh) }
+      } else {
+          s = string(e.csip) ?? ""
+          d = string(e.cdip) ?? ""
+          if match(s, ip_re) { se.ip = s }
+          if match(d, ip_re) { de.ip = d }
+          sp = to_int(e.csport) ?? 0
+          dp = to_int(e.cdport) ?? 0
+          if sp != 0 { se.port = sp }
+          if dp != 0 { de.port = dp }
+          if device_host != "" { se.hostname = downcase(device_host) }
+      }
+      if !exists(se.ip) && !exists(se.hostname) && !exists(de.ip) && !exists(de.hostname) {
+          se.svc_name = "zscaler-zia"
+      }
+
+      bytes_in = to_int(e.inbytes) ?? 0
+      bytes_out = to_int(e.outbytes) ?? 0
+      if is_tunnel {
+          # Tunnel logs: src = the customer tunnel endpoint, dst = the ZIA node.
+          # rxbytes = received BY ZIA from the tunnel (src -> dst = bytes_out),
+          # txbytes = transmitted BY ZIA into the tunnel (dst -> src = bytes_in).
+          bytes_in = to_int(e.txbytes) ?? 0
+          bytes_out = to_int(e.rxbytes) ?? 0
+      }
+
+      proto = upcase(string(e.proto) ?? "")
+      if proto == "" { proto = upcase(string(e.protocol) ?? "") }
+
+      . = {
+          "class_uid": 4001,
+          "class_name": "Network Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": 6,
+          "activity_name": "Traffic",
+          "type_uid": 400106,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": 1,
+          "status": "Success",
+          "action_id": action_id,
+          "action": action_name,
+          "disposition_id": disposition_id,
+          "disposition": disposition_name,
+          "is_alert": is_alert,
+          "time": time_ms,
+          "duration": to_int(e.duration) ?? 0,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "traffic": { "bytes_in": bytes_in, "bytes_out": bytes_out }
+      }
+      if exists(se.ip) || exists(se.hostname) || exists(se.svc_name) { .src_endpoint = se }
+      if exists(de.ip) || exists(de.hostname) { .dst_endpoint = de }
+      if proto != "" { .connection_info = { "direction_id": 2, "direction": "Outbound", "protocol_name": downcase(proto) } }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      rule = string(e.rule) ?? ""
+      if rule != "" { .firewall_rule = { "name": rule } }
+      if threat_name != "" {
+          .malware = [{ "name": threat_name, "classification_ids": [0], "provider": "Zscaler" }]
+      }
+      if length(unmapped) > 0 { .unmapped = unmapped }
+  } else if ok && contains(sourcetype, "dns") {
+      # =================== DNS Activity (4003) ===================
+      qname = string(e.dns_req) ?? ""
+      answer = string(e.dns_resp) ?? ""
+      qtype = upcase(string(e.dns_reqtype) ?? "")
+
+      . = {
+          "class_uid": 4003,
+          "class_name": "DNS Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": 2,
+          "activity_name": "Response",
+          "type_uid": 400302,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": 1,
+          "status": "Success",
+          "action_id": action_id,
+          "action": action_name,
+          "disposition_id": disposition_id,
+          "disposition": disposition_name,
+          "is_alert": is_alert,
+          "time": time_ms,
+          "duration": to_int(e.durationms) ?? 0,
+          "raw_data": raw_log,
+          "metadata": metadata
+      }
+      if qname != "" {
+          q = { "hostname": downcase(qname) }
+          if qtype != "" { q.type = qtype }
+          .query = q
+      }
+      if answer != "" { .answers = [{ "rdata": answer }] }
+      se = {}
+      cs = string(e.clt_sip) ?? ""
+      if match(cs, ip_re) { se.ip = cs }
+      if device_host != "" { se.hostname = downcase(device_host) }
+      de = {}
+      sd = string(e.srv_dip) ?? ""
+      if match(sd, ip_re) { de.ip = sd }
+      dpn = to_int(e.srv_dport) ?? 0
+      if dpn != 0 { de.port = dpn }
+      if exists(se.ip) || exists(se.hostname) { .src_endpoint = se }
+      if exists(de.ip) { .dst_endpoint = de }
+      if !exists(.src_endpoint) && !exists(.dst_endpoint) { .dst_endpoint = { "svc_name": "zscaler-dns" } }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if length(unmapped) > 0 { .unmapped = unmapped }
+  } else if ok && (contains(sourcetype, "dlp") || contains(sourcetype, "edlp")) {
+      # =================== Detection Finding (2004) ===================
+      rule_name = string(e.dlprulename) ?? ""
+      engine = string(e.dlpeng) ?? ""
+      finding_uid = recid
+      if finding_uid == "" { finding_uid = to_string(e.dlpidentifier) ?? "" }
+      if finding_uid == "" { finding_uid = sha2("zscaler_zia|raw|" + raw_log, variant: "SHA-256") }
+
+      finding_info = { "uid": finding_uid }
+      if rule_name != "" { finding_info.title = rule_name }
+      if engine != "" {
+          # analytic.type_id 1 = Rule; a DLP engine is a rule set, not an ML model.
+          finding_info.analytic = { "name": engine, "type_id": 1, "type": "Rule" }
+      }
+      finding_info.types = ["Data Loss Prevention"]
+
+      . = {
+          "class_uid": 2004,
+          "class_name": "Detection Finding",
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": 1,
+          "activity_name": "Create",
+          "type_uid": 200401,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": 1,
+          "status": "New",
+          "action_id": action_id,
+          "action": action_name,
+          "disposition_id": disposition_id,
+          "disposition": disposition_name,
+          "is_alert": true,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "finding_info": finding_info
+      }
+      fname = string(e.filename) ?? ""
+      fhash = downcase(string(e.sha256) ?? "")
+      ev = {}
+      if fname != "" || fhash != "" {
+          fobj = { "type_id": 1 }
+          if fname != "" { fobj.name = fname }
+          if fhash != "" { fobj.hashes = [{ "algorithm_id": 3, "value": fhash }] }
+          ev.file = fobj
+      }
+      if user_name != "" { ev.user = { "name": user_name } }
+      if device_host != "" { ev.device = { "type_id": 0, "hostname": downcase(device_host) } }
+      if length(ev) > 0 { .evidences = [ev] }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      # `evidences.*` is not addressable in nPL on this deployment; observables
+      # are, so the DLP file/user pivots are mirrored there.
+      obs = []
+      if user_name != "" { obs = push(obs, { "name": "evidences.user.name", "type": "User Name", "type_id": 4, "value": user_name }) }
+      if fhash != "" { obs = push(obs, { "name": "evidences.file.hashes.value", "type": "Hash", "type_id": 8, "value": fhash }) }
+      if fname != "" { obs = push(obs, { "name": "evidences.file.name", "type": "File Name", "type_id": 7, "value": fname }) }
+      if length(obs) > 0 { .observables = obs }
+      if length(unmapped) > 0 { .unmapped = unmapped }
+  } else if ok && contains(sourcetype, "audit") {
+      # =================== API Activity (6003) ===================
+      op = string(e.action) ?? ""
+      if op == "" { op = "Unknown" }
+      cat = string(e.category) ?? ""
+      result = downcase(string(e.result) ?? "")
+      status_id = 0
+      status_str = "Unknown"
+      if contains(result, "success") { status_id = 1; status_str = "Success" }
+      if contains(result, "fail") { status_id = 2; status_str = "Failure" }
+
+      api = { "operation": op, "service": { "name": "ZIA Admin Portal" } }
+
+      se = {}
+      cip = string(e.clientip) ?? ""
+      if match(cip, ip_re) { se.ip = cip } else { se.svc_name = "zia-admin" }
+
+      . = {
+          "class_uid": 6003,
+          "class_name": "API Activity",
+          "category_uid": 6,
+          "category_name": "Application Activity",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 600399,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "api": api,
+          "src_endpoint": se,
+          "actor": { "user": { "name": user_name } }
+      }
+      if user_name == "" { .actor = { "user": { "name": "unknown" } } }
+      res = string(e.resource) ?? ""
+      rtype = string(e.resourcetype) ?? ""
+      if res != "" {
+          r = { "name": res }
+          if rtype != "" { r.type = rtype }
+          .resources = [r]
+      }
+      if cat != "" { unmapped.category = cat }
+      pre = string(e.preaction) ?? ""
+      post = string(e.postaction) ?? ""
+      if pre != "" { unmapped.pre_action = pre }
+      if post != "" { unmapped.post_action = post }
+      if length(unmapped) > 0 { .unmapped = unmapped }
+  } else {
+      # =================== Base Event (0) ===================
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": 0,
+          "status": "Unknown",
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("zscaler_zia|raw|" + raw_log, variant: "SHA-256"),
+              "profiles": ["host"],
+              "log_name": "zscaler-zia",
+              "product": { "name": "Internet Access", "vendor_name": "Zscaler" }
+          }
+      }
+      if !ok { .metadata.log_level = "error" }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if length(unmapped) > 0 { .unmapped = unmapped }
+  }
+
+  .
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  __mapped = object!(parse_json!(encode_json(.)))
+  __existing = object(__mapped.unmapped) ?? {}
+  __discard = del(__mapped.raw_data)
+  __discard = del(__mapped.unmapped)
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __represented = []
+  __walk = map_values(__mapped, recursive: true) -> |value| {
+      __represented = push(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __represented = push(__represented, to_string(value) ?? "")
+      }
+      value
+  }
+  __consumed = []
+  # BEGIN parser-specific transformations
+  # sourcetype: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # event.action: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # event.reqaction: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # event.actiontaken: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # event.threatseverity: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # event.severity: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # event.sha256: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # event.result: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # event.time: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # event.datetime: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # event.result: Parser normalizes the caption case; verify the emitted caption.
+  # event.result: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
+  # event.actiontaken: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
+  # event.devicehostname: Case normalization already performed by the parser; observed at src_endpoint.hostname, and checked against the emitted branch.
+  # event.reqaction: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
+  # event.action: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
+  # event.proto: Case normalization already performed by the parser; observed at connection_info.protocol_name, and checked against the emitted branch.
+  # event.protocol: Case normalization already performed by the parser; observed at connection_info.protocol_name, and checked against the emitted branch.
+  # event.epochtime: Existing unit conversion by 1000 verified against time; unused clock fallbacks remain residual.
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = ["action", "actiontaken", "admin", "adminid", "b64url", "category", "cdip", "cdport", "clientip", "clt_sip", "cltip", "contenttype", "csip", "csport", "datetime", "destinationip", "destinationiphost", "destinationport", "devicehostname", "dlpeng", "dlpidentifier", "dlprulename", "dns_req", "dns_reqtype", "dns_resp", "duration", "durationms", "epochtime", "event", "event.action", "event.actiontaken", "event.admin", "event.adminid", "event.b64url", "event.category", "event.cdip", "event.cdport", "event.clientip", "event.clt_sip", "event.cltip", "event.contenttype", "event.csip", "event.csport", "event.datetime", "event.destinationip", "event.destinationiphost", "event.destinationport", "event.devicehostname", "event.dlpeng", "event.dlpidentifier", "event.dlprulename", "event.dns_req", "event.dns_reqtype", "event.dns_resp", "event.duration", "event.durationms", "event.epochtime", "event.filename", "event.host", "event.inbytes", "event.login", "event.outbytes", "event.postaction", "event.preaction", "event.proto", "event.protocol", "event.recordid", "event.referrer", "event.reqaction", "event.reqmethod", "event.reqsize", "event.resource", "event.resourcetype", "event.respcode", "event.respsize", "event.result", "event.riskscore", "event.rule", "event.rxbytes", "event.serverip", "event.severity", "event.sha256", "event.sourceip", "event.sourceport", "event.srciphost", "event.srv_dip", "event.srv_dport", "event.threatname", "event.threatseverity", "event.time", "event.txbytes", "event.url", "event.urlsupercat", "event.user", "event.useragent", "filename", "host", "inbytes", "login", "outbytes", "postaction", "preaction", "proto", "protocol", "recordid", "referrer", "reqaction", "reqmethod", "reqsize", "resource", "resourcetype", "respcode", "respsize", "result", "riskscore", "rule", "rxbytes", "serverip", "severity", "sha256", "sourceip", "sourceport", "sourcetype", "srciphost", "srv_dip", "srv_dport", "threatname", "threatseverity", "time", "txbytes", "url", "urlsupercat", "user", "useragent"]
+  __preserve = []
+  __rules = array!(parse_json!("[{\"source\":\"sourcetype\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"event.action\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"event.reqaction\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"event.actiontaken\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"event.threatseverity\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"event.severity\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"event.sha256\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"event.result\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"event.time\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Successful ISO timestamp conversion to the selected event clock in milliseconds.\"},{\"source\":\"event.datetime\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Successful ISO timestamp conversion to the selected event clock in milliseconds.\"},{\"source\":\"event.result\",\"kind\":\"enum\",\"target\":\"status\",\"values\":{\"success\":\"Success\"},\"reason\":\"Parser normalizes the caption case; verify the emitted caption.\"},{\"source\":\"event.result\",\"kind\":\"enum\",\"target\":\"status_id\",\"values\":{\"success\":1,\"succeeded\":1,\"failure\":2,\"failed\":2},\"reason\":\"Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.\"},{\"source\":\"event.actiontaken\",\"kind\":\"enum\",\"target\":\"action_id\",\"values\":{\"allow\":1,\"allowed\":1,\"accept\":1,\"accepted\":1,\"permit\":1,\"permitted\":1,\"pass\":1,\"passed\":1,\"deny\":2,\"denied\":2,\"block\":2,\"blocked\":2,\"reject\":2,\"rejected\":2,\"drop\":2,\"dropped\":2,\"log\":3,\"observed\":3},\"reason\":\"Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.\"},{\"source\":\"event.devicehostname\",\"kind\":\"lowercase\",\"reason\":\"Case normalization already performed by the parser; observed at src_endpoint.hostname, and checked against the emitted branch.\"},{\"source\":\"event.reqaction\",\"kind\":\"enum\",\"target\":\"action_id\",\"values\":{\"allow\":1,\"allowed\":1,\"accept\":1,\"accepted\":1,\"permit\":1,\"permitted\":1,\"pass\":1,\"passed\":1,\"deny\":2,\"denied\":2,\"block\":2,\"blocked\":2,\"reject\":2,\"rejected\":2,\"drop\":2,\"dropped\":2,\"log\":3,\"observed\":3},\"reason\":\"Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.\"},{\"source\":\"event.action\",\"kind\":\"enum\",\"target\":\"action_id\",\"values\":{\"allow\":1,\"allowed\":1,\"accept\":1,\"accepted\":1,\"permit\":1,\"permitted\":1,\"pass\":1,\"passed\":1,\"deny\":2,\"denied\":2,\"block\":2,\"blocked\":2,\"reject\":2,\"rejected\":2,\"drop\":2,\"dropped\":2,\"log\":3,\"observed\":3},\"reason\":\"Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.\"},{\"source\":\"event.proto\",\"kind\":\"lowercase\",\"reason\":\"Case normalization already performed by the parser; observed at connection_info.protocol_name, and checked against the emitted branch.\"},{\"source\":\"event.protocol\",\"kind\":\"lowercase\",\"reason\":\"Case normalization already performed by the parser; observed at connection_info.protocol_name, and checked against the emitted branch.\"},{\"source\":\"event.epochtime\",\"kind\":\"scale\",\"factor\":1000,\"target\":\"time\",\"reason\":\"Existing unit conversion by 1000 verified against time; unused clock fallbacks remain residual.\"}]"))
+  __source_flat = flatten(__source_kv)
+  for_each(__rules) -> |_index, rule| {
+      __source_key = string!(rule.source)
+      __value = get!(__source_flat, [__source_key])
+      __expected = null
+      __valid = false
+      if rule.kind == "lowercase" && is_string(__value) {
+          __expected = downcase(string!(__value))
+          __valid = true
+      } else if rule.kind == "epoch_ms" {
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", string(rule.format) ?? "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              __valid = true
+          }
+      } else if rule.kind == "scale" {
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * to_float!(rule.factor))
+              __valid = true
+          }
+      } else if rule.kind == "hex" {
+          __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
+          __integer, __integer_err = parse_int(__hex, base: 16)
+          __expected = __integer
+          __valid = is_string(__value) && starts_with(downcase(string(__value) ?? ""), "0x") && __integer_err == null
+      } else if rule.kind == "enum" {
+          __expected = get!(object!(rule.values), [downcase(to_string(__value) ?? "")])
+          __valid = __expected != null
+      }
+      __matches = includes(__represented, encode_json(__expected))
+      if is_string(rule.target) { __matches = get!(., split(string!(rule.target), ".")) == __expected }
+      if __valid && __matches { __consumed = push(__consumed, __source_key) }
+  }
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  __safe = map_values(object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing}))), recursive: true) -> |value| {
+      if is_object(value) {
+          # Header/parameter arrays commonly encode sensitive keys as name/value
+          # or Key/Value objects instead of using the secret name as an object key.
+          __sensitive_pair = false
+          for_each(object!(value)) -> |key, child| {
+              if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                  __sensitive_pair = true
+              }
+          }
+          for_each(object!(value)) -> |key, _child| {
+              if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                  value = set!(value, [key], "<redacted>")
+              }
+          }
+      }
+      value
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  __escaped = map_keys(object!(__safe.source), recursive: true) -> |key| {
+      replace(replace(key, "~", "~0"), ".", "~1")
+  }
+  __flat = flatten(__escaped)
+  __residual = {}
+  for_each(__flat) -> |key, value| {
+      key = replace(replace(key, "~1", "."), "~0", "~")
+      # flatten stops at arrays, so objects inside an array still carry the
+      # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+      if is_array(value) || is_object(value) {
+          value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+              replace(replace(inner, "~1", "."), "~0", "~")
+          }, ["v"])
+      }
+      __same = includes(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __same = __same || includes(__represented, to_string(value) ?? "")
+      }
+      # A scalar array is consumed only if every element is represented. Preserve
+      # partially represented arrays intact, including their ordering and repeats.
+      if is_array(value) && !is_empty(array!(value)) {
+          __all_items = true
+          for_each(array!(value)) -> |_index, item| {
+              __item_same = includes(__represented, encode_json(item))
+              if !is_object(item) && !is_array(item) && !is_null(item) {
+                  __item_same = __item_same || includes(__represented, to_string(item) ?? "")
+              }
+              if is_object(item) || is_array(item) || !__item_same { __all_items = false }
+          }
+          __same = __same || __all_items
+      }
+      if __same && includes(__candidates, key) { __consumed = push(__consumed, key) }
+      # Redacted leaves always remain visible. Do not spill a copy of the raw body.
+      if (!includes(__consumed, key) || value == "<redacted>") && value != __raw_body {
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          __base = join!(__parts, ".")
+          __key = __base
+          __suffix = 2
+          if includes(keys(__residual), __key) {
+              for_each(__flat) -> |_other_key, _other_value| {
+                  if includes(keys(__residual), __key) {
+                      __key = __base + "_" + to_string(__suffix)
+                      __suffix = __suffix + 1
+                  }
+              }
+          }
+          __complex = is_object(value)
+          if is_array(value) {
+              for_each(array!(value)) -> |_index, item| {
+                  if is_object(item) || is_array(item) { __complex = true }
+              }
+          }
+          __spill = if __complex { encode_json(value) } else { value }
+          __residual = set!(__residual, [__key], __spill)
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  __original_values = []
+  for_each(flatten(__source_kv)) -> |_key, value| {
+      __original_values = push(__original_values, encode_json(value))
+      if !is_object(value) && !is_array(value) { __original_values = push(__original_values, to_string(value) ?? "") }
+  }
+  for_each(flatten(__existing)) -> |key, value| {
+      __source_alias = includes(__original_values, encode_json(value)) || includes(__original_values, to_string(value) ?? "")
+      __mapped_alias = includes(__represented, encode_json(value)) || includes(__represented, to_string(value) ?? "")
+      __decoded, __decode_err = parse_json(string(value) ?? "")
+      __encoded_container = __decode_err == null && (is_object(__decoded) || is_array(__decoded))
+      if !is_null(value) && value != "" && !__source_alias && !__mapped_alias && !__encoded_container && value != __raw_body {
+          # Existing aggregates may contain sensitive descendants; the canonical
+          # source spill above is the authoritative representation of containers.
+          if !is_array(value) && !is_object(value) && !match(downcase(key), r'password|secret|authorization|token') {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+# Runtime samples (NAN-2327): one per event shape this parser routes.
+# `class_uid` is asserted because class routing is the whole point of the
+# OCSF conversion — a silent reroute is the defect most likely to survive
+# a compile-only check.
+samples:
+  - raw: '{"sourcetype":"zscalernss-audit","event":{"datetime":"Wed Aug 12 09:15:26 2026","adminid":"admin@corp.example","action":"UPDATE","category":"URL Filtering Policy","subcategory":"Rule","result":"SUCCESS","resource":"Block Gambling","resourcetype":"UrlFilteringRule","clientip":"198.51.100.250","recordid":"5510"}}'
+    expect:
+      class_uid: 6003
+      activity_id: 99
+  - raw: 'NOT JSON'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: '{"sourcetype":"zscalernss-edlp","event":{"datetime":"Wed Aug 12 09:15:25 2026","user":"dan@corp.example","actiontaken":"Block","dlpeng":"PCI Engine","dlpdict":"Credit Card","dlpdicthitcount":14,"dlprulename":"Block PCI Upload","dlpidentifier":99881,"filename":"cards.csv","sha256":"AA86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08","severity":"High","devicehostname":"LAP-7788","channel":"Web"}}'
+    expect:
+      class_uid: 2004
+      activity_id: 1
+  - raw: '{"sourcetype":"zscalernss-dns","event":{"datetime":"Wed Aug 12 09:15:23 2026","clt_sip":"10.70.1.12","srv_dip":"185.228.168.9","srv_dport":53,"dns_req":"c2.evil.example","dns_resp":"127.0.0.1","dns_reqtype":"A","reqaction":"BLOCK","durationms":4,"user":"carol@corp.example","devicehostname":"LAP-3300","category":"Command and Control"}}'
+    expect:
+      class_uid: 4003
+      activity_id: 2
+  - raw: '{"sourcetype":"zscalernss-fw","event":{"datetime":"Wed Aug 12 09:15:22 2026","csip":"10.70.1.11","cdip":"198.51.100.7","csport":51000,"cdport":445,"proto":"TCP","inbytes":4096,"outbytes":8192,"duration":12,"user":"bob@corp.example","action":"Drop","rule":"Block SMB Egress","devicehostname":"LAP-9001","threatname":"None"}}'
+    expect:
+      class_uid: 4001
+      activity_id: 6
+  - raw: '{"sourcetype":"zscalernss-tunnel","event":{"datetime":"Wed Aug 12 09:15:24 2026","sourceip":"203.0.113.40","destinationip":"165.225.0.10","sourceport":500,"destinationport":4500,"protocol":"UDP","rxbytes":102400,"txbytes":51200,"user":"branch-fw","tunneltype":"IPSEC","ikeversion":"IKEv2","event":"TUNNEL_UP"}}'
+    expect:
+      class_uid: 4001
+      activity_id: 6
+  - raw: '{"sourcetype":"zscalernss-mystery","event":{"user":"eve@corp.example","action":"Allow","severity":"Low"}}'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: '{"sourcetype":"zscalernss-web","event":{"epochtime":1786000522,"login":"alice@corp.example","dept":"Finance","location":"HQ","cltip":"10.70.1.10","serverip":"93.184.216.34","host":"downloads.example.com","reqmethod":"GET","respcode":403,"reqsize":900,"respsize":0,"contenttype":"application/octet-stream","useragent":"Mozilla/5.0","referrer":"https://portal.example.com/","b64url":"aHR0cHM6Ly9kb3dubG9hZHMuZXhhbXBsZS5jb20vc2V0dXAuZXhl","action":"Blocked","reason":"Malware","threatname":"Win32.Trojan.Generic","threatseverity":"Critical","urlsupercat":"Software Downloads","urlclass":"Business Use","riskscore":88,"filename":"setup.exe","sha256":"9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08","devicehostname":"LAP-4471","deviceostype":"Windows","dlprulename":"","recordid":"771122"}}'
+    expect:
+      class_uid: 4002
+      activity_id: 3
+  # NAN-2995: OCSF 1.9 bytes_in = destination -> source, bytes_out = source -> destination; web respsize is bytes_in, reqsize is bytes_out.
+  - raw: "{\"sourcetype\":\"zscalernss-web\",\"event\":{\"epochtime\":1786000522,\"login\":\"alice@corp.example\",\"dept\":\"Finance\",\"location\":\"HQ\",\"cltip\":\"10.70.1.10\",\"serverip\":\"93.184.216.34\",\"host\":\"downloads.example.com\",\"reqmethod\":\"GET\",\"respcode\":200,\"reqsize\":900,\"respsize\":48000,\"contenttype\":\"application/octet-stream\",\"useragent\":\"Mozilla/5.0\",\"referrer\":\"https://portal.example.com/\",\"b64url\":\"aHR0cHM6Ly9kb3dubG9hZHMuZXhhbXBsZS5jb20vc2V0dXAuZXhl\",\"action\":\"Allowed\",\"reason\":\"Malware\",\"threatname\":\"Win32.Trojan.Generic\",\"threatseverity\":\"Critical\",\"urlsupercat\":\"Software Downloads\",\"urlclass\":\"Business Use\",\"riskscore\":88,\"filename\":\"setup.exe\",\"sha256\":\"9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08\",\"devicehostname\":\"LAP-4471\",\"deviceostype\":\"Windows\",\"dlprulename\":\"\",\"recordid\":\"771122\"}}"
+    expect:
+      "traffic.bytes_in": 48000
+      "traffic.bytes_out": 900
+  # NAN-2995: OCSF 1.9 bytes_in = destination -> source, bytes_out = source -> destination; tunnel rxbytes (received BY ZIA from the source) is bytes_out.
+  - raw: "{\"sourcetype\":\"zscalernss-tunnel\",\"event\":{\"datetime\":\"Wed Aug 12 09:15:24 2026\",\"sourceip\":\"203.0.113.40\",\"destinationip\":\"165.225.0.10\",\"sourceport\":500,\"destinationport\":4500,\"protocol\":\"UDP\",\"rxbytes\":102400,\"txbytes\":51200,\"user\":\"branch-fw\",\"tunneltype\":\"IPSEC\",\"ikeversion\":\"IKEv2\",\"event\":\"TUNNEL_UP\"}}"
+    expect:
+      "traffic.bytes_in": 51200
+      "traffic.bytes_out": 102400
+  # NAN-2995: OCSF 1.9 bytes_in = destination -> source, bytes_out = source -> destination; firewall inbytes (server -> client) is bytes_in, unchanged.
+  - raw: "{\"sourcetype\":\"zscalernss-fw\",\"event\":{\"datetime\":\"Wed Aug 12 09:15:22 2026\",\"csip\":\"10.70.1.11\",\"cdip\":\"198.51.100.7\",\"csport\":51000,\"cdport\":445,\"proto\":\"TCP\",\"inbytes\":4096,\"outbytes\":8192,\"duration\":12,\"user\":\"bob@corp.example\",\"action\":\"Drop\",\"rule\":\"Block SMB Egress\",\"devicehostname\":\"LAP-9001\",\"threatname\":\"None\"}}"
+    expect:
+      "traffic.bytes_in": 4096
+      "traffic.bytes_out": 8192
+  # NAN-3702 (natural id removed): metadata.uid is sha256("zscaler_zia|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"sourcetype\":\"zscalernss-audit\",\"event\":{\"datetime\":\"Wed Aug 12 09:15:26 2026\",\"adminid\":\"admin@corp.example\",\"action\":\"UPDATE\",\"category\":\"URL Filtering Policy\",\"subcategory\":\"Rule\",\"result\":\"SUCCESS\",\"resource\":\"Block Gambling\",\"resourcetype\":\"UrlFilteringRule\",\"clientip\":\"198.51.100.250\"}}"
+    expect:
+      "metadata.uid": "aa918a8c183e9bdd60862cbebd83b5c8a3a9a9d3d8577fb727a80089c31a2268"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("zscaler_zia|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"sourcetype\":\"zscalernss-edlp\",\"event\":{\"datetime\":\"Wed Aug 12 09:15:25 2026\",\"user\":\"dan@corp.example\",\"actiontaken\":\"Block\",\"dlpeng\":\"PCI Engine\",\"dlpdict\":\"Credit Card\",\"dlpdicthitcount\":14,\"dlprulename\":\"Block PCI Upload\",\"filename\":\"cards.csv\",\"sha256\":\"AA86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08\",\"severity\":\"High\",\"devicehostname\":\"LAP-7788\",\"channel\":\"Web\"}}"
+    expect:
+      "metadata.uid": "057cc6286b7a66b223254f1a71f236d00ed8fd3003b852e07ef5aa296a2ff0d3"
+      "finding_info.uid": "057cc6286b7a66b223254f1a71f236d00ed8fd3003b852e07ef5aa296a2ff0d3"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("zscaler_zia|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "NOT JSON"
+    expect:
+      "metadata.uid": "3f90d0a733e53eae4931d449175f8bba1e6aea0c21e4e6b962efee6239d81044"

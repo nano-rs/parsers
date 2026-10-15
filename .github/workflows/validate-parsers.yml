@@ -1,8 +1,21 @@
 name: Validate & Auto-Merge Parsers
 
 on:
+  # NAN-3680: the merge to main/ocsf-1.9 re-runs validation with the private
+  # OCSF contract validator, so a fork PR (which cannot read it) is still
+  # schema-checked before its content is trusted.
+  push:
+    branches: [main, ocsf-1.9]
+    paths:
+      - "parsers-ocsf/**"
+      - "enrichments/**"
+      - "scripts/**"
+      - ".github/workflows/validate-parsers.yml"
   pull_request:
-    branches: [main]
+    # `main` is the OCSF 1.9 line (NAN-3897). `ocsf-1.9` is a frozen copy kept
+    # for installs that still pin it; it keeps the same gates. The UDM content
+    # lives only on the `legacy/clickhouse` archive branch, which has no CI.
+    branches: [main, ocsf-1.9]
     # `ready_for_review` is not in the default type set (opened, synchronize,
     # reopened). Without it, undrafting a PR re-runs nothing, so the Auto-Merge
     # job keeps whatever result it got while the PR was still a draft — a red X
@@ -10,7 +23,6 @@ on:
     # merge despite a green validation run.
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
-      - "parsers/**"
       # parsers-ocsf/ was covered by neither the path filter nor the discovery
       # glob, so its parsers had never been validated by CI at all — a PR
       # touching only them triggered no run.
@@ -48,8 +60,11 @@ jobs:
 
       - name: Find changed parsers
         id: changed
+        # PR-only: a push has no base ref. The whole-repo pass below covers it.
+        if: github.event_name == 'pull_request'
         run: |
-          changed=$(git diff --name-only origin/main...HEAD -- 'parsers/*/parser.yaml' 'enrichments/**/parser.yaml')
+          base="origin/${{ github.event.pull_request.base.ref }}"
+          changed=$(git diff --name-only "$base"...HEAD -- 'parsers-ocsf/*/parser.yaml' 'enrichments/**/parser.yaml')
           if [ -z "$changed" ]; then
             echo "No parser files changed"
             echo "has_changes=false" >> $GITHUB_OUTPUT
@@ -73,7 +88,7 @@ jobs:
       # main deployable rather than merely keeping each PR self-consistent.
       - name: Validate every parser in the repo
         run: |
-          find parsers parsers-ocsf enrichments -name parser.yaml | sort > /tmp/all_parsers.txt
+          find parsers-ocsf enrichments -name parser.yaml | sort > /tmp/all_parsers.txt
           count=$(wc -l < /tmp/all_parsers.txt)
           echo "Validating $count parsers"
           # A glob that silently matches nothing would let this step pass while
@@ -85,16 +100,85 @@ jobs:
           fi
           bash scripts/validate-vrl.sh /tmp/all_parsers.txt
 
+  validate-ocsf:
+    name: Validate OCSF
+    runs-on: ubuntu-24.04  # validator binary needs glibc >= 2.34
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Vector
+        run: |
+          curl -sSL https://sh.vector.dev | bash -s -- -y --prefix "$HOME/.vector"
+          echo "$HOME/.vector/bin" >> $GITHUB_PATH
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet pyyaml
+
+      # Whole-tree, same reasoning as the VRL job: validating only what a PR
+      # touched is what let broken parsers sit on main unnoticed. This job runs
+      # the static OCSF consistency rules (metadata.version vs the parser's own
+      # ocsf_version, type_uid arithmetic, no .udm.*/source_type, no deprecated
+      # class_uid) plus gate 1 against each parser's samples/ corpus.
+      #
+      # The OCSF *contract* half of gate 2 runs nano's `ocsf_event_validate`:
+      # the exact check nano's lake enforces at admission. NAN-3680: it is
+      # MANDATORY here. azure_monitor 1.0.0 passed this job with it skipped and
+      # then lost every unregistered-device sign-in in the lake. The binary is
+      # pinned (url + sha256) in scripts/ocsf-validator.lock; validate-ocsf.sh
+      # fails under CI when it is missing.
+      #
+      # The binary is a private nano build artifact: a release asset on the
+      # private, binary-only nano-rs/ocsf-validator-dist repo, read with
+      # OCSF_VALIDATOR_TOKEN (fine-grained, Contents read-only, that repo only,
+      # so a leaked token exposes the validator binary and nothing else). A fork PR cannot read
+      # repository secrets, so its schema half reports "skipped (fork)"; the
+      # push run after merge to main/ocsf-1.9 enforces it with the secret.
+      - name: Fetch nano OCSF contract validator
+        if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) }}
+        env:
+          OCSF_VALIDATOR_TOKEN: ${{ secrets.OCSF_VALIDATOR_TOKEN }}
+        # Assign first: `echo "...$(fetch)"` masks the fetch's exit status, so a
+        # 401/404 or sha mismatch would show this step green.
+        run: |
+          set -euo pipefail
+          validator="$(bash scripts/fetch-ocsf-validator.sh "$RUNNER_TEMP/ocsf")"
+          sha256sum "$validator"
+          echo "OCSF_VALIDATOR=$validator" >> "$GITHUB_ENV"
+
+      - name: Mark fork PR (schema half skipped, enforced post-merge)
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
+        run: echo "OCSF_VALIDATOR_SKIP_REASON=fork" >> "$GITHUB_ENV"
+
+      - name: Validate OCSF parser tree
+        run: bash scripts/validate-ocsf.sh
+
+      - name: Check generated residual blocks
+        run: python3 scripts/residual_spill.py --check
+
+      - name: Test rule 5 (canonical OCSF 1.9 paths)
+        run: python3 scripts/test_ocsf_event_checks.py
+
+      - name: Test residual preservation and checker rejection
+        run: python3 scripts/test_field_coverage_check.py
+
+      - name: Check field coverage for every OCSF parser
+        run: python3 scripts/field_coverage_check.py --all
+
   auto-merge:
     name: Auto-Merge
-    needs: validate-vrl
+    needs: [validate-vrl, validate-ocsf]
     runs-on: ubuntu-latest
     # Skip on drafts rather than attempting the merge and failing with
     # "Pull Request is still a draft". That error is expected on every draft
     # PR, but it surfaces as a failed check, which is indistinguishable at a
     # glance from a real problem. Combined with the ready_for_review trigger
     # above, a draft now shows no auto-merge result until it is marked ready.
-    if: success() && github.event.pull_request.draft == false
+    if: success() && github.event_name == 'pull_request' && github.event.pull_request.draft == false
     steps:
       - name: Enable auto-merge
         uses: actions/github-script@v7

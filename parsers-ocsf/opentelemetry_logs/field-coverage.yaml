@@ -1,0 +1,24 @@
+source: otlp
+transforms:
+- source: timestamp
+  kind: epoch_ms
+  target: time
+  reason: The LogRecord timestamp is converted to epoch milliseconds and wins over
+    ingest time.
+consumed_candidates:
+- message
+- severity
+- timestamp
+- trace_id
+consumed_reason: Only LogRecord fields this parser maps are eligible for exact-value
+  consumption. Resource and log attributes always spill to unmapped under their
+  "_"-flattened names (the names the platform parser always used), even when a
+  value is also mapped (service.name -> api.service.name), so existing hunts keep
+  working.
+preserve_unmapped:
+  trace_id: Documented fallback slot (source manifest field 37, role trace_fallback);
+    kept although trace.uid carries the same value.
+  span_id: Documented fallback slot (source manifest field 38, role span_fallback);
+    OCSF trace.span needs start/end times a LogRecord does not have.
+  nano_time_source: Derived fact that the row's time is ingest-side because the
+    LogRecord carried no usable timestamp.

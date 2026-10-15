@@ -1,0 +1,580 @@
+name: aws_guardduty_ocsf
+display_name: AWS GuardDuty (OCSF)
+version: "1.2.1"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses AWS GuardDuty findings into complete OCSF 1.9.0 "Detection Finding"
+  (class_uid 2004) records carrying the cloud and security_control profiles.
+  Handles all four GuardDuty action shapes (AWS_API_CALL, NETWORK_CONNECTION,
+  DNS_REQUEST, PORT_PROBE) and the AccessKey / Instance / S3Bucket resource
+  shapes. The whole OCSF object is emitted on the root so it lands in
+  ocsf_logs.event and the promoted columns materialize. Mirrors the UDM
+  aws_guardduty parser but targets OCSF instead of `.udm.*`.
+match_values:
+  - aws_guardduty
+category: cloud
+vendor: "Amazon"
+product: "GuardDuty"
+parser_vrl: |
+  # AWS GuardDuty finding -> OCSF 1.9.0 Detection Finding (class_uid 2004)
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+  class_uid = 2004
+
+  parsed, err = parse_json(raw_log)
+  __source_kv = object(parsed) ?? {}
+
+  if err != null || !is_object(parsed) {
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Detection Finding",
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": class_uid * 100 + 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "time": 0,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud", "security_control"],
+              "uid": sha2("aws_guardduty|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "GuardDuty",
+              "product": { "name": "AWS GuardDuty", "vendor_name": "Amazon" }
+          },
+          "cloud": { "provider": "AWS" },
+          "finding_info": { "uid": "unknown", "title": "Unparsable GuardDuty finding" }
+      }
+  } else {
+      p = object!(parsed)
+      resource = object(p.resource) ?? {}
+      service = object(p.service) ?? {}
+      action = object(service.action) ?? {}
+
+      finding_type = to_string(p.type) ?? ""
+      finding_id = to_string(p.id) ?? ""
+      if finding_id == "" { finding_id = sha2("aws_guardduty|raw|" + raw_log, variant: "SHA-256") }
+
+      # ---- severity: GuardDuty 0.1-10 -> OCSF severity_id ----
+      raw_sev = to_float(p.severity) ?? 0.0
+      severity_id = 1
+      severity = "Informational"
+      if raw_sev >= 1.0 { severity_id = 2; severity = "Low" }
+      if raw_sev >= 4.0 { severity_id = 3; severity = "Medium" }
+      if raw_sev >= 7.0 { severity_id = 4; severity = "High" }
+      if raw_sev >= 9.0 { severity_id = 5; severity = "Critical" }
+      risk_score = to_int(round(raw_sev * 10.0))
+
+      # ---- times ----
+      created_ms = 0
+      created_str = to_string(p.createdAt) ?? ""
+      if created_str != "" {
+          ct, cterr = parse_timestamp(created_str, "%+")
+          if cterr == null { created_ms = to_unix_timestamp(ct, unit: "milliseconds") }
+      }
+      updated_ms = 0
+      updated_str = to_string(p.updatedAt) ?? ""
+      if updated_str != "" {
+          ut, uterr = parse_timestamp(updated_str, "%+")
+          if uterr == null { updated_ms = to_unix_timestamp(ut, unit: "milliseconds") }
+      }
+      # A finding whose updatedAt has moved on is an update, not a first sighting.
+      activity_id = 1
+      activity_name = "Create"
+      if updated_ms > created_ms { activity_id = 2; activity_name = "Update" }
+      time_ms = created_ms
+      if updated_ms > 0 { time_ms = updated_ms }
+
+      # NAN-3721: metadata.uid is the lake's dedup key, so it must name ONE
+      # record. The finding id names the finding, and GuardDuty re-publishes
+      # the same id each time it updates the finding (count++, new updatedAt),
+      # so as the uid it dropped every update that landed in the same event
+      # hour. The uid is the finding id plus updatedAt: a redelivered copy
+      # still dedupes, a real update does not. finding_info.uid stays the id.
+      gd_id = to_string(p.id) ?? ""
+      record_uid = finding_id
+      if gd_id != "" && updated_str != "" { record_uid = gd_id + "|" + updated_str }
+
+      first_seen_ms = 0
+      fs_str = to_string(service.eventFirstSeen) ?? ""
+      if fs_str != "" {
+          ft, fterr = parse_timestamp(fs_str, "%+")
+          if fterr == null { first_seen_ms = to_unix_timestamp(ft, unit: "milliseconds") }
+      }
+      last_seen_ms = 0
+      ls_str = to_string(service.eventLastSeen) ?? ""
+      if ls_str != "" {
+          lt, lterr = parse_timestamp(ls_str, "%+")
+          if lterr == null { last_seen_ms = to_unix_timestamp(lt, unit: "milliseconds") }
+      }
+
+      # ---- finding_info ----
+      finding_info = {
+          "uid": finding_id,
+          "title": to_string(p.title) ?? finding_type,
+          "types": [finding_type],
+          "analytic": {
+              "name": "AWS GuardDuty",
+              "type_id": 2,
+              "type": "Behavioral",
+              "uid": to_string(service.detectorId) ?? "guardduty"
+          },
+          "data_sources": ["AWS GuardDuty"],
+          "product": { "name": "AWS GuardDuty", "vendor_name": "Amazon" }
+      }
+      desc = to_string(p.description) ?? ""
+      if desc != "" { finding_info.desc = desc }
+      if created_ms > 0 { finding_info.created_time = created_ms }
+      if updated_ms > 0 { finding_info.modified_time = updated_ms }
+      if first_seen_ms > 0 { finding_info.first_seen_time = first_seen_ms }
+      if last_seen_ms > 0 { finding_info.last_seen_time = last_seen_ms }
+      arn = to_string(p.arn) ?? ""
+      if arn != "" { finding_info.uid_alt = arn }
+
+      # ---- cloud ----
+      cloud = { "provider": "AWS" }
+      region = to_string(p.region) ?? ""
+      if region != "" { cloud.region = region }
+      acct = to_string(p.accountId) ?? ""
+      if acct != "" { cloud.account = { "uid": acct } }
+      partition = to_string(p.partition) ?? ""
+      if partition != "" { cloud.cloud_partition = partition }
+
+      unmapped = {}
+      resources = []
+      actor = {}
+      src_endpoint = {}
+      dst_endpoint = {}
+      api_obj = {}
+
+      # ---- resource: IAM access key ----
+      ak = object(resource.accessKeyDetails) ?? {}
+      if length(keys(ak)) > 0 {
+          user = {}
+          uname = to_string(ak.userName) ?? ""
+          if uname != "" { user.name = uname }
+          pid = to_string(ak.principalId) ?? ""
+          if pid != "" { user.uid = pid }
+          utype = to_string(ak.userType) ?? ""
+          if utype != "" { user.type = utype }
+          if length(keys(user)) > 0 { actor.user = user }
+          akid = to_string(ak.accessKeyId) ?? ""
+          if akid != "" { unmapped.access_key_id = akid }
+          resources = push(resources, { "type": "AWS::IAM::AccessKey", "uid": akid, "name": uname })
+      }
+
+      # ---- resource: EC2 instance ----
+      inst = object(resource.instanceDetails) ?? {}
+      if length(keys(inst)) > 0 {
+          iid = to_string(inst.instanceId) ?? ""
+          resources = push(resources, { "type": "AWS::EC2::Instance", "uid": iid, "name": iid })
+          if iid != "" { unmapped.instance_id = iid }
+          itype = to_string(inst.instanceType) ?? ""
+          if itype != "" { unmapped.instance_type = itype }
+          img = to_string(inst.imageId) ?? ""
+          if img != "" { unmapped.image_id = img }
+          az = to_string(inst.availabilityZone) ?? ""
+          if az != "" { cloud.zone = az }
+          ifaces = array(inst.networkInterfaces) ?? []
+          first_iface = get(ifaces, [0]) ?? null
+          if first_iface != null {
+              priv = to_string(get(first_iface, ["privateIpAddress"]) ?? "") ?? ""
+              if priv != "" { dst_endpoint.ip = downcase(priv) }
+              pdns = to_string(get(first_iface, ["privateDnsName"]) ?? "") ?? ""
+              if pdns != "" { dst_endpoint.hostname = pdns }
+              if iid != "" { dst_endpoint.instance_uid = iid }
+              vpc = to_string(get(first_iface, ["vpcId"]) ?? "") ?? ""
+              if vpc != "" { dst_endpoint.vpc_uid = vpc }
+              sub = to_string(get(first_iface, ["subnetId"]) ?? "") ?? ""
+              if sub != "" { dst_endpoint.subnet_uid = sub }
+              eni = to_string(get(first_iface, ["networkInterfaceId"]) ?? "") ?? ""
+              if eni != "" { dst_endpoint.interface_uid = eni }
+              pub = to_string(get(first_iface, ["publicIp"]) ?? "") ?? ""
+              if pub != "" { unmapped.instance_public_ip = pub }
+          }
+      }
+
+      # ---- resource: S3 buckets ----
+      buckets = array(resource.s3BucketDetails) ?? []
+      for_each(buckets) -> |_i, b| {
+          bname = to_string(get(b, ["name"]) ?? "") ?? ""
+          barn = to_string(get(b, ["arn"]) ?? "") ?? ""
+          resources = push(resources, { "type": "AWS::S3::Bucket", "uid": barn, "name": bname })
+      }
+
+      # ---- service.action: four shapes ----
+      action_type = to_string(action.actionType) ?? ""
+      if action_type != "" { unmapped.action_type = action_type }
+
+      api_call = object(action.awsApiCallAction) ?? {}
+      if length(keys(api_call)) > 0 {
+          api_name = to_string(api_call.api) ?? ""
+          api_svc = to_string(api_call.serviceName) ?? ""
+          svc_short = api_svc
+          sm, smerr = parse_regex(api_svc, r'^(?P<s>[^.]+)')
+          if smerr == null { svc_short = to_string(sm.s) }
+          api_obj = { "operation": api_name, "service": { "name": svc_short } }
+          caller_type = to_string(api_call.callerType) ?? ""
+          if caller_type != "" { unmapped.caller_type = caller_type }
+          dom = to_string(get(api_call, ["domainDetails", "domain"]) ?? "") ?? ""
+          if dom != "" { unmapped.caller_domain = dom }
+          rid = object(api_call.remoteIpDetails) ?? {}
+          if length(keys(rid)) > 0 {
+              rip = to_string(rid.ipAddressV4) ?? ""
+              if rip != "" { src_endpoint.ip = downcase(rip) }
+              country = to_string(get(rid, ["country", "countryName"]) ?? "") ?? ""
+              city = to_string(get(rid, ["city", "cityName"]) ?? "") ?? ""
+              loc = {}
+              if country != "" { loc.country = country }
+              if city != "" { loc.city = city }
+              if length(keys(loc)) > 0 { src_endpoint.location = loc }
+              asn = to_int(get(rid, ["organization", "asn"]) ?? 0) ?? 0
+              asn_org = to_string(get(rid, ["organization", "org"]) ?? "") ?? ""
+              as_obj = {}
+              if asn > 0 { as_obj.number = asn }
+              if asn_org != "" { as_obj.name = asn_org }
+              if length(keys(as_obj)) > 0 { src_endpoint.autonomous_system = as_obj }
+              isp = to_string(get(rid, ["organization", "isp"]) ?? "") ?? ""
+              if isp != "" { src_endpoint.isp = isp }
+          }
+      }
+
+      net_action = object(action.networkConnectionAction) ?? {}
+      if length(keys(net_action)) > 0 {
+          direction = to_string(net_action.connectionDirection) ?? ""
+          if direction != "" { unmapped.connection_direction = direction }
+          proto = to_string(net_action.protocol) ?? ""
+          if proto != "" { unmapped.protocol = downcase(proto) }
+          blocked = to_bool(net_action.blocked) ?? false
+          unmapped.blocked = blocked
+          lport = to_int(get(net_action, ["localPortDetails", "port"]) ?? 0) ?? 0
+          if lport > 0 { dst_endpoint.port = lport }
+          lip = to_string(get(net_action, ["localIpDetails", "ipAddressV4"]) ?? "") ?? ""
+          if lip != "" && !exists(dst_endpoint.ip) { dst_endpoint.ip = downcase(lip) }
+          rport = to_int(get(net_action, ["remotePortDetails", "port"]) ?? 0) ?? 0
+          if rport > 0 { src_endpoint.port = rport }
+          rid2 = object(net_action.remoteIpDetails) ?? {}
+          if length(keys(rid2)) > 0 {
+              rip2 = to_string(rid2.ipAddressV4) ?? ""
+              if rip2 != "" { src_endpoint.ip = downcase(rip2) }
+              country2 = to_string(get(rid2, ["country", "countryName"]) ?? "") ?? ""
+              if country2 != "" { src_endpoint.location = { "country": country2 } }
+              asn2 = to_int(get(rid2, ["organization", "asn"]) ?? 0) ?? 0
+              org2 = to_string(get(rid2, ["organization", "org"]) ?? "") ?? ""
+              as2 = {}
+              if asn2 > 0 { as2.number = asn2 }
+              if org2 != "" { as2.name = org2 }
+              if length(keys(as2)) > 0 { src_endpoint.autonomous_system = as2 }
+          }
+      }
+
+      dns_action = object(action.dnsRequestAction) ?? {}
+      if length(keys(dns_action)) > 0 {
+          dns_domain = to_string(dns_action.domain) ?? ""
+          if dns_domain != "" {
+              unmapped.dns_domain = dns_domain
+              dst_endpoint.domain = dns_domain
+          }
+          dns_blocked = to_bool(dns_action.blocked) ?? false
+          unmapped.blocked = dns_blocked
+          dns_proto = to_string(dns_action.protocol) ?? ""
+          if dns_proto != "" { unmapped.protocol = downcase(dns_proto) }
+      }
+
+      probe = object(action.portProbeAction) ?? {}
+      if length(keys(probe)) > 0 {
+          unmapped.blocked = to_bool(probe.blocked) ?? false
+          details = array(probe.portProbeDetails) ?? []
+          first_probe = get(details, [0]) ?? null
+          if first_probe != null {
+              pport = to_int(get(first_probe, ["localPortDetails", "port"]) ?? 0) ?? 0
+              if pport > 0 { dst_endpoint.port = pport }
+              prip = to_string(get(first_probe, ["remoteIpDetails", "ipAddressV4"]) ?? "") ?? ""
+              if prip != "" { src_endpoint.ip = downcase(prip) }
+              pcountry = to_string(get(first_probe, ["remoteIpDetails", "country", "countryName"]) ?? "") ?? ""
+              if pcountry != "" { src_endpoint.location = { "country": pcountry } }
+          }
+      }
+
+      # ---- threat intel evidence ----
+      evidence = object(service.evidence) ?? {}
+      tid = array(evidence.threatIntelligenceDetails) ?? []
+      first_ti = get(tid, [0]) ?? null
+      if first_ti != null {
+          tl = to_string(get(first_ti, ["threatListName"]) ?? "") ?? ""
+          if tl != "" { unmapped.threat_list_name = tl }
+          tnames = array(get(first_ti, ["threatNames"]) ?? []) ?? []
+          first_tn = get(tnames, [0]) ?? null
+          if first_tn != null { unmapped.threat_name = to_string(first_tn) ?? "" }
+      }
+
+      ocsf = {
+          "class_uid": class_uid,
+          "class_name": "Detection Finding",
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": 1,
+          "status": "New",
+          "is_alert": true,
+          "risk_score": risk_score,
+          "time": time_ms,
+          "message": to_string(p.title) ?? finding_type,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud", "security_control"],
+              "uid": record_uid,
+              "log_name": "GuardDuty",
+              "log_provider": "AWS GuardDuty",
+              "product": { "name": "AWS GuardDuty", "vendor_name": "Amazon" }
+          },
+          "cloud": cloud,
+          "finding_info": finding_info
+      }
+      if gd_id != "" { ocsf.metadata.original_event_uid = gd_id }
+      schema_ver = to_string(p.schemaVersion) ?? ""
+      if schema_ver != "" { unmapped.guardduty_schema_version = schema_ver }
+      cnt = to_int(service.count) ?? 0
+      if cnt > 0 { ocsf.count = cnt }
+      det = to_string(service.detectorId) ?? ""
+      if det != "" { unmapped.detector_id = det }
+      sample = to_bool(get(service, ["additionalInfo", "sample"]) ?? false) ?? false
+      unmapped.is_sample = sample
+
+      # `actor` on Detection Finding comes from the host profile, so declaring
+      # the profile is what makes the attribute legal.
+      if length(keys(actor)) > 0 {
+          ocsf.actor = actor
+          ocsf.metadata.profiles = ["cloud", "security_control", "host"]
+      }
+      if length(keys(api_obj)) > 0 { ocsf.api = api_obj }
+      if length(resources) > 0 { ocsf.resources = resources }
+      if length(keys(unmapped)) > 0 { ocsf.unmapped = unmapped }
+
+      # Detection Finding has no src_endpoint/dst_endpoint of its own; the
+      # network context rides in evidences[], which is the OCSF-sanctioned home.
+      ev = {}
+      if length(keys(src_endpoint)) > 0 { ev.src_endpoint = src_endpoint }
+      if length(keys(dst_endpoint)) > 0 { ev.dst_endpoint = dst_endpoint }
+      if length(keys(actor)) > 0 { ev.actor = actor }
+      if length(keys(api_obj)) > 0 { ev.api = api_obj }
+      if length(keys(ev)) > 0 {
+          ev.name = finding_type
+          ocsf.evidences = [ev]
+      }
+
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  __mapped = object!(parse_json!(encode_json(.)))
+  __existing = object(__mapped.unmapped) ?? {}
+  __discard = del(__mapped.raw_data)
+  __discard = del(__mapped.unmapped)
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __represented = []
+  __walk = map_values(__mapped, recursive: true) -> |value| {
+      __represented = push(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __represented = push(__represented, to_string(value) ?? "")
+      }
+      value
+  }
+  __consumed = []
+  # BEGIN parser-specific transformations
+  # createdAt: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # updatedAt: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # service.eventFirstSeen: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # service.eventLastSeen: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # createdAt: Existing timestamp conversion verified against the emitted millisecond clock.
+  # service.eventFirstSeen: Existing timestamp conversion verified against the emitted millisecond clock.
+  # service.eventLastSeen: Existing timestamp conversion verified against the emitted millisecond clock.
+  # service.serviceName: Parser normalizes the caption case; verify the emitted caption.
+  # severity: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = ["accountId", "arn", "createdAt", "description", "id", "partition", "region", "resource", "resource.accessKeyDetails", "resource.accessKeyDetails.accessKeyId", "resource.accessKeyDetails.principalId", "resource.accessKeyDetails.userName", "resource.accessKeyDetails.userType", "resource.instanceDetails", "resource.instanceDetails.availabilityZone", "resource.instanceDetails.imageId", "resource.instanceDetails.instanceId", "resource.instanceDetails.instanceType", "resource.instanceDetails.networkInterfaces", "resource.s3BucketDetails", "schemaVersion", "service", "service.action", "service.action.actionType", "service.action.awsApiCallAction", "service.action.awsApiCallAction.api", "service.action.awsApiCallAction.callerType", "service.action.awsApiCallAction.domainDetails.domain", "service.action.awsApiCallAction.remoteIpDetails", "service.action.awsApiCallAction.remoteIpDetails.city.cityName", "service.action.awsApiCallAction.remoteIpDetails.country.countryName", "service.action.awsApiCallAction.remoteIpDetails.ipAddressV4", "service.action.awsApiCallAction.remoteIpDetails.organization.asn", "service.action.awsApiCallAction.remoteIpDetails.organization.isp", "service.action.awsApiCallAction.remoteIpDetails.organization.org", "service.action.awsApiCallAction.serviceName", "service.action.dnsRequestAction", "service.action.dnsRequestAction.blocked", "service.action.dnsRequestAction.domain", "service.action.dnsRequestAction.protocol", "service.action.networkConnectionAction", "service.action.networkConnectionAction.blocked", "service.action.networkConnectionAction.connectionDirection", "service.action.networkConnectionAction.localIpDetails.ipAddressV4", "service.action.networkConnectionAction.localPortDetails.port", "service.action.networkConnectionAction.protocol", "service.action.networkConnectionAction.remoteIpDetails", "service.action.networkConnectionAction.remoteIpDetails.country.countryName", "service.action.networkConnectionAction.remoteIpDetails.ipAddressV4", "service.action.networkConnectionAction.remoteIpDetails.organization.asn", "service.action.networkConnectionAction.remoteIpDetails.organization.org", "service.action.networkConnectionAction.remotePortDetails.port", "service.action.portProbeAction", "service.action.portProbeAction.blocked", "service.action.portProbeAction.portProbeDetails", "service.additionalInfo.sample", "service.count", "service.detectorId", "service.eventFirstSeen", "service.eventLastSeen", "service.evidence", "service.evidence.threatIntelligenceDetails", "severity", "title", "type", "updatedAt"]
+  __preserve = []
+  __rules = array!(parse_json!("[{\"source\":\"createdAt\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Successful ISO timestamp conversion to the selected event clock in milliseconds.\"},{\"source\":\"updatedAt\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Successful ISO timestamp conversion to the selected event clock in milliseconds.\"},{\"source\":\"service.eventFirstSeen\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Successful ISO timestamp conversion to the selected event clock in milliseconds.\"},{\"source\":\"service.eventLastSeen\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Successful ISO timestamp conversion to the selected event clock in milliseconds.\"},{\"source\":\"createdAt\",\"kind\":\"epoch_ms\",\"target\":\"finding_info.created_time\",\"format\":\"%+\",\"reason\":\"Existing timestamp conversion verified against the emitted millisecond clock.\"},{\"source\":\"service.eventFirstSeen\",\"kind\":\"epoch_ms\",\"target\":\"finding_info.first_seen_time\",\"format\":\"%+\",\"reason\":\"Existing timestamp conversion verified against the emitted millisecond clock.\"},{\"source\":\"service.eventLastSeen\",\"kind\":\"epoch_ms\",\"target\":\"finding_info.created_time\",\"format\":\"%+\",\"reason\":\"Existing timestamp conversion verified against the emitted millisecond clock.\"},{\"source\":\"service.serviceName\",\"kind\":\"enum\",\"target\":\"metadata.log_name\",\"values\":{\"guardduty\":\"GuardDuty\"},\"reason\":\"Parser normalizes the caption case; verify the emitted caption.\"},{\"source\":\"severity\",\"kind\":\"enum\",\"target\":\"severity_id\",\"values\":{\"informational\":1,\"info\":1,\"debug\":1,\"low\":2,\"medium\":3,\"warn\":3,\"warning\":3,\"high\":4,\"error\":4,\"critical\":5,\"fatal\":6},\"reason\":\"Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.\"}]"))
+  __source_flat = flatten(__source_kv)
+  for_each(__rules) -> |_index, rule| {
+      __source_key = string!(rule.source)
+      __value = get!(__source_flat, [__source_key])
+      __expected = null
+      __valid = false
+      if rule.kind == "lowercase" && is_string(__value) {
+          __expected = downcase(string!(__value))
+          __valid = true
+      } else if rule.kind == "epoch_ms" {
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", string(rule.format) ?? "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              __valid = true
+          }
+      } else if rule.kind == "scale" {
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * to_float!(rule.factor))
+              __valid = true
+          }
+      } else if rule.kind == "hex" {
+          __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
+          __integer, __integer_err = parse_int(__hex, base: 16)
+          __expected = __integer
+          __valid = is_string(__value) && starts_with(downcase(string(__value) ?? ""), "0x") && __integer_err == null
+      } else if rule.kind == "enum" {
+          __expected = get!(object!(rule.values), [downcase(to_string(__value) ?? "")])
+          __valid = __expected != null
+      }
+      __matches = includes(__represented, encode_json(__expected))
+      if is_string(rule.target) { __matches = get!(., split(string!(rule.target), ".")) == __expected }
+      if __valid && __matches { __consumed = push(__consumed, __source_key) }
+  }
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  __safe = map_values(object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing}))), recursive: true) -> |value| {
+      if is_object(value) {
+          # Header/parameter arrays commonly encode sensitive keys as name/value
+          # or Key/Value objects instead of using the secret name as an object key.
+          __sensitive_pair = false
+          for_each(object!(value)) -> |key, child| {
+              if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                  __sensitive_pair = true
+              }
+          }
+          for_each(object!(value)) -> |key, _child| {
+              if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                  value = set!(value, [key], "<redacted>")
+              }
+          }
+      }
+      value
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  __escaped = map_keys(object!(__safe.source), recursive: true) -> |key| {
+      replace(replace(key, "~", "~0"), ".", "~1")
+  }
+  __flat = flatten(__escaped)
+  __residual = {}
+  for_each(__flat) -> |key, value| {
+      key = replace(replace(key, "~1", "."), "~0", "~")
+      # flatten stops at arrays, so objects inside an array still carry the
+      # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+      if is_array(value) || is_object(value) {
+          value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+              replace(replace(inner, "~1", "."), "~0", "~")
+          }, ["v"])
+      }
+      __same = includes(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __same = __same || includes(__represented, to_string(value) ?? "")
+      }
+      # A scalar array is consumed only if every element is represented. Preserve
+      # partially represented arrays intact, including their ordering and repeats.
+      if is_array(value) && !is_empty(array!(value)) {
+          __all_items = true
+          for_each(array!(value)) -> |_index, item| {
+              __item_same = includes(__represented, encode_json(item))
+              if !is_object(item) && !is_array(item) && !is_null(item) {
+                  __item_same = __item_same || includes(__represented, to_string(item) ?? "")
+              }
+              if is_object(item) || is_array(item) || !__item_same { __all_items = false }
+          }
+          __same = __same || __all_items
+      }
+      if __same && includes(__candidates, key) { __consumed = push(__consumed, key) }
+      # Redacted leaves always remain visible. Do not spill a copy of the raw body.
+      if (!includes(__consumed, key) || value == "<redacted>") && value != __raw_body {
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          __base = join!(__parts, ".")
+          __key = __base
+          __suffix = 2
+          if includes(keys(__residual), __key) {
+              for_each(__flat) -> |_other_key, _other_value| {
+                  if includes(keys(__residual), __key) {
+                      __key = __base + "_" + to_string(__suffix)
+                      __suffix = __suffix + 1
+                  }
+              }
+          }
+          __complex = is_object(value)
+          if is_array(value) {
+              for_each(array!(value)) -> |_index, item| {
+                  if is_object(item) || is_array(item) { __complex = true }
+              }
+          }
+          __spill = if __complex { encode_json(value) } else { value }
+          __residual = set!(__residual, [__key], __spill)
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  __original_values = []
+  for_each(flatten(__source_kv)) -> |_key, value| {
+      __original_values = push(__original_values, encode_json(value))
+      if !is_object(value) && !is_array(value) { __original_values = push(__original_values, to_string(value) ?? "") }
+  }
+  for_each(flatten(__existing)) -> |key, value| {
+      __source_alias = includes(__original_values, encode_json(value)) || includes(__original_values, to_string(value) ?? "")
+      __mapped_alias = includes(__represented, encode_json(value)) || includes(__represented, to_string(value) ?? "")
+      __decoded, __decode_err = parse_json(string(value) ?? "")
+      __encoded_container = __decode_err == null && (is_object(__decoded) || is_array(__decoded))
+      if !is_null(value) && value != "" && !__source_alias && !__mapped_alias && !__encoded_container && value != __raw_body {
+          # Existing aggregates may contain sensitive descendants; the canonical
+          # source spill above is the authoritative representation of containers.
+          if !is_array(value) && !is_object(value) && !match(downcase(key), r'password|secret|authorization|token') {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # NAN-3702 (unparseable record, error branch): metadata.uid is sha256("aws_guardduty|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "NAN-3702 determinism probe: not a aws_guardduty record"
+    expect:
+      "metadata.uid": "88db5a2efec50526776f6d18692c1f856d74c038a0b0e9684ab5d00ac2979e6c"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("aws_guardduty|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"schemaVersion\":\"2.0\",\"accountId\":\"123456789012\",\"region\":\"us-east-1\",\"partition\":\"aws\",\"arn\":\"arn:aws:guardduty:us-east-1:123456789012:detector/abc/finding/aabb\",\"createdAt\":\"2026-08-18T20:00:00.000Z\",\"updatedAt\":\"2026-08-18T20:05:00.000Z\",\"type\":\"UnauthorizedAccess:IAMUser/MaliciousIPCaller.Custom\",\"severity\":8.0,\"title\":\"API GetObject was invoked from a known malicious IP address.\",\"description\":\"API GetObject was invoked from IP address 198.51.100.5 which is on a custom threat list.\",\"resource\":{\"resourceType\":\"AccessKey\",\"accessKeyDetails\":{\"accessKeyId\":\"AKIAIOSFODNN7EXAMPLE\",\"principalId\":\"AIDACKCEVSQ6C2EXAMPLE\",\"userType\":\"IAMUser\",\"userName\":\"alice\"}},\"service\":{\"serviceName\":\"guardduty\",\"detectorId\":\"abc123\",\"count\":3,\"eventFirstSeen\":\"2026-08-18T19:50:00Z\",\"eventLastSeen\":\"2026-08-18T20:00:00Z\",\"action\":{\"actionType\":\"AWS_API_CALL\",\"awsApiCallAction\":{\"api\":\"GetObject\",\"serviceName\":\"s3.amazonaws.com\",\"callerType\":\"Remote IP\",\"remoteIpDetails\":{\"ipAddressV4\":\"198.51.100.5\",\"organization\":{\"asn\":\"64512\",\"asnOrg\":\"EvilNet\",\"isp\":\"EvilNet\",\"org\":\"EvilNet\"},\"country\":{\"countryName\":\"Russia\"},\"city\":{\"cityName\":\"Moscow\"}}}},\"evidence\":{\"threatIntelligenceDetails\":[{\"threatListName\":\"CustomList\",\"threatNames\":[\"BadActor\"]}]},\"additionalInfo\":{\"sample\":false}}}"
+    expect:
+      "metadata.uid": "524939459a6aa68da5b7c0b21c304c2a75b01a8013b05abe5d291fa837d6bc66"
+      "finding_info.uid": "524939459a6aa68da5b7c0b21c304c2a75b01a8013b05abe5d291fa837d6bc66"
+  # NAN-3721: the uid is the finding id plus updatedAt; original_event_uid is the finding id
+  - raw: "{\"schemaVersion\":\"2.0\",\"accountId\":\"123456789012\",\"region\":\"us-east-1\",\"partition\":\"aws\",\"arn\":\"arn:aws:guardduty:us-east-1:123456789012:detector/abc/finding/aabb\",\"createdAt\":\"2026-08-18T20:00:00.000Z\",\"updatedAt\":\"2026-08-18T20:05:00.000Z\",\"type\":\"UnauthorizedAccess:IAMUser/MaliciousIPCaller.Custom\",\"severity\":8.0,\"title\":\"API GetObject was invoked from a known malicious IP address.\",\"description\":\"API GetObject was invoked from IP address 198.51.100.5 which is on a custom threat list.\",\"resource\":{\"resourceType\":\"AccessKey\",\"accessKeyDetails\":{\"accessKeyId\":\"AKIAIOSFODNN7EXAMPLE\",\"principalId\":\"AIDACKCEVSQ6C2EXAMPLE\",\"userType\":\"IAMUser\",\"userName\":\"alice\"}},\"service\":{\"serviceName\":\"guardduty\",\"detectorId\":\"abc123\",\"count\":3,\"eventFirstSeen\":\"2026-08-18T19:50:00Z\",\"eventLastSeen\":\"2026-08-18T20:00:00Z\",\"action\":{\"actionType\":\"AWS_API_CALL\",\"awsApiCallAction\":{\"api\":\"GetObject\",\"serviceName\":\"s3.amazonaws.com\",\"callerType\":\"Remote IP\",\"remoteIpDetails\":{\"ipAddressV4\":\"198.51.100.5\",\"organization\":{\"asn\":\"64512\",\"asnOrg\":\"EvilNet\",\"isp\":\"EvilNet\",\"org\":\"EvilNet\"},\"country\":{\"countryName\":\"Russia\"},\"city\":{\"cityName\":\"Moscow\"}}}},\"evidence\":{\"threatIntelligenceDetails\":[{\"threatListName\":\"CustomList\",\"threatNames\":[\"BadActor\"]}]},\"additionalInfo\":{\"sample\":false}},\"id\":\"7cc5f0b1c4d6e8a9b0c1d2e3f4a5b6c7\"}"
+    expect:
+      "metadata.uid": "7cc5f0b1c4d6e8a9b0c1d2e3f4a5b6c7|2026-08-18T20:05:00.000Z"
+      "metadata.original_event_uid": "7cc5f0b1c4d6e8a9b0c1d2e3f4a5b6c7"
+      "finding_info.uid": "7cc5f0b1c4d6e8a9b0c1d2e3f4a5b6c7"
+  # NAN-3721: a later update of the SAME finding in the same hour: a distinct uid, so it is not dropped
+  - raw: "{\"schemaVersion\":\"2.0\",\"accountId\":\"123456789012\",\"region\":\"us-east-1\",\"partition\":\"aws\",\"arn\":\"arn:aws:guardduty:us-east-1:123456789012:detector/abc/finding/aabb\",\"createdAt\":\"2026-08-18T20:00:00.000Z\",\"updatedAt\":\"2026-08-18T20:20:00.000Z\",\"type\":\"UnauthorizedAccess:IAMUser/MaliciousIPCaller.Custom\",\"severity\":8.0,\"title\":\"API GetObject was invoked from a known malicious IP address.\",\"description\":\"API GetObject was invoked from IP address 198.51.100.5 which is on a custom threat list.\",\"resource\":{\"resourceType\":\"AccessKey\",\"accessKeyDetails\":{\"accessKeyId\":\"AKIAIOSFODNN7EXAMPLE\",\"principalId\":\"AIDACKCEVSQ6C2EXAMPLE\",\"userType\":\"IAMUser\",\"userName\":\"alice\"}},\"service\":{\"serviceName\":\"guardduty\",\"detectorId\":\"abc123\",\"count\":4,\"eventFirstSeen\":\"2026-08-18T19:50:00Z\",\"eventLastSeen\":\"2026-08-18T20:00:00Z\",\"action\":{\"actionType\":\"AWS_API_CALL\",\"awsApiCallAction\":{\"api\":\"GetObject\",\"serviceName\":\"s3.amazonaws.com\",\"callerType\":\"Remote IP\",\"remoteIpDetails\":{\"ipAddressV4\":\"198.51.100.5\",\"organization\":{\"asn\":\"64512\",\"asnOrg\":\"EvilNet\",\"isp\":\"EvilNet\",\"org\":\"EvilNet\"},\"country\":{\"countryName\":\"Russia\"},\"city\":{\"cityName\":\"Moscow\"}}}},\"evidence\":{\"threatIntelligenceDetails\":[{\"threatListName\":\"CustomList\",\"threatNames\":[\"BadActor\"]}]},\"additionalInfo\":{\"sample\":false}},\"id\":\"7cc5f0b1c4d6e8a9b0c1d2e3f4a5b6c7\"}"
+    expect:
+      "metadata.uid": "7cc5f0b1c4d6e8a9b0c1d2e3f4a5b6c7|2026-08-18T20:20:00.000Z"
+      "metadata.original_event_uid": "7cc5f0b1c4d6e8a9b0c1d2e3f4a5b6c7"
+      "finding_info.uid": "7cc5f0b1c4d6e8a9b0c1d2e3f4a5b6c7"

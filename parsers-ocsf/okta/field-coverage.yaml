@@ -1,0 +1,103 @@
+source: json
+transforms:
+- source: outcome.result
+  kind: lowercase
+  reason: Parser lowercases this source value; consume only when the normalized value
+    is emitted.
+- source: severity
+  kind: lowercase
+  reason: Parser lowercases this source value; consume only when the normalized value
+    is emitted.
+- source: published
+  kind: epoch_ms
+  target: time
+  reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+- source: outcome.result
+  target: status_id
+  kind: enum
+  reason: Okta outcome maps to OCSF status in the emitted branch.
+  values:
+    success: 1
+    allow: 1
+    failure: 2
+    deny: 2
+    challenge: 2
+- source: severity
+  kind: enum
+  target: severity_id
+  values:
+    informational: 1
+    info: 1
+    debug: 1
+    low: 2
+    medium: 3
+    warn: 3
+    warning: 3
+    high: 4
+    error: 4
+    critical: 5
+    fatal: 6
+  reason: Named vendor outcome/protocol/severity normalized by the existing mapping;
+    consume only when the expected ID is emitted.
+- source: debugContext.debugData.factorResult
+  kind: enum
+  target: status
+  values:
+    success: Success
+  reason: Parser normalizes the caption case; verify the emitted caption.
+consumed_candidates:
+- actor
+- actor.alternateId
+- actor.displayName
+- actor.id
+- actor.type
+- authenticationContext
+- authenticationContext.authenticationProvider
+- authenticationContext.credentialProvider
+- authenticationContext.credentialType
+- authenticationContext.externalSessionId
+- authenticationContext.interface
+- client
+- client.device
+- client.geographicalContext
+- client.geographicalContext.city
+- client.geographicalContext.country
+- client.geographicalContext.state
+- client.ipAddress
+- client.userAgent
+- client.userAgent.browser
+- client.userAgent.os
+- client.userAgent.rawUserAgent
+- client.zone
+- debugContext.debugData
+- debugContext.debugData.behaviors
+- debugContext.debugData.factor
+- debugContext.debugData.factorResult
+- debugContext.debugData.policyType
+- debugContext.debugData.requestUri
+- debugContext.debugData.risk
+- debugContext.debugData.rule
+- debugContext.debugData.threatSuspected
+- displayMessage
+- eventType
+- legacyEventType
+- outcome
+- outcome.reason
+- outcome.result
+- published
+- request.ipChain
+- securityContext
+- securityContext.asNumber
+- securityContext.asOrg
+- securityContext.domain
+- securityContext.isProxy
+- securityContext.isp
+- severity
+- target
+- transaction
+- transaction.id
+- transaction.type
+- uuid
+consumed_reason: Only source keys read by this parser are eligible for exact-value
+  consumption; the selected branch must emit the value. Unknown keys always spill,
+  even when their value equals an OCSF default.

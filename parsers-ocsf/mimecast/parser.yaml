@@ -1,0 +1,580 @@
+name: mimecast_ocsf
+display_name: Mimecast (OCSF)
+version: "1.2.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Mimecast Email Security logs into complete OCSF 1.9.0 Email Activity
+  (class_uid 4009) records:
+    type=receipt            -> activity Receive / Send by Dir, disposition from Act
+    type=url_protect        -> activity Scan, the clicked/scanned link in email.urls[]
+    type=attachment_protect -> activity Scan, the attachment in email.files[]
+  OCSF 1.9 DEPRECATES Email File Activity (4011) and Email URL Activity (4012);
+  its own guidance is to use Email Activity with the `email.files[]` and
+  `email.urls[]` arrays, which is what this parser does.
+  Carries metadata.profiles ["security_control"] because `disposition_id`,
+  `risk_score` and `is_alert` are bound to that profile in OCSF 1.9.
+match_values:
+  - mimecast
+category: security
+vendor: "Mimecast"
+product: "Email Security"
+parser_vrl: |
+  # Mimecast receipt / URL-protect / attachment-protect JSON -> OCSF 1.9.0 4009.
+  raw_log = string!(.message)
+  __raw_body = raw_log
+  __source_kv = {}
+  parsed, err = parse_json(raw_log)
+  __source_kv = object(parsed) ?? {}
+
+  if err != null || !is_object(parsed) {
+      # Unparseable input is emitted as an OCSF Base Event (class_uid 0)
+      # rather than being guessed into a security class: it stays valid, and
+      # therefore visible, without fabricating a user or an outcome.
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("mimecast|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "Mimecast Email Security",
+              "log_provider": "Mimecast",
+              "product": { "name": "Email Security", "vendor_name": "Mimecast" }
+          },
+          "unmapped": { "parse_error": "not a JSON object" }
+      }
+  } else {
+      p = object!(parsed)
+      spd = object(p.SpamProcessingDetail) ?? {}
+
+      event_type = string(p.type) ?? "unknown"
+      profiles = ["security_control"]
+
+      # ---- time ----
+      time_ms = 0
+      ts_str = string(p.datetime) ?? ""
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- direction ----
+      dir_raw = downcase(string(p.Dir) ?? string(p.route) ?? "")
+      direction_id = 0
+      if dir_raw == "inbound" || dir_raw == "in" { direction_id = 1 }
+      if dir_raw == "outbound" || dir_raw == "out" { direction_id = 2 }
+      if dir_raw == "internal" || dir_raw == "int" { direction_id = 3 }
+
+      severity_id = 1
+      severity = "Informational"
+      status_id = 1
+      status_str = "Success"
+      is_alert = false
+
+      ocsf = {
+          "class_uid": 4009,
+          "class_name": "Email Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity"
+      }
+
+      email_obj = {}
+      src_ip = ""
+
+      if event_type == "receipt" {
+          activity_id = 99
+          activity_name = "Other"
+          if direction_id == 1 { activity_id = 2; activity_name = "Receive" }
+          if direction_id == 2 || direction_id == 3 { activity_id = 1; activity_name = "Send" }
+
+          sender = string(p.Sender) ?? ""
+          rcpt = string(p.Rcpt) ?? ""
+          if match(sender, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["from"], downcase(sender)) }
+          if match(rcpt, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["to"], [downcase(rcpt)]) }
+          subj = string(p.Subject) ?? ""
+          if subj != "" { email_obj = set!(email_obj, ["subject"], subj) }
+          mid = string(p.MsgId) ?? ""
+          if mid != "" { email_obj = set!(email_obj, ["message_uid"], mid) }
+          msz = to_int(p.MsgSz) ?? 0
+          if msz > 0 { email_obj = set!(email_obj, ["size"], msz) }
+
+          # Attachment names arrive as a single delimited string.
+          att_names = string(p.AttNames) ?? ""
+          if att_names != "" {
+              files = []
+              for_each(split(att_names, ",")) -> |_i, fn| {
+                  nm = strip_whitespace(to_string(fn))
+                  if nm != "" { files = push(files, { "name": nm, "type_id": 1 }) }
+              }
+              if length(files) > 0 { email_obj = set!(email_obj, ["files"], files) }
+          }
+
+          # Mimecast delivery verdict -> OCSF disposition.
+          act = downcase(string(p.Act) ?? "")
+          disp_id = 0
+          disp = "Unknown"
+          if act == "acc" || act == "accept" { disp_id = 1; disp = "Allowed" }
+          if act == "rej" || act == "reject" { disp_id = 2; disp = "Blocked" }
+          if act == "hld" || act == "hold" { disp_id = 3; disp = "Quarantined" }
+          if act == "bnc" || act == "bounce" { disp_id = 6; disp = "Dropped" }
+          if act != "" && disp_id == 0 { disp_id = 99; disp = "Other" }
+          if disp_id != 0 {
+              ocsf.disposition_id = disp_id
+              ocsf.disposition = disp
+          }
+          if disp_id == 2 || disp_id == 3 || disp_id == 6 {
+              status_id = 2
+              status_str = "Failure"
+              severity_id = 2
+              severity = "Low"
+          }
+
+          spam_score = to_int(p.SpamScore) ?? 0
+          if spam_score > 0 { ocsf.risk_score = spam_score }
+
+          virus = string(p.VirusFound) ?? ""
+          if virus != "" {
+              is_alert = true
+              severity_id = 4
+              severity = "High"
+              ocsf.malware = [{ "name": virus, "classification_ids": [0] }]
+          }
+
+          auth = {}
+          spf = to_string(spd.spf.allow) ?? ""
+          if spf != "" { auth = set!(auth, ["spf"], spf) }
+          dkim = to_string(spd.dkim.allow) ?? ""
+          if dkim != "" { auth = set!(auth, ["dkim"], dkim) }
+          dmarc = to_string(spd.dmarc.allow) ?? ""
+          if dmarc != "" { auth = set!(auth, ["dmarc"], dmarc) }
+          if length(auth) > 0 { ocsf.email_auth = auth }
+
+          src_ip = string(p.IP) ?? ""
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+      } else if event_type == "url_protect" {
+          # A rewritten link scanned / clicked. OCSF 1.9 deprecates 4012 in
+          # favour of email.urls[] on Email Activity.
+          ocsf.activity_id = 3
+          ocsf.activity_name = "Scan"
+
+          sender = string(p.fromUserEmailAddress) ?? ""
+          rcpt = string(p.userEmailAddress) ?? ""
+          if match(sender, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["from"], downcase(sender)) }
+          if match(rcpt, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["to"], [downcase(rcpt)]) }
+          subj = string(p.Subject) ?? string(p.subject) ?? ""
+          if subj != "" { email_obj = set!(email_obj, ["subject"], subj) }
+          mid = string(p.messageId) ?? ""
+          if mid != "" { email_obj = set!(email_obj, ["message_uid"], mid) }
+          url_str = string(p.url) ?? ""
+          if url_str != "" {
+              url_obj = { "url_string": url_str }
+              cat = string(p.category) ?? ""
+              if cat != "" { url_obj = set!(url_obj, ["categories"], [cat]) }
+              email_obj = set!(email_obj, ["urls"], [url_obj])
+          }
+
+          action = downcase(string(p.action) ?? "")
+          disp_id = 0
+          disp = "Unknown"
+          if action == "allow" || action == "permit" { disp_id = 1; disp = "Allowed" }
+          if action == "block" || action == "blocked" { disp_id = 2; disp = "Blocked" }
+          if action == "warn" { disp_id = 23; disp = "Challenge" }
+          if action != "" && disp_id == 0 { disp_id = 99; disp = "Other" }
+          if disp_id != 0 {
+              ocsf.disposition_id = disp_id
+              ocsf.disposition = disp
+          }
+
+          scan_result = downcase(string(p.scanResult) ?? "")
+          if scan_result == "malicious" || disp_id == 2 {
+              is_alert = true
+              severity_id = 4
+              severity = "High"
+          }
+          src_ip = string(p.sendingIp) ?? ""
+      } else if event_type == "attachment_protect" {
+          ocsf.activity_id = 3
+          ocsf.activity_name = "Scan"
+
+          sender = string(p.senderAddress) ?? ""
+          rcpt = string(p.recipientAddress) ?? ""
+          if match(sender, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["from"], downcase(sender)) }
+          if match(rcpt, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["to"], [downcase(rcpt)]) }
+          subj = string(p.subject) ?? ""
+          if subj != "" { email_obj = set!(email_obj, ["subject"], subj) }
+          mid = string(p.messageId) ?? ""
+          if mid != "" { email_obj = set!(email_obj, ["message_uid"], mid) }
+
+          fname = string(p.fileName) ?? ""
+          fhash = string(p.fileHash) ?? ""
+          if fname != "" || fhash != "" {
+              nm = fname
+              if nm == "" { nm = "unknown" }
+              fobj = { "name": nm, "type_id": 1 }
+              if fhash != "" {
+                  # Pick the hash algorithm from the digest length.
+                  alg_id = 99
+                  alg = "Other"
+                  hl = length(fhash)
+                  if hl == 32 { alg_id = 1; alg = "MD5" }
+                  if hl == 40 { alg_id = 2; alg = "SHA-1" }
+                  if hl == 64 { alg_id = 3; alg = "SHA-256" }
+                  fobj = set!(fobj, ["hashes"], [{ "value": downcase(fhash), "algorithm_id": alg_id, "algorithm": alg }])
+              }
+              email_obj = set!(email_obj, ["files"], [fobj])
+          }
+
+          result = downcase(string(p.result) ?? "")
+          action_triggered = downcase(string(p.actionTriggered) ?? "")
+          disp_id = 0
+          disp = "Unknown"
+          if result == "safe" || result == "clean" { disp_id = 1; disp = "Allowed" }
+          if result == "malicious" || result == "unsafe" { disp_id = 2; disp = "Blocked" }
+          if contains(action_triggered, "hold") || contains(action_triggered, "quarantine") { disp_id = 3; disp = "Quarantined" }
+          if contains(action_triggered, "sandbox") || contains(action_triggered, "safefile") { disp_id = 4; disp = "Isolated" }
+          if disp_id != 0 {
+              ocsf.disposition_id = disp_id
+              ocsf.disposition = disp
+          }
+          if result == "malicious" || result == "unsafe" {
+              is_alert = true
+              severity_id = 4
+              severity = "High"
+              status_id = 2
+              status_str = "Failure"
+          }
+      } else {
+          ocsf.activity_id = 99
+          ocsf.activity_name = "Other"
+          sender = string(p.Sender) ?? string(p.senderAddress) ?? ""
+          rcpt = string(p.Rcpt) ?? string(p.recipientAddress) ?? ""
+          if match(sender, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["from"], downcase(sender)) }
+          if match(rcpt, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { email_obj = set!(email_obj, ["to"], [downcase(rcpt)]) }
+      }
+
+      # `email` is REQUIRED on 4009 and needs at_least_one(from, to).
+      if length(email_obj) == 0 { email_obj = { "from": "unknown@invalid.local" } }
+      if !exists(email_obj.from) && !exists(email_obj.to) {
+          email_obj = set!(email_obj, ["from"], "unknown@invalid.local")
+      }
+      ocsf.email = email_obj
+      ocsf.direction_id = direction_id
+
+      if src_ip != "" { ocsf.src_endpoint = { "ip": downcase(src_ip) } }
+
+      ocsf.is_alert = is_alert
+      ocsf.status_id = status_id
+      ocsf.status = status_str
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.type_uid = to_int(ocsf.class_uid) * 100 + to_int(ocsf.activity_id)
+      ocsf.time = time_ms
+      msg = event_type
+      subj_msg = string(p.Subject) ?? string(p.subject) ?? ""
+      if subj_msg != "" { msg = subj_msg }
+      ocsf.message = msg
+      ocsf.raw_data = raw_log
+
+      # NAN-3702: metadata.uid is the lake's dedup key. MsgId names the MESSAGE,
+      # and one message yields several events (receipt, delivery, URL / attachment
+      # protection), so keying on it kept only the first. Mimecast has no per-event
+      # id, so the uid hashes the raw record (a redelivery repeats it byte for
+      # byte); MsgId stays the original/correlation id.
+      msg_uid = string(p.MsgId) ?? string(p.messageId) ?? ""
+      evt_uid = sha2("mimecast|raw|" + raw_log, variant: "SHA-256")
+      orig_uid = msg_uid
+      if orig_uid == "" { orig_uid = evt_uid }
+      ocsf.metadata = {
+          "version": "1.9.0",
+          "profiles": profiles,
+          "uid": evt_uid,
+          "original_event_uid": orig_uid,
+          "event_code": event_type,
+          "log_name": "Mimecast Email Security",
+          "log_provider": "Mimecast",
+          "product": { "name": "Email Security", "vendor_name": "Mimecast" }
+      }
+
+      cand = {
+          "mimecast_type": event_type,
+          "account": string(p.acc) ?? "",
+          "act": string(p.Act) ?? "",
+          "direction_raw": dir_raw,
+          "spam_info": string(p.SpamInfo) ?? "",
+          "spam_limit": to_string(p.SpamLimit) ?? "",
+          "spam_score": to_string(p.SpamScore) ?? "",
+          "attachment_count": to_string(p.AttCnt) ?? "",
+          "tls_version": string(p.TlsVer) ?? "",
+          "cipher": string(p.Cphr) ?? "",
+          "virus_found": string(p.VirusFound) ?? "",
+          "scan_result": string(p.scanResult) ?? "",
+          "url_category": string(p.category) ?? "",
+          "url_action": string(p.action) ?? "",
+          "file_extension": string(p.fileExt) ?? "",
+          "attachment_result": string(p.result) ?? "",
+          "action_triggered": string(p.actionTriggered) ?? "",
+          "policy_definition": string(p.definition) ?? "",
+          "details": string(p.details) ?? ""
+      }
+      unmapped = {}
+      for_each(cand) -> |k, v| {
+          if v != "" { unmapped = set!(unmapped, [k], v) }
+      }
+      if length(unmapped) > 0 { ocsf.unmapped = unmapped }
+
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  __mapped = object!(parse_json!(encode_json(.)))
+  __existing = object(__mapped.unmapped) ?? {}
+  __discard = del(__mapped.raw_data)
+  __discard = del(__mapped.unmapped)
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __represented = []
+  __walk = map_values(__mapped, recursive: true) -> |value| {
+      __represented = push(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __represented = push(__represented, to_string(value) ?? "")
+      }
+      value
+  }
+  __consumed = []
+  # BEGIN parser-specific transformations
+  # Dir: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # Act: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # action: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # scanResult: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # result: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # actionTriggered: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # datetime: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = ["Act", "AttCnt", "AttNames", "Cphr", "Dir", "IP", "MsgId", "MsgSz", "Rcpt", "Sender", "SpamInfo", "SpamLimit", "SpamProcessingDetail", "SpamProcessingDetail.dkim.allow", "SpamProcessingDetail.dmarc.allow", "SpamProcessingDetail.spf.allow", "SpamScore", "Subject", "TlsVer", "VirusFound", "acc", "action", "actionTriggered", "category", "datetime", "definition", "details", "fileExt", "fileHash", "fileName", "fromUserEmailAddress", "messageId", "recipientAddress", "result", "route", "scanResult", "senderAddress", "sendingIp", "subject", "type", "url", "userEmailAddress"]
+  __preserve = []
+  __rules = array!(parse_json!("[{\"source\":\"Dir\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"Act\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"action\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"scanResult\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"result\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"actionTriggered\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"datetime\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Successful ISO timestamp conversion to the selected event clock in milliseconds.\"}]"))
+  __source_flat = flatten(__source_kv)
+  for_each(__rules) -> |_index, rule| {
+      __source_key = string!(rule.source)
+      __value = get!(__source_flat, [__source_key])
+      __expected = null
+      __valid = false
+      if rule.kind == "lowercase" && is_string(__value) {
+          __expected = downcase(string!(__value))
+          __valid = true
+      } else if rule.kind == "epoch_ms" {
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", string(rule.format) ?? "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              __valid = true
+          }
+      } else if rule.kind == "scale" {
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * to_float!(rule.factor))
+              __valid = true
+          }
+      } else if rule.kind == "hex" {
+          __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
+          __integer, __integer_err = parse_int(__hex, base: 16)
+          __expected = __integer
+          __valid = is_string(__value) && starts_with(downcase(string(__value) ?? ""), "0x") && __integer_err == null
+      } else if rule.kind == "enum" {
+          __expected = get!(object!(rule.values), [downcase(to_string(__value) ?? "")])
+          __valid = __expected != null
+      }
+      __matches = includes(__represented, encode_json(__expected))
+      if is_string(rule.target) { __matches = get!(., split(string!(rule.target), ".")) == __expected }
+      if __valid && __matches { __consumed = push(__consumed, __source_key) }
+  }
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  __safe = map_values(object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing}))), recursive: true) -> |value| {
+      if is_object(value) {
+          # Header/parameter arrays commonly encode sensitive keys as name/value
+          # or Key/Value objects instead of using the secret name as an object key.
+          __sensitive_pair = false
+          for_each(object!(value)) -> |key, child| {
+              if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                  __sensitive_pair = true
+              }
+          }
+          for_each(object!(value)) -> |key, _child| {
+              if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                  value = set!(value, [key], "<redacted>")
+              }
+          }
+      }
+      value
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  __escaped = map_keys(object!(__safe.source), recursive: true) -> |key| {
+      replace(replace(key, "~", "~0"), ".", "~1")
+  }
+  __flat = flatten(__escaped)
+  __residual = {}
+  for_each(__flat) -> |key, value| {
+      key = replace(replace(key, "~1", "."), "~0", "~")
+      # flatten stops at arrays, so objects inside an array still carry the
+      # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+      if is_array(value) || is_object(value) {
+          value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+              replace(replace(inner, "~1", "."), "~0", "~")
+          }, ["v"])
+      }
+      __same = includes(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __same = __same || includes(__represented, to_string(value) ?? "")
+      }
+      # A scalar array is consumed only if every element is represented. Preserve
+      # partially represented arrays intact, including their ordering and repeats.
+      if is_array(value) && !is_empty(array!(value)) {
+          __all_items = true
+          for_each(array!(value)) -> |_index, item| {
+              __item_same = includes(__represented, encode_json(item))
+              if !is_object(item) && !is_array(item) && !is_null(item) {
+                  __item_same = __item_same || includes(__represented, to_string(item) ?? "")
+              }
+              if is_object(item) || is_array(item) || !__item_same { __all_items = false }
+          }
+          __same = __same || __all_items
+      }
+      if __same && includes(__candidates, key) { __consumed = push(__consumed, key) }
+      # Redacted leaves always remain visible. Do not spill a copy of the raw body.
+      if (!includes(__consumed, key) || value == "<redacted>") && value != __raw_body {
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          __base = join!(__parts, ".")
+          __key = __base
+          __suffix = 2
+          if includes(keys(__residual), __key) {
+              for_each(__flat) -> |_other_key, _other_value| {
+                  if includes(keys(__residual), __key) {
+                      __key = __base + "_" + to_string(__suffix)
+                      __suffix = __suffix + 1
+                  }
+              }
+          }
+          __complex = is_object(value)
+          if is_array(value) {
+              for_each(array!(value)) -> |_index, item| {
+                  if is_object(item) || is_array(item) { __complex = true }
+              }
+          }
+          __spill = if __complex { encode_json(value) } else { value }
+          __residual = set!(__residual, [__key], __spill)
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  __original_values = []
+  for_each(flatten(__source_kv)) -> |_key, value| {
+      __original_values = push(__original_values, encode_json(value))
+      if !is_object(value) && !is_array(value) { __original_values = push(__original_values, to_string(value) ?? "") }
+  }
+  for_each(flatten(__existing)) -> |key, value| {
+      __source_alias = includes(__original_values, encode_json(value)) || includes(__original_values, to_string(value) ?? "")
+      __mapped_alias = includes(__represented, encode_json(value)) || includes(__represented, to_string(value) ?? "")
+      __decoded, __decode_err = parse_json(string(value) ?? "")
+      __encoded_container = __decode_err == null && (is_object(__decoded) || is_array(__decoded))
+      if !is_null(value) && value != "" && !__source_alias && !__mapped_alias && !__encoded_container && value != __raw_body {
+          # Existing aggregates may contain sensitive descendants; the canonical
+          # source spill above is the authoritative representation of containers.
+          if !is_array(value) && !is_object(value) && !match(downcase(key), r'password|secret|authorization|token') {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # attachment_protect_malicious.json
+  - raw: "{\"type\":\"attachment_protect\",\"datetime\":\"2026-08-18T12:41:19+0000\",\"acc\":\"C1A2B3\",\"fileName\":\"payroll.doc\",\"fileHash\":\"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\",\"fileExt\":\"doc\",\"result\":\"malicious\",\"actionTriggered\":\"Hold for review\",\"details\":\"Macro detected: AutoOpen\",\"definition\":\"Default Attachment Protect\",\"senderAddress\":\"attacker@evil.example\",\"recipientAddress\":\"bob.smith@example.com\",\"subject\":\"Payroll update\",\"messageId\":\"<CA+evil999@mail.evil.example>\",\"route\":\"inbound\"}"
+    expect:
+      "class_uid": 4009
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  # attachment_protect_safe.json
+  - raw: "{\"type\":\"attachment_protect\",\"datetime\":\"2026-08-18T12:34:02+0000\",\"acc\":\"C1A2B3\",\"fileName\":\"invoice_aug.pdf\",\"fileHash\":\"5d41402abc4b2a76b9719d911017c592\",\"fileExt\":\"pdf\",\"result\":\"safe\",\"actionTriggered\":\"Safe file delivered\",\"definition\":\"Default Attachment Protect\",\"senderAddress\":\"partner@supplier.example\",\"recipientAddress\":\"jane.doe@example.com\",\"subject\":\"August invoice\",\"messageId\":\"<CA+abc123@mail.supplier.example>\",\"route\":\"inbound\"}"
+    expect:
+      "class_uid": 4009
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  # malformed.txt
+  - raw: "mimecast not json"
+    expect:
+      "class_uid": 0
+      "activity_id": 0
+      "metadata.version": "1.9.0"
+  # receipt_accepted.json
+  - raw: "{\"type\":\"receipt\",\"datetime\":\"2026-08-18T12:33:44+0000\",\"aCode\":\"abc123\",\"acc\":\"C1A2B3\",\"Sender\":\"partner@supplier.example\",\"Rcpt\":\"jane.doe@example.com\",\"Subject\":\"August invoice\",\"MsgId\":\"<CA+abc123@mail.supplier.example>\",\"IP\":\"198.51.100.77\",\"Act\":\"Acc\",\"Dir\":\"Inbound\",\"SpamScore\":\"2\",\"SpamInfo\":\"[]\",\"SpamLimit\":\"5\",\"AttNames\":\"invoice_aug.pdf\",\"AttCnt\":\"1\",\"MsgSz\":\"84213\",\"TlsVer\":\"TLSv1.3\",\"Cphr\":\"TLS_AES_256_GCM_SHA384\",\"VirusFound\":\"\",\"SpamProcessingDetail\":{\"spf\":{\"allow\":\"true\",\"info\":\"Pass\"},\"dkim\":{\"allow\":\"true\",\"info\":\"Pass\"},\"dmarc\":{\"allow\":\"true\",\"info\":\"Pass\"}}}"
+    expect:
+      "class_uid": 4009
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  # receipt_held_virus.json
+  - raw: "{\"type\":\"receipt\",\"datetime\":\"2026-08-18T12:40:02+0000\",\"acc\":\"C1A2B3\",\"Sender\":\"attacker@evil.example\",\"Rcpt\":\"bob.smith@example.com\",\"Subject\":\"Payroll update\",\"MsgId\":\"<CA+evil999@mail.evil.example>\",\"IP\":\"198.51.100.201\",\"Act\":\"Hld\",\"Dir\":\"Inbound\",\"SpamScore\":\"9\",\"SpamInfo\":\"[Spam]\",\"SpamLimit\":\"5\",\"AttNames\":\"payroll.doc,readme.txt\",\"AttCnt\":\"2\",\"MsgSz\":\"120043\",\"VirusFound\":\"Trojan.Generic.KDZ\",\"SpamProcessingDetail\":{\"spf\":{\"allow\":\"false\",\"info\":\"Fail\"},\"dkim\":{\"allow\":\"false\",\"info\":\"None\"},\"dmarc\":{\"allow\":\"false\",\"info\":\"Fail\"}}}"
+    expect:
+      "class_uid": 4009
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  # receipt_outbound.json
+  - raw: "{\"type\":\"receipt\",\"datetime\":\"2026-08-18T13:01:12+0000\",\"acc\":\"C1A2B3\",\"Sender\":\"jane.doe@example.com\",\"Rcpt\":\"customer@client.example\",\"Subject\":\"Re: contract\",\"MsgId\":\"<CA+out555@mail.example.com>\",\"IP\":\"192.0.2.10\",\"Act\":\"Acc\",\"Dir\":\"Outbound\",\"MsgSz\":\"9421\",\"TlsVer\":\"TLSv1.2\"}"
+    expect:
+      "class_uid": 4009
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # unknown_type.json
+  - raw: "{\"type\":\"impersonation_protect\",\"datetime\":\"2026-08-18T13:20:00+0000\",\"acc\":\"C1A2B3\",\"senderAddress\":\"ceo@example.co\",\"recipientAddress\":\"finance@example.com\",\"subject\":\"Urgent wire transfer\",\"messageId\":\"<CA+imp001@mail.example.co>\",\"definition\":\"Impersonation Protect\",\"hits\":\"3\"}"
+    expect:
+      "class_uid": 4009
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  # url_protect_allow.json
+  - raw: "{\"type\":\"url_protect\",\"datetime\":\"2026-08-18T12:50:00+0000\",\"acc\":\"C1A2B3\",\"url\":\"https://docs.supplier.example/invoice/8812\",\"category\":\"Business\",\"scanResult\":\"clean\",\"action\":\"allow\",\"sendingIp\":\"198.51.100.77\",\"userEmailAddress\":\"jane.doe@example.com\",\"fromUserEmailAddress\":\"partner@supplier.example\",\"Subject\":\"August invoice\",\"messageId\":\"<CA+abc123@mail.supplier.example>\",\"route\":\"inbound\"}"
+    expect:
+      "class_uid": 4009
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  # url_protect_block.json
+  - raw: "{\"type\":\"url_protect\",\"datetime\":\"2026-08-18T12:45:31+0000\",\"acc\":\"C1A2B3\",\"url\":\"https://login.microsoftonline.evil.example/verify?u=jane\",\"category\":\"Phishing & Fraud\",\"scanResult\":\"malicious\",\"action\":\"block\",\"sendingIp\":\"198.51.100.201\",\"userEmailAddress\":\"jane.doe@example.com\",\"fromUserEmailAddress\":\"attacker@evil.example\",\"Subject\":\"Action required: verify your account\",\"messageId\":\"<CA+phish777@mail.evil.example>\",\"route\":\"inbound\",\"actions\":\"block\",\"adminOverride\":\"N/A\",\"userOverride\":\"None\"}"
+    expect:
+      "class_uid": 4009
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("mimecast|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "mimecast not json"
+    expect:
+      "metadata.uid": "b9fcb557bfd7bbbd68591e5eaca79f0b3953947f283052a3f93d0951764a4bde"
+  # NAN-3702 (existing sample): metadata.uid is sha256("mimecast|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"type\":\"attachment_protect\",\"datetime\":\"2026-08-18T12:41:19+0000\",\"acc\":\"C1A2B3\",\"fileName\":\"payroll.doc\",\"fileHash\":\"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\",\"fileExt\":\"doc\",\"result\":\"malicious\",\"actionTriggered\":\"Hold for review\",\"details\":\"Macro detected: AutoOpen\",\"definition\":\"Default Attachment Protect\",\"senderAddress\":\"attacker@evil.example\",\"recipientAddress\":\"bob.smith@example.com\",\"subject\":\"Payroll update\",\"messageId\":\"<CA+evil999@mail.evil.example>\",\"route\":\"inbound\"}"
+    expect:
+      "metadata.uid": "792d51bbe10f41ddab36a23c87169bdac5bddb9407c60dc40faaef0a285a0786"

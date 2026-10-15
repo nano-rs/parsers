@@ -1,26 +1,32 @@
 name: windows_event_ocsf
 display_name: Windows Event Log (OCSF)
-version: "1.1.0"
+version: "1.3.1"
 description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses Windows Security Event Log records (JSON; top-level event_id +
-  event_data) into complete OCSF 1.8.0 records, routed by EventID:
-    4624 Successful Logon       -> Authentication 3002 (Logon, Success)
-    4625 Failed Logon           -> Authentication 3002 (Logon, Failure)
-    4634 Logoff                 -> Authentication 3002 (Logoff)
-    4672 Special Privileges     -> Authorize Session 3003 (Assign Privileges)
-    4688 Process Creation       -> Process Activity 1007 (Launch)
+  event_data) into complete OCSF 1.9.0 records, routed by EventID:
+    4624 Successful Logon   -> Authentication 3002 (Logon, Success)
+    4625 Failed Logon       -> Authentication 3002 (Logon, Failure)
+    4634 Logoff             -> Authentication 3002 (Logoff)
+    4672 Special Privileges -> Authorize Session 3003 (Assign Privileges)
+    4688 Process Creation   -> Process Activity 1007 (Launch)
   Emits the whole OCSF object on the root so it lands in ocsf_logs.event and the
-  promoted columns materialize. Mirrors the UDM windows_event parser but targets
-  OCSF instead of `.udm.*`.
+  promoted columns materialize. Carries metadata.profiles ["host"] because the
+  `device` object is profile-bound in OCSF 1.9. Mirrors the UDM windows_event
+  parser but targets OCSF instead of `.udm.*`.
+ocsf_version: "1.9.0"
 match_values:
   - windows_event
 category: endpoint
 vendor: "Microsoft"
 product: "Windows"
 parser_vrl: |
-  # Windows Security Event Log JSON -> OCSF 1.8.0. Emits the COMPLETE record on root.
+  # Windows Security Event Log JSON -> OCSF 1.9.0. Emits the COMPLETE record on root.
   raw_log = string!(.message)
+  __raw_body = raw_log
+  __source_kv = {}
   parsed, err = parse_json(raw_log)
+  __source_kv = object(parsed) ?? {}
 
   if err != null || !is_object(parsed) {
       . = {
@@ -31,11 +37,14 @@ parser_vrl: |
           "severity_id": 1,
           "status_id": 0,
           "time": 0,
-          "message": raw_log,
+          "raw_data": raw_log,
+          # 3002 requires `user` plus one of service/dst_endpoint, even on the
+          # unparseable path.
+          "user": { "name": "" },
+          "dst_endpoint": { "hostname": "" },
           "metadata": {
-              "version": "1.8.0",
-              # NAN-3702: deterministic, so a redelivered unparseable record
-              # dedupes in the lake instead of landing as a second row.
+              "version": "1.9.0",
+              "profiles": ["host"],
               "uid": sha2("windows_event|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "product": { "name": "Windows", "vendor_name": "Microsoft" }
@@ -87,14 +96,18 @@ parser_vrl: |
               "pid": parse_int(string(ed.NewProcessId) ?? "0") ?? 0,
               "file": { "name": proc_name, "path": npn, "type_id": 1 }
           }
-          ocsf.actor = {
-              "process": { "name": parent_name, "file": { "name": parent_name, "path": ppn, "type_id": 1 } },
-              "user": { "name": downcase(string(ed.SubjectUserName) ?? "") }
-          }
-          ocsf.user = {
+          actor_user = {
               "name": downcase(string(ed.SubjectUserName) ?? ""),
               "domain": downcase(string(ed.SubjectDomainName) ?? ""),
               "uid": string(ed.SubjectUserSid) ?? ""
+          }
+          ocsf.actor = {
+              "process": {
+                  "name": parent_name,
+                  "pid": parse_int(string(ed.ProcessId) ?? "0") ?? 0,
+                  "file": { "name": parent_name, "path": ppn, "type_id": 1 }
+              },
+              "user": actor_user
           }
           ocsf.device = { "hostname": computer }
           ocsf.status_id = 1
@@ -122,7 +135,6 @@ parser_vrl: |
           ocsf.privileges = privileges
           ocsf.device = { "hostname": computer }
           ocsf.session = { "uid": string(ed.SubjectLogonId) ?? "" }
-          ocsf.unmapped = { "windows_event_id": eid }
       } else {
           # Authentication family -> 3002
           ocsf.class_uid = 3002
@@ -160,10 +172,11 @@ parser_vrl: |
           ocsf.severity_id = severity_id
           ocsf.severity = severity
           ocsf.user = { "name": downcase(uname), "domain": downcase(udom), "uid": usid }
-          ocsf.is_mfa = false
-
-          logon_id = string(ed.TargetLogonId) ?? string(ed.SubjectLogonId) ?? ""
-          if logon_id != "" { ocsf.session = { "uid": logon_id } }
+          # NAN-2986: the session is the TARGET logon's. A failed 4625 has no
+          # TargetLogonId, and falling back to SubjectLogonId stamped the
+          # caller's (usually 0x0 = no session) id as the failed logon's session.
+          logon_id = string(ed.TargetLogonId) ?? ""
+          if logon_id != "" && logon_id != "0x0" { ocsf.session = { "uid": logon_id } }
           if auth_protocol_id != 0 {
               ocsf.auth_protocol_id = auth_protocol_id
               ocsf.auth_protocol = pkg
@@ -184,32 +197,47 @@ parser_vrl: |
           ocsf.dst_endpoint = { "hostname": computer }
           ocsf.device = { "hostname": computer }
 
-          unmapped = { "windows_event_id": eid, "logon_type": string(ed.LogonType) ?? null }
-          if eid == 4625 {
-              unmapped.failure_reason = string(ed.FailureReason) ?? null
-              unmapped.status = string(ed.Status) ?? null
-              unmapped.sub_status = string(ed.SubStatus) ?? null
+          logon_type_raw = string(ed.LogonType) ?? ""
+          logon_type_id = to_int(ed.LogonType) ?? 0
+          logon_type = "Unknown"
+          if logon_type_id == 1 { logon_type = "System" }
+          if logon_type_id == 2 { logon_type = "Interactive" }
+          if logon_type_id == 3 { logon_type = "Network" }
+          if logon_type_id == 4 { logon_type = "Batch" }
+          if logon_type_id == 5 { logon_type = "OS Service" }
+          if logon_type_id == 7 { logon_type = "Unlock" }
+          if logon_type_id == 8 { logon_type = "Network Cleartext" }
+          if logon_type_id == 9 { logon_type = "New Credentials" }
+          if logon_type_id == 10 { logon_type = "Remote Interactive" }
+          if logon_type_id == 11 { logon_type = "Cached Interactive" }
+          if logon_type_id == 12 { logon_type = "Cached Remote Interactive" }
+          if logon_type_id == 13 { logon_type = "Cached Unlock" }
+          if logon_type_raw != "" {
+              if logon_type_id != 1 && logon_type_id != 2 && logon_type_id != 3 && logon_type_id != 4 && logon_type_id != 5 && logon_type_id != 7 && logon_type_id != 8 && logon_type_id != 9 && logon_type_id != 10 && logon_type_id != 11 && logon_type_id != 12 && logon_type_id != 13 {
+                  logon_type_id = 99
+                  logon_type = logon_type_raw
+              }
+              ocsf.logon_type_id = logon_type_id
+              ocsf.logon_type = logon_type
+              ocsf.is_remote = logon_type_id == 3 || logon_type_id == 8 || logon_type_id == 10 || logon_type_id == 12
+              ocsf.is_cleartext = logon_type_id == 8
           }
-          ocsf.unmapped = unmapped
+
+          if eid == 4625 {
+              ocsf.status_code = string(ed.Status) ?? ""
+              ocsf.status_detail = string(ed.FailureReason) ?? ""
+              ocsf.unmapped = { "sub_status": string(ed.SubStatus) ?? null }
+          }
       }
 
       # ---- common envelope ----
       ocsf.type_uid = to_int(ocsf.class_uid) * 100 + to_int(ocsf.activity_id)
       ocsf.time = time_ms
       ocsf.message = msg
-      # NAN-1403: record_id arrives as an integer and string() errors on
-      # integers; to_string coerces int → decimal string, string → itself,
-      # null/absent → "".
-      # NAN-3702: the lake drops a row whose (event hour, metadata.uid) it
-      # already stored, so the uid must be the same every time the same record
-      # arrives and must differ between records. A bare record_id is neither:
-      # it is a per-host, per-channel sequence, so two hosts (or channels) emit
-      # the same number in the same hour and all but one were dropped, and it
-      # restarts after a log reset. The uid is therefore the host/channel/
-      # provider/record/time composite (the same form as the ocsf-1.9 parser),
-      # and record_id itself moves to original_event_uid. Without the parts of
-      # the composite, the raw record is hashed, which a redelivery repeats
-      # byte for byte.
+      ocsf.raw_data = raw_log
+      # Windows record_id is only unique within a host/channel stream and can be
+      # reused after a log reset. Include the source event time so replaying the
+      # same event stays idempotent while a later reused RecordID cannot collide.
       record_id = to_string(p.record_id) ?? ""
       log_name = downcase(string(p.channel) ?? "Security")
       log_provider = downcase(string(p.provider_name) ?? "Microsoft-Windows-Security-Auditing")
@@ -218,38 +246,271 @@ parser_vrl: |
           record_uid = join!(["windows_event", computer, log_name, log_provider, record_id, ts_str], "|")
       }
       if record_uid == "" { record_uid = sha2("windows_event|raw|" + raw_log, variant: "SHA-256") }
+      if is_object(ocsf.device) { ocsf.device.type_id = 0 }
       ocsf.metadata = {
-          "version": "1.8.0",
+          "version": "1.9.0",
+          "profiles": ["host"],
           "uid": record_uid,
+          "event_code": to_string(eid),
           "log_name": string(p.channel) ?? "Security",
           "log_provider": string(p.provider_name) ?? "Microsoft-Windows-Security-Auditing",
           "product": { "name": "Windows", "vendor_name": "Microsoft" }
       }
 
+      # NAN-3713: original_event_uid carries the vendor's bare record number
+      # (the per-host, per-channel sequence), not the composite uid above, so
+      # it stays searchable as the number Windows shows. Omitted when absent.
       if record_id != "" { ocsf.metadata.original_event_uid = record_id }
+
+      # NAN-2986: drop empty user identifiers (a 4625 for an unknown account
+      # has no TargetUserSid). "" is not an identifier and matched every
+      # `user.uid=*` hunt. `user` itself stays: 3002/3003 require it.
+      if is_object(ocsf.user) {
+          for_each(["uid", "domain"]) -> |_i, attr| {
+              if (string(get!(ocsf.user, [attr])) ?? "") == "" { ocsf.user = remove!(object!(ocsf.user), [attr]) }
+          }
+      }
 
       . = ocsf
   }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  __mapped = object!(parse_json!(encode_json(.)))
+  __existing = object(__mapped.unmapped) ?? {}
+  __discard = del(__mapped.raw_data)
+  __discard = del(__mapped.unmapped)
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __represented = []
+  __walk = map_values(__mapped, recursive: true) -> |value| {
+      __represented = push(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __represented = push(__represented, to_string(value) ?? "")
+      }
+      value
+  }
+  __consumed = []
+  # BEGIN parser-specific transformations
+  # computer: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # event_data.SubjectUserName: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # event_data.SubjectDomainName: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # channel: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # provider_name: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # timestamp: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # event_data.TargetDomainName: Case normalization already performed by the parser; observed at user.domain, and checked against the emitted branch.
+  # event_data.WorkstationName: Case normalization already performed by the parser; observed at src_endpoint.hostname, and checked against the emitted branch.
+  # event_data.NewProcessId: Parsed hexadecimal process ID or access mask is represented as an integer at this destination.
+  # event_data.ProcessId: Parsed hexadecimal process ID or access mask is represented as an integer at this destination.
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = ["channel", "computer", "event_data", "event_data.AuthenticationPackageName", "event_data.CommandLine", "event_data.FailureReason", "event_data.IpAddress", "event_data.IpPort", "event_data.LogonType", "event_data.NewProcessId", "event_data.NewProcessName", "event_data.ParentProcessName", "event_data.PrivilegeList", "event_data.ProcessId", "event_data.Status", "event_data.SubStatus", "event_data.SubjectDomainName", "event_data.SubjectLogonId", "event_data.SubjectUserName", "event_data.SubjectUserSid", "event_data.TargetDomainName", "event_data.TargetLogonId", "event_data.TargetUserName", "event_data.TargetUserSid", "event_data.WorkstationName", "event_id", "host", "message", "provider_name", "record_id", "timestamp"]
+  __preserve = []
+  __rules = array!(parse_json!("[{\"source\":\"computer\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"event_data.SubjectUserName\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"event_data.SubjectDomainName\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"channel\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"provider_name\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"timestamp\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Successful ISO timestamp conversion to the selected event clock in milliseconds.\"},{\"source\":\"event_data.TargetDomainName\",\"kind\":\"lowercase\",\"reason\":\"Case normalization already performed by the parser; observed at user.domain, and checked against the emitted branch.\"},{\"source\":\"event_data.WorkstationName\",\"kind\":\"lowercase\",\"reason\":\"Case normalization already performed by the parser; observed at src_endpoint.hostname, and checked against the emitted branch.\"},{\"source\":\"event_data.NewProcessId\",\"kind\":\"hex\",\"target\":\"process.pid\",\"reason\":\"Parsed hexadecimal process ID or access mask is represented as an integer at this destination.\"},{\"source\":\"event_data.ProcessId\",\"kind\":\"hex\",\"target\":\"actor.process.pid\",\"reason\":\"Parsed hexadecimal process ID or access mask is represented as an integer at this destination.\"}]"))
+  __source_flat = flatten(__source_kv)
+  for_each(__rules) -> |_index, rule| {
+      __source_key = string!(rule.source)
+      __value = get!(__source_flat, [__source_key])
+      __expected = null
+      __valid = false
+      if rule.kind == "lowercase" && is_string(__value) {
+          __expected = downcase(string!(__value))
+          __valid = true
+      } else if rule.kind == "epoch_ms" {
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", string(rule.format) ?? "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              __valid = true
+          }
+      } else if rule.kind == "scale" {
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * to_float!(rule.factor))
+              __valid = true
+          }
+      } else if rule.kind == "hex" {
+          __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
+          __integer, __integer_err = parse_int(__hex, base: 16)
+          __expected = __integer
+          __valid = is_string(__value) && starts_with(downcase(string(__value) ?? ""), "0x") && __integer_err == null
+      } else if rule.kind == "enum" {
+          __expected = get!(object!(rule.values), [downcase(to_string(__value) ?? "")])
+          __valid = __expected != null
+      }
+      __matches = includes(__represented, encode_json(__expected))
+      if is_string(rule.target) { __matches = get!(., split(string!(rule.target), ".")) == __expected }
+      if __valid && __matches { __consumed = push(__consumed, __source_key) }
+  }
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  __safe = map_values(object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing}))), recursive: true) -> |value| {
+      if is_object(value) {
+          # Header/parameter arrays commonly encode sensitive keys as name/value
+          # or Key/Value objects instead of using the secret name as an object key.
+          __sensitive_pair = false
+          for_each(object!(value)) -> |key, child| {
+              if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                  __sensitive_pair = true
+              }
+          }
+          for_each(object!(value)) -> |key, _child| {
+              if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                  value = set!(value, [key], "<redacted>")
+              }
+          }
+      }
+      value
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  __escaped = map_keys(object!(__safe.source), recursive: true) -> |key| {
+      replace(replace(key, "~", "~0"), ".", "~1")
+  }
+  __flat = flatten(__escaped)
+  __residual = {}
+  for_each(__flat) -> |key, value| {
+      key = replace(replace(key, "~1", "."), "~0", "~")
+      # flatten stops at arrays, so objects inside an array still carry the
+      # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+      if is_array(value) || is_object(value) {
+          value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+              replace(replace(inner, "~1", "."), "~0", "~")
+          }, ["v"])
+      }
+      __same = includes(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __same = __same || includes(__represented, to_string(value) ?? "")
+      }
+      # A scalar array is consumed only if every element is represented. Preserve
+      # partially represented arrays intact, including their ordering and repeats.
+      if is_array(value) && !is_empty(array!(value)) {
+          __all_items = true
+          for_each(array!(value)) -> |_index, item| {
+              __item_same = includes(__represented, encode_json(item))
+              if !is_object(item) && !is_array(item) && !is_null(item) {
+                  __item_same = __item_same || includes(__represented, to_string(item) ?? "")
+              }
+              if is_object(item) || is_array(item) || !__item_same { __all_items = false }
+          }
+          __same = __same || __all_items
+      }
+      if __same && includes(__candidates, key) { __consumed = push(__consumed, key) }
+      # Redacted leaves always remain visible. Do not spill a copy of the raw body.
+      if (!includes(__consumed, key) || value == "<redacted>") && value != __raw_body {
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          __base = join!(__parts, ".")
+          __key = __base
+          __suffix = 2
+          if includes(keys(__residual), __key) {
+              for_each(__flat) -> |_other_key, _other_value| {
+                  if includes(keys(__residual), __key) {
+                      __key = __base + "_" + to_string(__suffix)
+                      __suffix = __suffix + 1
+                  }
+              }
+          }
+          __complex = is_object(value)
+          if is_array(value) {
+              for_each(array!(value)) -> |_index, item| {
+                  if is_object(item) || is_array(item) { __complex = true }
+              }
+          }
+          __spill = if __complex { encode_json(value) } else { value }
+          __residual = set!(__residual, [__key], __spill)
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  __original_values = []
+  for_each(flatten(__source_kv)) -> |_key, value| {
+      __original_values = push(__original_values, encode_json(value))
+      if !is_object(value) && !is_array(value) { __original_values = push(__original_values, to_string(value) ?? "") }
+  }
+  for_each(flatten(__existing)) -> |key, value| {
+      __source_alias = includes(__original_values, encode_json(value)) || includes(__original_values, to_string(value) ?? "")
+      __mapped_alias = includes(__represented, encode_json(value)) || includes(__represented, to_string(value) ?? "")
+      __decoded, __decode_err = parse_json(string(value) ?? "")
+      __encoded_container = __decode_err == null && (is_object(__decoded) || is_array(__decoded))
+      if !is_null(value) && value != "" && !__source_alias && !__mapped_alias && !__encoded_container && value != __raw_body {
+          # Existing aggregates may contain sensitive descendants; the canonical
+          # source spill above is the authoritative representation of containers.
+          if !is_array(value) && !is_object(value) && !match(downcase(key), r'password|secret|authorization|token') {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
 samples:
-  # NAN-3702: host/channel/provider/record/time composite; record_id moves to original_event_uid.
-  - raw: "{\"event_id\":4624,\"record_id\":12345,\"channel\":\"Security\",\"provider_name\":\"Microsoft-Windows-Security-Auditing\",\"computer\":\"DC-01.corp.local\",\"timestamp\":\"2026-08-18T11:00:00Z\",\"event_data\":{\"TargetUserName\":\"alice\",\"TargetDomainName\":\"CORP\",\"TargetUserSid\":\"S-1-5-21-1-2-3-1001\",\"TargetLogonId\":\"0x3e7abc\",\"LogonType\":\"10\",\"IpAddress\":\"10.2.3.4\",\"IpPort\":\"49152\",\"WorkstationName\":\"WKS-09\"}}"
+  - raw: "{\"event_id\":4624,\"record_id\":5001,\"channel\":\"Security\",\"provider_name\":\"Microsoft-Windows-Security-Auditing\",\"computer\":\"DC-01.corp.local\",\"timestamp\":\"2026-08-18T11:00:00Z\",\"message\":\"An account was successfully logged on.\",\"event_data\":{\"TargetUserName\":\"alice\",\"TargetDomainName\":\"CORP\",\"TargetUserSid\":\"S-1-5-21-1-2-3-1001\",\"TargetLogonId\":\"0x3e7abc\",\"SubjectUserName\":\"DC-01$\",\"LogonType\":\"10\",\"AuthenticationPackageName\":\"Kerberos\",\"IpAddress\":\"10.2.3.4\",\"IpPort\":\"49152\",\"WorkstationName\":\"WKS-09\",\"LogonProcessName\":\"Kerberos\"}}"
     expect:
       "class_uid": 3002
-      "metadata.uid": "windows_event|dc-01.corp.local|security|microsoft-windows-security-auditing|12345|2026-08-18T11:00:00Z"
-      "metadata.original_event_uid": "12345"
-  # NAN-3702: same record_id and hour on another host: a different uid, so it is not dropped as a duplicate.
-  - raw: "{\"event_id\":4624,\"record_id\":12345,\"channel\":\"Security\",\"provider_name\":\"Microsoft-Windows-Security-Auditing\",\"computer\":\"DC-02.corp.local\",\"timestamp\":\"2026-08-18T11:00:00Z\",\"event_data\":{\"TargetUserName\":\"alice\",\"TargetDomainName\":\"CORP\",\"TargetUserSid\":\"S-1-5-21-1-2-3-1001\",\"TargetLogonId\":\"0x3e7abc\",\"LogonType\":\"10\",\"IpAddress\":\"10.2.3.4\",\"IpPort\":\"49152\",\"WorkstationName\":\"WKS-09\"}}"
-    expect:
-      "metadata.uid": "windows_event|dc-02.corp.local|security|microsoft-windows-security-auditing|12345|2026-08-18T11:00:00Z"
-      "metadata.original_event_uid": "12345"
-  # NAN-3702: no record_id: the raw record is hashed.
-  - raw: "{\"event_id\":4624,\"channel\":\"Security\",\"provider_name\":\"Microsoft-Windows-Security-Auditing\",\"computer\":\"DC-01.corp.local\",\"timestamp\":\"2026-08-18T11:00:00Z\",\"event_data\":{\"TargetUserName\":\"alice\",\"TargetDomainName\":\"CORP\",\"TargetUserSid\":\"S-1-5-21-1-2-3-1001\",\"TargetLogonId\":\"0x3e7abc\",\"LogonType\":\"10\",\"IpAddress\":\"10.2.3.4\",\"IpPort\":\"49152\",\"WorkstationName\":\"WKS-09\"}}"
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":4625,\"record_id\":5002,\"computer\":\"DC-01\",\"timestamp\":\"2026-08-18T11:01:00Z\",\"event_data\":{\"TargetUserName\":\"admin\",\"TargetDomainName\":\"CORP\",\"LogonType\":\"3\",\"AuthenticationPackageName\":\"NTLM\",\"IpAddress\":\"203.0.113.9\",\"IpPort\":\"445\",\"Status\":\"0xC000006D\",\"SubStatus\":\"0xC000006A\",\"FailureReason\":\"Unknown user name or bad password\",\"WorkstationName\":\"EVIL\"}}"
     expect:
       "class_uid": 3002
-      "metadata.uid": "25d863b1c0098ba565cc4564709e98f8beb9705d00f2eaa51339ccf3bd72bb1a"
-      "metadata.original_event_uid": "<missing>"
-  # NAN-3702: unparseable record (error branch).
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":4634,\"record_id\":5003,\"computer\":\"DC-01\",\"timestamp\":\"2026-08-18T11:02:00Z\",\"event_data\":{\"TargetUserName\":\"alice\",\"TargetDomainName\":\"CORP\",\"TargetLogonId\":\"0x3e7abc\",\"LogonType\":\"2\"}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":4672,\"record_id\":5004,\"computer\":\"DC-01\",\"timestamp\":\"2026-08-18T11:03:00Z\",\"event_data\":{\"SubjectUserName\":\"admin\",\"SubjectDomainName\":\"CORP\",\"SubjectUserSid\":\"S-1-5-21-1-2-3-500\",\"SubjectLogonId\":\"0x3e7abd\",\"PrivilegeList\":\"SeDebugPrivilege SeTcbPrivilege\"}}"
+    expect:
+      "class_uid": 3003
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":4688,\"record_id\":5005,\"computer\":\"WKS-09\",\"timestamp\":\"2026-08-18T11:04:00Z\",\"event_data\":{\"NewProcessName\":\"C:\\\\Windows\\\\System32\\\\powershell.exe\",\"NewProcessId\":\"0x1a4\",\"ProcessId\":\"0x2b8\",\"ParentProcessName\":\"C:\\\\Windows\\\\explorer.exe\",\"CommandLine\":\"powershell -enc AAA\",\"SubjectUserName\":\"alice\",\"SubjectDomainName\":\"CORP\",\"SubjectUserSid\":\"S-1-5-21-1-2-3-1001\"}}"
+    expect:
+      "class_uid": 1007
+      "activity_id": 1
+      "metadata.version": "1.9.0"
   - raw: "<Event xmlns=not-json/>"
     expect:
-      "metadata.log_level": "error"
+      "class_uid": 3002
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  - raw: "{\"event_id\":4776,\"record_id\":5006,\"computer\":\"DC-01\",\"timestamp\":\"2026-08-18T11:05:00Z\",\"event_data\":{\"TargetUserName\":\"bob\"}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  # NAN-2986: log-blaster 4625 for an account with no TargetUserSid and no
+  # TargetLogonId. No empty user.uid, and no session borrowed from the
+  # caller's SubjectLogonId (0x0).
+  - raw: "{\"channel\":\"Security\",\"computer\":\"WS-HR-049.corp.local\",\"event_data\":{\"AuthenticationPackageName\":\"NTLM\",\"FailureReason\":\"Account locked out.\",\"IpAddress\":\"10.1.2.230\",\"IpPort\":\"53395\",\"LogonType\":\"2\",\"Status\":\"%%2304\",\"SubStatus\":\"0xC000006A\",\"SubjectDomainName\":\"-\",\"SubjectLogonId\":\"0x0\",\"SubjectUserName\":\"-\",\"TargetDomainName\":\"CORP.LOCAL\",\"TargetUserName\":\"smartinez\",\"WorkstationName\":\"WS-FIN-049\"},\"event_id\":4625,\"host\":\"WS-HR-049.corp.local\",\"keyword_names\":[\"Audit Failure\"],\"keywords\":\"0x8020000000000000\",\"level\":\"Information\",\"level_value\":0,\"message\":\"An account failed to log on.\",\"process_id\":1899,\"provider_guid\":\"{54849625-5478-4994-a5ba-3e3b0328c30d}\",\"provider_name\":\"Microsoft-Windows-Security-Auditing\",\"record_id\":1790622167378497,\"task\":12544,\"task_name\":\"Logon\",\"thread_id\":4302,\"timestamp\":\"2026-09-28T17:00:00.000426Z\",\"version\":2}"
+    expect:
+      "class_uid": 3002
+      "status": "Failure"
+      "user.name": "smartinez"
+      "user.uid": "<missing>"
+      "session.uid": "<missing>"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("windows_event|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "<Event xmlns=not-json/>"
+    expect:
       "metadata.uid": "e5591ec6df8f7d202c9cc670f84216a0db177d70d3d56a26835322e8f52490f1"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("windows_event|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"event_id\":4624,\"channel\":\"Security\",\"provider_name\":\"Microsoft-Windows-Security-Auditing\",\"computer\":\"DC-01.corp.local\",\"timestamp\":\"2026-08-18T11:00:00Z\",\"message\":\"An account was successfully logged on.\",\"event_data\":{\"TargetUserName\":\"alice\",\"TargetDomainName\":\"CORP\",\"TargetUserSid\":\"S-1-5-21-1-2-3-1001\",\"TargetLogonId\":\"0x3e7abc\",\"SubjectUserName\":\"DC-01$\",\"LogonType\":\"10\",\"AuthenticationPackageName\":\"Kerberos\",\"IpAddress\":\"10.2.3.4\",\"IpPort\":\"49152\",\"WorkstationName\":\"WKS-09\",\"LogonProcessName\":\"Kerberos\"}}"
+    expect:
+      "metadata.uid": "86d88cc2cbc4ab87a875f930d33064dd162b24b7c7256bc1cdf7da0c6c6d85cf"
+      "metadata.original_event_uid": "<missing>"
+  # NAN-3713: original_event_uid is the bare record number; metadata.uid stays the composite
+  - raw: "{\"event_id\":4624,\"record_id\":5001,\"channel\":\"Security\",\"provider_name\":\"Microsoft-Windows-Security-Auditing\",\"computer\":\"DC-01.corp.local\",\"timestamp\":\"2026-08-18T11:00:00Z\",\"message\":\"An account was successfully logged on.\",\"event_data\":{\"TargetUserName\":\"alice\",\"TargetDomainName\":\"CORP\",\"TargetUserSid\":\"S-1-5-21-1-2-3-1001\",\"TargetLogonId\":\"0x3e7abc\",\"SubjectUserName\":\"DC-01$\",\"LogonType\":\"10\",\"AuthenticationPackageName\":\"Kerberos\",\"IpAddress\":\"10.2.3.4\",\"IpPort\":\"49152\",\"WorkstationName\":\"WKS-09\",\"LogonProcessName\":\"Kerberos\"}}"
+    expect:
+      "metadata.uid": "windows_event|dc-01.corp.local|security|microsoft-windows-security-auditing|5001|2026-08-18T11:00:00Z"
+      "metadata.original_event_uid": "5001"
