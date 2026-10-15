@@ -1,0 +1,1100 @@
+name: azure_monitor_ocsf
+display_name: Azure Monitor diagnostic export (OCSF)
+version: "1.0.1"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Azure Monitor diagnostic-settings records (the resource-log schema
+  that Diagnostic Settings stream to an Event Hub or storage account) into
+  OCSF 1.9.0, dispatching on the record's `category`, because one Event Hub
+  routinely receives several categories (a subscription's Activity Log plus a
+  tenant's Entra ID logs):
+    * Activity Log  Administrative, Policy, Autoscale, Alert, Recommendation,
+                    ServiceHealth, ResourceHealth   -> API Activity 6003
+                    Security (Defender for Cloud)    -> Detection Finding 2004
+    * Entra ID      SignInLogs, NonInteractiveUserSignInLogs,
+                    ServicePrincipalSignInLogs,
+                    ManagedIdentitySignInLogs        -> Authentication 3002
+                    AuditLogs: user lifecycle/password/security-info and
+                    role membership                  -> User Management 3007
+                    group lifecycle/membership       -> Group Management 3006
+                    everything else (apps, policies,
+                    devices, directory)              -> API Activity 6003
+    * any other category (or no category)            -> Base Event 0
+  Nothing is dropped: every source field the mapping does not consume is
+  spilled to `unmapped`, and an unparseable body becomes a Base Event with
+  metadata.log_level = "error" and the body in raw_data. One record per event:
+  the Event Hubs `{"records": [...]}` envelope is exploded upstream by the
+  pull container's platform stamp; an envelope that reaches the lane anyway
+  is kept whole as a Base Event. metadata.uid is deterministic (sha256 of the record's natural id, or
+  of the record) so an Event Hubs replay dedupes in the lake. Account Change
+  3001 and User Access Management 3005 are deprecated in OCSF 1.9 and are
+  deliberately not emitted. On management events the initiator is `actor`
+  and the target is the subject (`user` / `group`).
+match_values:
+  - azure_monitor
+category: cloud
+vendor: "Microsoft"
+product: "Azure Monitor"
+parser_vrl: |
+  # Azure Monitor diagnostic-settings record -> OCSF 1.9.0 (dispatch on category).
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+
+  parsed, err = parse_json(raw_log)
+  p = {}
+  is_record = false
+  # One record per event: the pull container's platform stamp explodes the
+  # Event Hubs `{"records": [...]}` envelope before this lane. An envelope that
+  # reaches the lane anyway (e.g. pushed over HEC) has no category, so it is
+  # kept whole as a Base Event with the records in `unmapped` (never dropped).
+  if err == null && is_object(parsed) {
+      p = object!(parsed)
+      is_record = true
+  }
+  __source_kv = p
+
+  if !is_record {
+      # Unparseable body: still a VALID OCSF record (Base Event), never a drop.
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": to_unix_timestamp(now(), unit: "milliseconds"),
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud"],
+              "uid": sha2("azure_monitor|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "AzureMonitor",
+              "log_provider": "Azure Monitor",
+              "product": { "name": "Azure Monitor", "vendor_name": "Microsoft" }
+          },
+          "cloud": { "provider": "Azure" },
+          "unmapped": { "parse_error": "body is not a JSON object" }
+      }
+  } else {
+      props = object(p.properties) ?? {}
+
+      # ---- category -> family ----
+      category = to_string(p.category) ?? ""
+      if category == "" { category = to_string(get(p, ["category", "value"]) ?? null) ?? "" }
+      cat_l = downcase(category)
+      event_cat = to_string(props.eventCategory) ?? ""
+      res_id = to_string(p.resourceId) ?? ""
+      res_id_l = downcase(res_id)
+      activity_cats = ["administrative", "security", "servicehealth", "resourcehealth", "alert", "recommendation", "policy", "autoscale"]
+      signin_cats = ["signinlogs", "noninteractiveusersigninlogs", "serviceprincipalsigninlogs", "managedidentitysigninlogs"]
+      family = "other"
+      act_cat = ""
+      if includes(signin_cats, cat_l) {
+          family = "signin"
+      } else if cat_l == "auditlogs" {
+          family = "audit"
+      } else if includes(activity_cats, downcase(event_cat)) {
+          family = "activity"
+          act_cat = downcase(event_cat)
+      } else if includes(activity_cats, cat_l) {
+          family = "activity"
+          act_cat = cat_l
+      } else if includes(["write", "delete", "action"], cat_l) && starts_with(res_id_l, "/subscriptions/") {
+          # Older Activity Log exports carried the ARM verb as `category`;
+          # without properties.eventCategory the record is Administrative.
+          family = "activity"
+          act_cat = "administrative"
+      }
+
+      # ---- clock: properties' own event time wins, else the record time ----
+      time_ms = 0
+      ts_str = to_string(props.createdDateTime) ?? ""
+      if ts_str == "" { ts_str = to_string(props.activityDateTime) ?? "" }
+      if ts_str == "" { ts_str = to_string(p.time) ?? "" }
+      if ts_str == "" { ts_str = to_string(p.eventTimestamp) ?? "" }
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+      if time_ms == 0 { time_ms = to_unix_timestamp(now(), unit: "milliseconds") }
+
+      # ---- severity from the record level (string or Windows-style number) ----
+      level_raw = p.level
+      if level_raw == null { level_raw = p.Level }
+      level_s = downcase(to_string(level_raw) ?? "")
+      severity_id = 1
+      severity = "Informational"
+      if level_s == "warning" || level_s == "3" { severity_id = 3; severity = "Medium" }
+      if level_s == "error" || level_s == "2" { severity_id = 4; severity = "High" }
+      if level_s == "critical" || level_s == "1" { severity_id = 5; severity = "Critical" }
+
+      # ---- ARM coordinates from resourceId ----
+      sub_id = ""
+      rg_name = ""
+      rp_ns = ""
+      rp_type = ""
+      rm, rmerr = parse_regex(res_id, r'(?i)^/subscriptions/(?P<sub>[^/]+)(?:/resourcegroups/(?P<rg>[^/]+))?(?:/providers/(?P<ns>[^/]+)/(?P<ty>[^/]+))?')
+      if rmerr == null {
+          sub_id = string(rm.sub) ?? ""
+          rg_name = string(rm.rg) ?? ""
+          rp_ns = string(rm.ns) ?? ""
+          rp_type = string(rm.ty) ?? ""
+      }
+      tenant_id = to_string(p.tenantId) ?? ""
+      if tenant_id == "" {
+          tm, tmerr = parse_regex(res_id, r'(?i)^/tenants/(?P<t>[^/]+)')
+          if tmerr == null { tenant_id = string(tm.t) ?? "" }
+      }
+
+      correlation = to_string(p.correlationId) ?? ""
+      if correlation == "" { correlation = to_string(props.correlationId) ?? "" }
+      caller_ip = to_string(p.callerIpAddress) ?? ""
+      if caller_ip == "<null>" { caller_ip = "" }
+
+      ocsf = {}
+      natural_id = ""
+
+      if family == "signin" {
+          # =================== Entra ID sign-in -> Authentication 3002 ===================
+          natural_id = to_string(props.id) ?? ""
+
+          status_obj = object(props.status) ?? {}
+          error_code = to_int(status_obj.errorCode) ?? -1
+          failure_reason = to_string(status_obj.failureReason) ?? ""
+          additional = to_string(status_obj.additionalDetails) ?? ""
+          if error_code < 0 {
+              rt = to_string(p.resultType) ?? ""
+              if rt != "" { error_code = to_int(rt) ?? -1 }
+          }
+          if failure_reason == "" { failure_reason = to_string(p.resultDescription) ?? "" }
+          status_id = 0
+          status_str = "Unknown"
+          if error_code == 0 {
+              status_id = 1
+              status_str = "Success"
+          } else if error_code > 0 {
+              status_id = 2
+              status_str = "Failure"
+              if severity_id < 2 { severity_id = 2; severity = "Low" }
+          }
+
+          # ---- subject: the user, or the service principal / managed identity ----
+          upn = to_string(props.userPrincipalName) ?? ""
+          display = to_string(props.userDisplayName) ?? ""
+          sp_name = to_string(props.servicePrincipalName) ?? ""
+          sp_id = to_string(props.servicePrincipalId) ?? ""
+          is_workload = cat_l == "serviceprincipalsigninlogs" || cat_l == "managedidentitysigninlogs"
+          user = { "name": "unknown" }
+          if upn != "" && !is_workload {
+              user = { "name": upn, "type_id": 1, "type": "User" }
+              if contains(upn, "@") {
+                  user.email_addr = upn
+                  upn_parts = split(upn, "@")
+                  if length(upn_parts) == 2 { user.domain = string(upn_parts[1]) ?? "" }
+              }
+          } else if sp_name != "" {
+              user = { "name": sp_name, "type_id": 4, "type": "Service" }
+          } else if display != "" {
+              user = { "name": display, "type_id": 0, "type": "Unknown" }
+          }
+          if display != "" { user.display_name = display }
+          uid = to_string(props.userId) ?? ""
+          if uid == "" || is_workload { uid = sp_id }
+          if uid != "" { user.uid = uid }
+
+          # ---- the target application (3002 at_least_one: service) ----
+          app_name = to_string(props.resourceDisplayName) ?? ""
+          if app_name == "" { app_name = to_string(props.appDisplayName) ?? "" }
+          if app_name == "" { app_name = "unknown" }
+          service = { "name": app_name }
+          svc_uid = to_string(props.resourceId) ?? ""
+          if svc_uid != "" { service.uid = svc_uid }
+
+          # ---- source endpoint ----
+          ip = to_string(props.ipAddress) ?? ""
+          if ip == "" { ip = caller_ip }
+          src_endpoint = { "ip": "0.0.0.0" }
+          if ip != "" { src_endpoint = { "ip": downcase(ip) } }
+          location = object(props.location) ?? {}
+          loc = {}
+          country = to_string(location.countryOrRegion) ?? ""
+          if country != "" { loc.country = country }
+          city = to_string(location.city) ?? ""
+          if city != "" { loc.city = city }
+          state = to_string(location.state) ?? ""
+          if state != "" { loc.region = state }
+          if length(keys(loc)) > 0 { src_endpoint.location = loc }
+          asn = to_int(props.autonomousSystemNumber) ?? 0
+          if asn > 0 { src_endpoint.autonomous_system = { "number": asn } }
+
+          # ---- MFA / logon type / protocol ----
+          auth_req = to_string(props.authenticationRequirement) ?? ""
+          mfa_detail = object(props.mfaDetail) ?? {}
+          mfa_method = to_string(mfa_detail.authMethod) ?? ""
+          is_mfa = auth_req == "multiFactorAuthentication" || mfa_method != ""
+          is_interactive = to_bool(props.isInteractive) ?? false
+          logon_type_id = 3
+          logon_type = "Network"
+          if is_interactive { logon_type_id = 2; logon_type = "Interactive" }
+          auth_proto = downcase(to_string(props.authenticationProtocol) ?? "")
+          auth_protocol_id = 6
+          auth_protocol = "OAUTH 2.0"
+          if auth_proto == "saml" || auth_proto == "saml20" { auth_protocol_id = 5; auth_protocol = "SAML" }
+          if auth_proto == "openidconnect" || auth_proto == "oidc" { auth_protocol_id = 4; auth_protocol = "OpenID" }
+          if auth_proto == "ropc" || auth_proto == "password" { auth_protocol_id = 11; auth_protocol = "Basic Authentication" }
+          if auth_proto == "wsfederation" || auth_proto == "ws-fed" { auth_protocol_id = 99; auth_protocol = "Other" }
+
+          # ---- risk ----
+          risk = downcase(to_string(props.riskLevelDuringSignIn) ?? "")
+          if risk == "" || risk == "none" || risk == "hidden" { risk = downcase(to_string(props.riskLevelAggregated) ?? "") }
+          risk_level_id = 0
+          risk_level = "Info"
+          if risk == "low" { risk_level_id = 1; risk_level = "Low" }
+          if risk == "medium" { risk_level_id = 2; risk_level = "Medium" }
+          if risk == "high" { risk_level_id = 3; risk_level = "High" }
+          if risk_level_id >= 2 && severity_id < 3 { severity_id = 3; severity = "Medium" }
+
+          # ---- device (host profile) ----
+          dev_detail = object(props.deviceDetail) ?? {}
+          device = {}
+          dev_name = to_string(dev_detail.displayName) ?? ""
+          if dev_name != "" { device.hostname = dev_name }
+          dev_id = to_string(dev_detail.deviceId) ?? ""
+          if dev_id != "" { device.uid = dev_id }
+          dev_os = to_string(dev_detail.operatingSystem) ?? ""
+          if dev_os != "" {
+              os_l = downcase(dev_os)
+              os_type_id = 0
+              if contains(os_l, "windows") { os_type_id = 100 }
+              if contains(os_l, "android") { os_type_id = 201 }
+              if contains(os_l, "linux") || contains(os_l, "ubuntu") { os_type_id = 200 }
+              if contains(os_l, "macos") || contains(os_l, "mac os") || contains(os_l, "os x") { os_type_id = 300 }
+              if contains(os_l, "ios") && !contains(os_l, "bios") { os_type_id = 301 }
+              if contains(os_l, "ipados") { os_type_id = 302 }
+              device.os = { "name": dev_os, "type_id": os_type_id }
+          }
+          # NAN-3680: an OCSF device needs at least one of ip/uid/name/hostname/...; a sign-in
+          # from an unregistered device carries only operatingSystem/browser, and a device of
+          # just `os` is refused by the lake's strict OCSF check (the whole row was lost).
+          # Identify it by the sign-in's client IP; with no identifier at all emit no device
+          # (operatingSystem then spills to unmapped, never dropped).
+          if length(keys(device)) > 0 && !exists(device.hostname) && !exists(device.uid) {
+              if ip != "" && ip != "<null>" { device.ip = downcase(ip) } else { device = {} }
+          }
+          if length(keys(device)) > 0 { device.type_id = 0 }
+
+          session = { "is_mfa": is_mfa }
+          if natural_id != "" { session.uid = natural_id }
+          if is_interactive { session.is_remote = true }
+
+          ocsf = {
+              "class_uid": 3002,
+              "class_name": "Authentication",
+              "category_uid": 3,
+              "category_name": "Identity & Access Management",
+              "activity_id": 1,
+              "activity_name": "Logon",
+              "status_id": status_id,
+              "status": status_str,
+              "is_mfa": is_mfa,
+              "is_remote": true,
+              "logon_type_id": logon_type_id,
+              "logon_type": logon_type,
+              "auth_protocol_id": auth_protocol_id,
+              "auth_protocol": auth_protocol,
+              "risk_level_id": risk_level_id,
+              "risk_level": risk_level,
+              "message": "Sign-in to " + app_name + ": " + status_str,
+              "metadata": {
+                  "version": "1.9.0",
+                  "profiles": ["cloud", "host", "security_control"],
+                  "log_name": category,
+                  "log_provider": "Microsoft Entra ID",
+                  "product": { "name": "Microsoft Entra ID", "vendor_name": "Microsoft" }
+              },
+              "api": { "operation": "Sign-in activity", "service": { "name": "Microsoft Entra ID" } },
+              "user": user,
+              "service": service,
+              "src_endpoint": src_endpoint,
+              "session": session
+          }
+          if error_code > 0 { ocsf.status_code = to_string(error_code) }
+          if failure_reason != "" && error_code != 0 { ocsf.status_detail = failure_reason }
+          if additional != "" && error_code == 0 { ocsf.status_detail = additional }
+          if length(keys(device)) > 0 { ocsf.device = device }
+          ua = to_string(props.userAgent) ?? ""
+          if ua != "" { ocsf.http_request = { "user_agent": ua } }
+      } else if family == "audit" {
+          # =================== Entra ID audit -> 3007 / 3006 / 6003 ===================
+          natural_id = to_string(props.id) ?? ""
+          activity_display = to_string(props.activityDisplayName) ?? ""
+          if activity_display == "" { activity_display = to_string(p.operationName) ?? "" }
+          act_l = downcase(activity_display)
+          audit_cat = to_string(props.category) ?? ""
+          audit_cat_l = downcase(audit_cat)
+          op_type = downcase(to_string(props.operationType) ?? "")
+          logged_by = to_string(props.loggedByService) ?? ""
+          if logged_by == "" { logged_by = "Microsoft Entra ID" }
+
+          result_l = downcase(to_string(props.result) ?? "")
+          status_id = 0
+          status_str = "Unknown"
+          if result_l == "success" { status_id = 1; status_str = "Success" }
+          if result_l == "failure" { status_id = 2; status_str = "Failure" }
+          if result_l == "timeout" { status_id = 99; status_str = "Timeout" }
+          if status_id == 2 && severity_id < 2 { severity_id = 2; severity = "Low" }
+
+          # ---- initiator -> actor ----
+          initiated = object(props.initiatedBy) ?? {}
+          init_user = object(initiated.user) ?? {}
+          init_app = object(initiated.app) ?? {}
+          actor_user = { "name": "unknown" }
+          actor = {}
+          src_ip = ""
+          iu_upn = to_string(init_user.userPrincipalName) ?? ""
+          iu_id = to_string(init_user.id) ?? ""
+          iu_name = to_string(init_user.displayName) ?? ""
+          ia_name = to_string(init_app.displayName) ?? ""
+          ia_spn = to_string(init_app.servicePrincipalName) ?? ""
+          ia_spid = to_string(init_app.servicePrincipalId) ?? ""
+          ia_appid = to_string(init_app.appId) ?? ""
+          if iu_upn != "" || iu_id != "" {
+              actor_user = { "type_id": 1, "type": "User" }
+              actor_user.name = if iu_upn != "" { iu_upn } else if iu_name != "" { iu_name } else { iu_id }
+              if contains(iu_upn, "@") { actor_user.email_addr = iu_upn }
+              if iu_id != "" { actor_user.uid = iu_id }
+              if iu_name != "" { actor_user.display_name = iu_name }
+              src_ip = to_string(init_user.ipAddress) ?? ""
+          } else if ia_name != "" || ia_spid != "" || ia_appid != "" {
+              actor_user = { "type_id": 4, "type": "Service" }
+              actor_user.name = if ia_name != "" { ia_name } else if ia_spn != "" { ia_spn } else if ia_appid != "" { ia_appid } else { ia_spid }
+              if ia_spid != "" { actor_user.uid = ia_spid }
+              if ia_name != "" { actor.app_name = ia_name }
+              if ia_appid != "" { actor.app_uid = ia_appid }
+              src_ip = to_string(init_app.ipAddress) ?? ""
+          }
+          actor.user = actor_user
+          if src_ip == "" || src_ip == "<null>" { src_ip = caller_ip }
+
+          # ---- targets -> subject user / group, resources[] ----
+          targets = array(props.targetResources) ?? []
+          subj_user = {}
+          subj_group = {}
+          role_name = ""
+          resources = []
+          for_each(targets) -> |_i, target| {
+              tg = object(target) ?? {}
+              t_type = to_string(tg.type) ?? ""
+              t_type_l = downcase(t_type)
+              t_id = to_string(tg.id) ?? ""
+              t_upn = to_string(tg.userPrincipalName) ?? ""
+              t_name = to_string(tg.displayName) ?? ""
+              label = if t_upn != "" { t_upn } else if t_name != "" { t_name } else { t_id }
+              res = { "type": t_type }
+              if t_id != "" { res.uid = t_id }
+              if label != "" { res.name = label }
+              resources = push(resources, res)
+              if t_type_l == "user" && length(keys(subj_user)) == 0 {
+                  subj_user = { "name": label, "type_id": 1, "type": "User" }
+                  if t_id != "" { subj_user.uid = t_id }
+                  if contains(t_upn, "@") { subj_user.email_addr = t_upn }
+                  if t_name != "" { subj_user.display_name = t_name }
+              }
+              if t_type_l == "serviceprincipal" && length(keys(subj_user)) == 0 && audit_cat_l == "rolemanagement" {
+                  subj_user = { "name": label, "type_id": 4, "type": "Service" }
+                  if t_id != "" { subj_user.uid = t_id }
+              }
+              if t_type_l == "group" && length(keys(subj_group)) == 0 {
+                  subj_group = { "name": label }
+                  if t_id != "" { subj_group.uid = t_id }
+              }
+              if t_type_l == "role" && role_name == "" { role_name = label }
+          }
+          have_user = length(keys(subj_user)) > 0
+          have_group = length(keys(subj_group)) > 0
+
+          class_uid = 6003
+          activity_id = 99
+          activity_name = "Other"
+          if have_user && (audit_cat_l == "usermanagement" || audit_cat_l == "rolemanagement" || audit_cat_l == "userauthenticationmethod") {
+              class_uid = 3007
+              if act_l == "add user" || act_l == "create user" { activity_id = 1; activity_name = "Create" }
+              if act_l == "update user" || starts_with(act_l, "update stsrefreshtokenvalidfrom") { activity_id = 2; activity_name = "Update" }
+              if act_l == "delete user" || act_l == "hard delete user" { activity_id = 3; activity_name = "Delete" }
+              if act_l == "enable account" || act_l == "restore user" { activity_id = 4; activity_name = "Enable" }
+              if act_l == "disable account" { activity_id = 5; activity_name = "Disable" }
+              if contains(act_l, "change user password") || starts_with(act_l, "change password") { activity_id = 8; activity_name = "Password Change" }
+              if contains(act_l, "reset user password") || starts_with(act_l, "reset password") { activity_id = 9; activity_name = "Password Reset" }
+              if contains(act_l, "registered security info") { activity_id = 12; activity_name = "Enable MFA Factors" }
+              if contains(act_l, "deleted security info") { activity_id = 13; activity_name = "Disable MFA Factors" }
+              if starts_with(act_l, "add app role assignment") { activity_id = 14; activity_name = "Assign Privileges" }
+              if starts_with(act_l, "remove app role assignment") { activity_id = 15; activity_name = "Remove Privileges" }
+              if starts_with(act_l, "add") && contains(act_l, "member to role") { activity_id = 16; activity_name = "Assign Roles" }
+              if starts_with(act_l, "remove") && contains(act_l, "member from role") { activity_id = 17; activity_name = "Remove Roles" }
+          } else if have_group && audit_cat_l == "groupmanagement" {
+              class_uid = 3006
+              if act_l == "add group" { activity_id = 6; activity_name = "Create" }
+              if act_l == "delete group" || act_l == "hard delete group" { activity_id = 5; activity_name = "Delete" }
+              if act_l == "update group" { activity_id = 9; activity_name = "Update" }
+              if act_l == "add member to group" { activity_id = 3; activity_name = "Add User" }
+              if act_l == "remove member from group" { activity_id = 4; activity_name = "Remove User" }
+              if starts_with(act_l, "add app role assignment") { activity_id = 1; activity_name = "Assign Privileges" }
+              if starts_with(act_l, "remove app role assignment") { activity_id = 2; activity_name = "Revoke Privileges" }
+          } else {
+              if op_type == "add" || op_type == "create" { activity_id = 1; activity_name = "Create" }
+              if op_type == "update" || op_type == "assign" || op_type == "unassign" { activity_id = 3; activity_name = "Update" }
+              if op_type == "delete" || op_type == "remove" { activity_id = 4; activity_name = "Delete" }
+          }
+
+          ocsf = {
+              "class_uid": class_uid,
+              "category_uid": 3,
+              "category_name": "Identity & Access Management",
+              "activity_id": activity_id,
+              "activity_name": activity_name,
+              "status_id": status_id,
+              "status": status_str,
+              "message": activity_display,
+              "metadata": {
+                  "version": "1.9.0",
+                  "profiles": ["cloud"],
+                  "log_name": category,
+                  "log_provider": logged_by,
+                  "product": { "name": "Microsoft Entra ID", "vendor_name": "Microsoft" }
+              },
+              "api": { "operation": activity_display, "service": { "name": logged_by } },
+              "actor": actor
+          }
+          if class_uid == 3007 {
+              ocsf.class_name = "User Management"
+              ocsf.user = subj_user
+          } else if class_uid == 3006 {
+              ocsf.class_name = "Group Management"
+              ocsf.group = subj_group
+              if have_user { ocsf.user = subj_user }
+          } else {
+              ocsf.class_name = "API Activity"
+              ocsf.category_uid = 6
+              ocsf.category_name = "Application Activity"
+          }
+          src_ep = { "ip": "0.0.0.0" }
+          if src_ip != "" { src_ep = { "ip": downcase(src_ip) } }
+          ocsf.src_endpoint = src_ep
+          if length(resources) > 0 { ocsf.resources = resources }
+          reason = to_string(props.resultReason) ?? ""
+          if reason != "" { ocsf.status_detail = reason }
+          if audit_cat != "" { ocsf.metadata.event_code = audit_cat }
+      } else if family == "activity" {
+          # =================== Azure Activity Log -> 6003 / 2004 ===================
+          operation = to_string(p.operationName) ?? ""
+          if operation == "" { operation = to_string(get(p, ["operationName", "value"]) ?? null) ?? "" }
+          if operation == "" { operation = "Unknown" }
+          op_parts = split(operation, "/")
+          verb = downcase(string(op_parts[-1]) ?? "")
+          svc_name = string(op_parts[0]) ?? ""
+          if rp_ns != "" && svc_name == operation { svc_name = rp_ns }
+
+          result_raw = to_string(p.resultType) ?? ""
+          result_l = downcase(result_raw)
+          status_id = 0
+          status_str = "Unknown"
+          if result_l == "success" || result_l == "succeeded" { status_id = 1; status_str = "Success" }
+          if result_l == "failure" || result_l == "failed" { status_id = 2; status_str = "Failure" }
+          if status_id == 0 && result_raw != "" { status_id = 99; status_str = result_raw }
+          if status_id == 2 && severity_id < 2 { severity_id = 2; severity = "Low" }
+
+          # ---- caller identity from the ARM token claims / RBAC evidence ----
+          ident = object(p.identity) ?? {}
+          claims = object(ident.claims) ?? {}
+          authz = object(ident.authorization) ?? {}
+          evidence = object(authz.evidence) ?? {}
+          caller = strip_whitespace(to_string(get(claims, ["http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn"]) ?? null) ?? "")
+          if caller == "" { caller = strip_whitespace(to_string(get(claims, ["http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name"]) ?? null) ?? "") }
+          if caller == "" { caller = strip_whitespace(to_string(p.caller) ?? "") }
+          oid = to_string(get(claims, ["http://schemas.microsoft.com/identity/claims/objectidentifier"]) ?? null) ?? ""
+          if oid == "" { oid = to_string(evidence.principalId) ?? "" }
+          claim_name = to_string(claims.name) ?? ""
+          appid = to_string(claims.appid) ?? ""
+          principal_type = to_string(evidence.principalType) ?? ""
+          if tenant_id == "" { tenant_id = to_string(get(claims, ["http://schemas.microsoft.com/identity/claims/tenantid"]) ?? null) ?? "" }
+
+          actor = {}
+          if caller != "" || oid != "" || appid != "" {
+              actor_user = { "name": "unknown" }
+              if caller != "" { actor_user.name = caller } else if claim_name != "" { actor_user.name = claim_name } else if oid != "" { actor_user.name = oid } else { actor_user.name = appid }
+              if contains(caller, "@") { actor_user.email_addr = caller }
+              if oid != "" { actor_user.uid = oid }
+              if claim_name != "" { actor_user.display_name = claim_name }
+              pt_l = downcase(principal_type)
+              if pt_l == "user" || contains(caller, "@") {
+                  actor_user.type_id = 1
+                  actor_user.type = "User"
+              } else if pt_l == "serviceprincipal" || caller == "" {
+                  actor_user.type_id = 4
+                  actor_user.type = "Service"
+              }
+              actor.user = actor_user
+              if appid != "" { actor.app_uid = appid }
+          } else {
+              # Platform-originated events (health, advisor, autoscale) carry no caller.
+              actor.app_name = "Microsoft Azure"
+          }
+          if caller_ip == "" { caller_ip = to_string(claims.ipaddr) ?? "" }
+          src_ep = { "ip": "0.0.0.0" }
+          if caller_ip != "" { src_ep = { "ip": downcase(caller_ip) } }
+
+          res_parts = split(res_id, "/")
+          res_last = string(res_parts[-1]) ?? ""
+          resources = []
+          if res_id != "" {
+              res = { "uid": res_id }
+              if res_last != "" { res.name = res_last }
+              if rp_ns != "" && rp_type != "" { res.type = rp_ns + "/" + rp_type }
+              if rg_name != "" { res.group = { "name": rg_name } }
+              resources = push(resources, res)
+          }
+
+          status_code = to_string(props.statusCode) ?? ""
+          if status_code == "" { status_code = to_string(p.resultSignature) ?? "" }
+          detail = to_string(p.resultDescription) ?? ""
+          if detail == "" { detail = to_string(props.statusMessage) ?? "" }
+
+          if act_cat == "security" {
+              # Defender for Cloud alert -> Detection Finding 2004.
+              alert_sev = downcase(to_string(props.Severity) ?? to_string(props.severity) ?? "")
+              if alert_sev == "informational" || alert_sev == "low" || alert_sev == "medium" || alert_sev == "high" {
+                  severity_id = 1
+                  severity = "Informational"
+                  if alert_sev == "low" { severity_id = 2; severity = "Low" }
+                  if alert_sev == "medium" { severity_id = 3; severity = "Medium" }
+                  if alert_sev == "high" { severity_id = 4; severity = "High" }
+              }
+              title = to_string(props.eventName) ?? ""
+              if title == "" { title = to_string(props.alertDisplayName) ?? "" }
+              if title == "" { title = operation }
+              alert_uid = to_string(props.alertId) ?? ""
+              if alert_uid == "" { alert_uid = res_last }
+              if alert_uid == "" { alert_uid = correlation }
+              finding_info = { "uid": alert_uid, "title": title }
+              if detail != "" { finding_info.desc = detail }
+              f_activity = 2
+              f_activity_name = "Update"
+              f_status = 99
+              f_status_name = result_raw
+              if result_l == "active" { f_activity = 1; f_activity_name = "Create"; f_status = 1; f_status_name = "New" }
+              if result_l == "resolved" { f_activity = 3; f_activity_name = "Close"; f_status = 4; f_status_name = "Resolved" }
+              if result_l == "dismissed" { f_activity = 3; f_activity_name = "Close"; f_status = 3; f_status_name = "Suppressed" }
+              if result_raw == "" { f_status = 0; f_status_name = "Unknown" }
+              ocsf = {
+                  "class_uid": 2004,
+                  "class_name": "Detection Finding",
+                  "category_uid": 2,
+                  "category_name": "Findings",
+                  "activity_id": f_activity,
+                  "activity_name": f_activity_name,
+                  "status_id": f_status,
+                  "status": f_status_name,
+                  "is_alert": true,
+                  "message": title,
+                  "finding_info": finding_info,
+                  "metadata": {
+                      "version": "1.9.0",
+                      "profiles": ["cloud"],
+                      "log_name": "AzureActivity",
+                      "log_provider": "Azure Monitor",
+                      "event_code": "Security",
+                      "product": { "name": "Microsoft Defender for Cloud", "vendor_name": "Microsoft" }
+                  },
+                  "api": { "operation": operation, "service": { "name": svc_name } }
+              }
+              if length(resources) > 0 { ocsf.resources = resources }
+              if length(keys(actor)) > 0 && exists(actor.user) { ocsf.actor = actor }
+          } else {
+              activity_id = 99
+              activity_name = "Other"
+              act_event_code = event_cat
+              if act_event_code == "" { act_event_code = category }
+              if verb == "read" || verb == "list" || verb == "listkeys" { activity_id = 2; activity_name = "Read" }
+              if verb == "write" { activity_id = 3; activity_name = "Update" }
+              if verb == "delete" { activity_id = 4; activity_name = "Delete" }
+              ocsf = {
+                  "class_uid": 6003,
+                  "class_name": "API Activity",
+                  "category_uid": 6,
+                  "category_name": "Application Activity",
+                  "activity_id": activity_id,
+                  "activity_name": activity_name,
+                  "status_id": status_id,
+                  "status": status_str,
+                  "message": operation,
+                  "metadata": {
+                      "version": "1.9.0",
+                      "profiles": ["cloud"],
+                      "log_name": "AzureActivity",
+                      "log_provider": "Azure Monitor",
+                      "event_code": act_event_code,
+                      "product": { "name": "Azure Activity Log", "vendor_name": "Microsoft" }
+                  },
+                  "api": { "operation": operation, "service": { "name": svc_name } },
+                  "actor": actor,
+                  "src_endpoint": src_ep
+              }
+              if length(resources) > 0 { ocsf.resources = resources }
+              if status_code != "" { ocsf.status_code = status_code }
+              if detail != "" { ocsf.status_detail = detail }
+          }
+          op_id = to_string(props.operationId) ?? ""
+          if op_id != "" { ocsf.api.request = { "uid": op_id } }
+      } else {
+          # =================== unknown category -> Base Event 0 ===================
+          # Kept whole: every source field spills to `unmapped` below.
+          operation = to_string(p.operationName) ?? ""
+          other_log_name = category
+          if other_log_name == "" { other_log_name = "AzureMonitor" }
+          ocsf = {
+              "class_uid": 0,
+              "class_name": "Base Event",
+              "category_uid": 0,
+              "category_name": "Uncategorized",
+              "activity_id": 99,
+              "activity_name": "Other",
+              "status_id": 0,
+              "status": "Unknown",
+              "metadata": {
+                  "version": "1.9.0",
+                  "profiles": ["cloud"],
+                  "log_name": other_log_name,
+                  "log_provider": "Azure Monitor",
+                  "product": { "name": "Azure Monitor", "vendor_name": "Microsoft" }
+              }
+          }
+          if category != "" { ocsf.metadata.event_code = category }
+          if operation != "" { ocsf.message = operation }
+          result_raw = to_string(p.resultType) ?? ""
+          if result_raw != "" { ocsf.status_detail = result_raw }
+      }
+
+      # ---- common envelope ----
+      ocsf.type_uid = ocsf.class_uid * 100 + ocsf.activity_id
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.time = time_ms
+      ocsf.raw_data = raw_log
+      cloud = { "provider": "Azure" }
+      if sub_id != "" { cloud.account = { "uid": sub_id } } else if tenant_id != "" { cloud.account = { "uid": tenant_id } }
+      if tenant_id != "" { cloud.org = { "uid": tenant_id } }
+      ocsf.cloud = cloud
+      if correlation != "" { ocsf.metadata.correlation_uid = correlation }
+      # NAN-3490: deterministic uid. The lake keeps the first row per
+      # metadata.uid, so an Event Hubs replay (at-least-once) dedupes.
+      # The record's own clock is part of the key: Entra does not promise a
+      # sign-in id is unique across aggregated non-interactive rows.
+      uid_src = if natural_id != "" { "azure_monitor|" + cat_l + "|" + natural_id + "|" + ts_str } else { "azure_monitor|" + encode_json(p) }
+      ocsf.metadata.uid = sha2(uid_src, variant: "SHA-256")
+      if natural_id != "" { ocsf.metadata.original_event_uid = natural_id }
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  __mapped = object!(parse_json!(encode_json(.)))
+  __existing = object(__mapped.unmapped) ?? {}
+  __discard = del(__mapped.raw_data)
+  __discard = del(__mapped.unmapped)
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __represented = []
+  __walk = map_values(__mapped, recursive: true) -> |value| {
+      __represented = push(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __represented = push(__represented, to_string(value) ?? "")
+      }
+      value
+  }
+  __consumed = []
+  # BEGIN parser-specific transformations
+  # time: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # properties.createdDateTime: Sign-in event clock, preferred over the record time; verified against the emitted clock.
+  # properties.activityDateTime: Audit event clock, preferred over the record time; verified against the emitted clock.
+  # level: Azure record level normalized to OCSF severity; consume only when the expected ID is emitted.
+  # Level: Windows-style numeric record level normalized to OCSF severity; consume only when the expected ID is emitted.
+  # properties.Severity: Defender for Cloud alert severity drives the finding severity; consume only when the expected ID is emitted.
+  # properties.riskLevelDuringSignIn: Parser normalizes the caption case; verify the emitted caption.
+  # properties.result: Entra audit result normalized to the OCSF status caption; verify the emitted caption.
+  # resultType: Activity Log result normalized to the OCSF status caption; verify the emitted caption.
+  # callerIpAddress: Parser lowercases IPs (nano lowercases at ingest); consume only when the normalized value is emitted.
+  # properties.ipAddress: Parser lowercases IPs (nano lowercases at ingest); consume only when the normalized value is emitted.
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = ["time", "resourceId", "operationName", "category", "tenantId", "resultType", "resultSignature", "resultDescription", "callerIpAddress", "correlationId", "level", "Level", "identity.claims.http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn", "identity.claims.http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name", "identity.claims.http://schemas.microsoft.com/identity/claims/objectidentifier", "identity.claims.http://schemas.microsoft.com/identity/claims/tenantid", "identity.claims.name", "identity.claims.appid", "identity.claims.ipaddr", "identity.authorization.evidence.principalType", "properties.eventCategory", "properties.statusCode", "properties.statusMessage", "properties.operationId", "properties.eventName", "properties.alertDisplayName", "properties.alertId", "properties.id", "properties.correlationId", "properties.createdDateTime", "properties.userPrincipalName", "properties.userDisplayName", "properties.userId", "properties.servicePrincipalName", "properties.servicePrincipalId", "properties.resourceDisplayName", "properties.appDisplayName", "properties.resourceId", "properties.ipAddress", "properties.location.countryOrRegion", "properties.location.city", "properties.location.state", "properties.autonomousSystemNumber", "properties.status.errorCode", "properties.status.failureReason", "properties.status.additionalDetails", "properties.isInteractive", "properties.deviceDetail.displayName", "properties.deviceDetail.deviceId", "properties.deviceDetail.operatingSystem", "properties.userAgent", "properties.activityDisplayName", "properties.activityDateTime", "properties.category", "properties.result", "properties.resultReason", "properties.loggedByService", "properties.initiatedBy.user.id", "properties.initiatedBy.user.userPrincipalName", "properties.initiatedBy.user.displayName", "properties.initiatedBy.user.ipAddress", "properties.initiatedBy.app.displayName", "properties.initiatedBy.app.servicePrincipalId", "properties.initiatedBy.app.appId"]
+  __preserve = []
+  __rules = array!(parse_json!("[{\"source\":\"time\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Successful ISO timestamp conversion to the selected event clock in milliseconds.\"},{\"source\":\"properties.createdDateTime\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Sign-in event clock, preferred over the record time; verified against the emitted clock.\"},{\"source\":\"properties.activityDateTime\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Audit event clock, preferred over the record time; verified against the emitted clock.\"},{\"source\":\"level\",\"kind\":\"enum\",\"target\":\"severity_id\",\"values\":{\"informational\":1,\"information\":1,\"warning\":3,\"error\":4,\"critical\":5},\"reason\":\"Azure record level normalized to OCSF severity; consume only when the expected ID is emitted.\"},{\"source\":\"Level\",\"kind\":\"enum\",\"target\":\"severity_id\",\"values\":{\"4\":1,\"3\":3,\"2\":4,\"1\":5},\"reason\":\"Windows-style numeric record level normalized to OCSF severity; consume only when the expected ID is emitted.\"},{\"source\":\"properties.Severity\",\"kind\":\"enum\",\"target\":\"severity_id\",\"values\":{\"informational\":1,\"low\":2,\"medium\":3,\"high\":4},\"reason\":\"Defender for Cloud alert severity drives the finding severity; consume only when the expected ID is emitted.\"},{\"source\":\"properties.riskLevelDuringSignIn\",\"kind\":\"enum\",\"target\":\"risk_level\",\"values\":{\"low\":\"Low\",\"medium\":\"Medium\",\"high\":\"High\"},\"reason\":\"Parser normalizes the caption case; verify the emitted caption.\"},{\"source\":\"properties.result\",\"kind\":\"enum\",\"target\":\"status\",\"values\":{\"success\":\"Success\",\"failure\":\"Failure\"},\"reason\":\"Entra audit result normalized to the OCSF status caption; verify the emitted caption.\"},{\"source\":\"resultType\",\"kind\":\"enum\",\"target\":\"status\",\"values\":{\"success\":\"Success\",\"failure\":\"Failure\"},\"reason\":\"Activity Log result normalized to the OCSF status caption; verify the emitted caption.\"},{\"source\":\"callerIpAddress\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases IPs (nano lowercases at ingest); consume only when the normalized value is emitted.\"},{\"source\":\"properties.ipAddress\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases IPs (nano lowercases at ingest); consume only when the normalized value is emitted.\"}]"))
+  __source_flat = flatten(__source_kv)
+  for_each(__rules) -> |_index, rule| {
+      __source_key = string!(rule.source)
+      __value = get!(__source_flat, [__source_key])
+      __expected = null
+      __valid = false
+      if rule.kind == "lowercase" && is_string(__value) {
+          __expected = downcase(string!(__value))
+          __valid = true
+      } else if rule.kind == "epoch_ms" {
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", string(rule.format) ?? "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              __valid = true
+          }
+      } else if rule.kind == "scale" {
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * to_float!(rule.factor))
+              __valid = true
+          }
+      } else if rule.kind == "hex" {
+          __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
+          __integer, __integer_err = parse_int(__hex, base: 16)
+          __expected = __integer
+          __valid = is_string(__value) && starts_with(downcase(string(__value) ?? ""), "0x") && __integer_err == null
+      } else if rule.kind == "enum" {
+          __expected = get!(object!(rule.values), [downcase(to_string(__value) ?? "")])
+          __valid = __expected != null
+      }
+      __matches = includes(__represented, encode_json(__expected))
+      if is_string(rule.target) { __matches = get!(., split(string!(rule.target), ".")) == __expected }
+      if __valid && __matches { __consumed = push(__consumed, __source_key) }
+  }
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  __safe = map_values(object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing}))), recursive: true) -> |value| {
+      if is_object(value) {
+          # Header/parameter arrays commonly encode sensitive keys as name/value
+          # or Key/Value objects instead of using the secret name as an object key.
+          __sensitive_pair = false
+          for_each(object!(value)) -> |key, child| {
+              if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                  __sensitive_pair = true
+              }
+          }
+          for_each(object!(value)) -> |key, _child| {
+              if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                  value = set!(value, [key], "<redacted>")
+              }
+          }
+      }
+      value
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  __escaped = map_keys(object!(__safe.source), recursive: true) -> |key| {
+      replace(replace(key, "~", "~0"), ".", "~1")
+  }
+  __flat = flatten(__escaped)
+  __residual = {}
+  for_each(__flat) -> |key, value| {
+      key = replace(replace(key, "~1", "."), "~0", "~")
+      # flatten stops at arrays, so objects inside an array still carry the
+      # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+      if is_array(value) || is_object(value) {
+          value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+              replace(replace(inner, "~1", "."), "~0", "~")
+          }, ["v"])
+      }
+      __same = includes(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __same = __same || includes(__represented, to_string(value) ?? "")
+      }
+      # A scalar array is consumed only if every element is represented. Preserve
+      # partially represented arrays intact, including their ordering and repeats.
+      if is_array(value) && !is_empty(array!(value)) {
+          __all_items = true
+          for_each(array!(value)) -> |_index, item| {
+              __item_same = includes(__represented, encode_json(item))
+              if !is_object(item) && !is_array(item) && !is_null(item) {
+                  __item_same = __item_same || includes(__represented, to_string(item) ?? "")
+              }
+              if is_object(item) || is_array(item) || !__item_same { __all_items = false }
+          }
+          __same = __same || __all_items
+      }
+      if __same && includes(__candidates, key) { __consumed = push(__consumed, key) }
+      # Redacted leaves always remain visible. Do not spill a copy of the raw body.
+      if (!includes(__consumed, key) || value == "<redacted>") && value != __raw_body {
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          __base = join!(__parts, ".")
+          __key = __base
+          __suffix = 2
+          if includes(keys(__residual), __key) {
+              for_each(__flat) -> |_other_key, _other_value| {
+                  if includes(keys(__residual), __key) {
+                      __key = __base + "_" + to_string(__suffix)
+                      __suffix = __suffix + 1
+                  }
+              }
+          }
+          __complex = is_object(value)
+          if is_array(value) {
+              for_each(array!(value)) -> |_index, item| {
+                  if is_object(item) || is_array(item) { __complex = true }
+              }
+          }
+          __spill = if __complex { encode_json(value) } else { value }
+          __residual = set!(__residual, [__key], __spill)
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  __original_values = []
+  for_each(flatten(__source_kv)) -> |_key, value| {
+      __original_values = push(__original_values, encode_json(value))
+      if !is_object(value) && !is_array(value) { __original_values = push(__original_values, to_string(value) ?? "") }
+  }
+  for_each(flatten(__existing)) -> |key, value| {
+      __source_alias = includes(__original_values, encode_json(value)) || includes(__original_values, to_string(value) ?? "")
+      __mapped_alias = includes(__represented, encode_json(value)) || includes(__represented, to_string(value) ?? "")
+      __decoded, __decode_err = parse_json(string(value) ?? "")
+      __encoded_container = __decode_err == null && (is_object(__decoded) || is_array(__decoded))
+      if !is_null(value) && value != "" && !__source_alias && !__mapped_alias && !__encoded_container && value != __raw_body {
+          # Existing aggregates may contain sensitive descendants; the canonical
+          # source spill above is the authoritative representation of containers.
+          if !is_array(value) && !is_object(value) && !match(downcase(key), r'password|secret|authorization|token') {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # activity_write.json
+  - raw: "{\"time\":\"2026-10-11T14:02:31.3810679Z\",\"resourceId\":\"/SUBSCRIPTIONS/bbbb1b1b-cc2c-dd3d-ee4e-ffffff5f5f5f/RESOURCEGROUPS/RG-PROD/PROVIDERS/MICROSOFT.NETWORK/NETWORKSECURITYGROUPS/NSG-WEB\",\"operationName\":\"MICROSOFT.NETWORK/NETWORKSECURITYGROUPS/WRITE\",\"category\":\"Administrative\",\"resultType\":\"Success\",\"resultSignature\":\"Succeeded.Created\",\"durationMs\":\"0\",\"callerIpAddress\":\"203.0.113.10\",\"correlationId\":\"aaaa0000-bb11-2222-33cc-444444dddddd\",\"identity\":{\"authorization\":{\"scope\":\"/subscriptions/bbbb1b1b-cc2c-dd3d-ee4e-ffffff5f5f5f/resourceGroups/rg-prod/providers/Microsoft.Network/networkSecurityGroups/nsg-web\",\"action\":\"Microsoft.Network/networkSecurityGroups/write\",\"evidence\":{\"role\":\"Network Contributor\",\"roleAssignmentScope\":\"/subscriptions/bbbb1b1b-cc2c-dd3d-ee4e-ffffff5f5f5f\",\"roleAssignmentId\":\"0123456789abcdef0123456789abcdef\",\"roleDefinitionId\":\"4d97b98b1d4f4787a291c67834d212e7\",\"principalId\":\"bbbbbbbb111122223333cccccccccccc\",\"principalType\":\"User\"}},\"claims\":{\"aud\":\"https://management.core.windows.net/\",\"iss\":\"https://sts.windows.net/aaaabbbb-0000-cccc-1111-dddd2222eeee/\",\"iat\":\"1786000000\",\"nbf\":\"1786000000\",\"exp\":\"1786003900\",\"ver\":\"1.0\",\"http://schemas.microsoft.com/identity/claims/tenantid\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"http://schemas.microsoft.com/claims/authnmethodsreferences\":\"pwd,mfa\",\"http://schemas.microsoft.com/identity/claims/objectidentifier\":\"bbbbbbbb-1111-2222-3333-cccccccccccc\",\"http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn\":\"admin@contoso.com\",\"name\":\"Contoso Admin\",\"http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name\":\" admin@contoso.com\",\"appid\":\"c44b4083-3bb0-49c1-b47d-974e53cbdf3c\",\"appidacr\":\"2\",\"http://schemas.microsoft.com/identity/claims/scope\":\"user_impersonation\",\"ipaddr\":\"203.0.113.10\"}},\"level\":\"Information\",\"location\":\"global\",\"properties\":{\"statusCode\":\"Created\",\"serviceRequestId\":\"ffff5555-aa66-7777-88bb-999999cccccc\",\"eventCategory\":\"Administrative\",\"entity\":\"/subscriptions/bbbb1b1b-cc2c-dd3d-ee4e-ffffff5f5f5f/resourceGroups/rg-prod/providers/Microsoft.Network/networkSecurityGroups/nsg-web\",\"message\":\"Microsoft.Network/networkSecurityGroups/write\",\"hierarchy\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee/bbbb1b1b-cc2c-dd3d-ee4e-ffffff5f5f5f\"}}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 3
+      "type_uid": 600303
+      "status_id": 1
+      "api.operation": "MICROSOFT.NETWORK/NETWORKSECURITYGROUPS/WRITE"
+      "api.service.name": "MICROSOFT.NETWORK"
+      "actor.user.name": "admin@contoso.com"
+      "actor.user.uid": "bbbbbbbb-1111-2222-3333-cccccccccccc"
+      "src_endpoint.ip": "203.0.113.10"
+      "cloud.account.uid": "bbbb1b1b-cc2c-dd3d-ee4e-ffffff5f5f5f"
+      "resources.0.type": "MICROSOFT.NETWORK/NETWORKSECURITYGROUPS"
+      "resources.0.name": "NSG-WEB"
+      "status_code": "Created"
+      "metadata.event_code": "Administrative"
+      "metadata.product.name": "Azure Activity Log"
+      "metadata.version": "1.9.0"
+  # activity_fail_sp.json
+  - raw: "{\"time\":\"2026-10-11T14:05:10.1000000Z\",\"resourceId\":\"/subscriptions/bbbb1b1b-cc2c-dd3d-ee4e-ffffff5f5f5f/providers/Microsoft.Authorization/roleAssignments/11112222-3333-4444-5555-666677778888\",\"operationName\":\"Microsoft.Authorization/roleAssignments/write\",\"category\":\"Administrative\",\"resultType\":\"Failure\",\"resultSignature\":\"Forbidden\",\"durationMs\":\"0\",\"callerIpAddress\":\"198.51.100.23\",\"correlationId\":\"cccc2222-dd33-4444-55ee-666666ffffff\",\"identity\":{\"authorization\":{\"scope\":\"/subscriptions/bbbb1b1b-cc2c-dd3d-ee4e-ffffff5f5f5f\",\"action\":\"Microsoft.Authorization/roleAssignments/write\",\"evidence\":{\"principalId\":\"dddddddd333344445555eeeeeeeeeeee\",\"principalType\":\"ServicePrincipal\"}},\"claims\":{\"appid\":\"22223333-cccc-4444-dddd-5555eeee6666\",\"http://schemas.microsoft.com/identity/claims/tenantid\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"http://schemas.microsoft.com/identity/claims/objectidentifier\":\"dddddddd-3333-4444-5555-eeeeeeeeeeee\",\"idtyp\":\"app\"}},\"level\":\"Error\",\"location\":\"global\",\"properties\":{\"statusCode\":\"Forbidden\",\"statusMessage\":\"{\\\"error\\\":{\\\"code\\\":\\\"AuthorizationFailed\\\",\\\"message\\\":\\\"The client does not have authorization to perform action.\\\"}}\",\"eventCategory\":\"Administrative\"}}"
+    expect:
+      "class_uid": 6003
+      "status_id": 2
+      "severity_id": 4
+      "actor.user.type_id": 4
+      "actor.app_uid": "22223333-cccc-4444-dddd-5555eeee6666"
+      "status_code": "Forbidden"
+      "src_endpoint.ip": "198.51.100.23"
+      "metadata.version": "1.9.0"
+  # activity_legacy_delete.json
+  - raw: "{\"time\":\"2026-10-11T14:07:00.0000000Z\",\"resourceId\":\"/subscriptions/bbbb1b1b-cc2c-dd3d-ee4e-ffffff5f5f5f/resourceGroups/rg-dev/providers/Microsoft.Compute/virtualMachines/vm-build-01\",\"operationName\":\"Microsoft.Compute/virtualMachines/delete\",\"category\":\"Delete\",\"resultType\":\"Start\",\"resultSignature\":\"Started.\",\"durationMs\":0,\"callerIpAddress\":\"203.0.113.10\",\"correlationId\":\"eeee4444-ff55-6666-77aa-888888bbbbbb\",\"identity\":{\"claims\":{\"aud\":\"https://management.core.windows.net/\",\"iss\":\"https://sts.windows.net/aaaabbbb-0000-cccc-1111-dddd2222eeee/\",\"iat\":\"1786000000\",\"nbf\":\"1786000000\",\"exp\":\"1786003900\",\"ver\":\"1.0\",\"http://schemas.microsoft.com/identity/claims/tenantid\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"http://schemas.microsoft.com/claims/authnmethodsreferences\":\"pwd,mfa\",\"http://schemas.microsoft.com/identity/claims/objectidentifier\":\"eeeeeeee-4444-5555-6666-ffffffffffff\",\"http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn\":\"ops@contoso.com\",\"name\":\"Contoso Admin\",\"http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name\":\" ops@contoso.com\",\"appid\":\"c44b4083-3bb0-49c1-b47d-974e53cbdf3c\",\"appidacr\":\"2\",\"http://schemas.microsoft.com/identity/claims/scope\":\"user_impersonation\",\"ipaddr\":\"203.0.113.10\"}},\"level\":\"Information\",\"location\":\"global\",\"properties\":{\"serviceRequestId\":\"abcd0000-1111-2222-3333-444455556666\"}}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 4
+      "status_id": 99
+      "status": "Start"
+      "metadata.event_code": "Delete"
+      "metadata.version": "1.9.0"
+  # activity_service_health.json
+  - raw: "{\"time\":\"2026-10-11T09:00:00.0000000Z\",\"resourceId\":\"/subscriptions/bbbb1b1b-cc2c-dd3d-ee4e-ffffff5f5f5f\",\"operationName\":\"Microsoft.ServiceHealth/incident/action\",\"category\":\"ServiceHealth\",\"resultType\":\"Active\",\"resultSignature\":\"\",\"correlationId\":\"11110000-2222-3333-4444-555566667777\",\"level\":\"Warning\",\"location\":\"global\",\"properties\":{\"eventCategory\":\"ServiceHealth\",\"title\":\"Virtual Machines - East US - Mitigated\",\"service\":\"Virtual Machines\",\"region\":\"East US\",\"incidentType\":\"Incident\",\"trackingId\":\"AB-1CD\",\"impactStartTime\":\"2026-10-11T08:40:00Z\"}}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 99
+      "actor.app_name": "Microsoft Azure"
+      "severity_id": 3
+      "src_endpoint.ip": "0.0.0.0"
+      "metadata.event_code": "ServiceHealth"
+      "metadata.version": "1.9.0"
+  # activity_security_alert.json
+  - raw: "{\"time\":\"2026-10-11T06:02:18.6179339Z\",\"resourceId\":\"/subscriptions/bbbb1b1b-cc2c-dd3d-ee4e-ffffff5f5f5f/providers/Microsoft.Security/locations/centralus/alerts/2518939942613820660_a48f8653-3fc6-4166-9f19-914f030a13d3\",\"operationName\":\"Microsoft.Security/locations/alerts/activate/action\",\"category\":\"Security\",\"resultType\":\"Active\",\"resultSignature\":\"\",\"resultDescription\":\"Suspicious double extension file executed. Machine logs indicate an execution of a process with a suspicious double extension.\",\"correlationId\":\"99990000-8888-7777-6666-555544443333\",\"level\":\"Informational\",\"location\":\"global\",\"properties\":{\"eventCategory\":\"Security\",\"eventName\":\"Suspicious double extension file executed\",\"compromisedEntity\":\"vm-web-01\",\"commandLine\":\"c:\\\\temp\\\\invoice.pdf.exe\",\"processName\":\"c:\\\\temp\\\\invoice.pdf.exe\",\"userName\":\"svc_web\",\"ActionTaken\":\"Detected\",\"Severity\":\"High\"}}"
+    expect:
+      "class_uid": 2004
+      "activity_id": 1
+      "type_uid": 200401
+      "status_id": 1
+      "severity_id": 4
+      "finding_info.title": "Suspicious double extension file executed"
+      "finding_info.uid": "2518939942613820660_a48f8653-3fc6-4166-9f19-914f030a13d3"
+      "is_alert": true
+      "metadata.version": "1.9.0"
+  # activity_policy_deny.json
+  - raw: "{\"time\":\"2026-10-11T13:19:56.1227642Z\",\"resourceId\":\"/subscriptions/bbbb1b1b-cc2c-dd3d-ee4e-ffffff5f5f5f/resourceGroups/rg-prod/providers/Microsoft.Storage/storageAccounts/stprodlogs01\",\"operationName\":\"Microsoft.Authorization/policies/deny/action\",\"category\":\"Policy\",\"resultType\":\"Failure\",\"resultSignature\":\"\",\"correlationId\":\"aaaa1111-2222-3333-4444-555566667777\",\"level\":\"Error\",\"location\":\"global\",\"identity\":{\"claims\":{\"aud\":\"https://management.core.windows.net/\",\"iss\":\"https://sts.windows.net/aaaabbbb-0000-cccc-1111-dddd2222eeee/\",\"iat\":\"1786000000\",\"nbf\":\"1786000000\",\"exp\":\"1786003900\",\"ver\":\"1.0\",\"http://schemas.microsoft.com/identity/claims/tenantid\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"http://schemas.microsoft.com/claims/authnmethodsreferences\":\"pwd,mfa\",\"http://schemas.microsoft.com/identity/claims/objectidentifier\":\"bbbbbbbb-1111-2222-3333-cccccccccccc\",\"http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn\":\"admin@contoso.com\",\"name\":\"Contoso Admin\",\"http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name\":\" admin@contoso.com\",\"appid\":\"c44b4083-3bb0-49c1-b47d-974e53cbdf3c\",\"appidacr\":\"2\",\"http://schemas.microsoft.com/identity/claims/scope\":\"user_impersonation\",\"ipaddr\":\"203.0.113.10\"}},\"properties\":{\"eventCategory\":\"Policy\",\"isComplianceCheck\":\"False\",\"resourceLocation\":\"eastus\",\"policies\":\"[{\\\"policyDefinitionName\\\":\\\"deny-public-blob\\\",\\\"policyDefinitionEffect\\\":\\\"Deny\\\"}]\"}}"
+    expect:
+      "class_uid": 6003
+      "status_id": 2
+      "metadata.event_code": "Policy"
+      "actor.user.name": "admin@contoso.com"
+      "metadata.version": "1.9.0"
+  # signin_ok.json
+  - raw: "{\"time\":\"2026-10-11T15:00:00.0000000Z\",\"resourceId\":\"/tenants/aaaabbbb-0000-cccc-1111-dddd2222eeee/providers/Microsoft.aadiam\",\"operationName\":\"Sign-in activity\",\"operationVersion\":\"1.0\",\"category\":\"SignInLogs\",\"tenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"resultType\":\"0\",\"resultSignature\":\"None\",\"resultDescription\":\"\",\"durationMs\":0,\"callerIpAddress\":\"203.0.113.7\",\"correlationId\":\"c0ffee00-1111-2222-3333-444455556666\",\"identity\":\"Alice Smith\",\"Level\":4,\"location\":\"US\",\"properties\":{\"id\":\"66ea54eb-6301-4ee5-be62-ff5a759b8100\",\"createdDateTime\":\"2026-10-11T15:00:00.0000000+00:00\",\"userDisplayName\":\"Alice Smith\",\"userPrincipalName\":\"alice@contoso.com\",\"userId\":\"aaaaaaaa-0000-1111-2222-bbbbbbbbbbbb\",\"appId\":\"00000002-0000-0ff1-ce00-000000000000\",\"appDisplayName\":\"Office 365 Exchange Online\",\"ipAddress\":\"203.0.113.7\",\"status\":{\"errorCode\":0,\"additionalDetails\":\"MFA requirement satisfied by claim in the token\"},\"clientAppUsed\":\"Browser\",\"userAgent\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Edge/120.0\",\"deviceDetail\":{\"deviceId\":\"cccccccc-2222-3333-4444-dddddddddddd\",\"displayName\":\"ALICE-LAPTOP\",\"operatingSystem\":\"Windows 10\",\"browser\":\"Edge 120.0\",\"isCompliant\":true,\"isManaged\":true,\"trustType\":\"Azure AD joined\"},\"location\":{\"city\":\"Seattle\",\"state\":\"Washington\",\"countryOrRegion\":\"US\",\"geoCoordinates\":{\"latitude\":47.6,\"longitude\":-122.3}},\"correlationId\":\"c0ffee00-1111-2222-3333-444455556666\",\"conditionalAccessStatus\":\"success\",\"isInteractive\":true,\"riskDetail\":\"none\",\"riskLevelAggregated\":\"none\",\"riskLevelDuringSignIn\":\"none\",\"riskState\":\"none\",\"riskEventTypes_v2\":[],\"resourceDisplayName\":\"Office 365 Exchange Online\",\"resourceId\":\"00000002-0000-0ff1-ce00-000000000000\",\"authenticationRequirement\":\"multiFactorAuthentication\",\"authenticationProtocol\":\"none\",\"userType\":\"Member\",\"crossTenantAccessType\":\"none\",\"homeTenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"resourceTenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"tokenIssuerType\":\"AzureAD\",\"authenticationDetails\":[{\"authenticationStepDateTime\":\"2026-10-11T15:00:00Z\",\"authenticationMethod\":\"Password\",\"succeeded\":true},{\"authenticationStepDateTime\":\"2026-10-11T15:00:05Z\",\"authenticationMethod\":\"Mobile app notification\",\"succeeded\":true}],\"appliedConditionalAccessPolicies\":[{\"id\":\"77778888-9999-aaaa-bbbb-ccccddddeeee\",\"displayName\":\"Require MFA\",\"result\":\"success\"}],\"networkLocationDetails\":[],\"autonomousSystemNumber\":64500,\"processingTimeInMs\":211}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "type_uid": 300201
+      "status_id": 1
+      "user.name": "alice@contoso.com"
+      "user.uid": "aaaaaaaa-0000-1111-2222-bbbbbbbbbbbb"
+      "service.name": "Office 365 Exchange Online"
+      "src_endpoint.ip": "203.0.113.7"
+      "is_mfa": true
+      "logon_type_id": 2
+      "metadata.log_name": "SignInLogs"
+      "metadata.original_event_uid": "66ea54eb-6301-4ee5-be62-ff5a759b8100"
+      "cloud.org.uid": "aaaabbbb-0000-cccc-1111-dddd2222eeee"
+      "metadata.version": "1.9.0"
+  # signin_fail_risky.json
+  - raw: "{\"time\":\"2026-10-11T15:00:00.0000000Z\",\"resourceId\":\"/tenants/aaaabbbb-0000-cccc-1111-dddd2222eeee/providers/Microsoft.aadiam\",\"operationName\":\"Sign-in activity\",\"operationVersion\":\"1.0\",\"category\":\"SignInLogs\",\"tenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"resultType\":\"50126\",\"resultSignature\":\"None\",\"resultDescription\":\"Invalid username or password or Invalid on-premise username or password.\",\"durationMs\":0,\"callerIpAddress\":\"198.51.100.66\",\"correlationId\":\"c0ffee00-1111-2222-3333-444455556666\",\"identity\":\"Alice Smith\",\"Level\":4,\"location\":\"US\",\"properties\":{\"id\":\"11d1a2b3-0000-4444-8888-000000000001\",\"createdDateTime\":\"2026-10-11T15:00:00.0000000+00:00\",\"userDisplayName\":\"Alice Smith\",\"userPrincipalName\":\"alice@contoso.com\",\"userId\":\"aaaaaaaa-0000-1111-2222-bbbbbbbbbbbb\",\"appId\":\"00000002-0000-0ff1-ce00-000000000000\",\"appDisplayName\":\"Office 365 Exchange Online\",\"ipAddress\":\"198.51.100.66\",\"status\":{\"errorCode\":50126,\"failureReason\":\"Invalid username or password or Invalid on-premise username or password.\"},\"clientAppUsed\":\"Other clients\",\"userAgent\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Edge/120.0\",\"deviceDetail\":{},\"location\":{\"city\":\"Amsterdam\",\"countryOrRegion\":\"NL\"},\"correlationId\":\"c0ffee00-1111-2222-3333-444455556666\",\"conditionalAccessStatus\":\"notApplied\",\"isInteractive\":true,\"riskDetail\":\"none\",\"riskLevelAggregated\":\"none\",\"riskLevelDuringSignIn\":\"high\",\"riskState\":\"atRisk\",\"riskEventTypes_v2\":[\"unfamiliarFeatures\"],\"resourceDisplayName\":\"Office 365 Exchange Online\",\"resourceId\":\"00000002-0000-0ff1-ce00-000000000000\",\"authenticationRequirement\":\"singleFactorAuthentication\",\"authenticationProtocol\":\"none\",\"userType\":\"Member\",\"crossTenantAccessType\":\"none\",\"homeTenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"resourceTenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"tokenIssuerType\":\"AzureAD\",\"authenticationDetails\":[{\"authenticationStepDateTime\":\"2026-10-11T15:00:00Z\",\"authenticationMethod\":\"Password\",\"succeeded\":true},{\"authenticationStepDateTime\":\"2026-10-11T15:00:05Z\",\"authenticationMethod\":\"Mobile app notification\",\"succeeded\":true}],\"appliedConditionalAccessPolicies\":[{\"id\":\"77778888-9999-aaaa-bbbb-ccccddddeeee\",\"displayName\":\"Require MFA\",\"result\":\"success\"}],\"networkLocationDetails\":[],\"autonomousSystemNumber\":64500,\"processingTimeInMs\":211}}"
+    expect:
+      "class_uid": 3002
+      "status_id": 2
+      "status_code": "50126"
+      "risk_level_id": 3
+      "severity_id": 3
+      "is_mfa": false
+      "src_endpoint.ip": "198.51.100.66"
+      "metadata.version": "1.9.0"
+  # signin_unregistered_device.json (NAN-3680): deviceDetail carries only operatingSystem/browser
+  # (no deviceId/displayName). The device is identified by the client IP, never emitted as just `os`.
+  - raw: "{\"time\":\"2026-10-12T16:41:50.1234567Z\",\"resourceId\":\"/tenants/aaaabbbb-0000-cccc-1111-dddd2222eeee/providers/Microsoft.aadiam\",\"operationName\":\"Sign-in activity\",\"operationVersion\":\"1.0\",\"category\":\"SignInLogs\",\"tenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"resultType\":\"0\",\"resultSignature\":\"None\",\"resultDescription\":\"\",\"durationMs\":0,\"callerIpAddress\":\"198.51.100.23\",\"correlationId\":\"d00dfeed-1111-2222-3333-444455556666\",\"identity\":\"Bob Jones\",\"Level\":4,\"location\":\"US\",\"properties\":{\"id\":\"55d1a2b3-0000-4444-8888-000000000005\",\"createdDateTime\":\"2026-10-12T16:41:50.1234567+00:00\",\"userDisplayName\":\"Bob Jones\",\"userPrincipalName\":\"bob@contoso.com\",\"userId\":\"bbbbbbbb-0000-1111-2222-cccccccccccc\",\"appId\":\"00000003-0000-0000-c000-000000000000\",\"appDisplayName\":\"Microsoft Graph\",\"ipAddress\":\"198.51.100.23\",\"status\":{\"errorCode\":0},\"clientAppUsed\":\"Browser\",\"conditionalAccessStatus\":\"notApplied\",\"isInteractive\":true,\"deviceDetail\":{\"operatingSystem\":\"Windows10\",\"browser\":\"Edge 120.0\"},\"location\":{\"city\":\"Redmond\",\"state\":\"Washington\",\"countryOrRegion\":\"US\"},\"riskLevelAggregated\":\"none\",\"riskState\":\"none\",\"authenticationRequirement\":\"singleFactorAuthentication\"}}"
+    expect:
+      "class_uid": 3002
+      "device.ip": "198.51.100.23"
+      "device.os.name": "Windows10"
+      "src_endpoint.ip": "198.51.100.23"
+      "metadata.version": "1.9.0"
+  # signin_managed_identity_no_device_id.json (NAN-3680): no device identifier and no IP: no device
+  # object at all (operatingSystem spills to unmapped); the row stays valid OCSF.
+  - raw: "{\"time\":\"2026-10-12T16:41:50.1234567Z\",\"resourceId\":\"/tenants/aaaabbbb-0000-cccc-1111-dddd2222eeee/providers/Microsoft.aadiam\",\"operationName\":\"Sign-in activity\",\"operationVersion\":\"1.0\",\"category\":\"ManagedIdentitySignInLogs\",\"tenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"resultType\":\"0\",\"resultSignature\":\"None\",\"resultDescription\":\"\",\"durationMs\":0,\"callerIpAddress\":\"\",\"correlationId\":\"d00dfeed-1111-2222-3333-444455556666\",\"identity\":\"Bob Jones\",\"Level\":4,\"location\":\"US\",\"properties\":{\"id\":\"55d1a2b3-0000-4444-8888-000000000005\",\"createdDateTime\":\"2026-10-12T16:41:50.1234567+00:00\",\"userDisplayName\":\"\",\"userPrincipalName\":\"\",\"userId\":\"\",\"appId\":\"00000003-0000-0000-c000-000000000000\",\"appDisplayName\":\"Microsoft Graph\",\"ipAddress\":\"\",\"status\":{\"errorCode\":0},\"clientAppUsed\":\"Browser\",\"conditionalAccessStatus\":\"notApplied\",\"isInteractive\":false,\"deviceDetail\":{\"operatingSystem\":\"Windows10\",\"browser\":\"Edge 120.0\"},\"location\":{\"city\":\"Redmond\",\"state\":\"Washington\",\"countryOrRegion\":\"US\"},\"riskLevelAggregated\":\"none\",\"riskState\":\"none\",\"authenticationRequirement\":\"singleFactorAuthentication\",\"servicePrincipalName\":\"vm-web-02\",\"servicePrincipalId\":\"12345678-aaaa-bbbb-cccc-1234567890ac\"}}"
+    expect:
+      "class_uid": 3002
+      "metadata.log_name": "ManagedIdentitySignInLogs"
+      "metadata.version": "1.9.0"
+  # signin_noninteractive.json
+  - raw: "{\"time\":\"2026-10-11T15:00:00.0000000Z\",\"resourceId\":\"/tenants/aaaabbbb-0000-cccc-1111-dddd2222eeee/providers/Microsoft.aadiam\",\"operationName\":\"Sign-in activity\",\"operationVersion\":\"1.0\",\"category\":\"NonInteractiveUserSignInLogs\",\"tenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"resultType\":\"0\",\"resultSignature\":\"None\",\"resultDescription\":\"\",\"durationMs\":0,\"callerIpAddress\":\"203.0.113.7\",\"correlationId\":\"c0ffee00-1111-2222-3333-444455556666\",\"identity\":\"Alice Smith\",\"Level\":4,\"location\":\"US\",\"properties\":{\"id\":\"22d1a2b3-0000-4444-8888-000000000002\",\"createdDateTime\":\"2026-10-11T15:00:00.0000000+00:00\",\"userDisplayName\":\"Alice Smith\",\"userPrincipalName\":\"alice@contoso.com\",\"userId\":\"aaaaaaaa-0000-1111-2222-bbbbbbbbbbbb\",\"appId\":\"00000002-0000-0ff1-ce00-000000000000\",\"appDisplayName\":\"Office 365 Exchange Online\",\"ipAddress\":\"203.0.113.7\",\"status\":{\"errorCode\":0,\"additionalDetails\":\"MFA requirement satisfied by claim in the token\"},\"clientAppUsed\":\"Mobile Apps and Desktop clients\",\"userAgent\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Edge/120.0\",\"deviceDetail\":{\"deviceId\":\"cccccccc-2222-3333-4444-dddddddddddd\",\"displayName\":\"ALICE-LAPTOP\",\"operatingSystem\":\"Windows 10\",\"browser\":\"Edge 120.0\",\"isCompliant\":true,\"isManaged\":true,\"trustType\":\"Azure AD joined\"},\"location\":{\"city\":\"Seattle\",\"state\":\"Washington\",\"countryOrRegion\":\"US\",\"geoCoordinates\":{\"latitude\":47.6,\"longitude\":-122.3}},\"correlationId\":\"c0ffee00-1111-2222-3333-444455556666\",\"conditionalAccessStatus\":\"success\",\"isInteractive\":false,\"riskDetail\":\"none\",\"riskLevelAggregated\":\"none\",\"riskLevelDuringSignIn\":\"none\",\"riskState\":\"none\",\"riskEventTypes_v2\":[],\"resourceDisplayName\":\"Office 365 Exchange Online\",\"resourceId\":\"00000002-0000-0ff1-ce00-000000000000\",\"authenticationRequirement\":\"multiFactorAuthentication\",\"authenticationProtocol\":\"none\",\"userType\":\"Member\",\"crossTenantAccessType\":\"none\",\"homeTenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"resourceTenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"tokenIssuerType\":\"AzureAD\",\"authenticationDetails\":[{\"authenticationStepDateTime\":\"2026-10-11T15:00:00Z\",\"authenticationMethod\":\"Password\",\"succeeded\":true},{\"authenticationStepDateTime\":\"2026-10-11T15:00:05Z\",\"authenticationMethod\":\"Mobile app notification\",\"succeeded\":true}],\"appliedConditionalAccessPolicies\":[{\"id\":\"77778888-9999-aaaa-bbbb-ccccddddeeee\",\"displayName\":\"Require MFA\",\"result\":\"success\"}],\"networkLocationDetails\":[],\"autonomousSystemNumber\":64500,\"processingTimeInMs\":211,\"incomingTokenType\":\"refreshToken\"}}"
+    expect:
+      "class_uid": 3002
+      "logon_type_id": 3
+      "metadata.log_name": "NonInteractiveUserSignInLogs"
+      "metadata.version": "1.9.0"
+  # signin_service_principal.json
+  - raw: "{\"time\":\"2026-10-11T15:00:00.0000000Z\",\"resourceId\":\"/tenants/aaaabbbb-0000-cccc-1111-dddd2222eeee/providers/Microsoft.aadiam\",\"operationName\":\"Sign-in activity\",\"operationVersion\":\"1.0\",\"category\":\"ServicePrincipalSignInLogs\",\"tenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"resultType\":\"0\",\"resultSignature\":\"None\",\"resultDescription\":\"\",\"durationMs\":0,\"callerIpAddress\":\"192.0.2.15\",\"correlationId\":\"c0ffee00-1111-2222-3333-444455556666\",\"identity\":\"build-pipeline\",\"Level\":4,\"location\":\"US\",\"properties\":{\"id\":\"33d1a2b3-0000-4444-8888-000000000003\",\"createdDateTime\":\"2026-10-11T15:00:00.0000000+00:00\",\"userDisplayName\":\"\",\"userPrincipalName\":\"\",\"userId\":\"\",\"appId\":\"ffff0000-5555-6666-7777-888899990000\",\"appDisplayName\":\"build-pipeline\",\"ipAddress\":\"192.0.2.15\",\"status\":{\"errorCode\":0,\"additionalDetails\":\"MFA requirement satisfied by claim in the token\"},\"clientAppUsed\":\"Browser\",\"userAgent\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Edge/120.0\",\"deviceDetail\":{},\"location\":{\"city\":\"Seattle\",\"state\":\"Washington\",\"countryOrRegion\":\"US\",\"geoCoordinates\":{\"latitude\":47.6,\"longitude\":-122.3}},\"correlationId\":\"c0ffee00-1111-2222-3333-444455556666\",\"conditionalAccessStatus\":\"notApplied\",\"isInteractive\":false,\"riskDetail\":\"none\",\"riskLevelAggregated\":\"none\",\"riskLevelDuringSignIn\":\"none\",\"riskState\":\"none\",\"riskEventTypes_v2\":[],\"resourceDisplayName\":\"Azure Resource Manager\",\"resourceId\":\"797f4846-ba00-4fd7-ba43-dac1f8f63013\",\"authenticationRequirement\":\"singleFactorAuthentication\",\"authenticationProtocol\":\"none\",\"userType\":\"Member\",\"crossTenantAccessType\":\"none\",\"homeTenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"resourceTenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"tokenIssuerType\":\"AzureAD\",\"authenticationDetails\":[{\"authenticationStepDateTime\":\"2026-10-11T15:00:00Z\",\"authenticationMethod\":\"Password\",\"succeeded\":true},{\"authenticationStepDateTime\":\"2026-10-11T15:00:05Z\",\"authenticationMethod\":\"Mobile app notification\",\"succeeded\":true}],\"appliedConditionalAccessPolicies\":[{\"id\":\"77778888-9999-aaaa-bbbb-ccccddddeeee\",\"displayName\":\"Require MFA\",\"result\":\"success\"}],\"networkLocationDetails\":[],\"autonomousSystemNumber\":64500,\"processingTimeInMs\":211,\"servicePrincipalName\":\"build-pipeline\",\"servicePrincipalId\":\"eeeeffff-4444-5555-6666-777788889999\",\"clientCredentialType\":\"federatedIdentityCredential\"}}"
+    expect:
+      "class_uid": 3002
+      "user.name": "build-pipeline"
+      "user.type_id": 4
+      "user.uid": "eeeeffff-4444-5555-6666-777788889999"
+      "service.name": "Azure Resource Manager"
+      "metadata.log_name": "ServicePrincipalSignInLogs"
+      "metadata.version": "1.9.0"
+  # signin_managed_identity.json
+  - raw: "{\"time\":\"2026-10-11T15:00:00.0000000Z\",\"resourceId\":\"/tenants/aaaabbbb-0000-cccc-1111-dddd2222eeee/providers/Microsoft.aadiam\",\"operationName\":\"Sign-in activity\",\"operationVersion\":\"1.0\",\"category\":\"ManagedIdentitySignInLogs\",\"tenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"resultType\":\"0\",\"resultSignature\":\"None\",\"resultDescription\":\"\",\"durationMs\":0,\"callerIpAddress\":\"\",\"correlationId\":\"c0ffee00-1111-2222-3333-444455556666\",\"identity\":\"vm-web-01\",\"Level\":4,\"location\":\"US\",\"properties\":{\"id\":\"44d1a2b3-0000-4444-8888-000000000004\",\"createdDateTime\":\"2026-10-11T15:00:00.0000000+00:00\",\"userDisplayName\":\"\",\"userPrincipalName\":\"\",\"userId\":\"\",\"appId\":\"87654321-dddd-eeee-ffff-0987654321ba\",\"appDisplayName\":\"vm-web-01\",\"ipAddress\":\"\",\"status\":{\"errorCode\":0,\"additionalDetails\":\"MFA requirement satisfied by claim in the token\"},\"clientAppUsed\":\"Browser\",\"userAgent\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Edge/120.0\",\"deviceDetail\":{},\"location\":{\"city\":\"Seattle\",\"state\":\"Washington\",\"countryOrRegion\":\"US\",\"geoCoordinates\":{\"latitude\":47.6,\"longitude\":-122.3}},\"correlationId\":\"c0ffee00-1111-2222-3333-444455556666\",\"conditionalAccessStatus\":\"success\",\"isInteractive\":false,\"riskDetail\":\"none\",\"riskLevelAggregated\":\"none\",\"riskLevelDuringSignIn\":\"none\",\"riskState\":\"none\",\"riskEventTypes_v2\":[],\"resourceDisplayName\":\"Azure Key Vault\",\"resourceId\":\"cfa8b339-82a2-471a-a3c9-0fc0be7a4093\",\"authenticationRequirement\":\"singleFactorAuthentication\",\"authenticationProtocol\":\"none\",\"userType\":\"Member\",\"crossTenantAccessType\":\"none\",\"homeTenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"resourceTenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"tokenIssuerType\":\"AzureAD\",\"authenticationDetails\":[{\"authenticationStepDateTime\":\"2026-10-11T15:00:00Z\",\"authenticationMethod\":\"Password\",\"succeeded\":true},{\"authenticationStepDateTime\":\"2026-10-11T15:00:05Z\",\"authenticationMethod\":\"Mobile app notification\",\"succeeded\":true}],\"appliedConditionalAccessPolicies\":[{\"id\":\"77778888-9999-aaaa-bbbb-ccccddddeeee\",\"displayName\":\"Require MFA\",\"result\":\"success\"}],\"networkLocationDetails\":[],\"autonomousSystemNumber\":64500,\"processingTimeInMs\":211,\"servicePrincipalName\":\"vm-web-01\",\"servicePrincipalId\":\"12345678-aaaa-bbbb-cccc-1234567890ab\",\"managedIdentityType\":\"systemAssigned\"}}"
+    expect:
+      "class_uid": 3002
+      "user.name": "vm-web-01"
+      "user.type_id": 4
+      "src_endpoint.ip": "0.0.0.0"
+      "metadata.log_name": "ManagedIdentitySignInLogs"
+      "metadata.version": "1.9.0"
+  # audit_reset_password.json
+  - raw: "{\"time\":\"2026-10-11T16:10:00.0000000Z\",\"resourceId\":\"/tenants/aaaabbbb-0000-cccc-1111-dddd2222eeee/providers/Microsoft.aadiam\",\"operationName\":\"Reset user password\",\"operationVersion\":\"1.0\",\"category\":\"AuditLogs\",\"tenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"resultSignature\":\"None\",\"durationMs\":0,\"callerIpAddress\":\"<null>\",\"correlationId\":\"dddd3333-ee44-5555-66ff-777777aaaaaa\",\"Level\":4,\"properties\":{\"id\":\"Directory_0001\",\"category\":\"UserManagement\",\"correlationId\":\"dddd3333-ee44-5555-66ff-777777aaaaaa\",\"result\":\"success\",\"resultReason\":\"\",\"activityDisplayName\":\"Reset user password\",\"activityDateTime\":\"2026-10-11T16:10:00.1234567+00:00\",\"loggedByService\":\"Core Directory\",\"operationType\":\"Update\",\"initiatedBy\":{\"user\":{\"id\":\"bbbbbbbb-1111-2222-3333-cccccccccccc\",\"displayName\":null,\"userPrincipalName\":\"admin@contoso.com\",\"ipAddress\":\"203.0.113.10\",\"roles\":[]}},\"targetResources\":[{\"id\":\"aaaaaaaa-0000-1111-2222-bbbbbbbbbbbb\",\"displayName\":null,\"type\":\"User\",\"userPrincipalName\":\"bob@contoso.com\",\"modifiedProperties\":[],\"administrativeUnits\":[]}],\"additionalDetails\":[{\"key\":\"User-Agent\",\"value\":\"Mozilla/5.0 (Windows NT 10.0) Edge/120.0\"}]}}"
+    expect:
+      "class_uid": 3007
+      "activity_id": 9
+      "type_uid": 300709
+      "user.name": "bob@contoso.com"
+      "actor.user.name": "admin@contoso.com"
+      "src_endpoint.ip": "203.0.113.10"
+      "api.operation": "Reset user password"
+      "metadata.event_code": "UserManagement"
+      "metadata.log_name": "AuditLogs"
+      "metadata.version": "1.9.0"
+  # audit_add_group_member.json
+  - raw: "{\"time\":\"2026-10-11T16:10:00.0000000Z\",\"resourceId\":\"/tenants/aaaabbbb-0000-cccc-1111-dddd2222eeee/providers/Microsoft.aadiam\",\"operationName\":\"Add member to group\",\"operationVersion\":\"1.0\",\"category\":\"AuditLogs\",\"tenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"resultSignature\":\"None\",\"durationMs\":0,\"callerIpAddress\":\"<null>\",\"correlationId\":\"dddd3333-ee44-5555-66ff-777777aaaaaa\",\"Level\":4,\"properties\":{\"id\":\"Directory_0002\",\"category\":\"GroupManagement\",\"correlationId\":\"dddd3333-ee44-5555-66ff-777777aaaaaa\",\"result\":\"success\",\"resultReason\":\"\",\"activityDisplayName\":\"Add member to group\",\"activityDateTime\":\"2026-10-11T16:10:00.1234567+00:00\",\"loggedByService\":\"Core Directory\",\"operationType\":\"Assign\",\"initiatedBy\":{\"user\":{\"id\":\"bbbbbbbb-1111-2222-3333-cccccccccccc\",\"displayName\":null,\"userPrincipalName\":\"admin@contoso.com\",\"ipAddress\":\"203.0.113.10\",\"roles\":[]}},\"targetResources\":[{\"id\":\"aaaaaaaa-0000-1111-2222-bbbbbbbbbbbb\",\"displayName\":null,\"type\":\"User\",\"userPrincipalName\":\"bob@contoso.com\",\"modifiedProperties\":[],\"administrativeUnits\":[]},{\"id\":\"55556666-7777-8888-9999-aaaabbbbcccc\",\"displayName\":\"Finance-Admins\",\"type\":\"Group\",\"modifiedProperties\":[{\"displayName\":\"Group.DisplayName\",\"oldValue\":null,\"newValue\":\"\\\"Finance-Admins\\\"\"}],\"groupType\":\"unifiedGroups\"}],\"additionalDetails\":[{\"key\":\"User-Agent\",\"value\":\"Mozilla/5.0 (Windows NT 10.0) Edge/120.0\"}]}}"
+    expect:
+      "class_uid": 3006
+      "activity_id": 3
+      "type_uid": 300603
+      "group.name": "Finance-Admins"
+      "user.name": "bob@contoso.com"
+      "metadata.version": "1.9.0"
+  # audit_add_role_member.json
+  - raw: "{\"time\":\"2026-10-11T16:10:00.0000000Z\",\"resourceId\":\"/tenants/aaaabbbb-0000-cccc-1111-dddd2222eeee/providers/Microsoft.aadiam\",\"operationName\":\"Add member to role\",\"operationVersion\":\"1.0\",\"category\":\"AuditLogs\",\"tenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"resultSignature\":\"None\",\"durationMs\":0,\"callerIpAddress\":\"<null>\",\"correlationId\":\"dddd3333-ee44-5555-66ff-777777aaaaaa\",\"Level\":4,\"properties\":{\"id\":\"Directory_0003\",\"category\":\"RoleManagement\",\"correlationId\":\"dddd3333-ee44-5555-66ff-777777aaaaaa\",\"result\":\"success\",\"resultReason\":\"\",\"activityDisplayName\":\"Add member to role\",\"activityDateTime\":\"2026-10-11T16:10:00.1234567+00:00\",\"loggedByService\":\"Core Directory\",\"operationType\":\"Assign\",\"initiatedBy\":{\"user\":{\"id\":\"bbbbbbbb-1111-2222-3333-cccccccccccc\",\"displayName\":null,\"userPrincipalName\":\"admin@contoso.com\",\"ipAddress\":\"203.0.113.10\",\"roles\":[]}},\"targetResources\":[{\"id\":\"aaaaaaaa-0000-1111-2222-bbbbbbbbbbbb\",\"displayName\":null,\"type\":\"User\",\"userPrincipalName\":\"bob@contoso.com\",\"modifiedProperties\":[],\"administrativeUnits\":[]},{\"id\":\"62e90394-69f5-4237-9190-012177145e10\",\"displayName\":\"Global Administrator\",\"type\":\"Role\",\"modifiedProperties\":[{\"displayName\":\"Role.DisplayName\",\"oldValue\":null,\"newValue\":\"\\\"Global Administrator\\\"\"}]}],\"additionalDetails\":[{\"key\":\"User-Agent\",\"value\":\"Mozilla/5.0 (Windows NT 10.0) Edge/120.0\"}]}}"
+    expect:
+      "class_uid": 3007
+      "activity_id": 16
+      "type_uid": 300716
+      "user.name": "bob@contoso.com"
+      "resources.1.name": "Global Administrator"
+      "metadata.version": "1.9.0"
+  # audit_add_service_principal.json
+  - raw: "{\"time\":\"2026-10-11T16:10:00.0000000Z\",\"resourceId\":\"/tenants/aaaabbbb-0000-cccc-1111-dddd2222eeee/providers/Microsoft.aadiam\",\"operationName\":\"Add service principal\",\"operationVersion\":\"1.0\",\"category\":\"AuditLogs\",\"tenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"resultSignature\":\"None\",\"durationMs\":0,\"callerIpAddress\":\"<null>\",\"correlationId\":\"dddd3333-ee44-5555-66ff-777777aaaaaa\",\"Level\":4,\"properties\":{\"id\":\"Directory_0004\",\"category\":\"ApplicationManagement\",\"correlationId\":\"dddd3333-ee44-5555-66ff-777777aaaaaa\",\"result\":\"success\",\"resultReason\":\"\",\"activityDisplayName\":\"Add service principal\",\"activityDateTime\":\"2026-10-11T16:10:00.1234567+00:00\",\"loggedByService\":\"Core Directory\",\"operationType\":\"Add\",\"initiatedBy\":{\"app\":{\"appId\":null,\"displayName\":\"Microsoft Graph Command Line Tools\",\"servicePrincipalId\":\"11112222-3333-4444-5555-666677778888\",\"servicePrincipalName\":null}},\"targetResources\":[{\"id\":\"99998888-7777-6666-5555-444433332222\",\"displayName\":\"suspicious-oauth-app\",\"type\":\"ServicePrincipal\",\"modifiedProperties\":[{\"displayName\":\"AppAddress\",\"oldValue\":\"[]\",\"newValue\":\"[{\\\"Address\\\":\\\"https://app.example.com/callback\\\"}]\"}]}],\"additionalDetails\":[{\"key\":\"User-Agent\",\"value\":\"Mozilla/5.0 (Windows NT 10.0) Edge/120.0\"}]}}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 1
+      "actor.user.name": "Microsoft Graph Command Line Tools"
+      "actor.user.type_id": 4
+      "resources.0.name": "suspicious-oauth-app"
+      "api.service.name": "Core Directory"
+      "src_endpoint.ip": "0.0.0.0"
+      "metadata.version": "1.9.0"
+  # audit_delete_user_failed.json
+  - raw: "{\"time\":\"2026-10-11T16:10:00.0000000Z\",\"resourceId\":\"/tenants/aaaabbbb-0000-cccc-1111-dddd2222eeee/providers/Microsoft.aadiam\",\"operationName\":\"Delete user\",\"operationVersion\":\"1.0\",\"category\":\"AuditLogs\",\"tenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"resultSignature\":\"None\",\"durationMs\":0,\"callerIpAddress\":\"<null>\",\"correlationId\":\"dddd3333-ee44-5555-66ff-777777aaaaaa\",\"Level\":4,\"properties\":{\"id\":\"Directory_0005\",\"category\":\"UserManagement\",\"correlationId\":\"dddd3333-ee44-5555-66ff-777777aaaaaa\",\"result\":\"failure\",\"resultReason\":\"Insufficient privileges to complete the operation.\",\"activityDisplayName\":\"Delete user\",\"activityDateTime\":\"2026-10-11T16:10:00.1234567+00:00\",\"loggedByService\":\"Core Directory\",\"operationType\":\"Delete\",\"initiatedBy\":{\"user\":{\"id\":\"bbbbbbbb-1111-2222-3333-cccccccccccc\",\"displayName\":null,\"userPrincipalName\":\"admin@contoso.com\",\"ipAddress\":\"203.0.113.10\",\"roles\":[]}},\"targetResources\":[{\"id\":\"aaaaaaaa-0000-1111-2222-bbbbbbbbbbbb\",\"displayName\":null,\"type\":\"User\",\"userPrincipalName\":\"bob@contoso.com\",\"modifiedProperties\":[],\"administrativeUnits\":[]}],\"additionalDetails\":[{\"key\":\"User-Agent\",\"value\":\"Mozilla/5.0 (Windows NT 10.0) Edge/120.0\"}]}}"
+    expect:
+      "class_uid": 3007
+      "activity_id": 3
+      "status_id": 2
+      "status_detail": "Insufficient privileges to complete the operation."
+      "metadata.version": "1.9.0"
+  # unknown_category_keyvault.json
+  - raw: "{\"time\":\"2026-10-11T17:00:00.0000000Z\",\"resourceId\":\"/SUBSCRIPTIONS/bbbb1b1b-cc2c-dd3d-ee4e-ffffff5f5f5f/RESOURCEGROUPS/RG-PROD/PROVIDERS/MICROSOFT.KEYVAULT/VAULTS/KV-PROD\",\"operationName\":\"SecretGet\",\"category\":\"AuditEvent\",\"resultType\":\"Success\",\"resultSignature\":\"OK\",\"durationMs\":\"12\",\"callerIpAddress\":\"203.0.113.44\",\"correlationId\":\"12121212-3434-5656-7878-909090909090\",\"identity\":{\"claim\":{\"upn\":\"app@contoso.com\"}},\"properties\":{\"id\":\"https://kv-prod.vault.azure.net/secrets/db-password\",\"clientInfo\":\"azsdk-net\"}}"
+    expect:
+      "class_uid": 0
+      "activity_id": 99
+      "type_uid": 99
+      "metadata.log_name": "AuditEvent"
+      "message": "SecretGet"
+      "cloud.account.uid": "bbbb1b1b-cc2c-dd3d-ee4e-ffffff5f5f5f"
+      "unmapped.duration_ms": "12"
+      "metadata.version": "1.9.0"
+  # envelope_unexploded_many.json
+  - raw: "{\"records\":[{\"time\":\"2026-10-11T09:00:00.0000000Z\",\"resourceId\":\"/subscriptions/bbbb1b1b-cc2c-dd3d-ee4e-ffffff5f5f5f\",\"operationName\":\"Microsoft.ServiceHealth/incident/action\",\"category\":\"ServiceHealth\",\"resultType\":\"Active\",\"resultSignature\":\"\",\"correlationId\":\"11110000-2222-3333-4444-555566667777\",\"level\":\"Warning\",\"location\":\"global\",\"properties\":{\"eventCategory\":\"ServiceHealth\",\"title\":\"Virtual Machines - East US - Mitigated\",\"service\":\"Virtual Machines\",\"region\":\"East US\",\"incidentType\":\"Incident\",\"trackingId\":\"AB-1CD\",\"impactStartTime\":\"2026-10-11T08:40:00Z\"}},{\"time\":\"2026-10-11T15:00:00.0000000Z\",\"resourceId\":\"/tenants/aaaabbbb-0000-cccc-1111-dddd2222eeee/providers/Microsoft.aadiam\",\"operationName\":\"Sign-in activity\",\"operationVersion\":\"1.0\",\"category\":\"SignInLogs\",\"tenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"resultType\":\"50126\",\"resultSignature\":\"None\",\"resultDescription\":\"Invalid username or password or Invalid on-premise username or password.\",\"durationMs\":0,\"callerIpAddress\":\"198.51.100.66\",\"correlationId\":\"c0ffee00-1111-2222-3333-444455556666\",\"identity\":\"Alice Smith\",\"Level\":4,\"location\":\"US\",\"properties\":{\"id\":\"11d1a2b3-0000-4444-8888-000000000001\",\"createdDateTime\":\"2026-10-11T15:00:00.0000000+00:00\",\"userDisplayName\":\"Alice Smith\",\"userPrincipalName\":\"alice@contoso.com\",\"userId\":\"aaaaaaaa-0000-1111-2222-bbbbbbbbbbbb\",\"appId\":\"00000002-0000-0ff1-ce00-000000000000\",\"appDisplayName\":\"Office 365 Exchange Online\",\"ipAddress\":\"198.51.100.66\",\"status\":{\"errorCode\":50126,\"failureReason\":\"Invalid username or password or Invalid on-premise username or password.\"},\"clientAppUsed\":\"Other clients\",\"userAgent\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Edge/120.0\",\"deviceDetail\":{},\"location\":{\"city\":\"Amsterdam\",\"countryOrRegion\":\"NL\"},\"correlationId\":\"c0ffee00-1111-2222-3333-444455556666\",\"conditionalAccessStatus\":\"notApplied\",\"isInteractive\":true,\"riskDetail\":\"none\",\"riskLevelAggregated\":\"none\",\"riskLevelDuringSignIn\":\"high\",\"riskState\":\"atRisk\",\"riskEventTypes_v2\":[\"unfamiliarFeatures\"],\"resourceDisplayName\":\"Office 365 Exchange Online\",\"resourceId\":\"00000002-0000-0ff1-ce00-000000000000\",\"authenticationRequirement\":\"singleFactorAuthentication\",\"authenticationProtocol\":\"none\",\"userType\":\"Member\",\"crossTenantAccessType\":\"none\",\"homeTenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"resourceTenantId\":\"aaaabbbb-0000-cccc-1111-dddd2222eeee\",\"tokenIssuerType\":\"AzureAD\",\"authenticationDetails\":[{\"authenticationStepDateTime\":\"2026-10-11T15:00:00Z\",\"authenticationMethod\":\"Password\",\"succeeded\":true},{\"authenticationStepDateTime\":\"2026-10-11T15:00:05Z\",\"authenticationMethod\":\"Mobile app notification\",\"succeeded\":true}],\"appliedConditionalAccessPolicies\":[{\"id\":\"77778888-9999-aaaa-bbbb-ccccddddeeee\",\"displayName\":\"Require MFA\",\"result\":\"success\"}],\"networkLocationDetails\":[],\"autonomousSystemNumber\":64500,\"processingTimeInMs\":211}}]}"
+    expect:
+      "class_uid": 0
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  # malformed.txt (not JSON): Base Event error record, never a drop
+  - raw: "{\"records\": [ truncated mid-batch"
+    expect:
+      "class_uid": 0
+      "activity_id": 0
+      "metadata.log_level": "error"
+      "unmapped.parse_error": "body is not a JSON object"
+      "metadata.version": "1.9.0"
+

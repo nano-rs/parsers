@@ -1,0 +1,722 @@
+name: syslog_ocsf
+display_name: Generic Syslog (OCSF)
+version: "1.2.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses RFC 3164 (BSD) and RFC 5424 syslog into OCSF 1.9.0. Syslog is a
+  TRANSPORT, not a schema, so this parser routes on the content it can
+  positively identify and refuses to guess for the rest:
+    * sshd "Accepted…" / "Failed…"    -> Authentication    (class_uid 3002)
+    * sudo "user : TTY=… COMMAND=…"   -> Authentication    (class_uid 3002)
+    * kernel iptables/nftables SRC=…  -> Network Activity  (class_uid 4001)
+    * everything else                 -> Base Event        (class_uid 0)
+  Base Event (class_uid 0) is OCSF's own concrete class for an event that no
+  specific class describes; it keeps time, severity, message, device, actor
+  and unmapped queryable without asserting semantics the line does not carry.
+  Forcing an arbitrary daemon line into, say, HTTP Activity or API Activity
+  would make every class-scoped hunt wrong.
+
+  Two upstream defects in the UDM parser are deliberately not reproduced
+  (see ../parsers/parsers/syslog/parser.yaml, FRO-677): VRL division returns a
+  FLOAT, so the PRI facility quotient must be floored before it is used as an
+  array index; and a named regex group that does not participate yields null,
+  not "", so the optional "[pid]" capture must be read with to_string, never
+  string!.
+match_values:
+  - syslog
+category: generic
+vendor: "IETF"
+product: "Syslog"
+parser_vrl: |
+  # Generic Syslog -> OCSF 1.9.0 (content-routed)
+  raw_log = string!(.message)
+  __raw_body = raw_log
+  __source_kv = {}
+  __syslog, __syslog_err = parse_syslog(raw_log)
+  if __syslog_err == null {
+      for_each(object!(__syslog)) -> |key, value| {
+          if is_object(value) { __source_kv = set!(__source_kv, ["structured_data", key], value) }
+      }
+  }
+
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
+
+  facility_names = ["kern", "user", "mail", "daemon", "auth", "syslog", "lpr", "news",
+                    "uucp", "cron", "authpriv", "ftp", "ntp", "audit", "alert", "clock",
+                    "local0", "local1", "local2", "local3", "local4", "local5", "local6", "local7"]
+  severity_names = ["emergency", "alert", "critical", "error", "warning", "notice", "informational", "debug"]
+
+  have_pri = false
+  facility = ""
+  facility_num = 0
+  syslog_severity = ""
+  severity_num = 6
+  rfc = ""
+  hostname = ""
+  app_name = ""
+  pid_val = ""
+  msgid = ""
+  structured_data = ""
+  msg_body = ""
+  time_ms = 0
+
+  pm, pmerr = parse_regex(raw_log, r'^<(?P<pri>\d{1,3})>(?P<rest>.*)')
+  # Capture parsed fields before mapping; omit structural raw-body captures.
+  __capture = object(parse_json!(encode_json(pm))) ?? {}
+  __ignore = del(__capture.body)
+  __ignore = del(__capture.content)
+  __ignore = del(__capture.kvdata)
+  __ignore = del(__capture.kvpart)
+  __ignore = del(__capture.msg)
+  __ignore = del(__capture.payload)
+  __ignore = del(__capture.remainder)
+  __ignore = del(__capture.rest)
+  __ignore = del(__capture.sd)
+  __source_kv = set!(__source_kv, ["header"], merge(object(get(__source_kv, ["header"]) ?? null) ?? {}, __capture))
+  rest = raw_log
+  if pmerr == null {
+      have_pri = true
+      pri_val = to_int(to_string(pm.pri)) ?? 0
+      rest = to_string(pm.rest)
+      # VRL division yields a FLOAT; floor before indexing (FRO-677).
+      facility_num = to_int(floor(pri_val / 8))
+      severity_num = pri_val - (facility_num * 8)
+      fn = get(facility_names, [facility_num]) ?? null
+      facility = to_string(fn) ?? to_string(facility_num)
+      sn = get(severity_names, [severity_num]) ?? null
+      syslog_severity = to_string(sn) ?? to_string(severity_num)
+  }
+
+  m5, m5err = parse_regex(rest, r'^1\s+(?P<ts>\S+)\s+(?P<hostname>\S+)\s+(?P<app>\S+)\s+(?P<procid>\S+)\s+(?P<msgid>\S+)\s*(?P<remainder>.*)')
+  # Capture parsed fields before mapping; omit structural raw-body captures.
+  __capture = object(parse_json!(encode_json(m5))) ?? {}
+  __ignore = del(__capture.body)
+  __ignore = del(__capture.content)
+  __ignore = del(__capture.kvdata)
+  __ignore = del(__capture.kvpart)
+  __ignore = del(__capture.msg)
+  __ignore = del(__capture.payload)
+  __ignore = del(__capture.remainder)
+  __ignore = del(__capture.rest)
+  __ignore = del(__capture.sd)
+  __source_kv = set!(__source_kv, ["header"], merge(object(get(__source_kv, ["header"]) ?? null) ?? {}, __capture))
+  if m5err == null {
+      rfc = "5424"
+      ts_str = to_string(m5.ts)
+      if ts_str != "-" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+      h = to_string(m5.hostname)
+      if h != "-" { hostname = h }
+      a = to_string(m5.app)
+      if a != "-" { app_name = a }
+      pv = to_string(m5.procid)
+      if pv != "-" { pid_val = pv }
+      mi = to_string(m5.msgid)
+      if mi != "-" { msgid = mi }
+      remainder = to_string(m5.remainder)
+      sd, sderr = parse_regex(remainder, r'^\[(?P<sd>[^\]]+)\]\s*(?P<msg>.*)')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(sd))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
+      if sderr == null {
+          structured_data = to_string(sd.sd)
+          msg_body = strip_whitespace(to_string(sd.msg))
+      } else {
+          msg_body = strip_whitespace(remainder)
+      }
+  } else {
+      m3, m3err = parse_regex(rest, r'^(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(?P<hostname>\S+)\s+(?P<app>[^\[:\s]+)(?:\[(?P<pid>\d+)\])?:?\s*(?P<msg>.*)')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(m3))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
+      if m3err == null {
+          rfc = "3164"
+          ts_str = to_string(m3.ts)
+          t, terr = parse_timestamp(ts_str, "%b %d %H:%M:%S")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+          hostname = to_string(m3.hostname)
+          app_name = to_string(m3.app)
+          # A non-participating named group is null, not "" — to_string, not string! (FRO-677).
+          pid_val = to_string(m3.pid)
+          msg_body = to_string(m3.msg)
+      } else {
+          msg_body = strip_whitespace(rest)
+      }
+  }
+
+  # ---- syslog severity -> OCSF severity_id -------------------------------
+  severity_id = 1
+  severity = "Informational"
+  if severity_num <= 1 { severity_id = 6; severity = "Fatal" } else if severity_num == 2 { severity_id = 5; severity = "Critical" } else if severity_num == 3 { severity_id = 4; severity = "High" } else if severity_num == 4 { severity_id = 3; severity = "Medium" } else if severity_num == 5 { severity_id = 2; severity = "Low" }
+
+  app_lower = downcase(app_name)
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": sha2("syslog|raw|" + raw_log, variant: "SHA-256"),
+      "profiles": ["host", "security_control"],
+      "log_name": "syslog",
+      "log_level": syslog_severity,
+      "product": { "name": "Syslog", "vendor_name": "IETF" }
+  }
+  if app_name != "" { metadata.log_provider = app_name }
+  if msgid != "" { metadata.event_code = msgid }
+
+  unmapped = {}
+  if facility != "" { unmapped.facility = facility }
+  if have_pri { unmapped.facility_num = facility_num; unmapped.severity_num = severity_num }
+  if syslog_severity != "" { unmapped.syslog_severity = syslog_severity }
+  if rfc != "" { unmapped.rfc_version = rfc }
+  # Structured-data parameters are preserved individually by residual spill.
+  if __syslog_err == null && rfc == "5424" { msg_body = string(__syslog.message) ?? msg_body }
+  if app_name != "" { unmapped.service_name = app_name }
+  if hostname != "" { unmapped.host_name = hostname }
+  if !have_pri { unmapped.parse_note = "no syslog PRI header found" }
+
+  device = { "type_id": 0 }
+  if hostname != "" { device.hostname = downcase(hostname) }
+
+  routed = "base"
+
+  # ---- sshd -> Authentication (3002) ------------------------------------
+  ssh_user = ""
+  ssh_ip = ""
+  ssh_port = 0
+  ssh_method = ""
+  ssh_ok = false
+  if app_lower == "sshd" {
+      acc, accerr = parse_regex(msg_body, r'Accepted\s+(?P<method>\S+)\s+for\s+(?P<user>\S+)\s+from\s+(?P<ip>\S+)\s+port\s+(?P<port>\d+)')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(acc))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
+      if accerr == null {
+          routed = "auth_ssh"
+          ssh_ok = true
+          ssh_method = to_string(acc.method)
+          ssh_user = to_string(acc.user)
+          ssh_ip = to_string(acc.ip)
+          ssh_port = to_int(to_string(acc.port)) ?? 0
+      } else {
+          fal, falerr = parse_regex(msg_body, r'Failed\s+(?P<method>\S+)\s+for\s+(?:invalid user\s+)?(?P<user>\S+)\s+from\s+(?P<ip>\S+)\s+port\s+(?P<port>\d+)')
+          # Capture parsed fields before mapping; omit structural raw-body captures.
+          __capture = object(parse_json!(encode_json(fal))) ?? {}
+          __ignore = del(__capture.body)
+          __ignore = del(__capture.content)
+          __ignore = del(__capture.kvdata)
+          __ignore = del(__capture.kvpart)
+          __ignore = del(__capture.msg)
+          __ignore = del(__capture.payload)
+          __ignore = del(__capture.remainder)
+          __ignore = del(__capture.rest)
+          __ignore = del(__capture.sd)
+          __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
+          if falerr == null {
+              routed = "auth_ssh"
+              ssh_ok = false
+              ssh_method = to_string(fal.method)
+              ssh_user = to_string(fal.user)
+              ssh_ip = to_string(fal.ip)
+              ssh_port = to_int(to_string(fal.port)) ?? 0
+          }
+      }
+  }
+
+  # ---- sudo -> Authentication (3002) ------------------------------------
+  sudo_user = ""
+  sudo_target = ""
+  sudo_cmd = ""
+  sudo_tty = ""
+  sudo_pwd = ""
+  if app_lower == "sudo" {
+      sm, smerr = parse_regex(msg_body, r'(?P<user>\S+)\s+:\s+TTY=(?P<tty>\S+)\s*;\s*PWD=(?P<pwd>\S+)\s*;\s*USER=(?P<target_user>\S+)\s*;\s*COMMAND=(?P<command>.*)')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(sm))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
+      if smerr == null {
+          routed = "auth_sudo"
+          sudo_user = to_string(sm.user)
+          sudo_target = to_string(sm.target_user)
+          sudo_cmd = to_string(sm.command)
+          sudo_tty = to_string(sm.tty)
+          sudo_pwd = to_string(sm.pwd)
+      }
+  }
+
+  # ---- kernel netfilter -> Network Activity (4001) -----------------------
+  fw = {}
+  if app_lower == "kernel" {
+      im, imerr = parse_regex(msg_body, r'(?:iptables|nftables|netfilter)[^:]*:\s*(?P<body>.*)')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(im))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["header"], merge(object(get(__source_kv, ["header"]) ?? null) ?? {}, __capture))
+      if imerr == null {
+          kv, kverr = parse_key_value(to_string(im.body), key_value_delimiter: "=", field_delimiter: " ")
+          __kv_capture = object(parse_json!(encode_json(kv))) ?? {}
+          for_each(__kv_capture) -> |key, value| {
+              if !is_boolean(value) { __source_kv = set!(__source_kv, [key], value) }
+          }
+          if kverr == null {
+              routed = "firewall"
+              fw = object!(kv)
+          }
+      }
+  }
+
+  if routed == "auth_ssh" {
+      status_id = 2
+      status_str = "Failure"
+      if ssh_ok { status_id = 1; status_str = "Success" }
+      sev_id = severity_id
+      sev = severity
+      if !ssh_ok && sev_id < 3 { sev_id = 3; sev = "Medium" }
+
+      . = {
+          "class_uid": 3002,
+          "class_name": "Authentication",
+          "category_uid": 3,
+          "category_name": "Identity & Access Management",
+          "activity_id": 1,
+          "activity_name": "Logon",
+          "type_uid": 300201,
+          "severity_id": sev_id,
+          "severity": sev,
+          "status_id": status_id,
+          "status": status_str,
+          "is_alert": !ssh_ok,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "user": { "name": ssh_user },
+          "service": { "name": "sshd" },
+          "logon_type": "Network",
+          "is_remote": true,
+          "device": device
+      }
+      se = {}
+      if match(ssh_ip, ip_re) { se.ip = ssh_ip } else if ssh_ip != "" { se.hostname = downcase(ssh_ip) }
+      if ssh_port != 0 { se.port = ssh_port }
+      if exists(se.ip) || exists(se.hostname) { .src_endpoint = se }
+      if ssh_method != "" { unmapped.auth_method = ssh_method }
+      if pid_val != "" { .actor = { "process": { "name": app_name, "pid": to_int(pid_val) ?? 0 } } }
+      .unmapped = unmapped
+  } else if routed == "auth_sudo" {
+      # sudo is an account switch: the invoking user authenticates AS the
+      # target user. OCSF models that as Authentication with the target in
+      # `user` and the invoker in `actor.user`.
+      . = {
+          "class_uid": 3002,
+          "class_name": "Authentication",
+          "category_uid": 3,
+          "category_name": "Identity & Access Management",
+          "activity_id": 1,
+          "activity_name": "Logon",
+          "type_uid": 300201,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": 1,
+          "status": "Success",
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "user": { "name": sudo_target },
+          "service": { "name": "sudo" },
+          "logon_type": "Interactive",
+          "is_remote": false,
+          "device": device,
+          "account_switch_type": "sudo"
+      }
+      if sudo_tty != "" { .session = { "terminal": sudo_tty } }
+      # actor.process carries the sudo'd command line, but the OCSF `process`
+      # object requires one of pid/uid/cpid and a sudo syslog line carries a
+      # pid only when the daemon was configured to log one. When it is absent
+      # the command stays in `unmapped.command_line` (and in `message`) rather
+      # than being emitted under a fabricated process identity.
+      if pid_val != "" {
+          ap = { "pid": to_int(pid_val) ?? 0, "cmd_line": sudo_cmd }
+          cparts = split(sudo_cmd, " ")
+          cp0 = to_string(cparts[0])
+          if cp0 != "" {
+              pparts = split(cp0, "/")
+              ap.name = to_string(get(pparts, [-1]) ?? cp0) ?? cp0
+              ap.path = cp0
+          }
+          .actor = { "user": { "name": sudo_user }, "process": ap }
+      } else {
+          .actor = { "user": { "name": sudo_user } }
+          if sudo_cmd != "" { unmapped.command_line = sudo_cmd }
+      }
+      if sudo_pwd != "" { unmapped.working_directory = sudo_pwd }
+      .unmapped = unmapped
+  } else if routed == "firewall" {
+      verdict = upcase(msg_body)
+      action_id = 0
+      action_name = "Unknown"
+      disposition_id = 0
+      disposition_name = "Unknown"
+      activity_id = 6
+      activity_name = "Traffic"
+      if contains(verdict, "DROP") {
+          action_id = 2; action_name = "Denied"
+          disposition_id = 2; disposition_name = "Blocked"
+          activity_id = 4; activity_name = "Fail"
+      } else if contains(verdict, "REJECT") {
+          action_id = 2; action_name = "Denied"
+          disposition_id = 2; disposition_name = "Blocked"
+          activity_id = 5; activity_name = "Refuse"
+      } else if contains(verdict, "ACCEPT") {
+          action_id = 1; action_name = "Allowed"
+          disposition_id = 1; disposition_name = "Allowed"
+      }
+
+      se = {}
+      de = {}
+      s = to_string(get(fw, ["SRC"]) ?? "") ?? ""
+      d = to_string(get(fw, ["DST"]) ?? "") ?? ""
+      if match(s, ip_re) { se.ip = s }
+      if match(d, ip_re) { de.ip = d }
+      sp = to_int(get(fw, ["SPT"]) ?? 0) ?? 0
+      dp = to_int(get(fw, ["DPT"]) ?? 0) ?? 0
+      if sp != 0 { se.port = sp }
+      if dp != 0 { de.port = dp }
+      mac = to_string(get(fw, ["MAC"]) ?? "") ?? ""
+
+      . = {
+          "class_uid": 4001,
+          "class_name": "Network Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": 400100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": 1,
+          "status": "Success",
+          "action_id": action_id,
+          "action": action_name,
+          "disposition_id": disposition_id,
+          "disposition": disposition_name,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "device": device
+      }
+      if exists(se.ip) { .src_endpoint = se } else if exists(de.ip) { .src_endpoint = { "svc_name": "netfilter" } }
+      if exists(de.ip) { .dst_endpoint = de }
+      if !exists(.src_endpoint) && !exists(.dst_endpoint) { .src_endpoint = { "svc_name": "netfilter" } }
+      proto = to_string(get(fw, ["PROTO"]) ?? "") ?? ""
+      if proto != "" { .connection_info = { "direction_id": 0, "direction": "Unknown", "protocol_name": downcase(proto) } }
+      for_each(["IN", "OUT"]) -> |_i, k| {
+          v = to_string(get(fw, [k]) ?? "") ?? ""
+          if v != "" { unmapped = set!(unmapped, ["interface_" + downcase(k)], v) }
+      }
+      if mac != "" { unmapped.mac_address = mac }
+      .unmapped = unmapped
+  } else {
+      # ---- Base Event (0) ----
+      # No specific OCSF class describes an arbitrary daemon line. Base Event
+      # is the spec's concrete class for exactly that; it keeps time,
+      # severity, device, message and unmapped queryable and asserts nothing
+      # about semantics the line does not carry.
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": 0,
+          "status": "Unknown",
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "unmapped": unmapped
+      }
+      if exists(device.hostname) { .device = device }
+      if pid_val != "" && app_name != "" {
+          .actor = { "process": { "name": app_name, "pid": to_int(pid_val) ?? 0 } }
+      }
+      if msg_body != "" { .status_detail = msg_body }
+  }
+
+  .
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  __mapped = object!(parse_json!(encode_json(.)))
+  __existing = object(__mapped.unmapped) ?? {}
+  __discard = del(__mapped.raw_data)
+  __discard = del(__mapped.unmapped)
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __represented = []
+  __walk = map_values(__mapped, recursive: true) -> |value| {
+      __represented = push(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __represented = push(__represented, to_string(value) ?? "")
+      }
+      value
+  }
+  __consumed = []
+  # BEGIN parser-specific transformations
+  # header.ts: Existing timestamp conversion verified against the emitted millisecond clock.
+  # PROTO: Case normalization already performed by the parser; observed at connection_info.protocol_name, and checked against the emitted branch.
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = ["DPT", "DST", "MAC", "PROTO", "SPT", "SRC", "event.app", "event.command", "event.hostname", "event.ip", "event.method", "event.msg", "event.pid", "event.port", "event.pwd", "event.sd", "event.target_user", "event.ts", "event.tty", "event.user", "header.app", "header.body", "header.hostname", "header.msgid", "header.pri", "header.procid", "header.remainder", "header.rest", "header.ts"]
+  __preserve = []
+  __rules = array!(parse_json!("[{\"source\":\"header.ts\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"format\":\"%+\",\"reason\":\"Existing timestamp conversion verified against the emitted millisecond clock.\"},{\"source\":\"PROTO\",\"kind\":\"lowercase\",\"reason\":\"Case normalization already performed by the parser; observed at connection_info.protocol_name, and checked against the emitted branch.\"}]"))
+  __source_flat = flatten(__source_kv)
+  for_each(__rules) -> |_index, rule| {
+      __source_key = string!(rule.source)
+      __value = get!(__source_flat, [__source_key])
+      __expected = null
+      __valid = false
+      if rule.kind == "lowercase" && is_string(__value) {
+          __expected = downcase(string!(__value))
+          __valid = true
+      } else if rule.kind == "epoch_ms" {
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", string(rule.format) ?? "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              __valid = true
+          }
+      } else if rule.kind == "scale" {
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * to_float!(rule.factor))
+              __valid = true
+          }
+      } else if rule.kind == "hex" {
+          __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
+          __integer, __integer_err = parse_int(__hex, base: 16)
+          __expected = __integer
+          __valid = is_string(__value) && starts_with(downcase(string(__value) ?? ""), "0x") && __integer_err == null
+      } else if rule.kind == "enum" {
+          __expected = get!(object!(rule.values), [downcase(to_string(__value) ?? "")])
+          __valid = __expected != null
+      }
+      __matches = includes(__represented, encode_json(__expected))
+      if is_string(rule.target) { __matches = get!(., split(string!(rule.target), ".")) == __expected }
+      if __valid && __matches { __consumed = push(__consumed, __source_key) }
+  }
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  __safe = map_values(object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing}))), recursive: true) -> |value| {
+      if is_object(value) {
+          # Header/parameter arrays commonly encode sensitive keys as name/value
+          # or Key/Value objects instead of using the secret name as an object key.
+          __sensitive_pair = false
+          for_each(object!(value)) -> |key, child| {
+              if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                  __sensitive_pair = true
+              }
+          }
+          for_each(object!(value)) -> |key, _child| {
+              if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                  value = set!(value, [key], "<redacted>")
+              }
+          }
+      }
+      value
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  __escaped = map_keys(object!(__safe.source), recursive: true) -> |key| {
+      replace(replace(key, "~", "~0"), ".", "~1")
+  }
+  __flat = flatten(__escaped)
+  __residual = {}
+  for_each(__flat) -> |key, value| {
+      key = replace(replace(key, "~1", "."), "~0", "~")
+      # flatten stops at arrays, so objects inside an array still carry the
+      # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+      if is_array(value) || is_object(value) {
+          value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+              replace(replace(inner, "~1", "."), "~0", "~")
+          }, ["v"])
+      }
+      __same = includes(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __same = __same || includes(__represented, to_string(value) ?? "")
+      }
+      # A scalar array is consumed only if every element is represented. Preserve
+      # partially represented arrays intact, including their ordering and repeats.
+      if is_array(value) && !is_empty(array!(value)) {
+          __all_items = true
+          for_each(array!(value)) -> |_index, item| {
+              __item_same = includes(__represented, encode_json(item))
+              if !is_object(item) && !is_array(item) && !is_null(item) {
+                  __item_same = __item_same || includes(__represented, to_string(item) ?? "")
+              }
+              if is_object(item) || is_array(item) || !__item_same { __all_items = false }
+          }
+          __same = __same || __all_items
+      }
+      if __same && includes(__candidates, key) { __consumed = push(__consumed, key) }
+      # Redacted leaves always remain visible. Do not spill a copy of the raw body.
+      if (!includes(__consumed, key) || value == "<redacted>") && value != __raw_body {
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          __base = join!(__parts, ".")
+          __key = __base
+          __suffix = 2
+          if includes(keys(__residual), __key) {
+              for_each(__flat) -> |_other_key, _other_value| {
+                  if includes(keys(__residual), __key) {
+                      __key = __base + "_" + to_string(__suffix)
+                      __suffix = __suffix + 1
+                  }
+              }
+          }
+          __complex = is_object(value)
+          if is_array(value) {
+              for_each(array!(value)) -> |_index, item| {
+                  if is_object(item) || is_array(item) { __complex = true }
+              }
+          }
+          __spill = if __complex { encode_json(value) } else { value }
+          __residual = set!(__residual, [__key], __spill)
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  __original_values = []
+  for_each(flatten(__source_kv)) -> |_key, value| {
+      __original_values = push(__original_values, encode_json(value))
+      if !is_object(value) && !is_array(value) { __original_values = push(__original_values, to_string(value) ?? "") }
+  }
+  for_each(flatten(__existing)) -> |key, value| {
+      __source_alias = includes(__original_values, encode_json(value)) || includes(__original_values, to_string(value) ?? "")
+      __mapped_alias = includes(__represented, encode_json(value)) || includes(__represented, to_string(value) ?? "")
+      __decoded, __decode_err = parse_json(string(value) ?? "")
+      __encoded_container = __decode_err == null && (is_object(__decoded) || is_array(__decoded))
+      if !is_null(value) && value != "" && !__source_alias && !__mapped_alias && !__encoded_container && value != __raw_body {
+          # Existing aggregates may contain sensitive descendants; the canonical
+          # source spill above is the authoritative representation of containers.
+          if !is_array(value) && !is_object(value) && !match(downcase(key), r'password|secret|authorization|token') {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+# Runtime samples (NAN-2327): one per event shape this parser routes.
+# `class_uid` is asserted because class routing is the whole point of the
+# OCSF conversion — a silent reroute is the defect most likely to survive
+# a compile-only check.
+samples:
+  - raw: '<34>1 2026-08-05T12:00:00.000Z host1 myapp 555 ID47 - structured probe'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: '<34>1 2026-08-05T12:00:01.000Z host1 myapp 556 ID48 [exampleSDID@32473 iut="3" eventSource="App"] structured with sd'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: '<0>Aug  5 12:04:00 host1 kernel: emergency probe'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: '<30>Aug  5 12:03:00 host1 testd: daemon informational probe'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: '<4>Aug  5 12:02:00 host1 kernel: iptables-DROP: IN=eth0 OUT= MAC=00:11:22:33:44:55 SRC=203.0.113.99 DST=10.0.0.5 LEN=60 PROTO=TCP SPT=51000 DPT=22 WINDOW=1024'
+    expect:
+      class_uid: 4001
+      activity_id: 4
+  - raw: '<191>Aug  5 12:04:10 host1 testd: local7 debug probe'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: '<38>Aug  5 12:03:10 host1 sshd: no pid bracket on this line'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: 'this line has no PRI header at all'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: '<38>Aug  5 12:00:05 host1 sshd[1240]: Failed password for invalid user root from 198.51.100.66 port 40122 ssh2'
+    expect:
+      class_uid: 3002
+      activity_id: 1
+  - raw: '<38>Aug  5 12:00:00 host1 sshd[1234]: Accepted publickey for alice from 203.0.113.5 port 22 ssh2'
+    expect:
+      class_uid: 3002
+      activity_id: 1
+  - raw: '<86>Aug  5 12:01:00 host1 sudo:  alice : TTY=pts/0 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/apt install nmap'
+    expect:
+      class_uid: 3002
+      activity_id: 1
+  - raw: '<86>Aug  5 12:01:10 host1 sudo[9911]:  bob : TTY=pts/2 ; PWD=/srv ; USER=root ; COMMAND=/bin/systemctl restart nginx'
+    expect:
+      class_uid: 3002
+      activity_id: 1
+  # NAN-3702 (existing sample): metadata.uid is sha256("syslog|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "<34>1 2026-08-05T12:00:00.000Z host1 myapp 555 ID47 - structured probe"
+    expect:
+      "metadata.uid": "80c435c4afc6017138e9da850f024c94239913ccb9eb4b73ff8e64915d94920c"

@@ -1,0 +1,442 @@
+name: kubernetes_audit_ocsf
+display_name: Kubernetes Audit Log (OCSF)
+version: "1.2.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Kubernetes API server audit events into complete OCSF 1.9.0
+  "API Activity" (class_uid 6003) records. The audit verb maps to the CRUD
+  activity_id, the requesting identity to actor.user, the objectRef to
+  resources[], and the RBAC decision to status / status_detail. The whole OCSF
+  object is emitted on the root so it lands in ocsf_logs.event and the promoted
+  columns materialize. Mirrors the UDM kubernetes_audit parser but targets OCSF
+  instead of `.udm.*`.
+match_values:
+  - kubernetes_audit
+category: cloud
+vendor: "CNCF"
+product: "Kubernetes"
+parser_vrl: |
+  # Kubernetes API server audit event -> OCSF 1.9.0 API Activity (class_uid 6003)
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+  class_uid = 6003
+
+  parsed, err = parse_json(raw_log)
+  __source_kv = object(parsed) ?? {}
+
+  if err != null || !is_object(parsed) {
+      . = {
+          "class_uid": class_uid,
+          "class_name": "API Activity",
+          "category_uid": 6,
+          "category_name": "Application Activity",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": class_uid * 100 + 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "time": 0,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("kubernetes_audit|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "kubernetes-audit",
+              "product": { "name": "Kubernetes", "vendor_name": "CNCF" }
+          },
+          "api": { "operation": "Unknown", "service": { "name": "kubernetes" } },
+          "actor": { "user": { "name": "unknown" } },
+          "src_endpoint": { "ip": "0.0.0.0" }
+      }
+  } else {
+      p = object!(parsed)
+      user_obj = object(p.user) ?? {}
+      obj_ref = object(p.objectRef) ?? {}
+      resp = object(p.responseStatus) ?? {}
+      annotations = object(p.annotations) ?? {}
+
+      # ---- time ----
+      time_ms = 0
+      ts_str = to_string(p.requestReceivedTimestamp) ?? ""
+      if ts_str == "" { ts_str = to_string(p.stageTimestamp) ?? "" }
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- verb -> activity_id ----
+      verb = downcase(to_string(p.verb) ?? "")
+      activity_id = 99
+      activity_name = "Other"
+      if verb == "create" || verb == "post" { activity_id = 1; activity_name = "Create" }
+      if verb == "get" || verb == "list" || verb == "watch" { activity_id = 2; activity_name = "Read" }
+      if verb == "update" || verb == "patch" { activity_id = 3; activity_name = "Update" }
+      if verb == "delete" || verb == "deletecollection" { activity_id = 4; activity_name = "Delete" }
+
+      # ---- identity ----
+      username = to_string(user_obj.username) ?? ""
+      user = { "name": "unknown" }
+      if username != "" {
+          user = { "name": username }
+          if starts_with(username, "system:serviceaccount:") {
+              user.type_id = 4
+              user.type = "Service"
+              sa_parts = split(username, ":")
+              if length(sa_parts) == 4 { user.domain = to_string(sa_parts[2]) }
+          } else if starts_with(username, "system:") {
+              user.type_id = 3
+              user.type = "System"
+          } else {
+              user.type_id = 1
+              user.type = "User"
+          }
+          if contains(username, "@") { user.email_addr = username }
+      }
+      user_uid = to_string(user_obj.uid) ?? ""
+      if user_uid != "" { user.uid = user_uid }
+      groups = array(user_obj.groups) ?? []
+      actor = { "user": user }
+
+      # ---- source ----
+      source_ips = array(p.sourceIPs) ?? []
+      first_ip = get(source_ips, [0]) ?? null
+      src_endpoint = { "ip": "0.0.0.0" }
+      if first_ip != null {
+          ip_str = to_string(first_ip) ?? ""
+          if ip_str != "" { src_endpoint = { "ip": downcase(ip_str) } }
+      }
+
+      # ---- outcome ----
+      code = to_int(resp.code) ?? 0
+      status_id = 0
+      status_str = "Unknown"
+      severity_id = 1
+      severity = "Informational"
+      if code > 0 {
+          if code >= 200 && code < 400 {
+              status_id = 1
+              status_str = "Success"
+          } else {
+              status_id = 2
+              status_str = "Failure"
+              severity_id = 2
+              severity = "Low"
+          }
+      }
+      decision = downcase(to_string(get(annotations, ["authorization.k8s.io/decision"]) ?? "") ?? "")
+      if decision == "forbid" {
+          status_id = 2
+          status_str = "Failure"
+          if severity_id < 3 { severity_id = 3; severity = "Medium" }
+      }
+      auth_reason = to_string(get(annotations, ["authorization.k8s.io/reason"]) ?? "") ?? ""
+
+      # ---- the API operation: "<verb> <resource>[/<subresource>]" ----
+      k_resource = to_string(obj_ref.resource) ?? ""
+      subresource = to_string(obj_ref.subresource) ?? ""
+      operation = verb
+      if k_resource != "" {
+          operation = verb + " " + k_resource
+          if subresource != "" { operation = operation + "/" + subresource }
+      }
+      if operation == "" { operation = "Unknown" }
+
+      api_group = to_string(obj_ref.apiGroup) ?? ""
+      api_obj = { "operation": operation, "service": { "name": "kubernetes" } }
+      audit_id = to_string(p.auditID) ?? ""
+      if audit_id != "" { api_obj.request = { "uid": audit_id } }
+      api_version = to_string(p.apiVersion) ?? ""
+      if api_version != "" { api_obj.version = api_version }
+      resp_msg = to_string(resp.message) ?? ""
+      if resp_msg != "" { api_obj.response = { "message": resp_msg } }
+
+      # ---- resources ----
+      resources = []
+      if k_resource != "" {
+          res = { "type": k_resource }
+          ns = to_string(obj_ref.namespace) ?? ""
+          rname = to_string(obj_ref.name) ?? ""
+          # Collection verbs (list/watch/deletecollection) carry no objectRef.name;
+          # OCSF resource_details still requires name or uid, so name the collection.
+          if rname == "" {
+              if ns != "" { rname = ns + "/" + k_resource } else { rname = k_resource }
+          }
+          res.name = rname
+          res.uid = rname
+          if ns != "" { res.namespace = ns }
+          if api_group != "" { res.version = api_group }
+          resources = push(resources, res)
+      }
+
+      # ---- request URI + user agent ----
+      http_request = {}
+      request_uri = to_string(p.requestURI) ?? ""
+      if request_uri != "" {
+          url_obj = {}
+          uri_parts = split(request_uri, "?", limit: 2)
+          url_obj.path = to_string(uri_parts[0])
+          if length(uri_parts) == 2 { url_obj.query_string = to_string(uri_parts[1]) }
+          http_request.url = url_obj
+      }
+      ua = to_string(p.userAgent) ?? ""
+      if ua != "" { http_request.user_agent = ua }
+      http_method = ""
+      if verb == "create" { http_method = "POST" }
+      if verb == "get" || verb == "list" || verb == "watch" { http_method = "GET" }
+      if verb == "update" { http_method = "PUT" }
+      if verb == "patch" { http_method = "PATCH" }
+      if verb == "delete" || verb == "deletecollection" { http_method = "DELETE" }
+      if http_method != "" { http_request.http_method = http_method }
+
+      ocsf = {
+          "class_uid": class_uid,
+          "class_name": "API Activity",
+          "category_uid": 6,
+          "category_name": "Application Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("kubernetes_audit|raw|" + raw_log, variant: "SHA-256"),
+              "log_name": "kubernetes-audit",
+              "log_provider": "Kubernetes API Server",
+              "product": { "name": "Kubernetes", "vendor_name": "CNCF" }
+          },
+          "api": api_obj,
+          "actor": actor,
+          "src_endpoint": src_endpoint
+      }
+      # NAN-3702: the API server writes one record per STAGE (RequestReceived,
+      # ResponseStarted, ResponseComplete, Panic) under the same auditID, and the
+      # lake dedupes on metadata.uid, so the uid is auditID + stage. auditID alone
+      # kept only the first stage's row. auditID stays the correlation id.
+      k8s_stage = to_string(p.stage) ?? ""
+      if audit_id != "" { ocsf.metadata.uid = audit_id + "|" + k8s_stage; ocsf.metadata.correlation_uid = audit_id }
+      if code > 0 { ocsf.status_code = to_string(code) }
+      if resp_msg != "" { ocsf.status_detail = resp_msg }
+      if length(resources) > 0 { ocsf.resources = resources }
+      if length(keys(http_request)) > 0 { ocsf.http_request = http_request }
+      if code > 0 { ocsf.http_response = { "code": code, "status": status_str } }
+
+      unmapped = {}
+      level = to_string(p.level) ?? ""
+      if level != "" { unmapped.audit_level = level }
+      stage = to_string(p.stage) ?? ""
+      if stage != "" { unmapped.stage = stage }
+      if length(groups) > 0 { unmapped.user_groups = encode_json(groups) }
+      if decision != "" { unmapped.authorization_decision = decision }
+      if auth_reason != "" { unmapped.authorization_reason = auth_reason }
+      resp_reason = to_string(resp.reason) ?? ""
+      if resp_reason != "" { unmapped.response_reason = resp_reason }
+      ns2 = to_string(obj_ref.namespace) ?? ""
+      if ns2 != "" { unmapped.k8s_namespace = ns2 }
+      if subresource != "" { unmapped.subresource = subresource }
+      if api_group != "" { unmapped.api_group = api_group }
+      stage_ts = to_string(p.stageTimestamp) ?? ""
+      if stage_ts != "" { unmapped.stage_timestamp = stage_ts }
+      if length(source_ips) > 1 { unmapped.source_ips = encode_json(source_ips) }
+      if length(keys(unmapped)) > 0 { ocsf.unmapped = unmapped }
+
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  __mapped = object!(parse_json!(encode_json(.)))
+  __existing = object(__mapped.unmapped) ?? {}
+  __discard = del(__mapped.raw_data)
+  __discard = del(__mapped.unmapped)
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __represented = []
+  __walk = map_values(__mapped, recursive: true) -> |value| {
+      __represented = push(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __represented = push(__represented, to_string(value) ?? "")
+      }
+      value
+  }
+  __consumed = []
+  # BEGIN parser-specific transformations
+  # verb: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # requestReceivedTimestamp: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # stageTimestamp: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # verb: Parser normalizes the caption case; verify the emitted caption.
+  # verb: Parser normalizes the caption case; verify the emitted caption.
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = ["annotations", "annotations.authorization.k8s.io/decision", "annotations.authorization.k8s.io/reason", "apiVersion", "auditID", "level", "objectRef", "objectRef.apiGroup", "objectRef.name", "objectRef.namespace", "objectRef.resource", "objectRef.subresource", "requestReceivedTimestamp", "requestURI", "responseStatus", "responseStatus.code", "responseStatus.message", "responseStatus.reason", "sourceIPs", "stage", "stageTimestamp", "user", "user.groups", "user.uid", "user.username", "userAgent", "verb"]
+  __preserve = []
+  __rules = array!(parse_json!("[{\"source\":\"verb\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"requestReceivedTimestamp\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Successful ISO timestamp conversion to the selected event clock in milliseconds.\"},{\"source\":\"stageTimestamp\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Successful ISO timestamp conversion to the selected event clock in milliseconds.\"},{\"source\":\"verb\",\"kind\":\"enum\",\"target\":\"activity_name\",\"values\":{\"create\":\"Create\"},\"reason\":\"Parser normalizes the caption case; verify the emitted caption.\"},{\"source\":\"verb\",\"kind\":\"enum\",\"target\":\"activity_name\",\"values\":{\"delete\":\"Delete\"},\"reason\":\"Parser normalizes the caption case; verify the emitted caption.\"}]"))
+  __source_flat = flatten(__source_kv)
+  for_each(__rules) -> |_index, rule| {
+      __source_key = string!(rule.source)
+      __value = get!(__source_flat, [__source_key])
+      __expected = null
+      __valid = false
+      if rule.kind == "lowercase" && is_string(__value) {
+          __expected = downcase(string!(__value))
+          __valid = true
+      } else if rule.kind == "epoch_ms" {
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", string(rule.format) ?? "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              __valid = true
+          }
+      } else if rule.kind == "scale" {
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * to_float!(rule.factor))
+              __valid = true
+          }
+      } else if rule.kind == "hex" {
+          __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
+          __integer, __integer_err = parse_int(__hex, base: 16)
+          __expected = __integer
+          __valid = is_string(__value) && starts_with(downcase(string(__value) ?? ""), "0x") && __integer_err == null
+      } else if rule.kind == "enum" {
+          __expected = get!(object!(rule.values), [downcase(to_string(__value) ?? "")])
+          __valid = __expected != null
+      }
+      __matches = includes(__represented, encode_json(__expected))
+      if is_string(rule.target) { __matches = get!(., split(string!(rule.target), ".")) == __expected }
+      if __valid && __matches { __consumed = push(__consumed, __source_key) }
+  }
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  __safe = map_values(object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing}))), recursive: true) -> |value| {
+      if is_object(value) {
+          # Header/parameter arrays commonly encode sensitive keys as name/value
+          # or Key/Value objects instead of using the secret name as an object key.
+          __sensitive_pair = false
+          for_each(object!(value)) -> |key, child| {
+              if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                  __sensitive_pair = true
+              }
+          }
+          for_each(object!(value)) -> |key, _child| {
+              if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                  value = set!(value, [key], "<redacted>")
+              }
+          }
+      }
+      value
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  __escaped = map_keys(object!(__safe.source), recursive: true) -> |key| {
+      replace(replace(key, "~", "~0"), ".", "~1")
+  }
+  __flat = flatten(__escaped)
+  __residual = {}
+  for_each(__flat) -> |key, value| {
+      key = replace(replace(key, "~1", "."), "~0", "~")
+      # flatten stops at arrays, so objects inside an array still carry the
+      # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+      if is_array(value) || is_object(value) {
+          value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+              replace(replace(inner, "~1", "."), "~0", "~")
+          }, ["v"])
+      }
+      __same = includes(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __same = __same || includes(__represented, to_string(value) ?? "")
+      }
+      # A scalar array is consumed only if every element is represented. Preserve
+      # partially represented arrays intact, including their ordering and repeats.
+      if is_array(value) && !is_empty(array!(value)) {
+          __all_items = true
+          for_each(array!(value)) -> |_index, item| {
+              __item_same = includes(__represented, encode_json(item))
+              if !is_object(item) && !is_array(item) && !is_null(item) {
+                  __item_same = __item_same || includes(__represented, to_string(item) ?? "")
+              }
+              if is_object(item) || is_array(item) || !__item_same { __all_items = false }
+          }
+          __same = __same || __all_items
+      }
+      if __same && includes(__candidates, key) { __consumed = push(__consumed, key) }
+      # Redacted leaves always remain visible. Do not spill a copy of the raw body.
+      if (!includes(__consumed, key) || value == "<redacted>") && value != __raw_body {
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          __base = join!(__parts, ".")
+          __key = __base
+          __suffix = 2
+          if includes(keys(__residual), __key) {
+              for_each(__flat) -> |_other_key, _other_value| {
+                  if includes(keys(__residual), __key) {
+                      __key = __base + "_" + to_string(__suffix)
+                      __suffix = __suffix + 1
+                  }
+              }
+          }
+          __complex = is_object(value)
+          if is_array(value) {
+              for_each(array!(value)) -> |_index, item| {
+                  if is_object(item) || is_array(item) { __complex = true }
+              }
+          }
+          __spill = if __complex { encode_json(value) } else { value }
+          __residual = set!(__residual, [__key], __spill)
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  __original_values = []
+  for_each(flatten(__source_kv)) -> |_key, value| {
+      __original_values = push(__original_values, encode_json(value))
+      if !is_object(value) && !is_array(value) { __original_values = push(__original_values, to_string(value) ?? "") }
+  }
+  for_each(flatten(__existing)) -> |key, value| {
+      __source_alias = includes(__original_values, encode_json(value)) || includes(__original_values, to_string(value) ?? "")
+      __mapped_alias = includes(__represented, encode_json(value)) || includes(__represented, to_string(value) ?? "")
+      __decoded, __decode_err = parse_json(string(value) ?? "")
+      __encoded_container = __decode_err == null && (is_object(__decoded) || is_array(__decoded))
+      if !is_null(value) && value != "" && !__source_alias && !__mapped_alias && !__encoded_container && value != __raw_body {
+          # Existing aggregates may contain sensitive descendants; the canonical
+          # source spill above is the authoritative representation of containers.
+          if !is_array(value) && !is_object(value) && !match(downcase(key), r'password|secret|authorization|token') {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # NAN-3702 (unparseable record, error branch): metadata.uid is sha256("kubernetes_audit|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "NAN-3702 determinism probe: not a kubernetes_audit record"
+    expect:
+      "metadata.uid": "e6aaef7cee841ec86f1bbfa0e026565280c5f6e8d1744609547fa8f1ab747939"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("kubernetes_audit|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"kind\":\"Event\",\"apiVersion\":\"audit.k8s.io/v1\",\"level\":\"RequestResponse\",\"stage\":\"ResponseComplete\",\"requestURI\":\"/api/v1/namespaces/default/pods\",\"verb\":\"create\",\"user\":{\"username\":\"system:serviceaccount:kube-system:deploy\",\"uid\":\"u1\",\"groups\":[\"system:serviceaccounts\"]},\"sourceIPs\":[\"10.0.0.7\"],\"userAgent\":\"kubectl/v1.29.0\",\"objectRef\":{\"resource\":\"pods\",\"namespace\":\"default\",\"name\":\"nginx-1\",\"apiVersion\":\"v1\"},\"responseStatus\":{\"metadata\":{},\"code\":201},\"requestReceivedTimestamp\":\"2026-08-18T20:00:00.000000Z\",\"stageTimestamp\":\"2026-08-18T20:00:00.100000Z\",\"annotations\":{\"authorization.k8s.io/decision\":\"allow\",\"authorization.k8s.io/reason\":\"RBAC: allowed by ClusterRoleBinding\"}}"
+    expect:
+      "metadata.uid": "04c3f8707941e1670c543c12bdc151ae79662aef80efd4cb0b8d32504b851a12"
+  # NAN-3702: one API request is audited once per stage under the same auditID,
+  # so the uid is auditID + stage (auditID alone kept only the first stage).
+  - raw: "{\"kind\": \"Event\", \"apiVersion\": \"audit.k8s.io/v1\", \"level\": \"RequestResponse\", \"auditID\": \"a-1\", \"stage\": \"ResponseComplete\", \"requestURI\": \"/api/v1/namespaces/default/pods\", \"verb\": \"create\", \"user\": {\"username\": \"system:serviceaccount:kube-system:deploy\", \"uid\": \"u1\", \"groups\": [\"system:serviceaccounts\"]}, \"sourceIPs\": [\"10.0.0.7\"], \"userAgent\": \"kubectl/v1.29.0\", \"objectRef\": {\"resource\": \"pods\", \"namespace\": \"default\", \"name\": \"nginx-1\", \"apiVersion\": \"v1\"}, \"responseStatus\": {\"metadata\": {}, \"code\": 201}, \"requestReceivedTimestamp\": \"2026-08-18T20:00:00.000000Z\", \"stageTimestamp\": \"2026-08-18T20:00:00.100000Z\", \"annotations\": {\"authorization.k8s.io/decision\": \"allow\", \"authorization.k8s.io/reason\": \"RBAC: allowed by ClusterRoleBinding\"}}"
+    expect:
+      "metadata.uid": "a-1|ResponseComplete"
+      "metadata.correlation_uid": "a-1"

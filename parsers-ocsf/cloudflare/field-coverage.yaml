@@ -1,0 +1,123 @@
+source: json
+transforms:
+- source: QueryName
+  kind: lowercase
+  reason: Parser lowercases this source value; consume only when the normalized value
+    is emitted.
+- source: ClientRequestScheme
+  kind: lowercase
+  reason: Parser lowercases this source value; consume only when the normalized value
+    is emitted.
+- source: Action
+  kind: lowercase
+  reason: Parser lowercases this source value; consume only when the normalized value
+    is emitted.
+- source: WAFAction
+  kind: lowercase
+  reason: Parser lowercases this source value; consume only when the normalized value
+    is emitted.
+- source: Timestamp
+  kind: epoch_ms
+  target: time
+  reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+- source: Datetime
+  kind: epoch_ms
+  target: time
+  reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+- source: EdgeStartTimestamp
+  kind: epoch_ms
+  target: time
+  reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+- source: Action
+  kind: enum
+  target: action_id
+  values:
+    allow: 1
+    allowed: 1
+    accept: 1
+    accepted: 1
+    permit: 1
+    permitted: 1
+    pass: 1
+    passed: 1
+    deny: 2
+    denied: 2
+    block: 2
+    blocked: 2
+    reject: 2
+    rejected: 2
+    drop: 2
+    dropped: 2
+    log: 3
+    observed: 3
+  reason: Named vendor outcome/protocol/severity normalized by the existing mapping;
+    consume only when the expected ID is emitted.
+- source: ClientCountry
+  kind: enum
+  target: src_endpoint.location.country
+  values:
+    ru: RU
+  reason: Parser normalizes the caption case; verify the emitted caption.
+- source: ClientCountry
+  kind: enum
+  target: src_endpoint.location.country
+  values:
+    de: DE
+  reason: Parser normalizes the caption case; verify the emitted caption.
+- source: EdgeStartTimestamp
+  kind: scale
+  factor: 1.0e-06
+  target: time
+  reason: Existing unit conversion by 1e-06 verified against time; unused clock fallbacks
+    remain residual.
+- source: WAFAction
+  kind: enum
+  target: action
+  values:
+    unknown: Unknown
+  reason: Parser normalizes the caption case; verify the emitted caption.
+consumed_candidates:
+- Action
+- BotScore
+- ClientASN
+- ClientASNDescription
+- ClientCountry
+- ClientIP
+- ClientRequestBytes
+- ClientRequestHost
+- ClientRequestMethod
+- ClientRequestPath
+- ClientRequestProtocol
+- ClientRequestQuery
+- ClientRequestReferer
+- ClientRequestScheme
+- ClientRequestURI
+- ClientRequestUserAgent
+- ClientSrcPort
+- ColoCode
+- Datetime
+- Description
+- EDNSSubnet
+- EdgeResponseBytes
+- EdgeResponseContentType
+- EdgeResponseStatus
+- EdgeServerIP
+- EdgeStartTimestamp
+- FirewallMatchesActions
+- FirewallMatchesRuleIDs
+- Kind
+- OriginIP
+- OriginResponseTime
+- QueryName
+- QueryType
+- RayID
+- ResponseCode
+- RuleID
+- SourceIP
+- Timestamp
+- WAFAction
+- WAFRuleID
+- WAFRuleMessage
+consumed_reason: Only source keys read by this parser are eligible for exact-value
+  consumption; the selected branch must emit the value. Unknown keys always spill,
+  even when their value equals an OCSF default.

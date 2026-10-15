@@ -1,0 +1,34 @@
+__source_flat = flatten(__source_kv)
+for_each(__rules) -> |_index, rule| {
+    __source_key = string!(rule.source)
+    __value = get!(__source_flat, [__source_key])
+    __expected = null
+    __valid = false
+    if rule.kind == "lowercase" && is_string(__value) {
+        __expected = downcase(string!(__value))
+        __valid = true
+    } else if rule.kind == "epoch_ms" {
+        __clock, __clock_err = parse_timestamp(string(__value) ?? "", string(rule.format) ?? "%+")
+        if __clock_err == null {
+            __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+            __valid = true
+        }
+    } else if rule.kind == "scale" {
+        __number, __number_err = to_float(__value)
+        if __number_err == null && __value != null && !is_boolean(__value) {
+            __expected = to_int(__number * to_float!(rule.factor))
+            __valid = true
+        }
+    } else if rule.kind == "hex" {
+        __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
+        __integer, __integer_err = parse_int(__hex, base: 16)
+        __expected = __integer
+        __valid = is_string(__value) && starts_with(downcase(string(__value) ?? ""), "0x") && __integer_err == null
+    } else if rule.kind == "enum" {
+        __expected = get!(object!(rule.values), [downcase(to_string(__value) ?? "")])
+        __valid = __expected != null
+    }
+    __matches = includes(__represented, encode_json(__expected))
+    if is_string(rule.target) { __matches = get!(., split(string!(rule.target), ".")) == __expected }
+    if __valid && __matches { __consumed = push(__consumed, __source_key) }
+}

@@ -1,0 +1,975 @@
+name: routeros_ocsf
+display_name: MikroTik RouterOS (OCSF)
+version: "1.2.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses MikroTik RouterOS remote syslog into OCSF 1.9.0. The envelope matrix
+  is handled the same way as the UDM parser — PRI, timestamp (bsd-syslog or
+  iso8601), hostname and the comma-separated topic prefix are each independently
+  optional, because remote-log-format and syslog-time-format vary per device.
+  Message families route as: DNS query / answer / NXDOMAIN / NODATA -> DNS
+  Activity (4003); user logged in / out and login failure -> Authentication
+  (3002); firewall connection tracking -> Network Activity (4001); DHCP
+  assigned / deassigned -> DHCP Activity (4004). Anything else — including the
+  deliberately unparsed ssh transport detail and web proxy lines — emits a Base
+  Event (class_uid 0) with activity_id 99 and the raw line in `message`, rather
+  than being guessed into a security class.
+match_values:
+  - routeros
+category: network
+vendor: "MikroTik"
+product: "RouterOS"
+parser_vrl: |
+  # MikroTik RouterOS -> OCSF 1.9.0
+
+  raw_log = string!(.message)
+  __raw_body = raw_log
+  __source_kv = {}
+  body = raw_log
+
+  severity_id = 1
+  severity = "Informational"
+
+  # ---- optional PRI ----
+  pm, pe = parse_regex(body, r'^<(?P<pri>\d+)>(?P<rest>.*)$')
+  # Capture parsed fields before mapping; omit structural raw-body captures.
+  __capture = object(parse_json!(encode_json(pm))) ?? {}
+  __ignore = del(__capture.body)
+  __ignore = del(__capture.content)
+  __ignore = del(__capture.kvdata)
+  __ignore = del(__capture.kvpart)
+  __ignore = del(__capture.msg)
+  __ignore = del(__capture.payload)
+  __ignore = del(__capture.remainder)
+  __ignore = del(__capture.rest)
+  __ignore = del(__capture.sd)
+  __source_kv = set!(__source_kv, ["header"], merge(object(get(__source_kv, ["header"]) ?? null) ?? {}, __capture))
+  if pe == null && pm != null {
+      body = string!(pm.rest)
+      pri_val = to_int(pm.pri) ?? 30
+      sev_num = mod(pri_val, 8)
+      if sev_num <= 2 { severity_id = 5; severity = "Critical" }
+      if sev_num == 3 { severity_id = 4; severity = "High" }
+      if sev_num == 4 { severity_id = 3; severity = "Medium" }
+      if sev_num >= 5 { severity_id = 1; severity = "Informational" }
+  }
+
+  # ---- optional timestamp: iso8601 or bsd-syslog ----
+  time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
+  im, ie = parse_regex(body, r'^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s+(?P<rest>.*)$')
+  # Capture parsed fields before mapping; omit structural raw-body captures.
+  __capture = object(parse_json!(encode_json(im))) ?? {}
+  __ignore = del(__capture.body)
+  __ignore = del(__capture.content)
+  __ignore = del(__capture.kvdata)
+  __ignore = del(__capture.kvpart)
+  __ignore = del(__capture.msg)
+  __ignore = del(__capture.payload)
+  __ignore = del(__capture.remainder)
+  __ignore = del(__capture.rest)
+  __ignore = del(__capture.sd)
+  __source_kv = set!(__source_kv, ["header"], merge(object(get(__source_kv, ["header"]) ?? null) ?? {}, __capture))
+  if ie == null && im != null {
+      body = string!(im.rest)
+      ts, ts_err = parse_timestamp(string!(im.ts), "%Y-%m-%dT%H:%M:%S%.fZ")
+      if ts_err == null {
+          time_ms = to_int(to_unix_timestamp(ts, unit: "milliseconds"))
+      } else {
+          ts2, ts2_err = parse_timestamp(string!(im.ts), "%Y-%m-%dT%H:%M:%S%.f%z")
+          if ts2_err == null { time_ms = to_int(to_unix_timestamp(ts2, unit: "milliseconds")) }
+      }
+  } else {
+      bm, be = parse_regex(body, r'^(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(?P<rest>.*)$')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(bm))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["header"], merge(object(get(__source_kv, ["header"]) ?? null) ?? {}, __capture))
+      if be == null && bm != null {
+          body = string!(bm.rest)
+          full = string!(bm.ts) + " " + format_timestamp!(now(), "%Y")
+          ts3, ts3_err = parse_timestamp(full, "%b %d %H:%M:%S %Y")
+          if ts3_err == null { time_ms = to_int(to_unix_timestamp(ts3, unit: "milliseconds")) }
+      }
+  }
+
+  # ---- optional hostname, consumed only when what follows still looks like a
+  # topic list or a known message family ----
+  dvc_host = ""
+  hm, he = parse_regex(body, r'^(?P<host>[A-Za-z0-9][A-Za-z0-9._-]*)\s+(?P<rest>(?:[a-z]+(?:,[a-z]+)*\s+)?(?:query |done query|local query|user |login failure|forward:|input:|output:|prerouting:|postrouting:|dhcp).*)$')
+  # Capture parsed fields before mapping; omit structural raw-body captures.
+  __capture = object(parse_json!(encode_json(hm))) ?? {}
+  __ignore = del(__capture.body)
+  __ignore = del(__capture.content)
+  __ignore = del(__capture.kvdata)
+  __ignore = del(__capture.kvpart)
+  __ignore = del(__capture.msg)
+  __ignore = del(__capture.payload)
+  __ignore = del(__capture.remainder)
+  __ignore = del(__capture.rest)
+  __ignore = del(__capture.sd)
+  __source_kv = set!(__source_kv, ["header"], merge(object(get(__source_kv, ["header"]) ?? null) ?? {}, __capture))
+  if he == null && hm != null {
+      dvc_host = string!(hm.host)
+      body = string!(hm.rest)
+  }
+
+  # ---- optional topic prefix ----
+  topics = ""
+  tm, te = parse_regex(body, r'^(?P<topics>[a-z]+(?:,[a-z]+)+|dns|dhcp|firewall|system|account|ssh)\s+(?P<rest>.*)$')
+  # Capture parsed fields before mapping; omit structural raw-body captures.
+  __capture = object(parse_json!(encode_json(tm))) ?? {}
+  __ignore = del(__capture.body)
+  __ignore = del(__capture.content)
+  __ignore = del(__capture.kvdata)
+  __ignore = del(__capture.kvpart)
+  __ignore = del(__capture.msg)
+  __ignore = del(__capture.payload)
+  __ignore = del(__capture.remainder)
+  __ignore = del(__capture.rest)
+  __ignore = del(__capture.sd)
+  __source_kv = set!(__source_kv, ["header"], merge(object(get(__source_kv, ["header"]) ?? null) ?? {}, __capture))
+  if te == null && tm != null {
+      topics = string!(tm.topics)
+      body = string!(tm.rest)
+      if contains(topics, "critical") { severity_id = 5; severity = "Critical" }
+      if contains(topics, "error") { severity_id = 4; severity = "High" }
+      if contains(topics, "warning") { severity_id = 3; severity = "Medium" }
+  }
+
+  # ---- accumulators ----
+  route = "base"
+  activity_id = 99
+  activity_name = "Other"
+  action_id = 3
+  action = "Observed"
+  disposition_id = 17
+  disposition = "Logged"
+  status_id = 1
+  status_str = "Success"
+
+  src_ip = ""
+  dst_ip = ""
+  src_port = 0
+  dst_port = 0
+  src_mac = ""
+  proto = ""
+  in_if = ""
+  out_if = ""
+  chain = ""
+  pkt_len = 0
+  user_name = ""
+  auth_via = ""
+  qname = ""
+  qtype = ""
+  qid = ""
+  answer = ""
+  rcode = ""
+  dhcp_server = ""
+  dhcp_ip = ""
+  dhcp_mac = ""
+
+  matched = false
+
+  # ---- DNS query: "query from 192.168.1.100: #12345 google.com. A" ----
+  dq, dqe = parse_regex(body, r'query from (?P<src_ip>[^:\s]+):\s+#(?P<qid>\d+)\s+(?P<qname>\S+?)\.?\s+(?P<qtype>[A-Z]+)\b')
+  # Capture parsed fields before mapping; omit structural raw-body captures.
+  __capture = object(parse_json!(encode_json(dq))) ?? {}
+  __ignore = del(__capture.body)
+  __ignore = del(__capture.content)
+  __ignore = del(__capture.kvdata)
+  __ignore = del(__capture.kvpart)
+  __ignore = del(__capture.msg)
+  __ignore = del(__capture.payload)
+  __ignore = del(__capture.remainder)
+  __ignore = del(__capture.rest)
+  __ignore = del(__capture.sd)
+  __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
+  if dqe == null && dq != null {
+      src_ip = string!(dq.src_ip)
+      qid = string!(dq.qid)
+      qname = string!(dq.qname)
+      qtype = string!(dq.qtype)
+      route = "dns"
+      activity_id = 1
+      activity_name = "Query"
+      matched = true
+  }
+
+  if !matched {
+      dl, dle = parse_regex(body, r'local query:\s+#(?P<qid>\d+)\s+(?P<qname>\S+?)\.?\s+(?P<qtype>[A-Z]+)\b')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(dl))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
+      if dle == null && dl != null {
+          qid = string!(dl.qid)
+          qname = string!(dl.qname)
+          qtype = string!(dl.qtype)
+          route = "dns"
+          activity_id = 1
+          activity_name = "Query"
+          matched = true
+      }
+  }
+
+  if !matched {
+      nx, nxe = parse_regex(body, r'done query:\s+#(?P<qid>\d+)\s+dns name does not exist')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(nx))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
+      if nxe == null && nx != null {
+          qid = string!(nx.qid)
+          rcode = "NXDomain"
+          route = "dns"
+          activity_id = 2
+          activity_name = "Response"
+          status_id = 2
+          status_str = "Failure"
+          matched = true
+      }
+  }
+
+  if !matched {
+      nd, nde = parse_regex(body, r'done query:\s+#(?P<qid>\d+)\s+dns name exists, but no appropriate record')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(nd))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
+      if nde == null && nd != null {
+          qid = string!(nd.qid)
+          rcode = "NoError"
+          route = "dns"
+          activity_id = 2
+          activity_name = "Response"
+          status_id = 2
+          status_str = "Failure"
+          matched = true
+      }
+  }
+
+  if !matched {
+      da, dae = parse_regex(body, r'done query:\s+#(?P<qid>\d+)\s+(?P<qname>\S+?)\.?\s+(?P<answer>[0-9]{1,3}(?:\.[0-9]{1,3}){3}|[0-9a-fA-F:]{3,})\s*$')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(da))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
+      if dae == null && da != null {
+          qid = string!(da.qid)
+          qname = string!(da.qname)
+          answer = string!(da.answer)
+          rcode = "NoError"
+          route = "dns"
+          activity_id = 2
+          activity_name = "Response"
+          matched = true
+      }
+  }
+
+  # ---- login / logout ----
+  if !matched {
+      lm, le = parse_regex(body, r'user\s+(?P<user>\S+)\s+logged\s+(?P<dir>in|out)\s+from\s+(?P<src_ip>\S+)(?:\s+via\s+(?P<via>\S+))?')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(lm))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
+      if le == null && lm != null {
+          user_name = string!(lm.user)
+          src_ip = string!(lm.src_ip)
+          auth_via = to_string(lm.via)
+          route = "auth"
+          activity_id = 1
+          activity_name = "Logon"
+          if string!(lm.dir) == "out" { activity_id = 2; activity_name = "Logoff" }
+          action_id = 1
+          action = "Allowed"
+          disposition_id = 1
+          disposition = "Allowed"
+          matched = true
+      }
+  }
+
+  if !matched {
+      lf, lfe = parse_regex(body, r'login failure for user\s+(?P<user>\S+)\s+from\s+(?P<src_ip>\S+)(?:\s+via\s+(?P<via>\S+))?')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(lf))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
+      if lfe == null && lf != null {
+          user_name = string!(lf.user)
+          src_ip = string!(lf.src_ip)
+          auth_via = to_string(lf.via)
+          route = "auth"
+          activity_id = 1
+          activity_name = "Logon"
+          action_id = 2
+          action = "Denied"
+          disposition_id = 2
+          disposition = "Blocked"
+          status_id = 2
+          status_str = "Failure"
+          if severity_id < 2 { severity_id = 2; severity = "Low" }
+          matched = true
+      }
+  }
+
+  # ---- firewall connection tracking ----
+  if !matched {
+      fm, fe = parse_regex(body, r'(?P<src_ip>[0-9]{1,3}(?:\.[0-9]{1,3}){3}):(?P<src_port>\d+)->(?P<dst_ip>[0-9]{1,3}(?:\.[0-9]{1,3}){3}):(?P<dst_port>\d+)')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(fm))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
+      if fe == null && fm != null {
+          src_ip = string!(fm.src_ip)
+          dst_ip = string!(fm.dst_ip)
+          src_port = to_int(fm.src_port) ?? 0
+          dst_port = to_int(fm.dst_port) ?? 0
+          route = "network"
+          activity_id = 6
+          activity_name = "Traffic"
+          matched = true
+
+          cm, ce = parse_regex(body, r'(?P<chain>input|output|forward|prerouting|postrouting):')
+          # Capture parsed fields before mapping; omit structural raw-body captures.
+          __capture = object(parse_json!(encode_json(cm))) ?? {}
+          __ignore = del(__capture.body)
+          __ignore = del(__capture.content)
+          __ignore = del(__capture.kvdata)
+          __ignore = del(__capture.kvpart)
+          __ignore = del(__capture.msg)
+          __ignore = del(__capture.payload)
+          __ignore = del(__capture.remainder)
+          __ignore = del(__capture.rest)
+          __ignore = del(__capture.sd)
+          __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
+          if ce == null && cm != null { chain = string!(cm.chain) }
+          fim, fie = parse_regex(body, r'in:(?P<in_if>\S*)\s+out:(?P<out_if>\S*?),')
+          # Capture parsed fields before mapping; omit structural raw-body captures.
+          __capture = object(parse_json!(encode_json(fim))) ?? {}
+          __ignore = del(__capture.body)
+          __ignore = del(__capture.content)
+          __ignore = del(__capture.kvdata)
+          __ignore = del(__capture.kvpart)
+          __ignore = del(__capture.msg)
+          __ignore = del(__capture.payload)
+          __ignore = del(__capture.remainder)
+          __ignore = del(__capture.rest)
+          __ignore = del(__capture.sd)
+          __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
+          if fie == null && fim != null {
+              in_if = to_string(fim.in_if)
+              out_if = to_string(fim.out_if)
+          }
+          mm, me = parse_regex(body, r'src-mac\s+(?P<mac>[0-9a-fA-F:]{11,17})')
+          # Capture parsed fields before mapping; omit structural raw-body captures.
+          __capture = object(parse_json!(encode_json(mm))) ?? {}
+          __ignore = del(__capture.body)
+          __ignore = del(__capture.content)
+          __ignore = del(__capture.kvdata)
+          __ignore = del(__capture.kvpart)
+          __ignore = del(__capture.msg)
+          __ignore = del(__capture.payload)
+          __ignore = del(__capture.remainder)
+          __ignore = del(__capture.rest)
+          __ignore = del(__capture.sd)
+          __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
+          if me == null && mm != null { src_mac = downcase(string!(mm.mac)) }
+          pm2, pe2 = parse_regex(body, r'proto\s+(?P<proto>[A-Za-z0-9-]+)')
+          # Capture parsed fields before mapping; omit structural raw-body captures.
+          __capture = object(parse_json!(encode_json(pm2))) ?? {}
+          __ignore = del(__capture.body)
+          __ignore = del(__capture.content)
+          __ignore = del(__capture.kvdata)
+          __ignore = del(__capture.kvpart)
+          __ignore = del(__capture.msg)
+          __ignore = del(__capture.payload)
+          __ignore = del(__capture.remainder)
+          __ignore = del(__capture.rest)
+          __ignore = del(__capture.sd)
+          __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
+          if pe2 == null && pm2 != null { proto = downcase(string!(pm2.proto)) }
+          lm2, le2 = parse_regex(body, r'\blen\s+(?P<len>\d+)')
+          # Capture parsed fields before mapping; omit structural raw-body captures.
+          __capture = object(parse_json!(encode_json(lm2))) ?? {}
+          __ignore = del(__capture.body)
+          __ignore = del(__capture.content)
+          __ignore = del(__capture.kvdata)
+          __ignore = del(__capture.kvpart)
+          __ignore = del(__capture.msg)
+          __ignore = del(__capture.payload)
+          __ignore = del(__capture.remainder)
+          __ignore = del(__capture.rest)
+          __ignore = del(__capture.sd)
+          __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
+          if le2 == null && lm2 != null { pkt_len = to_int(lm2.len) ?? 0 }
+      }
+  }
+
+  # ---- DHCP ----
+  if !matched {
+      dm, dme = parse_regex(body, r'(?P<server>\S+)\s+(?P<action>assigned|deassigned)\s+(?P<ip>[0-9]{1,3}(?:\.[0-9]{1,3}){3})\s+(?:to|from)\s+(?P<mac>[0-9a-fA-F:]{11,17})')
+      # Capture parsed fields before mapping; omit structural raw-body captures.
+      __capture = object(parse_json!(encode_json(dm))) ?? {}
+      __ignore = del(__capture.body)
+      __ignore = del(__capture.content)
+      __ignore = del(__capture.kvdata)
+      __ignore = del(__capture.kvpart)
+      __ignore = del(__capture.msg)
+      __ignore = del(__capture.payload)
+      __ignore = del(__capture.remainder)
+      __ignore = del(__capture.rest)
+      __ignore = del(__capture.sd)
+      __source_kv = set!(__source_kv, ["event"], merge(object(get(__source_kv, ["event"]) ?? null) ?? {}, __capture))
+      if dme == null && dm != null {
+          dhcp_server = string!(dm.server)
+          dhcp_ip = string!(dm.ip)
+          dhcp_mac = downcase(string!(dm.mac))
+          route = "dhcp"
+          if string!(dm.action) == "assigned" {
+              activity_id = 5
+              activity_name = "Ack"
+          } else {
+              activity_id = 7
+              activity_name = "Release"
+          }
+          action_id = 1
+          action = "Allowed"
+          disposition_id = 1
+          disposition = "Allowed"
+          matched = true
+      }
+  }
+
+  proto_num = 0
+  if proto == "tcp" { proto_num = 6 }
+  if proto == "udp" { proto_num = 17 }
+  if proto == "icmp" { proto_num = 1 }
+
+  src = {}
+  if src_ip != "" { src.ip = downcase(src_ip) }
+  if src_port > 0 { src.port = src_port }
+  if src_mac != "" { src.mac = src_mac }
+  if in_if != "" { src.interface_name = in_if }
+  dst = {}
+  if dst_ip != "" { dst.ip = downcase(dst_ip) }
+  if dst_port > 0 { dst.port = dst_port }
+  if out_if != "" { dst.interface_name = out_if }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": sha2("routeros|raw|" + raw_log, variant: "SHA-256"),
+      "log_source": "routeros",
+      "log_provider": "RouterOS",
+      "profiles": ["host", "security_control"],
+      "product": {
+          "name": "RouterOS",
+          "vendor_name": "MikroTik",
+          "feature": { "name": "router" }
+      }
+  }
+  if topics != "" { metadata.log_name = topics }
+
+  device = { "type_id": 12, "type": "Router" }
+  has_device = false
+  if dvc_host != "" { device.hostname = dvc_host; has_device = true }
+
+  unmapped = {}
+  if topics != "" { unmapped.topics = topics }
+  if chain != "" { unmapped.chain = chain }
+  if in_if != "" { unmapped.interface_in = in_if }
+  if out_if != "" { unmapped.interface_out = out_if }
+  if qid != "" { unmapped.dns_query_id = qid }
+  if dhcp_server != "" { unmapped.dhcp_server = dhcp_server }
+  if auth_via != "" { unmapped.auth_via = auth_via }
+  if !matched { unmapped.unparsed = "true" }
+
+  obs = []
+  if src_ip != "" { obs = push(obs, { "name": "src_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(src_ip) }) }
+  if dst_ip != "" { obs = push(obs, { "name": "dst_endpoint.ip", "type": "IP Address", "type_id": 2, "value": downcase(dst_ip) }) }
+  if user_name != "" { obs = push(obs, { "name": "user.name", "type": "User Name", "type_id": 4, "value": user_name }) }
+  if qname != "" { obs = push(obs, { "name": "query.hostname", "type": "Hostname", "type_id": 1, "value": qname }) }
+
+  # ============================================================
+  # Assemble
+  # ============================================================
+  if route == "dns" {
+      class_uid = 4003
+      . = {
+          "class_uid": class_uid,
+          "class_name": "DNS Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": { "direction_id": 0, "protocol_num": 17, "protocol_name": "udp" }
+      }
+      q = {}
+      if qname != "" { q.hostname = qname }
+      if qtype != "" { q.type = qtype }
+      if length(q) > 0 { .query = q }
+      if answer != "" { .answers = [{ "rdata": answer }] }
+      if rcode != "" { .rcode = rcode }
+      qidn = to_int(qid) ?? 0
+      if qidn > 0 { .transaction_id = qidn }
+      if length(src) > 0 { .src_endpoint = src }
+      dstd = dst
+      if length(dstd) == 0 { dstd = { "svc_name": "dns", "port": 53 } }
+      if dvc_host != "" { dstd.hostname = dvc_host }
+      .dst_endpoint = dstd
+      if has_device { .device = device }
+
+  } else if route == "auth" {
+      class_uid = 3002
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Authentication",
+          "category_uid": 3,
+          "category_name": "Identity & Access Management",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "user": { "name": user_name },
+          "is_remote": true
+      }
+      if length(src) > 0 { .src_endpoint = src }
+      if dvc_host != "" {
+          .dst_endpoint = { "hostname": dvc_host }
+      } else {
+          .service = { "name": "RouterOS management" }
+      }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if auth_via != "" { .logon_type = auth_via }
+      if has_device { .device = device }
+
+  } else if route == "dhcp" {
+      class_uid = 4004
+      csrc = { "ip": downcase(dhcp_ip), "mac": dhcp_mac }
+      . = {
+          "class_uid": class_uid,
+          "class_name": "DHCP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "src_endpoint": csrc
+      }
+      dstd2 = { "svc_name": "dhcp", "port": 67 }
+      if dvc_host != "" { dstd2.hostname = dvc_host }
+      .dst_endpoint = dstd2
+      if has_device { .device = device }
+      obs = push(obs, { "name": "src_endpoint.mac", "type": "MAC Address", "type_id": 3, "value": dhcp_mac })
+
+  } else if route == "network" {
+      class_uid = 4001
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Network Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "action_id": action_id,
+          "action": action,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "metadata": metadata,
+          "connection_info": { "direction_id": 0, "protocol_num": proto_num }
+      }
+      if proto != "" { .connection_info.protocol_name = proto }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if pkt_len > 0 { .traffic = { "bytes_out": pkt_len } }
+      if chain != "" { .firewall_rule = { "name": chain, "uid": chain } }
+      if has_device { .device = device }
+
+  } else {
+      class_uid = 0
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata
+      }
+      if topics != "" { .metadata.event_code = topics }
+  }
+
+  if length(unmapped) > 0 { .unmapped = unmapped }
+  if length(obs) > 0 { .observables = obs }
+
+  .
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  __mapped = object!(parse_json!(encode_json(.)))
+  __existing = object(__mapped.unmapped) ?? {}
+  __discard = del(__mapped.raw_data)
+  __discard = del(__mapped.unmapped)
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __represented = []
+  __walk = map_values(__mapped, recursive: true) -> |value| {
+      __represented = push(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __represented = push(__represented, to_string(value) ?? "")
+      }
+      value
+  }
+  __consumed = []
+  # BEGIN parser-specific transformations
+  # event.mac: Case normalization already performed by the parser; observed at src_endpoint.mac, and checked against the emitted branch.
+  # event.proto: Case normalization already performed by the parser; observed at connection_info.protocol_name, and checked against the emitted branch.
+  # event.proto: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = ["event.action", "event.answer", "event.chain", "event.dir", "event.dst_ip", "event.dst_port", "event.in_if", "event.ip", "event.len", "event.mac", "event.out_if", "event.proto", "event.qid", "event.qname", "event.qtype", "event.server", "event.src_ip", "event.src_port", "event.user", "event.via", "header.host", "header.pri", "header.rest", "header.topics", "header.ts"]
+  __preserve = []
+  __rules = array!(parse_json!("[{\"source\":\"event.mac\",\"kind\":\"lowercase\",\"reason\":\"Case normalization already performed by the parser; observed at src_endpoint.mac, and checked against the emitted branch.\"},{\"source\":\"event.proto\",\"kind\":\"lowercase\",\"reason\":\"Case normalization already performed by the parser; observed at connection_info.protocol_name, and checked against the emitted branch.\"},{\"source\":\"event.proto\",\"kind\":\"enum\",\"target\":\"connection_info.protocol_num\",\"values\":{\"tcp\":6,\"udp\":17,\"icmp\":1,\"icmpv6\":58,\"ipv6-icmp\":58},\"reason\":\"Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.\"}]"))
+  __source_flat = flatten(__source_kv)
+  for_each(__rules) -> |_index, rule| {
+      __source_key = string!(rule.source)
+      __value = get!(__source_flat, [__source_key])
+      __expected = null
+      __valid = false
+      if rule.kind == "lowercase" && is_string(__value) {
+          __expected = downcase(string!(__value))
+          __valid = true
+      } else if rule.kind == "epoch_ms" {
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", string(rule.format) ?? "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              __valid = true
+          }
+      } else if rule.kind == "scale" {
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * to_float!(rule.factor))
+              __valid = true
+          }
+      } else if rule.kind == "hex" {
+          __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
+          __integer, __integer_err = parse_int(__hex, base: 16)
+          __expected = __integer
+          __valid = is_string(__value) && starts_with(downcase(string(__value) ?? ""), "0x") && __integer_err == null
+      } else if rule.kind == "enum" {
+          __expected = get!(object!(rule.values), [downcase(to_string(__value) ?? "")])
+          __valid = __expected != null
+      }
+      __matches = includes(__represented, encode_json(__expected))
+      if is_string(rule.target) { __matches = get!(., split(string!(rule.target), ".")) == __expected }
+      if __valid && __matches { __consumed = push(__consumed, __source_key) }
+  }
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  __safe = map_values(object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing}))), recursive: true) -> |value| {
+      if is_object(value) {
+          # Header/parameter arrays commonly encode sensitive keys as name/value
+          # or Key/Value objects instead of using the secret name as an object key.
+          __sensitive_pair = false
+          for_each(object!(value)) -> |key, child| {
+              if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                  __sensitive_pair = true
+              }
+          }
+          for_each(object!(value)) -> |key, _child| {
+              if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                  value = set!(value, [key], "<redacted>")
+              }
+          }
+      }
+      value
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  __escaped = map_keys(object!(__safe.source), recursive: true) -> |key| {
+      replace(replace(key, "~", "~0"), ".", "~1")
+  }
+  __flat = flatten(__escaped)
+  __residual = {}
+  for_each(__flat) -> |key, value| {
+      key = replace(replace(key, "~1", "."), "~0", "~")
+      # flatten stops at arrays, so objects inside an array still carry the
+      # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+      if is_array(value) || is_object(value) {
+          value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+              replace(replace(inner, "~1", "."), "~0", "~")
+          }, ["v"])
+      }
+      __same = includes(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __same = __same || includes(__represented, to_string(value) ?? "")
+      }
+      # A scalar array is consumed only if every element is represented. Preserve
+      # partially represented arrays intact, including their ordering and repeats.
+      if is_array(value) && !is_empty(array!(value)) {
+          __all_items = true
+          for_each(array!(value)) -> |_index, item| {
+              __item_same = includes(__represented, encode_json(item))
+              if !is_object(item) && !is_array(item) && !is_null(item) {
+                  __item_same = __item_same || includes(__represented, to_string(item) ?? "")
+              }
+              if is_object(item) || is_array(item) || !__item_same { __all_items = false }
+          }
+          __same = __same || __all_items
+      }
+      if __same && includes(__candidates, key) { __consumed = push(__consumed, key) }
+      # Redacted leaves always remain visible. Do not spill a copy of the raw body.
+      if (!includes(__consumed, key) || value == "<redacted>") && value != __raw_body {
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          __base = join!(__parts, ".")
+          __key = __base
+          __suffix = 2
+          if includes(keys(__residual), __key) {
+              for_each(__flat) -> |_other_key, _other_value| {
+                  if includes(keys(__residual), __key) {
+                      __key = __base + "_" + to_string(__suffix)
+                      __suffix = __suffix + 1
+                  }
+              }
+          }
+          __complex = is_object(value)
+          if is_array(value) {
+              for_each(array!(value)) -> |_index, item| {
+                  if is_object(item) || is_array(item) { __complex = true }
+              }
+          }
+          __spill = if __complex { encode_json(value) } else { value }
+          __residual = set!(__residual, [__key], __spill)
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  __original_values = []
+  for_each(flatten(__source_kv)) -> |_key, value| {
+      __original_values = push(__original_values, encode_json(value))
+      if !is_object(value) && !is_array(value) { __original_values = push(__original_values, to_string(value) ?? "") }
+  }
+  for_each(flatten(__existing)) -> |key, value| {
+      __source_alias = includes(__original_values, encode_json(value)) || includes(__original_values, to_string(value) ?? "")
+      __mapped_alias = includes(__represented, encode_json(value)) || includes(__represented, to_string(value) ?? "")
+      __decoded, __decode_err = parse_json(string(value) ?? "")
+      __encoded_container = __decode_err == null && (is_object(__decoded) || is_array(__decoded))
+      if !is_null(value) && value != "" && !__source_alias && !__mapped_alias && !__encoded_container && value != __raw_body {
+          # Existing aggregates may contain sensitive descendants; the canonical
+          # source spill above is the authoritative representation of containers.
+          if !is_array(value) && !is_object(value) && !match(downcase(key), r'password|secret|authorization|token') {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+- raw: <30>Aug  5 12:00:00 edge-rtr dhcp,info dhcp1 assigned 10.20.0.9 to 00:16:3E:AA:BB:CC
+  expect:
+    class_uid: 4004
+    activity_id: 5
+    src_endpoint.ip: 10.20.0.9
+    disposition_id: 1
+- raw: <30>Aug  5 12:00:00 edge-rtr dhcp,info dhcp1 deassigned 10.20.0.9 from 00:16:3E:AA:BB:CC
+  expect:
+    class_uid: 4004
+    activity_id: 7
+    src_endpoint.ip: 10.20.0.9
+    disposition_id: 1
+- raw: '<30>Aug  5 12:00:00 edge-rtr done query: #1001 example.com. 192.0.2.10'
+  expect:
+    class_uid: 4003
+    activity_id: 2
+    query.hostname: example.com
+    disposition_id: 17
+- raw: '<30>Aug  5 12:00:00 edge-rtr done query: #1005 dns name exists, but no appropriate record'
+  expect:
+    class_uid: 4003
+    activity_id: 2
+    disposition_id: 17
+- raw: '<30>Aug  5 12:00:00 edge-rtr done query: #1004 dns name does not exist'
+  expect:
+    class_uid: 4003
+    activity_id: 2
+    disposition_id: 17
+- raw: '<30>Aug  5 12:00:00 edge-rtr query from 10.20.0.5: #1001 example.com. A'
+  expect:
+    class_uid: 4003
+    activity_id: 1
+    src_endpoint.ip: 10.20.0.5
+    query.hostname: example.com
+    disposition_id: 17
+- raw: '<30>2026-08-05T12:00:00Z edge-rtr query from 10.20.0.7: #1003 example.org. A'
+  expect:
+    class_uid: 4003
+    activity_id: 1
+    src_endpoint.ip: 10.20.0.7
+    query.hostname: example.org
+    disposition_id: 17
+- raw: '<30>Aug  5 12:00:00 edge-rtr dns,packet query from 10.20.0.6: #1002 example.net. AAAA'
+  expect:
+    class_uid: 4003
+    activity_id: 1
+    src_endpoint.ip: 10.20.0.6
+    query.hostname: example.net
+    disposition_id: 17
+- raw: '<30>Aug  5 12:00:00 edge-rtr firewall,info forward: in:ether1 out:ether2, src-mac 00:16:3e:aa:bb:cc, proto TCP (SYN), 10.20.0.8:51000->192.0.2.20:443, len 60'
+  expect:
+    class_uid: 4001
+    activity_id: 6
+    src_endpoint.ip: 10.20.0.8
+    dst_endpoint.ip: 192.0.2.20
+    disposition_id: 17
+- raw: <30>Aug  5 12:00:00 edge-rtr system,info,account user admin logged in from 203.0.113.9 via ssh
+  expect:
+    class_uid: 3002
+    activity_id: 1
+    src_endpoint.ip: 203.0.113.9
+    user.name: admin
+    actor.user.name: admin
+    disposition_id: 1
+- raw: <38>Aug  5 12:00:00 edge-rtr system,error,critical login failure for user root from 198.51.100.4 via ssh
+  expect:
+    class_uid: 3002
+    activity_id: 1
+    src_endpoint.ip: 198.51.100.4
+    user.name: root
+    actor.user.name: root
+    disposition_id: 2
+- raw: plain line with no envelope at all
+  expect:
+    class_uid: 0
+    activity_id: 99
+- raw: '<30>Aug  5 12:00:00 edge-rtr ssh,debug auth req: admin ssh-connection publickey'
+  expect:
+    class_uid: 0
+    activity_id: 99
+# NAN-3702 (existing sample): metadata.uid is sha256("routeros|raw|" + raw), so the
+# same record parsed twice gets the same uid (a random uid could never match).
+- raw: "<30>Aug  5 12:00:00 edge-rtr dhcp,info dhcp1 assigned 10.20.0.9 to 00:16:3E:AA:BB:CC"
+  expect:
+    "metadata.uid": "a6b289f38c36805dcee8bdee583beb0a1a623c7147ae1494552ba234087ded78"

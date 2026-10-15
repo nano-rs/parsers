@@ -1,0 +1,432 @@
+name: aws_alb_ocsf
+display_name: AWS ALB Access Logs (OCSF)
+version: "1.3.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed columns in redacted, dotted snake_case unmapped keys.
+  Parses AWS Application Load Balancer access logs into complete OCSF 1.9.0
+  "HTTP Activity" (class_uid 4002) records. The whole OCSF object is emitted on
+  the root so it lands in ocsf_logs.event and the promoted columns materialize
+  (http_request.*, http_response.*, src_endpoint, dst_endpoint, traffic.*,
+  trace.uid, cloud.*). Mirrors the UDM aws_alb parser but targets OCSF instead
+  of `.udm.*`.
+match_values:
+  - aws_alb
+category: cloud
+vendor: "Amazon"
+product: "ALB"
+parser_vrl: |
+  # AWS ALB access log (space delimited) -> OCSF 1.9.0 HTTP Activity (4002)
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+
+  m = parse_regex(raw_log, r'^(?P<type>\S+)\s+(?P<timestamp>\S+)\s+(?P<elb>\S+)\s+(?P<client_port>\S+)\s+(?P<target_port>\S+)\s+(?P<request_processing_time>\S+)\s+(?P<target_processing_time>\S+)\s+(?P<response_processing_time>\S+)\s+(?P<elb_status_code>\S+)\s+(?P<target_status_code>\S+)\s+(?P<received_bytes>\S+)\s+(?P<sent_bytes>\S+)\s+"(?P<request>[^"]*)"\s+"(?P<user_agent>[^"]*)"\s+(?P<ssl_cipher>\S+)\s+(?P<ssl_protocol>\S+)\s+(?P<target_group_arn>\S+)\s+"(?P<trace_id>[^"]*)"\s+"(?P<domain_name>[^"]*)"\s+"(?P<chosen_cert_arn>[^"]*)"\s+(?P<matched_rule_priority>\S+)\s+(?P<request_creation_time>\S+)\s+"(?P<actions_executed>[^"]*)"\s+"(?P<redirect_url>[^"]*)"\s+"(?P<error_reason>[^"]*)"') ?? {}
+  __source_kv = m
+
+  class_uid = 4002
+
+  if length(keys(m)) > 0 {
+      # ---- time ----
+      time_ms = 0
+      ts_str = to_string(m.timestamp)
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- request line: "METHOD URL PROTO" ----
+      request_str = to_string(m.request)
+      method = ""
+      url_raw = ""
+      http_ver = ""
+      req_parts = split(request_str, " ")
+      if length(req_parts) >= 1 { method = upcase(to_string(req_parts[0])) }
+      if length(req_parts) >= 2 { url_raw = to_string(req_parts[1]) }
+      if length(req_parts) >= 3 { http_ver = to_string(req_parts[2]) }
+
+      activity_id = 99
+      activity_name = "Other"
+      if method == "CONNECT" { activity_id = 1; activity_name = "Connect" }
+      if method == "DELETE"  { activity_id = 2; activity_name = "Delete" }
+      if method == "GET"     { activity_id = 3; activity_name = "Get" }
+      if method == "HEAD"    { activity_id = 4; activity_name = "Head" }
+      if method == "OPTIONS" { activity_id = 5; activity_name = "Options" }
+      if method == "POST"    { activity_id = 6; activity_name = "Post" }
+      if method == "PUT"     { activity_id = 7; activity_name = "Put" }
+      if method == "TRACE"   { activity_id = 8; activity_name = "Trace" }
+      if method == "PATCH"   { activity_id = 9; activity_name = "Patch" }
+
+      # ---- url object ----
+      url_obj = {}
+      if url_raw != "" && url_raw != "-" {
+          u, uerr = parse_url(url_raw)
+          if uerr == null {
+              url_obj = { "url_string": url_raw }
+              scheme = to_string(u.scheme)
+              if scheme != "" { url_obj.scheme = scheme }
+              host = to_string(u.host)
+              if host != "" { url_obj.hostname = host }
+              upath = to_string(u.path)
+              if upath != "" { url_obj.path = upath }
+              uq = to_string(u.query) ?? ""
+              if uq != "" && uq != "{}" { url_obj.query_string = uq }
+              uport = to_int(u.port)
+              if uport > 0 { url_obj.port = uport }
+          } else {
+              url_obj = { "path": url_raw }
+          }
+      }
+      dom = to_string(m.domain_name)
+      if dom != "" && dom != "-" { url_obj.hostname = dom }
+
+      # ---- http_request ----
+      http_request = {}
+      if method != "" && method != "-" { http_request.http_method = method }
+      if http_ver != "" && http_ver != "-" { http_request.version = http_ver }
+      ua = to_string(m.user_agent)
+      if ua != "" && ua != "-" { http_request.user_agent = ua }
+      if length(keys(url_obj)) > 0 { http_request.url = url_obj }
+
+      # ---- http_response ----
+      elb_status = to_string(m.elb_status_code)
+      code = to_int(elb_status) ?? 0
+      status_id = 0
+      status_str = "Unknown"
+      if code > 0 {
+          if code >= 200 && code < 400 { status_id = 1; status_str = "Success" } else { status_id = 2; status_str = "Failure" }
+      }
+      sent = to_int(to_string(m.sent_bytes)) ?? 0
+      recv = to_int(to_string(m.received_bytes)) ?? 0
+      http_response = { "length": sent }
+      if code > 0 { http_response.code = code; http_response.status = status_str }
+
+      # ---- endpoints ----
+      src_endpoint = {}
+      client_str = to_string(m.client_port)
+      if client_str != "-" {
+          cp = split(client_str, ":")
+          if length(cp) >= 2 {
+              src_endpoint.ip = downcase(to_string(cp[0]))
+              src_endpoint.port = to_int(to_string(cp[1])) ?? 0
+          }
+      }
+      dst_endpoint = {}
+      target_str = to_string(m.target_port)
+      if target_str != "-" {
+          tp = split(target_str, ":")
+          if length(tp) >= 2 {
+              dst_endpoint.ip = downcase(to_string(tp[0]))
+              dst_endpoint.port = to_int(to_string(tp[1])) ?? 0
+          }
+      }
+      if dom != "" && dom != "-" { dst_endpoint.hostname = dom }
+
+      # ---- duration: ALB reports seconds; OCSF wants milliseconds ----
+      rpt = to_float(to_string(m.request_processing_time)) ?? 0.0
+      tpt = to_float(to_string(m.target_processing_time)) ?? 0.0
+      rspt = to_float(to_string(m.response_processing_time)) ?? 0.0
+      total_s = 0.0
+      if rpt > 0.0 { total_s = total_s + rpt }
+      if tpt > 0.0 { total_s = total_s + tpt }
+      if rspt > 0.0 { total_s = total_s + rspt }
+      duration_ms = to_int(round(total_s * 1000.0))
+
+      ocsf = {
+          "class_uid": class_uid,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "duration": duration_ms,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud", "load_balancer"],
+              "uid": sha2("aws_alb|raw|" + raw_log, variant: "SHA-256"),
+              "log_name": "ALB Access Log",
+              "log_provider": "AWS Elastic Load Balancing",
+              "product": { "name": "AWS Application Load Balancer", "vendor_name": "Amazon" }
+          },
+          "cloud": { "provider": "AWS" },
+          # NAN-2995: OCSF 1.9 network_traffic: bytes_in = destination -> source, bytes_out = source -> destination.
+          # received_bytes = client -> ALB (request), sent_bytes = ALB -> client (response).
+          "traffic": { "bytes_in": sent, "bytes_out": recv },
+          "http_response": http_response
+      }
+      if length(keys(http_request)) > 0 { ocsf.http_request = http_request }
+      if length(keys(src_endpoint)) > 0 { ocsf.src_endpoint = src_endpoint }
+      if length(keys(dst_endpoint)) > 0 { ocsf.dst_endpoint = dst_endpoint }
+
+      # ---- load_balancer profile ----
+      lb = {}
+      elb_name = to_string(m.elb)
+      if elb_name != "" && elb_name != "-" { lb.name = elb_name }
+      if code > 0 { lb.code = code }
+      err_reason = to_string(m.error_reason)
+      if err_reason != "" && err_reason != "-" { lb.error_message = err_reason }
+      if length(keys(dst_endpoint)) > 0 { lb.dst_endpoint = dst_endpoint }
+      if length(keys(lb)) > 0 { ocsf.load_balancer = lb }
+
+      # ---- TLS ----
+      tls_obj = {}
+      cipher = to_string(m.ssl_cipher)
+      if cipher != "" && cipher != "-" { tls_obj.cipher = cipher }
+      sslp = to_string(m.ssl_protocol)
+      if sslp != "" && sslp != "-" { tls_obj.version = sslp }
+      if dom != "" && dom != "-" { tls_obj.sni = dom }
+      if length(keys(tls_obj)) > 1 { ocsf.tls = tls_obj }
+
+      # ---- X-Amzn-Trace-Id -> trace profile ----
+      trace_id = to_string(m.trace_id)
+      if trace_id != "" && trace_id != "-" {
+          ocsf.trace = { "uid": trace_id }
+          ocsf.metadata.profiles = ["cloud", "load_balancer", "trace"]
+      }
+
+      # ---- everything with no canonical home ----
+      unmapped = {}
+      lb_type = to_string(m.type)
+      if lb_type != "" { unmapped.listener_type = lb_type }
+      tsc = to_string(m.target_status_code)
+      if tsc != "" && tsc != "-" { unmapped.target_status_code = tsc }
+      tga = to_string(m.target_group_arn)
+      if tga != "" && tga != "-" { unmapped.target_group_arn = tga }
+      cert = to_string(m.chosen_cert_arn)
+      if cert != "" && cert != "-" { unmapped.chosen_cert_arn = cert }
+      prio = to_string(m.matched_rule_priority)
+      if prio != "" && prio != "-" { unmapped.matched_rule_priority = prio }
+      acts = to_string(m.actions_executed)
+      if acts != "" && acts != "-" { unmapped.actions_executed = acts }
+      redir = to_string(m.redirect_url)
+      if redir != "" && redir != "-" { unmapped.redirect_url = redir }
+      rct = to_string(m.request_creation_time)
+      if rct != "" && rct != "-" { unmapped.request_creation_time = rct }
+      if rpt >= 0.0 { unmapped.request_processing_time = rpt }
+      if tpt >= 0.0 { unmapped.target_processing_time = tpt }
+      if rspt >= 0.0 { unmapped.response_processing_time = rspt }
+      if length(keys(unmapped)) > 0 { ocsf.unmapped = unmapped }
+
+      . = ocsf
+  } else {
+      # Unrecognised line: emit a minimal, still-valid record so it stays queryable.
+      . = {
+          "class_uid": class_uid,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": class_uid * 100 + 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "time": 0,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud"],
+              "uid": sha2("aws_alb|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "ALB Access Log",
+              "product": { "name": "AWS Application Load Balancer", "vendor_name": "Amazon" }
+          },
+          "cloud": { "provider": "AWS" },
+          "http_request": { "url": { "path": "/" } }
+      }
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  __mapped = object!(parse_json!(encode_json(.)))
+  __existing = object(__mapped.unmapped) ?? {}
+  __discard = del(__mapped.raw_data)
+  __discard = del(__mapped.unmapped)
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __represented = []
+  __walk = map_values(__mapped, recursive: true) -> |value| {
+      __represented = push(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __represented = push(__represented, to_string(value) ?? "")
+      }
+      value
+  }
+  __consumed = []
+  # BEGIN parser-specific transformations
+  # timestamp: Parsed access-log timestamp converted to event milliseconds.
+  # target_processing_time: Existing unit conversion by 1000 verified against duration; unused clock fallbacks remain residual.
+  # request_creation_time: Existing timestamp conversion verified against the emitted millisecond clock.
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = ["actions_executed", "chosen_cert_arn", "client_port", "domain_name", "elb", "elb_status_code", "error_reason", "matched_rule_priority", "received_bytes", "redirect_url", "request", "request_creation_time", "request_processing_time", "response_processing_time", "sent_bytes", "ssl_cipher", "ssl_protocol", "target_group_arn", "target_port", "target_processing_time", "target_status_code", "timestamp", "trace_id", "type", "user_agent"]
+  __preserve = []
+  __rules = array!(parse_json!("[{\"source\":\"timestamp\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"format\":\"%+\",\"reason\":\"Parsed access-log timestamp converted to event milliseconds.\"},{\"source\":\"target_processing_time\",\"kind\":\"scale\",\"factor\":1000,\"target\":\"duration\",\"reason\":\"Existing unit conversion by 1000 verified against duration; unused clock fallbacks remain residual.\"},{\"source\":\"request_creation_time\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"format\":\"%+\",\"reason\":\"Existing timestamp conversion verified against the emitted millisecond clock.\"}]"))
+  __source_flat = flatten(__source_kv)
+  for_each(__rules) -> |_index, rule| {
+      __source_key = string!(rule.source)
+      __value = get!(__source_flat, [__source_key])
+      __expected = null
+      __valid = false
+      if rule.kind == "lowercase" && is_string(__value) {
+          __expected = downcase(string!(__value))
+          __valid = true
+      } else if rule.kind == "epoch_ms" {
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", string(rule.format) ?? "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              __valid = true
+          }
+      } else if rule.kind == "scale" {
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * to_float!(rule.factor))
+              __valid = true
+          }
+      } else if rule.kind == "hex" {
+          __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
+          __integer, __integer_err = parse_int(__hex, base: 16)
+          __expected = __integer
+          __valid = is_string(__value) && starts_with(downcase(string(__value) ?? ""), "0x") && __integer_err == null
+      } else if rule.kind == "enum" {
+          __expected = get!(object!(rule.values), [downcase(to_string(__value) ?? "")])
+          __valid = __expected != null
+      }
+      __matches = includes(__represented, encode_json(__expected))
+      if is_string(rule.target) { __matches = get!(., split(string!(rule.target), ".")) == __expected }
+      if __valid && __matches { __consumed = push(__consumed, __source_key) }
+  }
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  __safe = map_values(object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing}))), recursive: true) -> |value| {
+      if is_object(value) {
+          # Header/parameter arrays commonly encode sensitive keys as name/value
+          # or Key/Value objects instead of using the secret name as an object key.
+          __sensitive_pair = false
+          for_each(object!(value)) -> |key, child| {
+              if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                  __sensitive_pair = true
+              }
+          }
+          for_each(object!(value)) -> |key, _child| {
+              if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                  value = set!(value, [key], "<redacted>")
+              }
+          }
+      }
+      value
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  __escaped = map_keys(object!(__safe.source), recursive: true) -> |key| {
+      replace(replace(key, "~", "~0"), ".", "~1")
+  }
+  __flat = flatten(__escaped)
+  __residual = {}
+  for_each(__flat) -> |key, value| {
+      key = replace(replace(key, "~1", "."), "~0", "~")
+      # flatten stops at arrays, so objects inside an array still carry the
+      # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+      if is_array(value) || is_object(value) {
+          value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+              replace(replace(inner, "~1", "."), "~0", "~")
+          }, ["v"])
+      }
+      __same = includes(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __same = __same || includes(__represented, to_string(value) ?? "")
+      }
+      # A scalar array is consumed only if every element is represented. Preserve
+      # partially represented arrays intact, including their ordering and repeats.
+      if is_array(value) && !is_empty(array!(value)) {
+          __all_items = true
+          for_each(array!(value)) -> |_index, item| {
+              __item_same = includes(__represented, encode_json(item))
+              if !is_object(item) && !is_array(item) && !is_null(item) {
+                  __item_same = __item_same || includes(__represented, to_string(item) ?? "")
+              }
+              if is_object(item) || is_array(item) || !__item_same { __all_items = false }
+          }
+          __same = __same || __all_items
+      }
+      if __same && includes(__candidates, key) { __consumed = push(__consumed, key) }
+      # Redacted leaves always remain visible. Do not spill a copy of the raw body.
+      if (!includes(__consumed, key) || value == "<redacted>") && value != __raw_body {
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          __base = join!(__parts, ".")
+          __key = __base
+          __suffix = 2
+          if includes(keys(__residual), __key) {
+              for_each(__flat) -> |_other_key, _other_value| {
+                  if includes(keys(__residual), __key) {
+                      __key = __base + "_" + to_string(__suffix)
+                      __suffix = __suffix + 1
+                  }
+              }
+          }
+          __complex = is_object(value)
+          if is_array(value) {
+              for_each(array!(value)) -> |_index, item| {
+                  if is_object(item) || is_array(item) { __complex = true }
+              }
+          }
+          __spill = if __complex { encode_json(value) } else { value }
+          __residual = set!(__residual, [__key], __spill)
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  __original_values = []
+  for_each(flatten(__source_kv)) -> |_key, value| {
+      __original_values = push(__original_values, encode_json(value))
+      if !is_object(value) && !is_array(value) { __original_values = push(__original_values, to_string(value) ?? "") }
+  }
+  for_each(flatten(__existing)) -> |key, value| {
+      __source_alias = includes(__original_values, encode_json(value)) || includes(__original_values, to_string(value) ?? "")
+      __mapped_alias = includes(__represented, encode_json(value)) || includes(__represented, to_string(value) ?? "")
+      __decoded, __decode_err = parse_json(string(value) ?? "")
+      __encoded_container = __decode_err == null && (is_object(__decoded) || is_array(__decoded))
+      if !is_null(value) && value != "" && !__source_alias && !__mapped_alias && !__encoded_container && value != __raw_body {
+          # Existing aggregates may contain sensitive descendants; the canonical
+          # source spill above is the authoritative representation of containers.
+          if !is_array(value) && !is_object(value) && !match(downcase(key), r'password|secret|authorization|token') {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # NAN-2995: OCSF 1.9 bytes_in = destination -> source, bytes_out = source -> destination; sent_bytes (ALB -> client) is bytes_in, received_bytes is bytes_out.
+  - raw: "http 2026-08-18T20:00:00.123456Z app/my-loadbalancer/50dc6c495c0c9188 192.0.2.10:2817 10.0.0.5:80 0.000 0.001 0.000 200 200 34 366 \"GET http://www.example.com:80/index.html HTTP/1.1\" \"curl/7.68.0\" - - arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/my-targets/73e2d6bc24d8a067 \"Root=1-58337262-36d228ad5d99923122bbe354\" \"-\" \"-\" 0 2026-08-18T20:00:00.000000Z \"forward\" \"-\" \"-\""
+    expect:
+      "traffic.bytes_in": 366
+      "traffic.bytes_out": 34
+  # NAN-3702 (existing sample): metadata.uid is sha256("aws_alb|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "http 2026-08-18T20:00:00.123456Z app/my-loadbalancer/50dc6c495c0c9188 192.0.2.10:2817 10.0.0.5:80 0.000 0.001 0.000 200 200 34 366 \"GET http://www.example.com:80/index.html HTTP/1.1\" \"curl/7.68.0\" - - arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/my-targets/73e2d6bc24d8a067 \"Root=1-58337262-36d228ad5d99923122bbe354\" \"-\" \"-\" 0 2026-08-18T20:00:00.000000Z \"forward\" \"-\" \"-\""
+    expect:
+      "metadata.uid": "f26f207ee5e7bd38dc7897f37681c9cc18994a5a603aa2afc3bde4c6ed5ee36f"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("aws_alb|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"timestamp\":\"2025-01-01T00:00:00Z\",\"severity\":\"INFO\"}"
+    expect:
+      "metadata.uid": "08369dbaa2143894bc5e657330d836fa4f1b6a831c8b3dabf1d90401b5996b1b"

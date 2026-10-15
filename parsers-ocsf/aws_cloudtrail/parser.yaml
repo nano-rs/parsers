@@ -1,8 +1,10 @@
 name: aws_cloudtrail_ocsf
 display_name: AWS CloudTrail (OCSF)
-version: "1.1.0"
+version: "1.4.0"
+ocsf_version: "1.9.0"
 description: >
-  Parses AWS CloudTrail management events into complete OCSF 1.8.0
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses AWS CloudTrail management events into complete OCSF 1.9
   "API Activity" (class_uid 6003) records. The whole OCSF object is emitted on
   the root so it lands in ocsf_logs.event and the promoted columns materialize
   (api.service.name, api.operation, cloud.*, resources[], src_endpoint, actor).
@@ -13,9 +15,12 @@ category: cloud
 vendor: "Amazon"
 product: "AWS CloudTrail"
 parser_vrl: |
-  # AWS CloudTrail JSON -> OCSF 1.8.0 API Activity (class_uid 6003).
+  # AWS CloudTrail JSON -> OCSF 1.9.0 API Activity (class_uid 6003).
   raw_log = string!(.message)
+  __raw_body = raw_log
+  __source_kv = {}
   parsed, err = parse_json(raw_log)
+  __source_kv = object(parsed) ?? {}
 
   if err != null || !is_object(parsed) {
       . = {
@@ -26,15 +31,20 @@ parser_vrl: |
           "severity_id": 1,
           "status_id": 0,
           "time": 0,
-          "message": raw_log,
+          "raw_data": raw_log,
           "metadata": {
-              "version": "1.8.0",
+              "version": "1.9.0",
+              "profiles": ["cloud"],
               # NAN-3702: deterministic, so a redelivered unparseable record
               # dedupes in the lake instead of landing as a second row.
               "uid": sha2("aws_cloudtrail|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "product": { "name": "AWS CloudTrail", "vendor_name": "Amazon" }
-          }
+          },
+          "api": { "operation": "Unknown", "service": { "name": "unknown" } },
+          "cloud": { "provider": "AWS" },
+          "actor": { "user": { "name": "unknown" } },
+          "src_endpoint": { "ip": "0.0.0.0" }
       }
   } else {
       p = object!(parsed)
@@ -53,6 +63,22 @@ parser_vrl: |
       if change == "update" { activity_id = 3; activity_name = "Update" }
       if change == "delete" { activity_id = 4; activity_name = "Delete" }
       if activity_id == 99 && read_only { activity_id = 2; activity_name = "Read" }
+      # NAN-2986: `_nanosiem.changeType` is log-blaster metadata; real
+      # CloudTrail never carries it, so every non-read call landed as 99
+      # Other. Fall back to the eventName verb, which is AWS's own API
+      # naming convention (CreateSecret, PutObject, DeleteBucket, ...).
+      event_name = string(p.eventName) ?? ""
+      if activity_id == 99 {
+          if match(event_name, r'^(Describe|Get|List|Lookup|Head|Search|Scan|Query|BatchGet|Select)[A-Z]') {
+              activity_id = 2; activity_name = "Read"
+          } else if match(event_name, r'^(Delete|Remove|Terminate|Deregister|Release|Destroy|Unassign|Deactivate)[A-Z]') {
+              activity_id = 4; activity_name = "Delete"
+          } else if match(event_name, r'^(Create|Put|Run|Add|Allocate|Import|Register|Generate|Issue|Upload|Copy|Request|Assign|BatchPut|BatchWrite)[A-Z]') {
+              activity_id = 1; activity_name = "Create"
+          } else if match(event_name, r'^(Update|Modify|Set|Attach|Detach|Associate|Disassociate|Authorize|Revoke|Enable|Disable|Change|Replace|Reboot|Start|Stop|Tag|Untag|Reset|Restore|Rotate|Activate|Apply|Edit)[A-Z]') {
+              activity_id = 3; activity_name = "Update"
+          }
+      }
 
       # ---- AWS service token out of eventSource ("ec2.amazonaws.com" -> "ec2") ----
       event_source = string(p.eventSource) ?? ""
@@ -93,10 +119,30 @@ parser_vrl: |
       }
 
       # ---- caller identity ----
-      caller = string(nano.callerName) ?? string(ui.userName) ?? ""
+      # NAN-2986: real CloudTrail has no `_nanosiem.callerName`. AssumedRole
+      # and federated callers carry no userIdentity.userName either; their
+      # name is the session issuer (the role), and AWS service callers are
+      # named by invokedBy. Without these fallbacks actor.user.name was "".
+      session_ctx = object(ui.sessionContext) ?? {}
+      issuer = object(session_ctx.sessionIssuer) ?? {}
+      caller = string(nano.callerName) ?? string(ui.userName) ?? string(issuer.userName) ?? string(ui.invokedBy) ?? ""
       caller_uid = string(ui.arn) ?? string(ui.principalId) ?? ""
 
-      mfa = if is_boolean(nano.mfaAuthenticated) { bool(nano.mfaAuthenticated) ?? false } else { false }
+      # MFA: blaster metadata first, then CloudTrail's own session attribute
+      # ("true"/"false" string), then ConsoleLogin's additionalEventData.
+      # Unknown stays unknown: defaulting to false asserted "no MFA" for every
+      # event that simply does not report it.
+      mfa = null
+      if is_boolean(nano.mfaAuthenticated) {
+          mfa = bool(nano.mfaAuthenticated) ?? null
+      } else {
+          session_attrs = object(session_ctx.attributes) ?? {}
+          mfa_attr = downcase(to_string(session_attrs.mfaAuthenticated) ?? "")
+          aed = object(p.additionalEventData) ?? {}
+          mfa_used = downcase(to_string(aed.MFAUsed) ?? "")
+          if mfa_attr == "true" || mfa_used == "yes" { mfa = true }
+          if mfa_attr == "false" || (mfa_attr == "" && mfa_used == "no") { mfa = false }
+      }
 
       # NAN-3702: the lake drops a row whose (event hour, metadata.uid) it has
       # already stored, so the uid must be the same every time the same record
@@ -119,9 +165,10 @@ parser_vrl: |
           "status_id": status_id,
           "status": status_str,
           "time": time_ms,
-          "message": raw_log,
+          "raw_data": raw_log,
           "metadata": {
-              "version": "1.8.0",
+              "version": "1.9.0",
+              "profiles": ["cloud"],
               "uid": event_uid,
               "log_name": "CloudTrail",
               "log_provider": "AWS CloudTrail",
@@ -150,15 +197,37 @@ parser_vrl: |
       }
 
       # src_endpoint is REQUIRED on API Activity 6003 — always emit it.
-      ocsf.src_endpoint = { "ip": downcase(string(p.sourceIPAddress) ?? "") }
+      src_ip_raw = downcase(string(p.sourceIPAddress) ?? "")
+      if is_ipv4(src_ip_raw) || is_ipv6(src_ip_raw) {
+          ocsf.src_endpoint = { "ip": src_ip_raw }
+      } else if src_ip_raw != "" {
+          # CloudTrail also emits service principals here ("ec2.amazonaws.com").
+          ocsf.src_endpoint = { "ip": "0.0.0.0", "hostname": src_ip_raw }
+      } else {
+          ocsf.src_endpoint = { "ip": "0.0.0.0" }
+      }
+
+      # api.request.uid is the promoted, class-native home of the request ID
+      # (metadata.correlation_uid keeps it too, for existing queries).
+      request_id = string(p.requestID) ?? ""
+      if request_id != "" { ocsf.api.request = { "uid": request_id } }
 
       ua = string(p.userAgent) ?? ""
       if ua != "" { ocsf.http_request = { "user_agent": ua } }
 
       if length(resources) > 0 { ocsf.resources = resources }
 
-      # is_mfa is NOT an API Activity attribute (it's auth-specific) -> unmapped.
-      unmapped = { "mfa_authenticated": mfa }
+      # AWS account alias is log-blaster metadata; omit rather than emit "".
+      account_alias = string(nano.accountAlias) ?? ""
+      if account_alias == "" { ocsf.cloud.account = { "uid": ocsf.cloud.account.uid } }
+
+      # NAN-2986: MFA belongs to the caller's session, and actor.session.is_mfa
+      # is a promoted (queryable) column on every class. It used to go to
+      # unmapped.mfa_authenticated, which the NAN-2421 residual then rewrote
+      # to its source path — and a CloudTrail event that did not report MFA
+      # was stamped false.
+      if mfa != null { ocsf.actor.session = { "is_mfa": mfa } }
+      unmapped = {}
       if error_code != "" {
           unmapped.error_code = error_code
           unmapped.error_message = string(p.errorMessage) ?? null
@@ -167,24 +236,219 @@ parser_vrl: |
 
       . = ocsf
   }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  __mapped = object!(parse_json!(encode_json(.)))
+  __existing = object(__mapped.unmapped) ?? {}
+  __discard = del(__mapped.raw_data)
+  __discard = del(__mapped.unmapped)
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __represented = []
+  __walk = map_values(__mapped, recursive: true) -> |value| {
+      __represented = push(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __represented = push(__represented, to_string(value) ?? "")
+      }
+      value
+  }
+  __consumed = []
+  # BEGIN parser-specific transformations
+  # _nanosiem.changeType: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # sourceIPAddress: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # eventTime: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # _nanosiem.changeType: Parser normalizes the caption case; verify the emitted caption.
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = ["_nanosiem", "_nanosiem.accountAlias", "_nanosiem.callerName", "_nanosiem.changeType", "_nanosiem.cloudService", "_nanosiem.mfaAuthenticated", "_nanosiem.status", "awsRegion", "errorCode", "errorMessage", "eventID", "eventName", "eventSource", "eventTime", "readOnly", "recipientAccountId", "requestID", "resources", "sourceIPAddress", "userAgent", "userIdentity", "userIdentity.accountId", "userIdentity.arn", "userIdentity.invokedBy", "userIdentity.principalId", "userIdentity.sessionContext.attributes.mfaAuthenticated", "userIdentity.sessionContext.sessionIssuer.userName", "userIdentity.type", "userIdentity.userName"]
+  __preserve = []
+  __rules = array!(parse_json!("[{\"source\":\"_nanosiem.changeType\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"sourceIPAddress\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"eventTime\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Successful ISO timestamp conversion to the selected event clock in milliseconds.\"},{\"source\":\"_nanosiem.changeType\",\"kind\":\"enum\",\"target\":\"activity_name\",\"values\":{\"create\":\"Create\"},\"reason\":\"Parser normalizes the caption case; verify the emitted caption.\"}]"))
+  __source_flat = flatten(__source_kv)
+  for_each(__rules) -> |_index, rule| {
+      __source_key = string!(rule.source)
+      __value = get!(__source_flat, [__source_key])
+      __expected = null
+      __valid = false
+      if rule.kind == "lowercase" && is_string(__value) {
+          __expected = downcase(string!(__value))
+          __valid = true
+      } else if rule.kind == "epoch_ms" {
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", string(rule.format) ?? "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              __valid = true
+          }
+      } else if rule.kind == "scale" {
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * to_float!(rule.factor))
+              __valid = true
+          }
+      } else if rule.kind == "hex" {
+          __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
+          __integer, __integer_err = parse_int(__hex, base: 16)
+          __expected = __integer
+          __valid = is_string(__value) && starts_with(downcase(string(__value) ?? ""), "0x") && __integer_err == null
+      } else if rule.kind == "enum" {
+          __expected = get!(object!(rule.values), [downcase(to_string(__value) ?? "")])
+          __valid = __expected != null
+      }
+      __matches = includes(__represented, encode_json(__expected))
+      if is_string(rule.target) { __matches = get!(., split(string!(rule.target), ".")) == __expected }
+      if __valid && __matches { __consumed = push(__consumed, __source_key) }
+  }
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  __safe = map_values(object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing}))), recursive: true) -> |value| {
+      if is_object(value) {
+          # Header/parameter arrays commonly encode sensitive keys as name/value
+          # or Key/Value objects instead of using the secret name as an object key.
+          __sensitive_pair = false
+          for_each(object!(value)) -> |key, child| {
+              if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                  __sensitive_pair = true
+              }
+          }
+          for_each(object!(value)) -> |key, _child| {
+              if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                  value = set!(value, [key], "<redacted>")
+              }
+          }
+      }
+      value
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  __escaped = map_keys(object!(__safe.source), recursive: true) -> |key| {
+      replace(replace(key, "~", "~0"), ".", "~1")
+  }
+  __flat = flatten(__escaped)
+  __residual = {}
+  for_each(__flat) -> |key, value| {
+      key = replace(replace(key, "~1", "."), "~0", "~")
+      # flatten stops at arrays, so objects inside an array still carry the
+      # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+      if is_array(value) || is_object(value) {
+          value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+              replace(replace(inner, "~1", "."), "~0", "~")
+          }, ["v"])
+      }
+      __same = includes(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __same = __same || includes(__represented, to_string(value) ?? "")
+      }
+      # A scalar array is consumed only if every element is represented. Preserve
+      # partially represented arrays intact, including their ordering and repeats.
+      if is_array(value) && !is_empty(array!(value)) {
+          __all_items = true
+          for_each(array!(value)) -> |_index, item| {
+              __item_same = includes(__represented, encode_json(item))
+              if !is_object(item) && !is_array(item) && !is_null(item) {
+                  __item_same = __item_same || includes(__represented, to_string(item) ?? "")
+              }
+              if is_object(item) || is_array(item) || !__item_same { __all_items = false }
+          }
+          __same = __same || __all_items
+      }
+      if __same && includes(__candidates, key) { __consumed = push(__consumed, key) }
+      # Redacted leaves always remain visible. Do not spill a copy of the raw body.
+      if (!includes(__consumed, key) || value == "<redacted>") && value != __raw_body {
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          __base = join!(__parts, ".")
+          __key = __base
+          __suffix = 2
+          if includes(keys(__residual), __key) {
+              for_each(__flat) -> |_other_key, _other_value| {
+                  if includes(keys(__residual), __key) {
+                      __key = __base + "_" + to_string(__suffix)
+                      __suffix = __suffix + 1
+                  }
+              }
+          }
+          __complex = is_object(value)
+          if is_array(value) {
+              for_each(array!(value)) -> |_index, item| {
+                  if is_object(item) || is_array(item) { __complex = true }
+              }
+          }
+          __spill = if __complex { encode_json(value) } else { value }
+          __residual = set!(__residual, [__key], __spill)
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  __original_values = []
+  for_each(flatten(__source_kv)) -> |_key, value| {
+      __original_values = push(__original_values, encode_json(value))
+      if !is_object(value) && !is_array(value) { __original_values = push(__original_values, to_string(value) ?? "") }
+  }
+  for_each(flatten(__existing)) -> |key, value| {
+      __source_alias = includes(__original_values, encode_json(value)) || includes(__original_values, to_string(value) ?? "")
+      __mapped_alias = includes(__represented, encode_json(value)) || includes(__represented, to_string(value) ?? "")
+      __decoded, __decode_err = parse_json(string(value) ?? "")
+      __encoded_container = __decode_err == null && (is_object(__decoded) || is_array(__decoded))
+      if !is_null(value) && value != "" && !__source_alias && !__mapped_alias && !__encoded_container && value != __raw_body {
+          # Existing aggregates may contain sensitive descendants; the canonical
+          # source spill above is the authoritative representation of containers.
+          if !is_array(value) && !is_object(value) && !match(downcase(key), r'password|secret|authorization|token') {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+# NAN-2986: REAL CloudTrail (no log-blaster `_nanosiem` helper object). Before
+# this, activity came only from _nanosiem.changeType (every write was 99
+# Other), an AssumedRole caller had actor.user.name "", and MFA defaulted to
+# false when CloudTrail did not report it (now actor.session.is_mfa, only when known).
 samples:
-  # NAN-3702: eventID stays the uid when present, so existing uids do not move.
-  - raw: "{\"eventVersion\":\"1.08\",\"eventID\":\"3f1c2a4e-8d4b-4c59-9a1e-0f6b7c8d9e01\",\"eventTime\":\"2026-09-28T17:00:00Z\",\"eventSource\":\"secretsmanager.amazonaws.com\",\"eventName\":\"CreateSecret\",\"awsRegion\":\"us-east-1\",\"sourceIPAddress\":\"10.0.1.10\",\"userAgent\":\"aws-cli/2.15\",\"readOnly\":false,\"recipientAccountId\":\"456789012345\",\"requestID\":\"req-1\",\"eventType\":\"AwsApiCall\",\"userIdentity\":{\"type\":\"AssumedRole\",\"principalId\":\"AROAEXAMPLE:session-1\",\"arn\":\"arn:aws:sts::456789012345:assumed-role/app/session-1\",\"accountId\":\"456789012345\"}}"
+  - raw: "{\"eventVersion\":\"1.09\",\"eventTime\":\"2026-09-28T17:00:00Z\",\"eventSource\":\"secretsmanager.amazonaws.com\",\"eventName\":\"CreateSecret\",\"awsRegion\":\"us-east-1\",\"sourceIPAddress\":\"10.0.1.10\",\"userAgent\":\"aws-cli/2.15\",\"readOnly\":false,\"recipientAccountId\":\"456789012345\",\"requestID\":\"req-assumed-1\",\"eventID\":\"evt-assumed-1\",\"eventType\":\"AwsApiCall\",\"managementEvent\":true,\"eventCategory\":\"Management\",\"requestParameters\":{\"name\":\"prod/db\"},\"responseElements\":null,\"userIdentity\":{\"type\":\"AssumedRole\",\"principalId\":\"AROAEXAMPLE:session-1\",\"arn\":\"arn:aws:sts::456789012345:assumed-role/eks-node-role/session-1\",\"accountId\":\"456789012345\",\"accessKeyId\":\"ASIAEXAMPLE\",\"sessionContext\":{\"sessionIssuer\":{\"type\":\"Role\",\"principalId\":\"AROAEXAMPLE\",\"arn\":\"arn:aws:iam::456789012345:role/eks-node-role\",\"accountId\":\"456789012345\",\"userName\":\"eks-node-role\"},\"attributes\":{\"creationDate\":\"2026-09-28T13:00:00Z\",\"mfaAuthenticated\":\"true\"}}}}"
     expect:
       "class_uid": 6003
-      "metadata.uid": "3f1c2a4e-8d4b-4c59-9a1e-0f6b7c8d9e01"
-  # NAN-3702: no eventID: the raw record is hashed.
-  - raw: "{\"eventVersion\":\"1.08\",\"eventTime\":\"2026-09-28T17:00:00Z\",\"eventSource\":\"secretsmanager.amazonaws.com\",\"eventName\":\"CreateSecret\",\"awsRegion\":\"us-east-1\",\"sourceIPAddress\":\"10.0.1.10\",\"userAgent\":\"aws-cli/2.15\",\"readOnly\":false,\"recipientAccountId\":\"456789012345\",\"requestID\":\"req-1\",\"eventType\":\"AwsApiCall\",\"userIdentity\":{\"type\":\"AssumedRole\",\"principalId\":\"AROAEXAMPLE:session-1\",\"arn\":\"arn:aws:sts::456789012345:assumed-role/app/session-1\",\"accountId\":\"456789012345\"}}"
+      "activity_id": 1
+      "activity_name": "Create"
+      "actor.user.name": "eks-node-role"
+      "actor.user.type": "AssumedRole"
+      "api.operation": "CreateSecret"
+      "api.request.uid": "req-assumed-1"
+      # NAN-3702: eventID stays the uid when present, so existing uids do not move.
+      "metadata.uid": "evt-assumed-1"
+      "cloud.account.uid": "456789012345"
+      "cloud.account.name": "<missing>"
+      "actor.session.is_mfa": true
+  - raw: "{\"eventVersion\":\"1.09\",\"eventTime\":\"2026-09-28T17:01:00Z\",\"eventSource\":\"s3.amazonaws.com\",\"eventName\":\"DeleteBucket\",\"awsRegion\":\"us-west-2\",\"sourceIPAddress\":\"203.0.113.51\",\"userAgent\":\"console.amazonaws.com\",\"readOnly\":false,\"recipientAccountId\":\"345678901234\",\"requestID\":\"req-iam-1\",\"eventID\":\"evt-iam-1\",\"eventType\":\"AwsApiCall\",\"errorCode\":\"AccessDenied\",\"errorMessage\":\"Access Denied\",\"requestParameters\":{\"bucketName\":\"logs-archive\"},\"responseElements\":null,\"userIdentity\":{\"type\":\"IAMUser\",\"principalId\":\"AIDAEXAMPLE\",\"arn\":\"arn:aws:iam::345678901234:user/jane.doe\",\"accountId\":\"345678901234\",\"userName\":\"jane.doe\"}}"
     expect:
       "class_uid": 6003
-      "metadata.uid": "06cc283969029b80dbdee5ed61387867fc0734862e5a9e58f10e06a58b86f456"
-  # NAN-3702: empty eventID counts as missing: the raw record is hashed.
-  - raw: "{\"eventVersion\":\"1.08\",\"eventID\":\"\",\"eventTime\":\"2026-09-28T17:00:00Z\",\"eventSource\":\"secretsmanager.amazonaws.com\",\"eventName\":\"CreateSecret\",\"awsRegion\":\"us-east-1\",\"sourceIPAddress\":\"10.0.1.10\",\"userAgent\":\"aws-cli/2.15\",\"readOnly\":false,\"recipientAccountId\":\"456789012345\",\"requestID\":\"req-1\",\"eventType\":\"AwsApiCall\",\"userIdentity\":{\"type\":\"AssumedRole\",\"principalId\":\"AROAEXAMPLE:session-1\",\"arn\":\"arn:aws:sts::456789012345:assumed-role/app/session-1\",\"accountId\":\"456789012345\"}}"
+      "activity_id": 4
+      "status": "Failure"
+      "actor.user.name": "jane.doe"
+      "unmapped.error_code": "AccessDenied"
+      "actor.session.is_mfa": "<missing>"
+  - raw: "{\"eventVersion\":\"1.09\",\"eventTime\":\"2026-09-28T17:02:00Z\",\"eventSource\":\"kms.amazonaws.com\",\"eventName\":\"Decrypt\",\"awsRegion\":\"us-east-1\",\"sourceIPAddress\":\"cloudtrail.amazonaws.com\",\"userAgent\":\"cloudtrail.amazonaws.com\",\"readOnly\":true,\"recipientAccountId\":\"456789012345\",\"requestID\":\"req-svc-1\",\"eventID\":\"evt-svc-1\",\"eventType\":\"AwsApiCall\",\"requestParameters\":{\"keyId\":\"k-1\"},\"responseElements\":null,\"userIdentity\":{\"type\":\"AWSService\",\"invokedBy\":\"cloudtrail.amazonaws.com\"}}"
     expect:
       "class_uid": 6003
-      "metadata.uid": "8707073894de6de9772aecf121b6a55cd22ec2145280b402299e764bfc4d2c2c"
-  # NAN-3702: unparseable record (error branch).
+      "activity_id": 2
+      "actor.user.name": "cloudtrail.amazonaws.com"
+      "src_endpoint.hostname": "cloudtrail.amazonaws.com"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("aws_cloudtrail|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
   - raw: "not json at all"
     expect:
-      "metadata.log_level": "error"
       "metadata.uid": "58351a9c5d9ceedc418d3c559220e83bb5f573f63120432664543d2c06616225"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("aws_cloudtrail|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"eventVersion\":\"1.09\",\"eventTime\":\"2026-09-28T17:00:00Z\",\"eventSource\":\"secretsmanager.amazonaws.com\",\"eventName\":\"CreateSecret\",\"awsRegion\":\"us-east-1\",\"sourceIPAddress\":\"10.0.1.10\",\"userAgent\":\"aws-cli/2.15\",\"readOnly\":false,\"recipientAccountId\":\"456789012345\",\"requestID\":\"req-assumed-1\",\"eventType\":\"AwsApiCall\",\"managementEvent\":true,\"eventCategory\":\"Management\",\"requestParameters\":{\"name\":\"prod/db\"},\"responseElements\":null,\"userIdentity\":{\"type\":\"AssumedRole\",\"principalId\":\"AROAEXAMPLE:session-1\",\"arn\":\"arn:aws:sts::456789012345:assumed-role/eks-node-role/session-1\",\"accountId\":\"456789012345\",\"accessKeyId\":\"ASIAEXAMPLE\",\"sessionContext\":{\"sessionIssuer\":{\"type\":\"Role\",\"principalId\":\"AROAEXAMPLE\",\"arn\":\"arn:aws:iam::456789012345:role/eks-node-role\",\"accountId\":\"456789012345\",\"userName\":\"eks-node-role\"},\"attributes\":{\"creationDate\":\"2026-09-28T13:00:00Z\",\"mfaAuthenticated\":\"true\"}}}}"
+    expect:
+      "metadata.uid": "614bb40efe8b3d8e8ab1f7e55d3ed862313fdb62328c3c84e15c514f79cc4603"

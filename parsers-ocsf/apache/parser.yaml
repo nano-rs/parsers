@@ -1,37 +1,49 @@
 name: apache_ocsf
 display_name: Apache HTTP Server (OCSF)
-version: "1.1.0"
+version: "1.4.0"
+ocsf_version: "1.9.0"
 description: >
-  Parses Apache combined/common log format into a complete OCSF 1.8.0
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Apache combined/common log format into a complete OCSF 1.9.0
   "HTTP Activity" (class_uid 4002) record. The whole OCSF object is emitted
   on the root so it can be inserted into the ocsf_logs `event` column, from
   which the promoted columns materialize. Mirrors the shape of the UDM
   apache parser (../parsers/parsers/apache/parser.yaml) but targets OCSF
   instead of `.udm.*`.
+
+  v1.1.0 — OCSF 1.8.0 -> 1.9.0 upgrade:
+    * metadata.version is now "1.9.0" (1.8.0 is rejected by this release).
+    * `actor` is a host-profile attribute on 4002, so the event now declares
+      metadata.profiles ["host"]; without it the authenticated-user mapping
+      was rejected as "attribute \"actor\" is not defined for this OCSF
+      class/profile".
+    * The unparsable-line fallback used to emit class 4002 with neither
+      http_request nor http_response, which violates the class constraint
+      "at least one of [http_request, http_response]". It now emits Base
+      Event (class_uid 0), which is what an unparsable line actually is.
 match_values:
   - apache_access
 category: application
 vendor: "Apache Software Foundation"
 product: "Apache HTTP Server"
 parser_vrl: |
-  # Apache Combined Log Format -> OCSF 1.8.0 HTTP Activity (class_uid 4002)
+  # Apache Combined Log Format -> OCSF 1.9.0 HTTP Activity (class_uid 4002)
   # Format: %h %l %u %t "%r" %>s %b "%{Referer}i" "%{User-Agent}i"
   #
   # Emits the COMPLETE standard OCSF record on the root. This object is what
   # gets written to ocsf_logs.event; the MATERIALIZED columns derive from it.
 
   raw_log = string!(.message)
+  __raw_body = raw_log
+  __source_kv = {}
 
-  # NAN-3702: the lake drops a row whose (event hour, metadata.uid) it already
-  # stored, so the uid must be the same every time the same line arrives.
-  # Apache lines carry no record id, so the raw line is hashed. The "apache|"
-  # prefix keeps an identical line from another source from sharing the uid.
-  record_uid = sha2("apache|raw|" + raw_log, variant: "SHA-256")
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
 
   parsed, err = parse_apache_log(raw_log, "combined")
+  __source_kv = object(parse_json!(encode_json(parsed))) ?? {}
 
   if err == null {
-      # ---- method -> activity_id (OCSF HTTP Activity enum, 1.8.0) ----
+      # ---- method -> activity_id (OCSF HTTP Activity enum, 1.9.0) ----
       # parse_apache_log returns method as a known String; no coalescing needed.
       method = upcase(string!(parsed.method))
       activity_id = 99
@@ -100,24 +112,34 @@ parser_vrl: |
           "status_id": status_id,
           "status": status_str,
           "time": time_ms,
-          "message": raw_log,
+          "raw_data": raw_log,
           "metadata": {
-              "version": "1.8.0",
-              "uid": record_uid,
+              "version": "1.9.0",
+              "uid": sha2("apache|raw|" + raw_log, variant: "SHA-256"),
+              # `actor` is host-profile-bound on 4002 in OCSF 1.9.
+              "profiles": ["host"],
+              "log_name": "apache",
               "product": {
                   "name": "Apache HTTP Server",
                   "vendor_name": "Apache Software Foundation"
               }
           },
-          "src_endpoint": {
-              "ip": to_string(parsed.host)
-          },
           "http_request": http_request,
           "http_response": http_response,
-          # traffic.bytes_out exercises our promoted `traffic.bytes_out` column.
+          # NAN-2995: OCSF 1.9 network_traffic: bytes_in = destination -> source, bytes_out = source -> destination.
+          # src = client, dst = server, so the response size (%b) is bytes_in.
           "traffic": {
-              "bytes_out": size
+              "bytes_in": size
           }
+      }
+
+      # %h is an IP unless HostnameLookups is on; network_endpoint.ip is
+      # regex-checked as ip_t, so a resolved name must go to hostname.
+      remote = to_string(parsed.host)
+      if match(remote, ip_re) {
+          .src_endpoint = { "ip": remote }
+      } else if remote != "" && remote != "-" {
+          .src_endpoint = { "hostname": downcase(remote) }
       }
 
       # authenticated user (Apache %u) -> actor.user.name, omit "-"
@@ -126,20 +148,28 @@ parser_vrl: |
           .actor = { "user": { "name": auth_user } }
       }
   } else {
-      # On parse failure, emit a minimal record carrying the raw + error so the
-      # row still lands and is debuggable rather than silently dropped.
+      # On parse failure, emit a Base Event carrying the raw line so the row
+      # still lands and is debuggable rather than silently dropped. It is NOT
+      # emitted as 4002: an unparsable line has neither http_request nor
+      # http_response, which violates the HTTP Activity class constraint.
       . = {
-          "class_uid": 4002,
-          "category_uid": 4,
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
           "activity_id": 99,
-          "type_uid": 400299,
+          "activity_name": "Other",
+          "type_uid": 99,
           "severity_id": 1,
+          "severity": "Informational",
           "status_id": 0,
+          "status": "Unknown",
           "time": 0,
-          "message": raw_log,
+          "raw_data": raw_log,
           "metadata": {
-              "version": "1.8.0",
-              "uid": record_uid,
+              "version": "1.9.0",
+              "uid": sha2("apache|raw|" + raw_log, variant: "SHA-256"),
+              "log_name": "apache",
               "product": {
                   "name": "Apache HTTP Server",
                   "vendor_name": "Apache Software Foundation"
@@ -148,14 +178,251 @@ parser_vrl: |
           }
       }
   }
+
+  .
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  __mapped = object!(parse_json!(encode_json(.)))
+  __existing = object(__mapped.unmapped) ?? {}
+  __discard = del(__mapped.raw_data)
+  __discard = del(__mapped.unmapped)
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __represented = []
+  __walk = map_values(__mapped, recursive: true) -> |value| {
+      __represented = push(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __represented = push(__represented, to_string(value) ?? "")
+      }
+      value
+  }
+  __consumed = []
+  # BEGIN parser-specific transformations
+  # timestamp: Built-in Apache timestamp converted to epoch milliseconds.
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = ["agent", "host", "method", "path", "referrer", "size", "status", "timestamp", "user"]
+  __preserve = []
+  __rules = array!(parse_json!("[{\"source\":\"timestamp\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Built-in Apache timestamp converted to epoch milliseconds.\"}]"))
+  __source_flat = flatten(__source_kv)
+  for_each(__rules) -> |_index, rule| {
+      __source_key = string!(rule.source)
+      __value = get!(__source_flat, [__source_key])
+      __expected = null
+      __valid = false
+      if rule.kind == "lowercase" && is_string(__value) {
+          __expected = downcase(string!(__value))
+          __valid = true
+      } else if rule.kind == "epoch_ms" {
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", string(rule.format) ?? "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              __valid = true
+          }
+      } else if rule.kind == "scale" {
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * to_float!(rule.factor))
+              __valid = true
+          }
+      } else if rule.kind == "hex" {
+          __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
+          __integer, __integer_err = parse_int(__hex, base: 16)
+          __expected = __integer
+          __valid = is_string(__value) && starts_with(downcase(string(__value) ?? ""), "0x") && __integer_err == null
+      } else if rule.kind == "enum" {
+          __expected = get!(object!(rule.values), [downcase(to_string(__value) ?? "")])
+          __valid = __expected != null
+      }
+      __matches = includes(__represented, encode_json(__expected))
+      if is_string(rule.target) { __matches = get!(., split(string!(rule.target), ".")) == __expected }
+      if __valid && __matches { __consumed = push(__consumed, __source_key) }
+  }
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  __safe = map_values(object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing}))), recursive: true) -> |value| {
+      if is_object(value) {
+          # Header/parameter arrays commonly encode sensitive keys as name/value
+          # or Key/Value objects instead of using the secret name as an object key.
+          __sensitive_pair = false
+          for_each(object!(value)) -> |key, child| {
+              if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                  __sensitive_pair = true
+              }
+          }
+          for_each(object!(value)) -> |key, _child| {
+              if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                  value = set!(value, [key], "<redacted>")
+              }
+          }
+      }
+      value
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  __escaped = map_keys(object!(__safe.source), recursive: true) -> |key| {
+      replace(replace(key, "~", "~0"), ".", "~1")
+  }
+  __flat = flatten(__escaped)
+  __residual = {}
+  for_each(__flat) -> |key, value| {
+      key = replace(replace(key, "~1", "."), "~0", "~")
+      # flatten stops at arrays, so objects inside an array still carry the
+      # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+      if is_array(value) || is_object(value) {
+          value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+              replace(replace(inner, "~1", "."), "~0", "~")
+          }, ["v"])
+      }
+      __same = includes(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __same = __same || includes(__represented, to_string(value) ?? "")
+      }
+      # A scalar array is consumed only if every element is represented. Preserve
+      # partially represented arrays intact, including their ordering and repeats.
+      if is_array(value) && !is_empty(array!(value)) {
+          __all_items = true
+          for_each(array!(value)) -> |_index, item| {
+              __item_same = includes(__represented, encode_json(item))
+              if !is_object(item) && !is_array(item) && !is_null(item) {
+                  __item_same = __item_same || includes(__represented, to_string(item) ?? "")
+              }
+              if is_object(item) || is_array(item) || !__item_same { __all_items = false }
+          }
+          __same = __same || __all_items
+      }
+      if __same && includes(__candidates, key) { __consumed = push(__consumed, key) }
+      # Redacted leaves always remain visible. Do not spill a copy of the raw body.
+      if (!includes(__consumed, key) || value == "<redacted>") && value != __raw_body {
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          __base = join!(__parts, ".")
+          __key = __base
+          __suffix = 2
+          if includes(keys(__residual), __key) {
+              for_each(__flat) -> |_other_key, _other_value| {
+                  if includes(keys(__residual), __key) {
+                      __key = __base + "_" + to_string(__suffix)
+                      __suffix = __suffix + 1
+                  }
+              }
+          }
+          __complex = is_object(value)
+          if is_array(value) {
+              for_each(array!(value)) -> |_index, item| {
+                  if is_object(item) || is_array(item) { __complex = true }
+              }
+          }
+          __spill = if __complex { encode_json(value) } else { value }
+          __residual = set!(__residual, [__key], __spill)
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  __original_values = []
+  for_each(flatten(__source_kv)) -> |_key, value| {
+      __original_values = push(__original_values, encode_json(value))
+      if !is_object(value) && !is_array(value) { __original_values = push(__original_values, to_string(value) ?? "") }
+  }
+  for_each(flatten(__existing)) -> |key, value| {
+      __source_alias = includes(__original_values, encode_json(value)) || includes(__original_values, to_string(value) ?? "")
+      __mapped_alias = includes(__represented, encode_json(value)) || includes(__represented, to_string(value) ?? "")
+      __decoded, __decode_err = parse_json(string(value) ?? "")
+      __encoded_container = __decode_err == null && (is_object(__decoded) || is_array(__decoded))
+      if !is_null(value) && value != "" && !__source_alias && !__mapped_alias && !__encoded_container && value != __raw_body {
+          # Existing aggregates may contain sensitive descendants; the canonical
+          # source spill above is the authoritative representation of containers.
+          if !is_array(value) && !is_object(value) && !match(downcase(key), r'password|secret|authorization|token') {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+# Runtime samples (NAN-2327): one per event shape this parser routes.
+# `class_uid` is asserted because class routing is the whole point of the
+# OCSF conversion — a silent reroute is the defect most likely to survive
+# a compile-only check.
 samples:
-  # NAN-3702: existing-format line: no record id, so the raw line is hashed.
+  - raw: '127.0.0.1 - frank [10/Oct/2000:13:55:36 -0700] "GET /apache_pb.gif HTTP/1.0" 200 2326 "http://www.example.com/start.html" "Mozilla/4.08 [en] (Win98; I ;Nav)"'
+    expect:
+      class_uid: 4002
+      activity_id: 3
+  - raw: 'this is not an nginx log line at all'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  - raw: '10.1.2.3 - - [12/Aug/2026:09:15:22 +0000] "POST /wp-login.php HTTP/1.1" 500 0 "-" "-"'
+    expect:
+      class_uid: 4002
+      activity_id: 6
+  # NAN-2986: the live-tenant HEC canary (sourcetype apache_access). Common
+  # log with a "-" referrer; every HTTP field must populate and the row must
+  # NOT carry the parse-failure log_level.
+  - raw: '10.9.8.1 - - [28/Sep/2026:17:00:00 +0000] "GET /claude-canary-20260928T170713Z/1 HTTP/1.1" 200 512 "-" "canary"'
+    expect:
+      class_uid: 4002
+      activity_id: 3
+      severity: Informational
+      status: Success
+      src_endpoint.ip: 10.9.8.1
+      http_request.http_method: GET
+      http_request.url.path: /claude-canary-20260928T170713Z/1
+      http_request.user_agent: canary
+      http_request.referrer: <missing>
+      http_response.code: 200
+      http_response.length: 512
+      http_response.status: Success
+      metadata.log_level: <missing>
+  # NAN-2986: log-blaster apache_access generator output — full combined
+  # format with a referrer and a browser user agent, 4xx outcome.
+  - raw: '11.14.181.116 - - [28/Sep/2026:17:00:00 +0000] "POST /login HTTP/1.1" 404 1568 "https://www.google.com/" "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"'
+    expect:
+      class_uid: 4002
+      activity_id: 6
+      severity: Informational
+      status: Failure
+      src_endpoint.ip: 11.14.181.116
+      http_request.referrer: https://www.google.com/
+      http_request.user_agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36
+      http_request.url.path: /login
+      http_response.code: 404
+      http_response.length: 1568
+      metadata.log_level: <missing>
+  # NAN-2986: what the "thin" live rows actually were. The Worker roll's
+  # post-promote data-plane probe posts this non-Apache body on the
+  # apache_access source token; it is correctly a Base Event, not HTTP
+  # Activity, and is the only apache_access input that sets log_level.
+  - raw: 'nano source cutover probe'
+    expect:
+      class_uid: 0
+      activity_id: 99
+      metadata.log_level: error
+      raw_data: nano source cutover probe
+  # NAN-2995: OCSF 1.9 bytes_in = destination -> source, bytes_out = source -> destination; the response size (%b) is bytes_in.
   - raw: "127.0.0.1 - frank [10/Oct/2000:13:55:36 -0700] \"GET /apache_pb.gif HTTP/1.0\" 200 2326 \"http://www.example.com/start.html\" \"Mozilla/4.08 [en] (Win98; I ;Nav)\""
     expect:
-      "class_uid": 4002
-      "metadata.uid": "60e849949f4a65a058099c583ab2bc565f064e0b3999d1849a47f07e3b9f7fb4"
-  # NAN-3702: unparseable line (error branch).
-  - raw: "this is not an apache log line at all"
+      "traffic.bytes_in": 2326
+      "traffic.bytes_out": "<missing>"
+      "http_response.length": 2326
+  # NAN-3702 (existing sample): metadata.uid is sha256("apache|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "127.0.0.1 - frank [10/Oct/2000:13:55:36 -0700] \"GET /apache_pb.gif HTTP/1.0\" 200 2326 \"http://www.example.com/start.html\" \"Mozilla/4.08 [en] (Win98; I ;Nav)\""
     expect:
-      "metadata.log_level": "error"
-      "metadata.uid": "651db76fee7cabea4a0d4863e63cfbe1687a530476d8045711360396f45861b5"
+      "metadata.uid": "60e849949f4a65a058099c583ab2bc565f064e0b3999d1849a47f07e3b9f7fb4"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("apache|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "this is not an nginx log line at all"
+    expect:
+      "metadata.uid": "f5a8dc3df658af278445846a455807d69545a23ad82875a5f3dcaea1f83fa69b"

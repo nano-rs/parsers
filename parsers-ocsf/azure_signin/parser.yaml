@@ -1,0 +1,481 @@
+name: azure_signin_ocsf
+display_name: Azure Sign-in Logs (OCSF)
+version: "1.2.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Microsoft Entra ID (Azure AD) sign-in logs into complete OCSF 1.9.0
+  "Authentication" (class_uid 3002) records. Handles the diagnostic-settings
+  envelope (properties{...}) and the flattened Graph shape, plus interactive,
+  non-interactive and service-principal sign-ins. Declares the cloud, host and
+  security_control profiles so cloud.*, device.* and risk_level_id are legal.
+  The whole OCSF object is emitted on the root so it lands in ocsf_logs.event
+  and the promoted columns materialize. Mirrors the UDM azure_signin parser but
+  targets OCSF instead of `.udm.*`.
+match_values:
+  - azure_signin
+category: cloud
+vendor: "Microsoft"
+product: "Entra ID"
+parser_vrl: |
+  # Entra ID sign-in log -> OCSF 1.9.0 Authentication (class_uid 3002)
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+  class_uid = 3002
+
+  parsed, err = parse_json(raw_log)
+  __source_kv = object(parsed) ?? {}
+
+  if err != null || !is_object(parsed) {
+      . = {
+          "class_uid": class_uid,
+          "class_name": "Authentication",
+          "category_uid": 3,
+          "category_name": "Identity & Access Management",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": class_uid * 100 + 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "time": 0,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud"],
+              "uid": sha2("azure_signin|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "SignInLogs",
+              "product": { "name": "Microsoft Entra ID", "vendor_name": "Microsoft" }
+          },
+          "cloud": { "provider": "Azure" },
+          "api": { "operation": "SignIn", "service": { "name": "entra_id" } },
+          "user": { "name": "unknown" },
+          "service": { "name": "unknown" }
+      }
+  } else {
+      top = object!(parsed)
+      props = object(top.properties) ?? top
+
+      # ---- time ----
+      time_ms = 0
+      ts_str = to_string(top.time) ?? ""
+      if ts_str == "" { ts_str = to_string(props.createdDateTime) ?? "" }
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- outcome: properties.status.errorCode wins, else top-level resultType ----
+      status_obj = object(props.status) ?? {}
+      error_code = -1
+      failure_reason = ""
+      additional = ""
+      if length(keys(status_obj)) > 0 {
+          error_code = to_int(status_obj.errorCode) ?? -1
+          failure_reason = to_string(status_obj.failureReason) ?? ""
+          additional = to_string(status_obj.additionalDetails) ?? ""
+      }
+      if error_code < 0 {
+          rt = to_string(top.resultType) ?? ""
+          if rt != "" { error_code = to_int(rt) ?? -1 }
+          if failure_reason == "" { failure_reason = to_string(top.resultDescription) ?? "" }
+      }
+      status_id = 0
+      status_str = "Unknown"
+      severity_id = 1
+      severity = "Informational"
+      if error_code == 0 {
+          status_id = 1
+          status_str = "Success"
+      } else if error_code > 0 {
+          status_id = 2
+          status_str = "Failure"
+          severity_id = 2
+          severity = "Low"
+      }
+
+      # ---- subject ----
+      upn = to_string(props.userPrincipalName) ?? ""
+      display = to_string(props.userDisplayName) ?? ""
+      sp_name = to_string(props.servicePrincipalName) ?? ""
+      user = { "name": "unknown" }
+      if upn != "" {
+          user = { "name": upn, "type_id": 1, "type": "User" }
+          user.email_addr = upn
+          upn_parts = split(upn, "@")
+          if length(upn_parts) == 2 { user.domain = to_string(upn_parts[1]) }
+      } else if sp_name != "" {
+          user = { "name": sp_name, "type_id": 4, "type": "Service" }
+      } else if display != "" {
+          user = { "name": display, "type_id": 0 }
+      }
+      if display != "" { user.display_name = display }
+      uid = to_string(props.userId) ?? ""
+      if uid == "" { uid = to_string(props.servicePrincipalId) ?? "" }
+      if uid != "" { user.uid = uid }
+
+      # ---- the target application -> `service` (satisfies the 3002 constraint) ----
+      app_name = to_string(props.resourceDisplayName) ?? ""
+      if app_name == "" { app_name = to_string(props.appDisplayName) ?? "" }
+      if app_name == "" { app_name = "unknown" }
+      service = { "name": app_name }
+      res_uid = to_string(props.resourceId) ?? ""
+      if res_uid != "" { service.uid = res_uid }
+
+      # ---- source endpoint ----
+      ip = to_string(props.ipAddress) ?? ""
+      if ip == "" { ip = to_string(top.callerIpAddress) ?? "" }
+      src_endpoint = { "ip": "0.0.0.0" }
+      if ip != "" { src_endpoint = { "ip": downcase(ip) } }
+      location = object(props.location) ?? {}
+      loc = {}
+      country = to_string(location.countryOrRegion) ?? ""
+      if country != "" { loc.country = country }
+      city = to_string(location.city) ?? ""
+      if city != "" { loc.city = city }
+      state = to_string(location.state) ?? ""
+      if state != "" { loc.region = state }
+      if length(keys(loc)) > 0 { src_endpoint.location = loc }
+      asn = to_int(props.autonomousSystemNumber) ?? 0
+      if asn > 0 { src_endpoint.autonomous_system = { "number": asn } }
+
+      # ---- MFA / logon type / auth protocol ----
+      auth_req = to_string(props.authenticationRequirement) ?? ""
+      mfa_detail = object(props.mfaDetail) ?? {}
+      mfa_method = to_string(mfa_detail.authMethod) ?? ""
+      is_mfa = false
+      if auth_req == "multiFactorAuthentication" { is_mfa = true }
+      if mfa_method != "" { is_mfa = true }
+
+      is_interactive = to_bool(props.isInteractive) ?? false
+      logon_type_id = 3
+      logon_type = "Network"
+      if is_interactive { logon_type_id = 2; logon_type = "Interactive" }
+
+      auth_proto = downcase(to_string(props.authenticationProtocol) ?? "")
+      auth_protocol_id = 6
+      auth_protocol = "OAUTH 2.0"
+      if auth_proto == "saml" { auth_protocol_id = 5; auth_protocol = "SAML" }
+      if auth_proto == "openidconnect" || auth_proto == "oidc" { auth_protocol_id = 4; auth_protocol = "OpenID" }
+      if auth_proto == "ropc" || auth_proto == "password" { auth_protocol_id = 11; auth_protocol = "Basic Authentication" }
+      if auth_proto == "wsfederation" || auth_proto == "ws-fed" { auth_protocol_id = 99; auth_protocol = "Other" }
+
+      # ---- risk ----
+      risk = downcase(to_string(props.riskLevelDuringSignIn) ?? "")
+      if risk == "" || risk == "none" { risk = downcase(to_string(props.riskLevelAggregated) ?? "") }
+      risk_level_id = 0
+      risk_level = "Info"
+      if risk == "low" { risk_level_id = 1; risk_level = "Low" }
+      if risk == "medium" { risk_level_id = 2; risk_level = "Medium" }
+      if risk == "high" { risk_level_id = 3; risk_level = "High" }
+      if risk_level_id >= 2 && severity_id < 3 { severity_id = 3; severity = "Medium" }
+
+      # ---- device (host profile) ----
+      dev_detail = object(props.deviceDetail) ?? {}
+      device = {}
+      dev_name = to_string(dev_detail.displayName) ?? ""
+      if dev_name != "" { device.hostname = dev_name }
+      dev_id = to_string(dev_detail.deviceId) ?? ""
+      if dev_id != "" { device.uid = dev_id }
+      dev_os = to_string(dev_detail.operatingSystem) ?? ""
+      if dev_os != "" {
+          os_l = downcase(dev_os)
+          os_type_id = 0
+          if contains(os_l, "windows") { os_type_id = 100 }
+          if contains(os_l, "android") { os_type_id = 201 }
+          if contains(os_l, "linux") || contains(os_l, "ubuntu") { os_type_id = 200 }
+          if contains(os_l, "macos") || contains(os_l, "mac os") || contains(os_l, "os x") { os_type_id = 300 }
+          if contains(os_l, "ios") && !contains(os_l, "bios") { os_type_id = 301 }
+          if contains(os_l, "ipados") { os_type_id = 302 }
+          device.os = { "name": dev_os, "type_id": os_type_id }
+      }
+      if length(keys(device)) > 0 { device.type_id = 0 }
+
+      # ---- session ----
+      correlation = to_string(props.correlationId) ?? ""
+      if correlation == "" { correlation = to_string(top.correlationId) ?? "" }
+      session = { "is_mfa": is_mfa }
+      session_uid = to_string(props.id) ?? ""
+      if session_uid != "" { session.uid = session_uid }
+      if is_interactive { session.is_remote = true }
+
+      tenant_id = to_string(top.tenantId) ?? ""
+      cloud = { "provider": "Azure" }
+      if tenant_id != "" {
+          cloud.account = { "uid": tenant_id }
+          cloud.org = { "uid": tenant_id }
+      }
+
+      ocsf = {
+          "class_uid": class_uid,
+          "class_name": "Authentication",
+          "category_uid": 3,
+          "category_name": "Identity & Access Management",
+          "activity_id": 1,
+          "activity_name": "Logon",
+          "type_uid": class_uid * 100 + 1,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "is_mfa": is_mfa,
+          "logon_type_id": logon_type_id,
+          "logon_type": logon_type,
+          "auth_protocol_id": auth_protocol_id,
+          "auth_protocol": auth_protocol,
+          "risk_level_id": risk_level_id,
+          "risk_level": risk_level,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud", "host", "security_control"],
+              "uid": sha2("azure_signin|raw|" + raw_log, variant: "SHA-256"),
+              "log_name": "SignInLogs",
+              "log_provider": "Microsoft Entra ID",
+              "product": { "name": "Microsoft Entra ID", "vendor_name": "Microsoft" }
+          },
+          "cloud": cloud,
+          "api": { "operation": "SignIn", "service": { "name": "entra_id" } },
+          "user": user,
+          "service": service,
+          "src_endpoint": src_endpoint,
+          "session": session
+      }
+      if session_uid != "" { ocsf.metadata.uid = session_uid }
+      if correlation != "" { ocsf.metadata.correlation_uid = correlation }
+      if error_code > 0 { ocsf.status_code = to_string(error_code) }
+      if failure_reason != "" { ocsf.status_detail = failure_reason }
+      if length(keys(device)) > 0 { ocsf.device = device }
+
+      unmapped = {}
+      app_id = to_string(props.appId) ?? ""
+      if app_id != "" { unmapped.app_id = app_id }
+      app_disp = to_string(props.appDisplayName) ?? ""
+      if app_disp != "" { unmapped.app_display_name = app_disp }
+      if auth_req != "" { unmapped.authentication_requirement = auth_req }
+      if mfa_method != "" { unmapped.mfa_method = mfa_method }
+      ca_status = to_string(props.conditionalAccessStatus) ?? ""
+      if ca_status != "" { unmapped.conditional_access_status = ca_status }
+      risk_state = to_string(props.riskState) ?? ""
+      if risk_state != "" { unmapped.risk_state = risk_state }
+      risk_detail = to_string(props.riskDetail) ?? ""
+      if risk_detail != "" { unmapped.risk_detail = risk_detail }
+      if additional != "" { unmapped.status_additional_details = additional }
+      if tenant_id != "" { unmapped.tenant_id = tenant_id }
+      home_tenant = to_string(props.homeTenantId) ?? ""
+      if home_tenant != "" { unmapped.home_tenant_id = home_tenant }
+      client_app = to_string(props.clientAppUsed) ?? ""
+      if client_app != "" { unmapped.client_app_used = client_app }
+      browser = to_string(dev_detail.browser) ?? ""
+      if browser != "" { unmapped.device_browser = browser }
+      trust = to_string(dev_detail.trustType) ?? ""
+      if trust != "" { unmapped.device_trust_type = trust }
+      compliant = to_bool(dev_detail.isCompliant) ?? null
+      if compliant != null { unmapped.device_is_compliant = compliant }
+      managed = to_bool(dev_detail.isManaged) ?? null
+      if managed != null { unmapped.device_is_managed = managed }
+      ca_policies = array(props.appliedConditionalAccessPolicies) ?? []
+      if length(ca_policies) > 0 { unmapped.conditional_access_policies = encode_json(ca_policies) }
+      net_locs = array(props.networkLocationDetails) ?? []
+      if length(net_locs) > 0 { unmapped.network_location_details = encode_json(net_locs) }
+      ptime = to_int(props.processingTimeInMs) ?? 0
+      if ptime > 0 { unmapped.processing_time_ms = ptime }
+      if length(keys(unmapped)) > 0 { ocsf.unmapped = unmapped }
+
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  __mapped = object!(parse_json!(encode_json(.)))
+  __existing = object(__mapped.unmapped) ?? {}
+  __discard = del(__mapped.raw_data)
+  __discard = del(__mapped.unmapped)
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __represented = []
+  __walk = map_values(__mapped, recursive: true) -> |value| {
+      __represented = push(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __represented = push(__represented, to_string(value) ?? "")
+      }
+      value
+  }
+  __consumed = []
+  # BEGIN parser-specific transformations
+  # properties.authenticationProtocol: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # authenticationProtocol: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # properties.riskLevelDuringSignIn: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # riskLevelDuringSignIn: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # properties.riskLevelAggregated: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # riskLevelAggregated: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # time: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # properties.createdDateTime: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # createdDateTime: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # properties.riskLevelDuringSignIn: Parser normalizes the caption case; verify the emitted caption.
+  # properties.conditionalAccessStatus: Parser normalizes the caption case; verify the emitted caption.
+  # severity: Parser normalizes the caption case; verify the emitted caption.
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = ["callerIpAddress", "correlationId", "properties", "properties.appDisplayName", "properties.appId", "properties.appliedConditionalAccessPolicies", "properties.authenticationProtocol", "properties.authenticationRequirement", "properties.autonomousSystemNumber", "properties.clientAppUsed", "properties.conditionalAccessStatus", "properties.correlationId", "properties.createdDateTime", "properties.deviceDetail", "properties.deviceDetail.browser", "properties.deviceDetail.deviceId", "properties.deviceDetail.displayName", "properties.deviceDetail.isCompliant", "properties.deviceDetail.isManaged", "properties.deviceDetail.operatingSystem", "properties.deviceDetail.trustType", "properties.homeTenantId", "properties.id", "properties.ipAddress", "properties.isInteractive", "properties.location", "properties.location.city", "properties.location.countryOrRegion", "properties.location.state", "properties.mfaDetail", "properties.mfaDetail.authMethod", "properties.networkLocationDetails", "properties.processingTimeInMs", "properties.resourceDisplayName", "properties.resourceId", "properties.riskDetail", "properties.riskLevelAggregated", "properties.riskLevelDuringSignIn", "properties.riskState", "properties.servicePrincipalId", "properties.servicePrincipalName", "properties.status", "properties.status.additionalDetails", "properties.status.errorCode", "properties.status.failureReason", "properties.userDisplayName", "properties.userId", "properties.userPrincipalName", "resultDescription", "resultType", "tenantId", "time"]
+  __preserve = []
+  __rules = array!(parse_json!("[{\"source\":\"properties.authenticationProtocol\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"authenticationProtocol\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"properties.riskLevelDuringSignIn\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"riskLevelDuringSignIn\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"properties.riskLevelAggregated\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"riskLevelAggregated\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"time\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Successful ISO timestamp conversion to the selected event clock in milliseconds.\"},{\"source\":\"properties.createdDateTime\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Successful ISO timestamp conversion to the selected event clock in milliseconds.\"},{\"source\":\"createdDateTime\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Successful ISO timestamp conversion to the selected event clock in milliseconds.\"},{\"source\":\"properties.riskLevelDuringSignIn\",\"kind\":\"enum\",\"target\":\"risk_level\",\"values\":{\"high\":\"High\"},\"reason\":\"Parser normalizes the caption case; verify the emitted caption.\"},{\"source\":\"properties.conditionalAccessStatus\",\"kind\":\"enum\",\"target\":\"status\",\"values\":{\"success\":\"Success\"},\"reason\":\"Parser normalizes the caption case; verify the emitted caption.\"},{\"source\":\"severity\",\"kind\":\"enum\",\"target\":\"risk_level\",\"values\":{\"info\":\"Info\"},\"reason\":\"Parser normalizes the caption case; verify the emitted caption.\"}]"))
+  __source_flat = flatten(__source_kv)
+  for_each(__rules) -> |_index, rule| {
+      __source_key = string!(rule.source)
+      __value = get!(__source_flat, [__source_key])
+      __expected = null
+      __valid = false
+      if rule.kind == "lowercase" && is_string(__value) {
+          __expected = downcase(string!(__value))
+          __valid = true
+      } else if rule.kind == "epoch_ms" {
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", string(rule.format) ?? "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              __valid = true
+          }
+      } else if rule.kind == "scale" {
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * to_float!(rule.factor))
+              __valid = true
+          }
+      } else if rule.kind == "hex" {
+          __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
+          __integer, __integer_err = parse_int(__hex, base: 16)
+          __expected = __integer
+          __valid = is_string(__value) && starts_with(downcase(string(__value) ?? ""), "0x") && __integer_err == null
+      } else if rule.kind == "enum" {
+          __expected = get!(object!(rule.values), [downcase(to_string(__value) ?? "")])
+          __valid = __expected != null
+      }
+      __matches = includes(__represented, encode_json(__expected))
+      if is_string(rule.target) { __matches = get!(., split(string!(rule.target), ".")) == __expected }
+      if __valid && __matches { __consumed = push(__consumed, __source_key) }
+  }
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  __safe = map_values(object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing}))), recursive: true) -> |value| {
+      if is_object(value) {
+          # Header/parameter arrays commonly encode sensitive keys as name/value
+          # or Key/Value objects instead of using the secret name as an object key.
+          __sensitive_pair = false
+          for_each(object!(value)) -> |key, child| {
+              if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                  __sensitive_pair = true
+              }
+          }
+          for_each(object!(value)) -> |key, _child| {
+              if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                  value = set!(value, [key], "<redacted>")
+              }
+          }
+      }
+      value
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  __escaped = map_keys(object!(__safe.source), recursive: true) -> |key| {
+      replace(replace(key, "~", "~0"), ".", "~1")
+  }
+  __flat = flatten(__escaped)
+  __residual = {}
+  for_each(__flat) -> |key, value| {
+      key = replace(replace(key, "~1", "."), "~0", "~")
+      # flatten stops at arrays, so objects inside an array still carry the
+      # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+      if is_array(value) || is_object(value) {
+          value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+              replace(replace(inner, "~1", "."), "~0", "~")
+          }, ["v"])
+      }
+      __same = includes(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __same = __same || includes(__represented, to_string(value) ?? "")
+      }
+      # A scalar array is consumed only if every element is represented. Preserve
+      # partially represented arrays intact, including their ordering and repeats.
+      if is_array(value) && !is_empty(array!(value)) {
+          __all_items = true
+          for_each(array!(value)) -> |_index, item| {
+              __item_same = includes(__represented, encode_json(item))
+              if !is_object(item) && !is_array(item) && !is_null(item) {
+                  __item_same = __item_same || includes(__represented, to_string(item) ?? "")
+              }
+              if is_object(item) || is_array(item) || !__item_same { __all_items = false }
+          }
+          __same = __same || __all_items
+      }
+      if __same && includes(__candidates, key) { __consumed = push(__consumed, key) }
+      # Redacted leaves always remain visible. Do not spill a copy of the raw body.
+      if (!includes(__consumed, key) || value == "<redacted>") && value != __raw_body {
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          __base = join!(__parts, ".")
+          __key = __base
+          __suffix = 2
+          if includes(keys(__residual), __key) {
+              for_each(__flat) -> |_other_key, _other_value| {
+                  if includes(keys(__residual), __key) {
+                      __key = __base + "_" + to_string(__suffix)
+                      __suffix = __suffix + 1
+                  }
+              }
+          }
+          __complex = is_object(value)
+          if is_array(value) {
+              for_each(array!(value)) -> |_index, item| {
+                  if is_object(item) || is_array(item) { __complex = true }
+              }
+          }
+          __spill = if __complex { encode_json(value) } else { value }
+          __residual = set!(__residual, [__key], __spill)
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  __original_values = []
+  for_each(flatten(__source_kv)) -> |_key, value| {
+      __original_values = push(__original_values, encode_json(value))
+      if !is_object(value) && !is_array(value) { __original_values = push(__original_values, to_string(value) ?? "") }
+  }
+  for_each(flatten(__existing)) -> |key, value| {
+      __source_alias = includes(__original_values, encode_json(value)) || includes(__original_values, to_string(value) ?? "")
+      __mapped_alias = includes(__represented, encode_json(value)) || includes(__represented, to_string(value) ?? "")
+      __decoded, __decode_err = parse_json(string(value) ?? "")
+      __encoded_container = __decode_err == null && (is_object(__decoded) || is_array(__decoded))
+      if !is_null(value) && value != "" && !__source_alias && !__mapped_alias && !__encoded_container && value != __raw_body {
+          # Existing aggregates may contain sensitive descendants; the canonical
+          # source spill above is the authoritative representation of containers.
+          if !is_array(value) && !is_object(value) && !match(downcase(key), r'password|secret|authorization|token') {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # NAN-3702 (unparseable record, error branch): metadata.uid is sha256("azure_signin|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "NAN-3702 determinism probe: not a azure_signin record"
+    expect:
+      "metadata.uid": "84026d6cb19e549257a0f4bcf2c999b65fa6a145736da9b762ef71ee7758b281"
+  # NAN-3702 (natural id removed): metadata.uid is sha256("azure_signin|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "{\"time\":\"2026-08-18T20:00:00.0000000Z\",\"resourceId\":\"/tenants/TTT/providers/Microsoft.aadiam\",\"operationName\":\"Sign-in activity\",\"category\":\"SignInLogs\",\"tenantId\":\"TTT\",\"resultType\":\"50126\",\"resultDescription\":\"Invalid username or password\",\"correlationId\":\"c-1\",\"identity\":\"Alice Smith\",\"callerIpAddress\":\"203.0.113.7\",\"level\":4,\"properties\":{\"createdDateTime\":\"2026-08-18T20:00:00.0000000Z\",\"userDisplayName\":\"Alice Smith\",\"userPrincipalName\":\"alice@contoso.com\",\"userId\":\"u-1\",\"appId\":\"app-1\",\"appDisplayName\":\"Office 365 Exchange Online\",\"ipAddress\":\"203.0.113.7\",\"status\":{\"errorCode\":50126,\"failureReason\":\"Error validating credentials due to invalid username or password.\",\"additionalDetails\":\"\"},\"clientAppUsed\":\"Browser\",\"deviceDetail\":{\"deviceId\":\"d-1\",\"displayName\":\"ALICE-LAPTOP\",\"operatingSystem\":\"Windows 10\",\"browser\":\"Edge 120\",\"isCompliant\":true,\"isManaged\":true,\"trustType\":\"Azure AD joined\"},\"location\":{\"city\":\"Seattle\",\"state\":\"Washington\",\"countryOrRegion\":\"US\",\"geoCoordinates\":{\"latitude\":47.6,\"longitude\":-122.3}},\"correlationId\":\"c-1\",\"conditionalAccessStatus\":\"notApplied\",\"isInteractive\":true,\"riskDetail\":\"none\",\"riskLevelAggregated\":\"none\",\"riskLevelDuringSignIn\":\"high\",\"riskState\":\"atRisk\",\"resourceDisplayName\":\"Office 365 Exchange Online\",\"resourceId\":\"r-1\",\"authenticationRequirement\":\"multiFactorAuthentication\",\"mfaDetail\":{},\"appliedConditionalAccessPolicies\":[{\"displayName\":\"Require MFA\",\"result\":\"success\"}],\"networkLocationDetails\":[{\"networkType\":\"namedNetwork\",\"networkNames\":[\"Corp\"]}],\"autonomousSystemNumber\":15169,\"processingTimeInMs\":211,\"homeTenantId\":\"TTT\",\"authenticationProtocol\":\"none\"}}"
+    expect:
+      "metadata.uid": "a9f12469a5592de4c93af24330225d34052a8064308b39421bb204a8dc2f2277"

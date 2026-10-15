@@ -1,0 +1,526 @@
+name: cisco_umbrella_ocsf
+display_name: Cisco Umbrella (OCSF)
+version: "1.3.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Cisco Umbrella DNS and proxy logs (S3/managed CSV export and the JSON
+  shape) into OCSF 1.9.0. DNS-layer records become "DNS Activity"
+  (class_uid 4003) with the resolved name in `query.hostname` and the Umbrella
+  verdict in the security-control action/disposition; proxy records become
+  "HTTP Activity" (class_uid 4002). Anything with too few CSV columns becomes
+  Base Event (class_uid 0). Mirrors the UDM cisco_umbrella parser
+  (../parsers/parsers/cisco_umbrella/parser.yaml).
+match_values:
+  - cisco_umbrella
+category: network
+vendor: "Cisco"
+product: "Umbrella"
+parser_vrl: |
+  # Cisco Umbrella -> OCSF 1.9.0 DNS Activity (4003) / HTTP Activity (4002)
+  raw_log = string!(.message)
+  __raw_body = raw_log
+  __source_kv = {}
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
+
+  kind = "none"
+  time_ms = 0
+  identity = ""
+  device = ""
+  internal_ip = ""
+  external_ip = ""
+  action_raw = ""
+  query_type = ""
+  rcode_str = ""
+  domain = ""
+  categories = []
+  policy = ""
+  identity_id = ""
+  url_raw = ""
+  referrer = ""
+  code = 0
+  req_bytes = 0
+  resp_bytes = 0
+  av_result = ""
+
+  j, jerr = parse_json(raw_log)
+  __source_kv = object(j) ?? {}
+  if jerr == null && is_object(j) {
+      # ---------------- JSON export (DNS) ----------------
+      kind = "dns"
+      ts_str = string(j.timestamp) ?? ""
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%Y-%m-%d %H:%M:%S")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") } else {
+              t2, terr2 = parse_timestamp(ts_str, "%+")
+              if terr2 == null { time_ms = to_unix_timestamp(t2, unit: "milliseconds") }
+          }
+      }
+      domain = string(j.domain) ?? ""
+      action_raw = string(j.action) ?? ""
+      identity = string(j.identity) ?? ""
+      internal_ip = string(j.internalIp) ?? ""
+      external_ip = string(j.externalIp) ?? ""
+      qt = string(j.queryType) ?? ""
+      if qt != "" { query_type = qt }
+      rc = string(j.responseCode) ?? ""
+      if rc != "" { rcode_str = rc }
+      cats = array(j.categories) ?? []
+      for_each(cats) -> |_i, c| { categories = push(categories, to_string(c) ?? "") }
+  } else {
+      # ---------------- CSV export ----------------
+      cleaned = replace(raw_log, "\"", "")
+      f = split(cleaned, ",")
+      n = length(f)
+      if n >= 9 {
+          __columns = ["timestamp", "identity", "device", "internal_ip", "external_ip", "action", "query_type", "response_code", "domain", "category_1", "category_2", "category_3", "column_12", "identity_id", "policy"]
+          if starts_with(string(f[5]) ?? "", "http") { __columns = ["timestamp", "identity", "device", "internal_ip", "external_ip", "url", "referrer", "action", "http_status", "request_bytes", "response_bytes", "column_11", "domain", "category", "column_14", "column_15", "av_result", "policy"] }
+          for_each(f) -> |index, value| {
+              __column = string(get(__columns, [index]) ?? null) ?? ("column_" + to_string(index))
+              __source_kv = set!(__source_kv, [__column], value)
+          }
+          ts_str = string(f[0]) ?? ""
+          t, terr = parse_timestamp(ts_str, "%Y-%m-%d %H:%M:%S")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+
+          identity = string(f[1]) ?? ""
+          device = string(f[2]) ?? ""
+          internal_ip = string(f[3]) ?? ""
+          external_ip = string(f[4]) ?? ""
+          field5 = string(f[5]) ?? ""
+
+          if starts_with(field5, "http") {
+              # ---- proxy record ----
+              kind = "proxy"
+              url_raw = field5
+              if n > 6 { referrer = string(f[6]) ?? "" }
+              if n > 7 { action_raw = string(f[7]) ?? "" }
+              if n > 8 { code = to_int(string(f[8]) ?? "0") ?? 0 }
+              if n > 9 { req_bytes = to_int(string(f[9]) ?? "0") ?? 0 }
+              if n > 10 { resp_bytes = to_int(string(f[10]) ?? "0") ?? 0 }
+              if n > 12 { domain = string(f[12]) ?? "" }
+              if n > 13 {
+                  cv = string(f[13]) ?? ""
+                  if cv != "" { categories = push(categories, cv) }
+              }
+              if n > 16 { av_result = string(f[16]) ?? "" }
+              if n > 17 { policy = string(f[17]) ?? "" }
+          } else {
+              # ---- DNS record ----
+              kind = "dns"
+              action_raw = field5
+              if n > 6 { query_type = string(f[6]) ?? "" }
+              if n > 7 { rcode_str = string(f[7]) ?? "" }
+              if n > 8 { domain = string(f[8]) ?? "" }
+              if n > 9 {
+                  cv = string(f[9]) ?? ""
+                  if cv != "" { categories = push(categories, cv) }
+              }
+              if n > 10 {
+                  cv = string(f[10]) ?? ""
+                  if cv != "" { categories = push(categories, cv) }
+              }
+              if n > 11 {
+                  cv = string(f[11]) ?? ""
+                  if cv != "" { categories = push(categories, cv) }
+              }
+              if n > 13 { identity_id = string(f[13]) ?? "" }
+              if n > 14 { policy = string(f[14]) ?? "" }
+          }
+      }
+  }
+
+  # ---- Umbrella verdict -> security-control action / disposition ----
+  al = downcase(action_raw)
+  action_id = 0
+  action_name = "Unknown"
+  disposition_id = 0
+  disposition_name = "Unknown"
+  severity_id = 1
+  severity = "Informational"
+  is_alert = false
+  if contains(al, "block") {
+      action_id = 2; action_name = "Denied"
+      disposition_id = 2; disposition_name = "Blocked"
+      severity_id = 4; severity = "High"
+      is_alert = true
+  } else if contains(al, "allow") {
+      action_id = 1; action_name = "Allowed"
+      disposition_id = 1; disposition_name = "Allowed"
+  } else if al != "" {
+      action_id = 99; action_name = action_raw
+  }
+
+  unmapped = {}
+  if match(external_ip, ip_re) { unmapped.client_address = external_ip }
+  if policy != "" { unmapped.policy_name = policy }
+  if identity_id != "" { unmapped.identity_id = identity_id }
+  if av_result != "" { unmapped.av_result = av_result }
+
+  src_endpoint = {}
+  if match(internal_ip, ip_re) { src_endpoint.ip = internal_ip }
+  if device != "" { src_endpoint.hostname = downcase(device) }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": sha2("cisco_umbrella|raw|" + raw_log, variant: "SHA-256"),
+      "profiles": ["host", "security_control"],
+      "log_name": "umbrella",
+      "product": { "name": "Umbrella", "vendor_name": "Cisco" }
+  }
+
+  if kind == "dns" && domain != "" {
+      # ---------------- DNS Activity (4003) ----------------
+      # A record that carries a response code is a resolved answer, not a bare
+      # query, so it is activity 2 (Response); otherwise 1 (Query).
+      activity_id = 1
+      activity_name = "Query"
+      if rcode_str != "" { activity_id = 2; activity_name = "Response" }
+
+      rc = upcase(rcode_str)
+      rcode_id = 99
+      if rc == "NOERROR" { rcode_id = 0 }
+      if rc == "FORMERROR" || rc == "FORMERR" { rcode_id = 1 }
+      if rc == "SERVFAIL" { rcode_id = 2 }
+      if rc == "NXDOMAIN" { rcode_id = 3 }
+      if rc == "NOTIMP" { rcode_id = 4 }
+      if rc == "REFUSED" { rcode_id = 5 }
+
+      status_id = 1
+      status_str = "Success"
+      if rcode_id != 0 && rcode_str != "" { status_id = 2; status_str = "Failure" }
+      if rcode_str == "" { status_id = 0; status_str = "Unknown" }
+
+      query_obj = { "hostname": downcase(domain) }
+      if query_type != "" { query_obj.type = upcase(query_type) }
+
+      . = {
+          "class_uid": 4003,
+          "class_name": "DNS Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": 400300 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "action_id": action_id,
+          "action": action_name,
+          "disposition_id": disposition_id,
+          "disposition": disposition_name,
+          "is_alert": is_alert,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "query": query_obj
+      }
+      if rcode_str != "" { .rcode = rcode_str; .rcode_id = rcode_id }
+      # dns_activity requires at least one endpoint; Umbrella is the resolver,
+      # so when the client address is unknown the resolver stands in.
+      if exists(src_endpoint.ip) || exists(src_endpoint.hostname) {
+          .src_endpoint = src_endpoint
+      } else {
+          .dst_endpoint = { "svc_name": "umbrella-dns" }
+      }
+      if identity != "" { .actor = { "user": { "name": identity } } }
+      if length(categories) > 0 { unmapped.url_categories = categories }
+      if length(unmapped) > 0 { .unmapped = unmapped }
+  } else if kind == "proxy" {
+      # ---------------- HTTP Activity (4002) ----------------
+      url_obj = {}
+      if url_raw != "" { url_obj.url_string = url_raw }
+      if domain != "" { url_obj.hostname = downcase(domain) }
+      if length(categories) > 0 { url_obj.categories = categories }
+      pu, puerr = parse_url(url_raw)
+      if puerr == null {
+          up = to_string(pu.path)
+          if up != "" { url_obj.path = up }
+          us = to_string(pu.scheme)
+          if us != "" { url_obj.scheme = us }
+          if !exists(url_obj.hostname) {
+              uh = to_string(pu.host)
+              if uh != "" { url_obj.hostname = downcase(uh) }
+          }
+      }
+      if !exists(url_obj.path) && !exists(url_obj.url_string) { url_obj.path = "/" }
+
+      status_id = 2
+      status_str = "Failure"
+      if code >= 200 && code < 400 { status_id = 1; status_str = "Success" }
+      if code == 0 { status_id = 0; status_str = "Unknown" }
+
+      http_request = { "url": url_obj }
+      if referrer != "" && referrer != "-" { http_request.referrer = referrer }
+
+      . = {
+          "class_uid": 4002,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 400299,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "action_id": action_id,
+          "action": action_name,
+          "disposition_id": disposition_id,
+          "disposition": disposition_name,
+          "is_alert": is_alert,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "http_request": http_request,
+          "http_response": { "code": code, "status": status_str },
+          # NAN-2995: OCSF 1.9 network_traffic: bytes_in = destination -> source, bytes_out = source -> destination.
+          # src = client: the request is bytes_out, the response is bytes_in.
+          "traffic": { "bytes_in": resp_bytes, "bytes_out": req_bytes }
+      }
+      if exists(src_endpoint.ip) || exists(src_endpoint.hostname) { .src_endpoint = src_endpoint }
+      if identity != "" { .actor = { "user": { "name": identity } } }
+      if av_result != "" && av_result != "-" {
+          .malware = [{ "name": av_result, "classification_ids": [0], "provider": "Cisco Umbrella" }]
+      }
+      if length(unmapped) > 0 { .unmapped = unmapped }
+  } else {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("cisco_umbrella|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "umbrella",
+              "product": { "name": "Umbrella", "vendor_name": "Cisco" }
+          }
+      }
+  }
+
+  .
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  __mapped = object!(parse_json!(encode_json(.)))
+  __existing = object(__mapped.unmapped) ?? {}
+  __discard = del(__mapped.raw_data)
+  __discard = del(__mapped.unmapped)
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __represented = []
+  __walk = map_values(__mapped, recursive: true) -> |value| {
+      __represented = push(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __represented = push(__represented, to_string(value) ?? "")
+      }
+      value
+  }
+  __consumed = []
+  # BEGIN parser-specific transformations
+  # timestamp: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # timestamp: Umbrella CSV timestamp parsed in the existing runtime timezone.
+  # device: Case normalization already performed by the parser; observed at src_endpoint.hostname, and checked against the emitted branch.
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = ["action", "av_result", "categories", "category", "category_1", "category_2", "category_3", "column_11", "column_12", "column_14", "column_15", "device", "domain", "externalIp", "external_ip", "http_status", "identity", "identity_id", "internalIp", "internal_ip", "policy", "queryType", "query_type", "referrer", "request_bytes", "responseCode", "response_bytes", "response_code", "timestamp", "url"]
+  __preserve = []
+  __rules = array!(parse_json!("[{\"source\":\"timestamp\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Successful ISO timestamp conversion to the selected event clock in milliseconds.\"},{\"source\":\"timestamp\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"format\":\"%Y-%m-%d %H:%M:%S\",\"reason\":\"Umbrella CSV timestamp parsed in the existing runtime timezone.\"},{\"source\":\"device\",\"kind\":\"lowercase\",\"reason\":\"Case normalization already performed by the parser; observed at src_endpoint.hostname, and checked against the emitted branch.\"}]"))
+  __source_flat = flatten(__source_kv)
+  for_each(__rules) -> |_index, rule| {
+      __source_key = string!(rule.source)
+      __value = get!(__source_flat, [__source_key])
+      __expected = null
+      __valid = false
+      if rule.kind == "lowercase" && is_string(__value) {
+          __expected = downcase(string!(__value))
+          __valid = true
+      } else if rule.kind == "epoch_ms" {
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", string(rule.format) ?? "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              __valid = true
+          }
+      } else if rule.kind == "scale" {
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * to_float!(rule.factor))
+              __valid = true
+          }
+      } else if rule.kind == "hex" {
+          __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
+          __integer, __integer_err = parse_int(__hex, base: 16)
+          __expected = __integer
+          __valid = is_string(__value) && starts_with(downcase(string(__value) ?? ""), "0x") && __integer_err == null
+      } else if rule.kind == "enum" {
+          __expected = get!(object!(rule.values), [downcase(to_string(__value) ?? "")])
+          __valid = __expected != null
+      }
+      __matches = includes(__represented, encode_json(__expected))
+      if is_string(rule.target) { __matches = get!(., split(string!(rule.target), ".")) == __expected }
+      if __valid && __matches { __consumed = push(__consumed, __source_key) }
+  }
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  __safe = map_values(object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing}))), recursive: true) -> |value| {
+      if is_object(value) {
+          # Header/parameter arrays commonly encode sensitive keys as name/value
+          # or Key/Value objects instead of using the secret name as an object key.
+          __sensitive_pair = false
+          for_each(object!(value)) -> |key, child| {
+              if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                  __sensitive_pair = true
+              }
+          }
+          for_each(object!(value)) -> |key, _child| {
+              if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                  value = set!(value, [key], "<redacted>")
+              }
+          }
+      }
+      value
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  __escaped = map_keys(object!(__safe.source), recursive: true) -> |key| {
+      replace(replace(key, "~", "~0"), ".", "~1")
+  }
+  __flat = flatten(__escaped)
+  __residual = {}
+  for_each(__flat) -> |key, value| {
+      key = replace(replace(key, "~1", "."), "~0", "~")
+      # flatten stops at arrays, so objects inside an array still carry the
+      # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+      if is_array(value) || is_object(value) {
+          value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+              replace(replace(inner, "~1", "."), "~0", "~")
+          }, ["v"])
+      }
+      __same = includes(__represented, encode_json(value))
+      if !is_object(value) && !is_array(value) && !is_null(value) {
+          __same = __same || includes(__represented, to_string(value) ?? "")
+      }
+      # A scalar array is consumed only if every element is represented. Preserve
+      # partially represented arrays intact, including their ordering and repeats.
+      if is_array(value) && !is_empty(array!(value)) {
+          __all_items = true
+          for_each(array!(value)) -> |_index, item| {
+              __item_same = includes(__represented, encode_json(item))
+              if !is_object(item) && !is_array(item) && !is_null(item) {
+                  __item_same = __item_same || includes(__represented, to_string(item) ?? "")
+              }
+              if is_object(item) || is_array(item) || !__item_same { __all_items = false }
+          }
+          __same = __same || __all_items
+      }
+      if __same && includes(__candidates, key) { __consumed = push(__consumed, key) }
+      # Redacted leaves always remain visible. Do not spill a copy of the raw body.
+      if (!includes(__consumed, key) || value == "<redacted>") && value != __raw_body {
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          __base = join!(__parts, ".")
+          __key = __base
+          __suffix = 2
+          if includes(keys(__residual), __key) {
+              for_each(__flat) -> |_other_key, _other_value| {
+                  if includes(keys(__residual), __key) {
+                      __key = __base + "_" + to_string(__suffix)
+                      __suffix = __suffix + 1
+                  }
+              }
+          }
+          __complex = is_object(value)
+          if is_array(value) {
+              for_each(array!(value)) -> |_index, item| {
+                  if is_object(item) || is_array(item) { __complex = true }
+              }
+          }
+          __spill = if __complex { encode_json(value) } else { value }
+          __residual = set!(__residual, [__key], __spill)
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  __original_values = []
+  for_each(flatten(__source_kv)) -> |_key, value| {
+      __original_values = push(__original_values, encode_json(value))
+      if !is_object(value) && !is_array(value) { __original_values = push(__original_values, to_string(value) ?? "") }
+  }
+  for_each(flatten(__existing)) -> |key, value| {
+      __source_alias = includes(__original_values, encode_json(value)) || includes(__original_values, to_string(value) ?? "")
+      __mapped_alias = includes(__represented, encode_json(value)) || includes(__represented, to_string(value) ?? "")
+      __decoded, __decode_err = parse_json(string(value) ?? "")
+      __encoded_container = __decode_err == null && (is_object(__decoded) || is_array(__decoded))
+      if !is_null(value) && value != "" && !__source_alias && !__mapped_alias && !__encoded_container && value != __raw_body {
+          # Existing aggregates may contain sensitive descendants; the canonical
+          # source spill above is the authoritative representation of containers.
+          if !is_array(value) && !is_object(value) && !match(downcase(key), r'password|secret|authorization|token') {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+# Runtime samples (NAN-2327): one per event shape this parser routes.
+# `class_uid` is asserted because class routing is the whole point of the
+# OCSF conversion — a silent reroute is the defect most likely to survive
+# a compile-only check.
+samples:
+  - raw: '"2026-08-12 09:15:25","alice@corp.example","LAPTOP-4471","10.40.1.22","198.51.100.4","Allowed","AAAA","NOERROR","www.example.com.","Business Services","","","","0123abcd","Default Policy"'
+    expect:
+      class_uid: 4003
+      activity_id: 2
+  - raw: '"2026-08-12 09:15:22","LAPTOP-4471","LAPTOP-4471","10.40.1.22","198.51.100.4","Blocked","A","NXDOMAIN","evil-c2.example.com.","Malware","Command and Control","Botnet","","0123abcd","Default Policy"'
+    expect:
+      class_uid: 4003
+      activity_id: 2
+  - raw: '{"timestamp":"2026-08-12 09:15:40","domain":"tracker.example.net","action":"Blocked","identity":"bob@corp.example","internalIp":"10.40.1.30","externalIp":"198.51.100.4","queryType":"A","responseCode":"NXDOMAIN","categories":["Adware","Tracking"]}'
+    expect:
+      class_uid: 4003
+      activity_id: 2
+  - raw: '"2026-08-12 09:15:31","alice@corp.example","LAPTOP-4471","10.40.1.22","198.51.100.4","https://files.example.org/setup.exe","https://portal.example.org/","Blocked","403","1024","0","","files.example.org","Software Downloads","","","EICAR-Test-File","Default Policy"'
+    expect:
+      class_uid: 4002
+      activity_id: 99
+  - raw: '"2026-08-12 09:15:44","x","y"'
+    expect:
+      class_uid: 0
+      activity_id: 99
+  # NAN-2995: OCSF 1.9 bytes_in = destination -> source, bytes_out = source -> destination; Response Size is bytes_in, Request Size is bytes_out.
+  - raw: "\"2026-08-12 09:15:31\",\"alice@corp.example\",\"LAPTOP-4471\",\"10.40.1.22\",\"198.51.100.4\",\"https://files.example.org/setup.exe\",\"https://portal.example.org/\",\"Allowed\",\"200\",\"512\",\"58213\",\"\",\"files.example.org\",\"Software Downloads\",\"\",\"\",\"\",\"Default Policy\""
+    expect:
+      "traffic.bytes_in": 58213
+      "traffic.bytes_out": 512
+  # NAN-3702 (existing sample): metadata.uid is sha256("cisco_umbrella|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "\"2026-08-12 09:15:25\",\"alice@corp.example\",\"LAPTOP-4471\",\"10.40.1.22\",\"198.51.100.4\",\"Allowed\",\"AAAA\",\"NOERROR\",\"www.example.com.\",\"Business Services\",\"\",\"\",\"\",\"0123abcd\",\"Default Policy\""
+    expect:
+      "metadata.uid": "3c8f04950bda43c584039caefea84173d67646abfd7e492cd2763391faa42425"
+  # NAN-3702 (existing sample, error branch): metadata.uid is sha256("cisco_umbrella|raw|" + raw), so the
+  # same record parsed twice gets the same uid (a random uid could never match).
+  - raw: "\"2026-08-12 09:15:44\",\"x\",\"y\""
+    expect:
+      "metadata.uid": "c2266c597cac6cf46ebb92407bcc65df6859bc369db95c806f72fa71ad95d77b"
