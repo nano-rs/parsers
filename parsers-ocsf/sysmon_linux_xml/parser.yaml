@@ -362,6 +362,11 @@ parser_vrl: |
       # it stays searchable as the number Windows shows. Omitted when absent.
       if record_id != "" { ocsf.metadata.original_event_uid = record_id }
 
+      # NAN-3342: publish the canonical lowercase name beside known IANA ids.
+      # Unknown numbers retain their id without inventing a name.
+      protocol_names = { "1": "icmp", "2": "igmp", "6": "tcp", "17": "udp", "41": "ipv6", "47": "gre", "50": "esp", "51": "ah", "58": "icmpv6", "89": "ospf", "132": "sctp" }
+      protocol_name = get(protocol_names, [to_string(ocsf.connection_info.protocol_num)]) ?? null
+      if is_string(protocol_name) { ocsf.connection_info.protocol_name = protocol_name }
       . = ocsf
   }
 

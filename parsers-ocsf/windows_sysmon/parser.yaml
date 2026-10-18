@@ -528,6 +528,11 @@ parser_vrl: |
           # Record ID is represented in original_event_uid (and the composite UID).
           __reference_consumed = push(__reference_consumed, "record_id")
       }
+      # NAN-3342: publish the canonical lowercase name beside known IANA ids.
+      # Unknown numbers retain their id without inventing a name.
+      protocol_names = { "1": "icmp", "2": "igmp", "6": "tcp", "17": "udp", "41": "ipv6", "47": "gre", "50": "esp", "51": "ah", "58": "icmpv6", "89": "ospf", "132": "sctp" }
+      protocol_name = get(protocol_names, [to_string(ocsf.connection_info.protocol_num) ?? ""]) ?? null
+      if is_string(protocol_name) { ocsf.connection_info.protocol_name = protocol_name }
       . = ocsf
   }
 
@@ -840,3 +845,17 @@ samples:
     expect:
       "metadata.uid": "windows_sysmon|wks-01.corp.local|microsoft-windows-sysmon/operational|microsoft-windows-sysmon|91234|2026-08-18T10:15:00.123Z"
       "metadata.original_event_uid": "91234"
+
+  # NAN-3342: live network query protocol=tcp must find this event.
+  - raw: "{\"event_id\":3,\"computer\":\"WKS-01\",\"timestamp\":\"2026-10-17T21:00:00Z\",\"event_data\":{\"Protocol\":\"TCP\",\"Image\":\"C:\\\\Windows\\\\cmd.exe\",\"SourceIp\":\"10.0.0.1\",\"DestinationIp\":\"10.0.0.2\",\"SourcePort\":\"4321\",\"DestinationPort\":\"443\",\"Initiated\":\"true\"}}"
+    expect:
+      "class_uid": 4001
+      "connection_info.protocol_num": 6
+      "connection_info.protocol_name": "tcp"
+
+  # NAN-3342: live network query protocol=udp must find this event.
+  - raw: "{\"event_id\":3,\"computer\":\"WKS-01\",\"timestamp\":\"2026-10-17T21:00:00Z\",\"event_data\":{\"Protocol\":\"udp\",\"Image\":\"C:\\\\Windows\\\\cmd.exe\",\"SourceIp\":\"10.0.0.1\",\"DestinationIp\":\"10.0.0.2\",\"SourcePort\":\"4321\",\"DestinationPort\":\"443\",\"Initiated\":\"true\"}}"
+    expect:
+      "class_uid": 4001
+      "connection_info.protocol_num": 17
+      "connection_info.protocol_name": "udp"
