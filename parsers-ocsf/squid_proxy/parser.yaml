@@ -1,6 +1,6 @@
 name: squid_proxy_ocsf
 display_name: Squid Proxy (OCSF)
-version: "1.3.0"
+version: "1.4.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -10,6 +10,8 @@ description: >
   verbatim in `unmapped.cache_status`; the HTTP status rides in
   http_response.code as a NUMBER so `http_response.code>=500` works. Lines
   that are too short to be an access record become Base Event (class_uid 0).
+  Fields a custom logformat appends after the ten native fields (other than a
+  lone quoted referrer) are kept verbatim in `unmapped.trailing`.
   Mirrors the UDM squid_proxy parser
   (../parsers/parsers/squid_proxy/parser.yaml).
 match_values:
@@ -82,9 +84,18 @@ parser_vrl: |
       # ---- optional trailing quoted referrer ----
       referrer = ""
       rm = parse_regex(raw_log, r'"(?P<referrer>[^"]*)"$') ?? {}
-      __source_kv.referrer = string(rm.referrer) ?? ""
       rv = string(rm.referrer) ?? ""
+      if exists(rm.referrer) { __source_kv.referrer = rv }
       if rv != "" && rv != "-" { referrer = rv }
+
+      # ---- anything a custom logformat appends after the ten native fields ----
+      # Kept verbatim so it spills to unmapped.trailing (and stays in raw_data)
+      # instead of being dropped; a lone quoted referrer is the native layout.
+      tm = parse_regex(raw_log, r'^(?:\S+ ){10}(?P<rest>.+)$') ?? {}
+      trailing = string(tm.rest) ?? ""
+      if trailing != "" && !(exists(rm.referrer) && trailing == "\"" + rv + "\"") {
+          __source_kv.trailing = trailing
+      }
 
       # ---- decompose the URL --------------------------------------------
       url_obj = {}
@@ -262,7 +273,7 @@ parser_vrl: |
   # BEGIN parser-specific transformations
   # timestamp: Squid Unix seconds converted to event milliseconds.
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
-  __candidates = ["bytes", "client", "content_type", "elapsed", "hierarchy_peer", "method", "result_status", "timestamp", "url", "user"]
+  __candidates = ["bytes", "client", "content_type", "elapsed", "hierarchy_peer", "method", "referrer", "result_status", "timestamp", "url", "user"]
   __preserve = []
   __rules = array!(parse_json!("[{\"source\":\"timestamp\",\"kind\":\"scale\",\"factor\":1000,\"target\":\"time\",\"reason\":\"Squid Unix seconds converted to event milliseconds.\"}]"))
   __source_flat = flatten(__source_kv)
