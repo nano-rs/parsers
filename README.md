@@ -233,6 +233,15 @@ repository on every PR (`.github/workflows/validate-parsers.yml`).
   every class. If the validator says an attribute "is not defined for this OCSF
   class/profile" and the path is right, the missing piece is almost always
   `metadata.profiles`, e.g. `"profiles": ["host"]`.
+- **Mark a fallback branch explicitly.** When the parser cannot read its input
+  but still emits a minimal record so the raw body lands, set
+  `unmapped.parse_fallback` to a short reason, e.g.
+  `. = set!(., ["unmapped", "parse_fallback"], "unparsable input")`. nano counts
+  it as a degraded parse in source health (parse success excludes it, and the
+  source warns above 2%). Do not rely on `metadata.log_level = "error"` or on
+  `class_uid` 0 for this: a log's own severity and a correctly classified Base
+  Event both use those. A genuine parse error still goes in
+  `unmapped.parse_error` (counted as a failure, not a fallback). (NAN-5264)
 - When nothing fits, **Base Event (`class_uid` 0) is the right answer.** It is the
   spec's home for an event with no class; forcing an application log line into a
   security class poisons every class-scoped hunt.
