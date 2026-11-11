@@ -164,15 +164,19 @@ parser_vrl: |
 
   actor = {}
   if user_name != "" { actor.user = { "name": user_name } }
-  # NAN-5073: name / cmd_line used to be emitted only alongside a pid, so a
-  # record carrying process_name or cmdline without a pid left them unmapped.
   # Base Event has no top-level `process`; actor.process (host profile) is
-  # the canonical home on every class this parser emits.
-  proc = {}
-  if pid != 0 { proc.pid = pid }
-  if proc_name != "" { proc.name = proc_name }
-  if cmd_line != "" { proc.cmd_line = cmd_line }
-  if length(proc) > 0 { actor.process = proc }
+  # the canonical home on every class this parser emits. NAN-5079: OCSF 1.9
+  # `process` requires at least one of pid / uid / cpid, so actor.process is
+  # emitted only with a pid. Without one, the process name is the initiating
+  # application (actor.app_name) and a bare command line stays in unmapped.
+  if pid != 0 {
+      proc = { "pid": pid }
+      if proc_name != "" { proc.name = proc_name }
+      if cmd_line != "" { proc.cmd_line = cmd_line }
+      actor.process = proc
+  } else if proc_name != "" {
+      actor.app_name = proc_name
+  }
 
   has_http = (method != "" || code != 0) && url_str != ""
   has_net = src_ip != "" || dst_ip != ""
@@ -556,12 +560,14 @@ samples:
       "unmapped.hash": "x"
       "unmapped.file_path": "/var/tmp/a.bin"
       "unmapped.sha_256": "ABCDEF"
-  # NAN-5073: process name / command line without a pid are still mapped.
+  # NAN-5073 / NAN-5079: a process name without a pid is still mapped, as
+  # actor.app_name (OCSF 1.9 process needs pid/uid/cpid); the command line
+  # stays in unmapped.
   - raw: '{"timestamp":"2026-11-08T20:20:00Z","message":"started","process_name":"ingestd","cmdline":"ingestd --run"}'
     expect:
       class_uid: 0
-      "actor.process.name": "ingestd"
-      "actor.process.cmd_line": "ingestd --run"
+      "actor.app_name": "ingestd"
+      "unmapped.cmdline": "ingestd --run"
   # Acceptance-harness `jg-epoch-time`: integer epoch-seconds `time`.
   - raw: '{"time":1794170278,"src_ip":"10.0.7.4","dest_ip":"198.51.100.11","dest_port":3389,"protocol":"TCP","action":"deny"}'
     expect:
