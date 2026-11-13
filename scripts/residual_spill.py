@@ -75,7 +75,10 @@ def unrolled(rule, templates):
     return text.replace('__SOURCE_STRING__', source).replace('__SOURCE__', source).replace('__MATCH__', match)
 
 
-REGEX_META = set('\\.+*?()|[]{}^$#&-~ ')
+REGEX_META = set('\\.+*?|^$#&-~ ')
+# nano's deploy validator counts raw ()[]{} characters across the whole VRL, so
+# a bracket in a candidate is written as a hex escape, never as \( etc.
+REGEX_HEX = {char: '\\x%02X' % ord(char) for char in '()[]{}'}
 
 
 def candidate_regex(candidates):
@@ -83,7 +86,8 @@ def candidate_regex(candidates):
 
     A regex literal compiles once with the program, so a lookup reads no copy
     of the set (NAN-5351). Verbose mode ignores the layout whitespace; every
-    regex metacharacter and space in a candidate is escaped.
+    regex metacharacter and space in a candidate is escaped, and a bracket is
+    hex-escaped so the raw bracket counts stay balanced.
     """
     if not candidates:
         return ["__candidates = r'\\b\\B'"]  # matches nothing
@@ -91,7 +95,7 @@ def candidate_regex(candidates):
     for index, candidate in enumerate(candidates):
         assert isinstance(candidate, str) and candidate and not re.search(r"[\x00-\x1f\x7f']", candidate), candidate
         assert not any(char.isspace() and char != ' ' for char in candidate), candidate
-        escaped = ''.join('\\' + char if char in REGEX_META else char for char in candidate)
+        escaped = ''.join(REGEX_HEX.get(char) or ('\\' + char if char in REGEX_META else char) for char in candidate)
         lines.append(('  ' if index == 0 else '| ') + escaped)
     return lines + [")\\z'"]
 
