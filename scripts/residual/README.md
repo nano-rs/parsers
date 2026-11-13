@@ -54,6 +54,28 @@ keys, nested objects, scalar/object arrays, secret redaction, and collisions.
 `--all` fails for any parser lacking source capture or a coverage manifest;
 it never silently treats unsupported text input as covered.
 
+## Per-event cost (NAN-5351)
+
+The block runs on every event, so it is written for VRL's cost model: every
+read of a variable copies it. An array or object used as a lookup set would
+be copied on each lookup, which made the original block quadratic in event
+size. The generated block therefore:
+
+- holds value sets in strings (`"," + encode_json(member)` per member) and
+  tests membership with `contains`; a string read shares its buffer;
+- turns `consumed_candidates` into a regex literal, compiled once;
+- unrolls each `transforms` rule from its template in `transforms.vrl` into
+  straight-line VRL with a static read of the flattened source, instead of
+  parsing a rule table and copying the source for every rule;
+- decides each source key with one `filter` and builds the residual with one
+  rename, falling back to the original in-order loop only when two keys decode
+  or snake-case to the same name;
+- skips work its input makes unnecessary (no secret word: no redaction walk;
+  no dotted key: no escaping; no array or brace-led string: scalar members only).
+
+Each shortcut must leave output byte-identical. Compare the emitted events of
+every sample before and after any change to the template.
+
 The original `sysmon_coverage_check.py` remains an additional, stricter check of
 Sysmon-specific mappings. The generic check is intended to complement those
 branch-specific assertions, not weaken them.
