@@ -172,9 +172,36 @@ jobs:
       - name: Check field coverage for every OCSF parser
         run: python3 scripts/field_coverage_check.py --all
 
+  # NAN-5388: compiling is not enough; a parser must also compile FAST. An
+  # install's deploy waits 45 s for Vector to acknowledge a reload, and a reload
+  # recompiles every deployed parser. #67 made Microsoft Sysmon slow enough to
+  # outlive that window on installs, and both jobs above passed it. This loads
+  # every parser in nano's own Vector build (the image installs run, pinned in
+  # scripts/compile-budget.lock) on one CPU and fails any parser over the
+  # budget. nano's content publisher runs the same check before it signs a
+  # parsers bundle, so a revision that fails here would never reach installs.
+  compile-budget:
+    name: Parser load budget
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Pull nano's Vector image
+        run: |
+          . scripts/compile-budget.lock
+          docker pull --quiet "$VECTOR_IMAGE"
+
+      - name: Load every parser within the budget
+        run: bash scripts/check-compile-budget.sh
+
   auto-merge:
     name: Auto-Merge
-    needs: [validate-vrl, validate-ocsf]
+    needs: [validate-vrl, validate-ocsf, compile-budget]
     runs-on: ubuntu-latest
     # Skip on drafts rather than attempting the merge and failing with
     # "Pull Request is still a draft". That error is expected on every draft

@@ -221,6 +221,26 @@ The reference data the script checks against lives next to it:
 CI runs both `scripts/validate-vrl.sh` and `scripts/validate-ocsf.sh` over the whole
 repository on every PR (`.github/workflows/validate-parsers.yml`).
 
+### Load budget
+
+A parser must also load **fast**. An install's deploy waits 45 s for Vector to
+acknowledge a config reload, and a reload recompiles every deployed parser, so
+one slow parser rolls back deploys everywhere. `scripts/check-compile-budget.sh`
+loads every parser in nano's own Vector build (the image installs run) on one CPU
+and fails any parser over the budget:
+
+```bash
+scripts/check-compile-budget.sh                          # whole repository
+scripts/check-compile-budget.sh <file-with-parser-paths> # like validate-vrl.sh
+```
+
+The budget (15 s per parser, budget v1) and the Vector image are pinned in
+`scripts/compile-budget.lock`. nano's content publisher holds every parser to the
+same budget before it signs a parsers bundle; a revision with a parser over it is
+not published and installs keep the previous bundle. VRL compile time grows
+fastest with nested function calls and long `if`/`else if` chains; measure before
+and after a large rewrite. CI runs the check on every PR (job "Parser load budget").
+
 ### Writing an OCSF parser
 
 - Emit the **complete OCSF object on the root** (`. = ocsf`) so it lands in
