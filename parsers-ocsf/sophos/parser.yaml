@@ -655,87 +655,63 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
-  __source_flat = flatten(__source_kv)
   # device_name: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."device_name"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("device_name")) }
-  }
   # priority: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."priority"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("priority")) }
-  }
   # src_ip: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."src_ip"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("src_ip")) }
-  }
   # dst_ip: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."dst_ip"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("dst_ip")) }
-  }
   # src_mac: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."src_mac"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("src_mac")) }
-  }
   # dst_mac: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."dst_mac"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("dst_mac")) }
-  }
   # protocol: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."protocol"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("protocol")) }
-  }
   # user_name: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."user_name"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("user_name")) }
-  }
   # localinterfaceip: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."localinterfaceip"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("localinterfaceip")) }
-  }
   # remoteinterfaceip: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."remoteinterfaceip"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("remoteinterfaceip")) }
-  }
   # filehash: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."filehash"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("filehash")) }
-  }
   # status: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
-  __value = __source_flat."status"
-  if __value != null {
-      __expected = get!({"success": 1, "succeeded": 1, "failure": 2, "failed": 2}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."status_id" == __expected { __consumed = __consumed + ("," + encode_json("status")) }
-      }
-  }
   # protocol: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
-  __value = __source_flat."protocol"
-  if __value != null {
-      __expected = get!({"tcp": 6, "udp": 17, "icmp": 1, "icmpv6": 58, "ipv6-icmp": 58}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."connection_info"."protocol_num" == __expected { __consumed = __consumed + ("," + encode_json("protocol")) }
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        device_name
+      | priority
+      | src_ip
+      | dst_ip
+      | src_mac
+      | dst_mac
+      | protocol
+      | user_name
+      | localinterfaceip
+      | remoteinterfaceip
+      | filehash
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        status
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"success": 1, "succeeded": 1, "failure": 2, "failed": 2}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."status_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        protocol
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"tcp": 6, "udp": 17, "icmp": 1, "icmpv6": 58, "ipv6-icmp": 58}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."connection_info"."protocol_num" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
       }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.

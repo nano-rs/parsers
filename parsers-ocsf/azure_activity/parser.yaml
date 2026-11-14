@@ -310,47 +310,59 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
-  __source_flat = flatten(__source_kv)
   # changeType: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."changeType"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("changeType")) }
-  }
   # level: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."level"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("level")) }
-  }
   # eventTimestamp: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-  __value = __source_flat."eventTimestamp"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("eventTimestamp")) }
-  }
   # time: Existing timestamp conversion verified against the emitted millisecond clock.
-  __value = __source_flat."time"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("time")) }
-  }
   # level: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
-  __value = __source_flat."level"
-  if __value != null {
-      __expected = get!({"informational": 1, "info": 1, "debug": 1, "low": 2, "medium": 3, "warn": 3, "warning": 3, "high": 4, "error": 4, "critical": 5, "fatal": 6}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."severity_id" == __expected { __consumed = __consumed + ("," + encode_json("level")) }
-      }
-  }
   # changeType: Parser normalizes the caption case; verify the emitted caption.
-  __value = __source_flat."changeType"
-  if __value != null {
-      __expected = get!({"create": "Create"}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."activity_name" == __expected { __consumed = __consumed + ("," + encode_json("changeType")) }
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        changeType
+      | level
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        eventTimestamp
+      | time
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        level
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"informational": 1, "info": 1, "debug": 1, "low": 2, "medium": 3, "warn": 3, "warning": 3, "high": 4, "error": 4, "critical": 5, "fatal": 6}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."severity_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        changeType
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"create": "Create"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."activity_name" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
       }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.

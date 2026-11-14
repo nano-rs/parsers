@@ -518,52 +518,61 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
-  __source_flat = flatten(__source_kv)
   # ResultStatus: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."ResultStatus"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("ResultStatus")) }
-  }
   # Direction: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."Direction"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("Direction")) }
-  }
   # Action: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."Action"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("Action")) }
-  }
   # ItemType: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."ItemType"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("ItemType")) }
-  }
   # CreationTime: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-  __value = __source_flat."CreationTime"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("CreationTime")) }
-  }
   # ResultStatus: M365 operation result maps to OCSF status.
-  __value = __source_flat."ResultStatus"
-  if __value != null {
-      __expected = get!({"succeeded": 1, "success": 1, "true": 1, "failed": 2, "failure": 2, "false": 2}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."status_id" == __expected { __consumed = __consumed + ("," + encode_json("ResultStatus")) }
-      }
-  }
   # CreationTime: M365 also accepts zone-less ISO clocks using the parser runtime timezone; compare the emitted milliseconds.
-  __value = __source_flat."CreationTime"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%Y-%m-%dT%H:%M:%S")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("CreationTime")) }
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        ResultStatus
+      | Direction
+      | Action
+      | ItemType
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        CreationTime
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        ResultStatus
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"succeeded": 1, "success": 1, "true": 1, "failed": 2, "failure": 2, "false": 2}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."status_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        CreationTime
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%Y-%m-%dT%H:%M:%S")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
   __candidates = r'(?x)

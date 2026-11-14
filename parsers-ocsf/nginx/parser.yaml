@@ -359,27 +359,43 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
-  __source_flat = flatten(__source_kv)
   # timestamp: Built-in parsed timestamp converted to event milliseconds.
-  __value = __source_flat."timestamp"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("timestamp")) }
-  }
   # time_local: Nginx local timestamp with explicit offset converted to event milliseconds.
-  __value = __source_flat."time_local"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%d/%b/%Y:%H:%M:%S %z")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("time_local")) }
-  }
   # request_time: Existing unit conversion by 1000 verified against duration; unused clock fallbacks remain residual.
-  __value = __source_flat."request_time"
-  __number, __number_err = to_float(__value)
-  if __number_err == null && __value != null && !is_boolean(__value) {
-      __expected = to_int(__number * 1000.0)
-      if ."duration" == __expected { __consumed = __consumed + ("," + encode_json("request_time")) }
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        timestamp
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        time_local
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%d/%b/%Y:%H:%M:%S %z")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        request_time
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if ."duration" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
   __candidates = r'(?x)

@@ -450,13 +450,19 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
-  __source_flat = flatten(__source_kv)
   # __REALTIME_TIMESTAMP: Existing unit conversion by 0.001 verified against time; unused clock fallbacks remain residual.
-  __value = __source_flat."__REALTIME_TIMESTAMP"
-  __number, __number_err = to_float(__value)
-  if __number_err == null && __value != null && !is_boolean(__value) {
-      __expected = to_int(__number * 0.001)
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("__REALTIME_TIMESTAMP")) }
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        __REALTIME_TIMESTAMP
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 0.001)
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
   __candidates = r'(?x)

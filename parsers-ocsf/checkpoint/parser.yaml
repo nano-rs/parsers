@@ -613,91 +613,74 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
-  __source_flat = flatten(__source_kv)
   # service_id: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."service_id"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("service_id")) }
-  }
   # proto: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."proto"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("proto")) }
-  }
   # ifdir: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."ifdir"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("ifdir")) }
-  }
   # rule_action: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."rule_action"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("rule_action")) }
-  }
   # action: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."action"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("action")) }
-  }
   # auth_status: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."auth_status"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("auth_status")) }
-  }
   # severity: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."severity"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("severity")) }
-  }
   # attack_severity: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."attack_severity"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("attack_severity")) }
-  }
   # action: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
-  __value = __source_flat."action"
-  if __value != null {
-      __expected = get!({"allow": 1, "allowed": 1, "accept": 1, "accepted": 1, "permit": 1, "permitted": 1, "pass": 1, "passed": 1, "deny": 2, "denied": 2, "block": 2, "blocked": 2, "reject": 2, "rejected": 2, "drop": 2, "dropped": 2, "log": 3, "observed": 3}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."action_id" == __expected { __consumed = __consumed + ("," + encode_json("action")) }
-      }
-  }
   # header.app: Case normalization already performed by the parser; observed at metadata.log_source, and checked against the emitted branch.
-  __value = __source_flat."header.app"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("header.app")) }
-  }
   # rule_action: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
-  __value = __source_flat."rule_action"
-  if __value != null {
-      __expected = get!({"allow": 1, "allowed": 1, "accept": 1, "accepted": 1, "permit": 1, "permitted": 1, "pass": 1, "passed": 1, "deny": 2, "denied": 2, "block": 2, "blocked": 2, "reject": 2, "rejected": 2, "drop": 2, "dropped": 2, "log": 3, "observed": 3}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."action_id" == __expected { __consumed = __consumed + ("," + encode_json("rule_action")) }
-      }
-  }
   # severity: Parser normalizes the caption case; verify the emitted caption.
-  __value = __source_flat."severity"
-  if __value != null {
-      __expected = get!({"medium": "Medium"}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."severity" == __expected { __consumed = __consumed + ("," + encode_json("severity")) }
-      }
-  }
   # severity: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
-  __value = __source_flat."severity"
-  if __value != null {
-      __expected = get!({"informational": 1, "info": 1, "debug": 1, "low": 2, "medium": 3, "warn": 3, "warning": 3, "high": 4, "error": 4, "critical": 5, "fatal": 6}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."severity_id" == __expected { __consumed = __consumed + ("," + encode_json("severity")) }
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        service_id
+      | proto
+      | ifdir
+      | rule_action
+      | action
+      | auth_status
+      | severity
+      | attack_severity
+      | header\.app
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        action
+      | rule_action
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"allow": 1, "allowed": 1, "accept": 1, "accepted": 1, "permit": 1, "permitted": 1, "pass": 1, "passed": 1, "deny": 2, "denied": 2, "block": 2, "blocked": 2, "reject": 2, "rejected": 2, "drop": 2, "dropped": 2, "log": 3, "observed": 3}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."action_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        severity
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"medium": "Medium"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."severity" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        severity
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"informational": 1, "info": 1, "debug": 1, "low": 2, "medium": 3, "warn": 3, "warning": 3, "high": 4, "error": 4, "critical": 5, "fatal": 6}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."severity_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
       }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.

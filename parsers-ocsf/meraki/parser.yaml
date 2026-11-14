@@ -519,55 +519,42 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
-  __source_flat = flatten(__source_kv)
   # protocol: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."protocol"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("protocol")) }
-  }
   # proto: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."proto"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("proto")) }
-  }
   # direction: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."direction"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("direction")) }
-  }
   # type: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."type"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("type")) }
-  }
   # blocked: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."blocked"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("blocked")) }
-  }
   # action: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."action"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("action")) }
-  }
   # mac: Case normalization already performed by the parser; observed at src_endpoint.mac, and checked against the emitted branch.
-  __value = __source_flat."mac"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("mac")) }
-  }
   # timestamp: Existing unit conversion by 1000 verified against time; unused clock fallbacks remain residual.
-  __value = __source_flat."timestamp"
-  __number, __number_err = to_float(__value)
-  if __number_err == null && __value != null && !is_boolean(__value) {
-      __expected = to_int(__number * 1000.0)
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("timestamp")) }
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        protocol
+      | proto
+      | direction
+      | type
+      | blocked
+      | action
+      | mac
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        timestamp
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
   __candidates = r'(?x)

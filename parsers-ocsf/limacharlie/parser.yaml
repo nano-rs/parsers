@@ -740,100 +740,68 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
-  __source_flat = flatten(__source_kv)
   # routing.hostname: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
-  __value = __source_flat."routing.hostname"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("routing.hostname")) }
-  }
   # routing.int_ip: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
-  __value = __source_flat."routing.int_ip"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("routing.int_ip")) }
-  }
   # event.USER_NAME: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
-  __value = __source_flat."event.USER_NAME"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("event.USER_NAME")) }
-  }
   # event.HASH: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
-  __value = __source_flat."event.HASH"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("event.HASH")) }
-  }
   # event.PARENT.HASH: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
-  __value = __source_flat."event.PARENT.HASH"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("event.PARENT.HASH")) }
-  }
   # event.ACCESS_MASK: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
-  __value = __source_flat."event.ACCESS_MASK"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("event.ACCESS_MASK")) }
-  }
   # event.DOMAIN_NAME: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
-  __value = __source_flat."event.DOMAIN_NAME"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("event.DOMAIN_NAME")) }
-  }
   # event.IP_ADDRESS: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
-  __value = __source_flat."event.IP_ADDRESS"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("event.IP_ADDRESS")) }
-  }
   # event.DOMAIN: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
-  __value = __source_flat."event.DOMAIN"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("event.DOMAIN")) }
-  }
   # event.SOURCE_IP: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
-  __value = __source_flat."event.SOURCE_IP"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("event.SOURCE_IP")) }
-  }
   # event.HOSTNAME: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
-  __value = __source_flat."event.HOSTNAME"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("event.HOSTNAME")) }
-  }
   # event.TYPE: Parser normalizes the caption case; verify the emitted caption.
-  __value = __source_flat."event.TYPE"
-  if __value != null {
-      __expected = get!({"aaaa": "AAAA"}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."query"."type" == __expected { __consumed = __consumed + ("," + encode_json("event.TYPE")) }
-      }
-  }
   # event.PARENT.USER_NAME: Case normalization already performed by the parser; observed at actor.user.name, and checked against the emitted branch.
-  __value = __source_flat."event.PARENT.USER_NAME"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("event.PARENT.USER_NAME")) }
-  }
   # event.ACCESS_MASK: Parsed hexadecimal process ID or access mask is represented as an integer at this destination.
-  __value = __source_flat."event.ACCESS_MASK"
-  __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
-  __integer, __integer_err = parse_int(__hex, base: 16)
-  if is_string(__value) && starts_with(downcase(string(__value) ?? ""), "0x") && __integer_err == null {
-      __expected = __integer
-      if ."actual_permissions" == __expected { __consumed = __consumed + ("," + encode_json("event.ACCESS_MASK")) }
-  }
   # event.SOURCE.USER_NAME: Case normalization already performed by the parser; observed at actor.user.name, and checked against the emitted branch.
-  __value = __source_flat."event.SOURCE.USER_NAME"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("event.SOURCE.USER_NAME")) }
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        routing\.hostname
+      | routing\.int_ip
+      | event\.USER_NAME
+      | event\.HASH
+      | event\.PARENT\.HASH
+      | event\.ACCESS_MASK
+      | event\.DOMAIN_NAME
+      | event\.IP_ADDRESS
+      | event\.DOMAIN
+      | event\.SOURCE_IP
+      | event\.HOSTNAME
+      | event\.PARENT\.USER_NAME
+      | event\.SOURCE\.USER_NAME
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        event\.TYPE
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"aaaa": "AAAA"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."query"."type" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        event\.ACCESS_MASK
+      )\z') {
+          __value = value
+          __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
+          __integer, __integer_err = parse_int(__hex, base: 16)
+          if is_string(__value) && starts_with(downcase(string(__value) ?? ""), "0x") && __integer_err == null {
+              __expected = __integer
+              if ."actual_permissions" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
   __candidates = r'(?x)

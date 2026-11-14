@@ -911,50 +911,50 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
-  __source_flat = flatten(__source_kv)
   # _path: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."_path"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("_path")) }
-  }
   # proto: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."proto"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("proto")) }
-  }
   # service: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."service"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("service")) }
-  }
   # msg_types: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."msg_types"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("msg_types")) }
-  }
   # action: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."action"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("action")) }
-  }
   # ts: Source seconds converted to the emitted millisecond value.
-  __value = __source_flat."ts"
-  __number, __number_err = to_float(__value)
-  if __number_err == null && __value != null && !is_boolean(__value) {
-      __expected = to_int(__number * 1000.0)
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("ts")) }
-  }
   # duration: Source seconds converted to the emitted millisecond value.
-  __value = __source_flat."duration"
-  __number, __number_err = to_float(__value)
-  if __number_err == null && __value != null && !is_boolean(__value) {
-      __expected = to_int(__number * 1000.0)
-      if ."duration" == __expected { __consumed = __consumed + ("," + encode_json("duration")) }
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        _path
+      | proto
+      | service
+      | msg_types
+      | action
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        ts
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        duration
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if ."duration" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
   __candidates = r'(?x)

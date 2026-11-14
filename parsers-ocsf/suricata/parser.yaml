@@ -650,102 +650,108 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
-  __source_flat = flatten(__source_kv)
   # event_type: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."event_type"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("event_type")) }
-  }
   # proto: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."proto"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("proto")) }
-  }
   # app_proto: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."app_proto"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("app_proto")) }
-  }
   # flow.state: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."flow.state"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("flow.state")) }
-  }
   # alert.action: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."alert.action"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("alert.action")) }
-  }
   # dns.type: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."dns.type"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("dns.type")) }
-  }
   # dhcp.dhcp_type: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."dhcp.dhcp_type"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("dhcp.dhcp_type")) }
-  }
   # timestamp: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-  __value = __source_flat."timestamp"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("timestamp")) }
-  }
   # alert.action: Parser normalizes the caption case; verify the emitted caption.
-  __value = __source_flat."alert.action"
-  if __value != null {
-      __expected = get!({"blocked": "Blocked"}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."disposition" == __expected { __consumed = __consumed + ("," + encode_json("alert.action")) }
-      }
-  }
   # alert.action: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
-  __value = __source_flat."alert.action"
-  if __value != null {
-      __expected = get!({"allow": 1, "allowed": 1, "accept": 1, "accepted": 1, "permit": 1, "permitted": 1, "pass": 1, "passed": 1, "deny": 2, "denied": 2, "block": 2, "blocked": 2, "reject": 2, "rejected": 2, "drop": 2, "dropped": 2, "log": 3, "observed": 3}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."action_id" == __expected { __consumed = __consumed + ("," + encode_json("alert.action")) }
-      }
-  }
   # dhcp.dhcp_type: Parser normalizes the caption case; verify the emitted caption.
-  __value = __source_flat."dhcp.dhcp_type"
-  if __value != null {
-      __expected = get!({"request": "Request"}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."activity_name" == __expected { __consumed = __consumed + ("," + encode_json("dhcp.dhcp_type")) }
-      }
-  }
   # dhcp.type: Parser normalizes the caption case; verify the emitted caption.
-  __value = __source_flat."dhcp.type"
-  if __value != null {
-      __expected = get!({"request": "Request"}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."activity_name" == __expected { __consumed = __consumed + ("," + encode_json("dhcp.type")) }
-      }
-  }
   # proto: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
-  __value = __source_flat."proto"
-  if __value != null {
-      __expected = get!({"tcp": 6, "udp": 17, "icmp": 1, "icmpv6": 58, "ipv6-icmp": 58}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."connection_info"."protocol_num" == __expected { __consumed = __consumed + ("," + encode_json("proto")) }
-      }
-  }
   # dns.type: Parser normalizes the caption case; verify the emitted caption.
-  __value = __source_flat."dns.type"
-  if __value != null {
-      __expected = get!({"query": "Query"}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."activity_name" == __expected { __consumed = __consumed + ("," + encode_json("dns.type")) }
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        event_type
+      | proto
+      | app_proto
+      | flow\.state
+      | alert\.action
+      | dns\.type
+      | dhcp\.dhcp_type
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        timestamp
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        alert\.action
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"blocked": "Blocked"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."disposition" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        alert\.action
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"allow": 1, "allowed": 1, "accept": 1, "accepted": 1, "permit": 1, "permitted": 1, "pass": 1, "passed": 1, "deny": 2, "denied": 2, "block": 2, "blocked": 2, "reject": 2, "rejected": 2, "drop": 2, "dropped": 2, "log": 3, "observed": 3}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."action_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        dhcp\.dhcp_type
+      | dhcp\.type
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"request": "Request"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."activity_name" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        proto
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"tcp": 6, "udp": 17, "icmp": 1, "icmpv6": 58, "ipv6-icmp": 58}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."connection_info"."protocol_num" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        dns\.type
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"query": "Query"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."activity_name" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
       }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.

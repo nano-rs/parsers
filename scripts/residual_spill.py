@@ -53,9 +53,8 @@ def kind_templates():
     return {kind: '\n'.join(lines) for kind, lines in templates.items()}
 
 
-def unrolled(rule, templates):
-    """One rule as straight-line VRL, mirroring the former __rules loop exactly."""
-    source = vrl_string(rule['source'])
+def rule_body(rule, templates):
+    """One rule's body, written against the loop's `key` and `value`."""
     if isinstance(rule.get('target'), str):
         path = ''.join('.' + vrl_string(part) for part in rule['target'].split('.'))
         match = path + ' == __expected'
@@ -72,7 +71,22 @@ def unrolled(rule, templates):
         # The template skips an absent source, which the old loop looked up as "".
         assert '' not in values and all(isinstance(k, str) for k in values), rule
         text = text.replace('__VALUES__', '{' + ', '.join(vrl_string(k) + ': ' + vrl_literal(v) for k, v in values.items()) + '}')
-    return text.replace('__SOURCE_STRING__', source).replace('__SOURCE__', source).replace('__MATCH__', match)
+    return text.replace('__MATCH__', match)
+
+
+def grouped(rules, templates):
+    """Rules that render to the same body, in first-appearance order.
+
+    NAN-5298: one `if` per rule made the program's statement count, and with it
+    Vector's compile (reload) time, grow with the rule count; a group costs one
+    regex test per source key at run time and one body at compile time.
+    """
+    groups = {}
+    for rule in rules:
+        keys = groups.setdefault(rule_body(rule, templates), [])
+        if rule['source'] not in keys:
+            keys.append(rule['source'])
+    return list(groups.items())
 
 
 REGEX_META = set('\\.+*?|^$#&-~ ')
@@ -81,23 +95,30 @@ REGEX_META = set('\\.+*?|^$#&-~ ')
 REGEX_HEX = {char: '\\x%02X' % ord(char) for char in '()[]{}'}
 
 
+def key_regex(keys):
+    """Whole-key alternation lines for a verbose regex literal.
+
+    Every regex metacharacter and space in a key is escaped, and a bracket is
+    hex-escaped so the raw bracket counts stay balanced.
+    """
+    lines = ['\\A(?:']
+    for index, key in enumerate(keys):
+        assert isinstance(key, str) and key and not re.search(r"[\x00-\x1f\x7f']", key), key
+        assert not any(char.isspace() and char != ' ' for char in key), key
+        escaped = ''.join(REGEX_HEX.get(char) or ('\\' + char if char in REGEX_META else char) for char in key)
+        lines.append(('  ' if index == 0 else '| ') + escaped)
+    return lines + [")\\z'"]
+
+
 def candidate_regex(candidates):
     """The candidate set as a whole-key regex literal, one candidate per line.
 
     A regex literal compiles once with the program, so a lookup reads no copy
-    of the set (NAN-5351). Verbose mode ignores the layout whitespace; every
-    regex metacharacter and space in a candidate is escaped, and a bracket is
-    hex-escaped so the raw bracket counts stay balanced.
+    of the set (NAN-5351). Verbose mode ignores the layout whitespace.
     """
     if not candidates:
         return ["__candidates = r'\\b\\B'"]  # matches nothing
-    lines = ["__candidates = r'(?x)", '\\A(?:']
-    for index, candidate in enumerate(candidates):
-        assert isinstance(candidate, str) and candidate and not re.search(r"[\x00-\x1f\x7f']", candidate), candidate
-        assert not any(char.isspace() and char != ' ' for char in candidate), candidate
-        escaped = ''.join(REGEX_HEX.get(char) or ('\\' + char if char in REGEX_META else char) for char in candidate)
-        lines.append(('  ' if index == 0 else '| ') + escaped)
-    return lines + [")\\z'"]
+    return ["__candidates = r'(?x)"] + key_regex(candidates)
 
 
 def transformations(config):
@@ -106,9 +127,18 @@ def transformations(config):
         assert rule.get('reason'), rule
         assert rule['kind'] in KINDS, rule
     templates = kind_templates()
-    lines = ['__source_flat = flatten(__source_kv)']
-    for rule in rules:
-        lines += ['# ' + rule['source'] + ': ' + rule['reason'], unrolled(rule, templates)]
+    lines = ['# ' + rule['source'] + ': ' + rule['reason'] for rule in rules]
+    groups = grouped(rules, templates)
+    if groups:
+        lines.append('for_each(flatten(__source_kv)) -> |key, value| {')
+        for body, keys in groups:
+            regex = key_regex(keys)
+            lines.append("    if match(key, r'(?x)")
+            lines += ['    ' + line for line in regex]
+            lines[-1] += ') {'
+            lines += ['        ' + line for line in body.splitlines()]
+            lines.append('    }')
+        lines.append('}')
     if config.get('reference') == 'windows_sysmon':
         lines += ['# ' + config['reference_reason'], 'for_each(array!(__reference_consumed)) -> |_index, key| {', '    __consumed = __consumed + ("," + encode_json(key))', '}']
     lines += ['# ' + config.get('consumed_reason', 'Explicit source candidates.')] + candidate_regex(config.get('consumed_candidates', []))

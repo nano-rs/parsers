@@ -64,14 +64,23 @@ size. The generated block therefore:
 - holds value sets in strings (`"," + encode_json(member)` per member) and
   tests membership with `contains`; a string read shares its buffer;
 - turns `consumed_candidates` into a regex literal, compiled once;
-- unrolls each `transforms` rule from its template in `transforms.vrl` into
-  straight-line VRL with a static read of the flattened source, instead of
-  parsing a rule table and copying the source for every rule;
+- groups the `transforms` rules that render to the same body (templates in
+  `transforms.vrl`) and runs them in ONE loop over the flattened source, each
+  group a whole-key regex literal around its body, instead of parsing a rule
+  table and copying the source for every rule;
 - decides each source key with one `filter` and builds the residual with one
   rename, falling back to the original in-order loop only when two keys decode
   or snake-case to the same name;
 - skips work its input makes unnecessary (no secret word: no redaction walk;
   no dotted key: no escaping; no array or brace-led string: scalar members only).
+
+Compile cost matters as much as per-event cost: Vector compiles every remap
+program in the tree on every reload, and nano rolls back a deploy whose reload
+is not acknowledged in time (NAN-5298). Unrolling one `if` block per rule was
+as fast per event but doubled compile time for the parsers with the most
+rules (crowdstrike_falcon 10 s -> 21 s in `vector validate`), because Vector's
+type checker clones and merges the program's whole type state at each branch.
+Keep the statement count independent of the rule count.
 
 Each shortcut must leave output byte-identical. Compare the emitted events of
 every sample before and after any change to the template.

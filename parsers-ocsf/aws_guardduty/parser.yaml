@@ -447,70 +447,76 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
-  __source_flat = flatten(__source_kv)
   # createdAt: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-  __value = __source_flat."createdAt"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("createdAt")) }
-  }
   # updatedAt: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-  __value = __source_flat."updatedAt"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("updatedAt")) }
-  }
   # service.eventFirstSeen: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-  __value = __source_flat."service.eventFirstSeen"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("service.eventFirstSeen")) }
-  }
   # service.eventLastSeen: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-  __value = __source_flat."service.eventLastSeen"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("service.eventLastSeen")) }
-  }
   # createdAt: Existing timestamp conversion verified against the emitted millisecond clock.
-  __value = __source_flat."createdAt"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."finding_info"."created_time" == __expected { __consumed = __consumed + ("," + encode_json("createdAt")) }
-  }
   # service.eventFirstSeen: Existing timestamp conversion verified against the emitted millisecond clock.
-  __value = __source_flat."service.eventFirstSeen"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."finding_info"."first_seen_time" == __expected { __consumed = __consumed + ("," + encode_json("service.eventFirstSeen")) }
-  }
   # service.eventLastSeen: Existing timestamp conversion verified against the emitted millisecond clock.
-  __value = __source_flat."service.eventLastSeen"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."finding_info"."created_time" == __expected { __consumed = __consumed + ("," + encode_json("service.eventLastSeen")) }
-  }
   # service.serviceName: Parser normalizes the caption case; verify the emitted caption.
-  __value = __source_flat."service.serviceName"
-  if __value != null {
-      __expected = get!({"guardduty": "GuardDuty"}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."metadata"."log_name" == __expected { __consumed = __consumed + ("," + encode_json("service.serviceName")) }
-      }
-  }
   # severity: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
-  __value = __source_flat."severity"
-  if __value != null {
-      __expected = get!({"informational": 1, "info": 1, "debug": 1, "low": 2, "medium": 3, "warn": 3, "warning": 3, "high": 4, "error": 4, "critical": 5, "fatal": 6}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."severity_id" == __expected { __consumed = __consumed + ("," + encode_json("severity")) }
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        createdAt
+      | updatedAt
+      | service\.eventFirstSeen
+      | service\.eventLastSeen
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        createdAt
+      | service\.eventLastSeen
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."finding_info"."created_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        service\.eventFirstSeen
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."finding_info"."first_seen_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        service\.serviceName
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"guardduty": "GuardDuty"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."metadata"."log_name" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        severity
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"informational": 1, "info": 1, "debug": 1, "low": 2, "medium": 3, "warn": 3, "warning": 3, "high": 4, "error": 4, "critical": 5, "fatal": 6}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."severity_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
       }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
