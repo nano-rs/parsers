@@ -363,13 +363,19 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
-  __source_flat = flatten(__source_kv)
   # filter_result: Parser normalizes the caption case; verify the emitted caption.
-  __value = __source_flat."filter_result"
-  if __value != null {
-      __expected = get!({"denied": "Denied"}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."action" == __expected { __consumed = __consumed + ("," + encode_json("filter_result")) }
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        filter_result
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"denied": "Denied"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."action" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
       }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.

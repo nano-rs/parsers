@@ -390,95 +390,102 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
-  __source_flat = flatten(__source_kv)
   # @timestamp: Existing timestamp conversion verified against the emitted millisecond clock.
-  __value = __source_flat."@timestamp"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("@timestamp")) }
-  }
   # level: Case normalization already performed by the parser; observed at metadata.log_level, and checked against the emitted branch.
-  __value = __source_flat."level"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("level")) }
-  }
   # timestamp: Existing timestamp conversion verified against the emitted millisecond clock.
-  __value = __source_flat."timestamp"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("timestamp")) }
-  }
   # protocol: Case normalization already performed by the parser; observed at connection_info.protocol_name, and checked against the emitted branch.
-  __value = __source_flat."protocol"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("protocol")) }
-  }
   # time: Existing unit conversion by 1000 verified against time; unused clock fallbacks remain residual.
-  __value = __source_flat."time"
-  __number, __number_err = to_float(__value)
-  if __number_err == null && __value != null && !is_boolean(__value) {
-      __expected = to_int(__number * 1000.0)
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("time")) }
-  }
   # datetime: Existing timestamp conversion verified against the emitted millisecond clock.
-  __value = __source_flat."datetime"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%Y-%m-%d %H:%M:%S")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("datetime")) }
-  }
   # pid: Integer identity (NAN-5073), checked at the exact emitted path, so a coincidentally equal value elsewhere in the event (severity_id, activity_id, another port) cannot consume the key; when the branch does not emit it, it stays in unmapped.
-  __value = __source_flat."pid"
-  __number, __number_err = to_float(__value)
-  if __number_err == null && __value != null && !is_boolean(__value) {
-      __expected = to_int(__number * 1.0)
-      if ."actor"."process"."pid" == __expected { __consumed = __consumed + ("," + encode_json("pid")) }
-  }
   # process_id: Integer identity (NAN-5073), checked at the exact emitted path, so a coincidentally equal value elsewhere in the event (severity_id, activity_id, another port) cannot consume the key; when the branch does not emit it, it stays in unmapped.
-  __value = __source_flat."process_id"
-  __number, __number_err = to_float(__value)
-  if __number_err == null && __value != null && !is_boolean(__value) {
-      __expected = to_int(__number * 1.0)
-      if ."actor"."process"."pid" == __expected { __consumed = __consumed + ("," + encode_json("process_id")) }
-  }
   # src_port: Integer identity (NAN-5073), checked at the exact emitted path, so a coincidentally equal value elsewhere in the event (severity_id, activity_id, another port) cannot consume the key; when the branch does not emit it, it stays in unmapped.
-  __value = __source_flat."src_port"
-  __number, __number_err = to_float(__value)
-  if __number_err == null && __value != null && !is_boolean(__value) {
-      __expected = to_int(__number * 1.0)
-      if ."src_endpoint"."port" == __expected { __consumed = __consumed + ("," + encode_json("src_port")) }
-  }
   # source_port: Integer identity (NAN-5073), checked at the exact emitted path, so a coincidentally equal value elsewhere in the event (severity_id, activity_id, another port) cannot consume the key; when the branch does not emit it, it stays in unmapped.
-  __value = __source_flat."source_port"
-  __number, __number_err = to_float(__value)
-  if __number_err == null && __value != null && !is_boolean(__value) {
-      __expected = to_int(__number * 1.0)
-      if ."src_endpoint"."port" == __expected { __consumed = __consumed + ("," + encode_json("source_port")) }
-  }
   # dest_port: Integer identity (NAN-5073), checked at the exact emitted path, so a coincidentally equal value elsewhere in the event (severity_id, activity_id, another port) cannot consume the key; when the branch does not emit it, it stays in unmapped.
-  __value = __source_flat."dest_port"
-  __number, __number_err = to_float(__value)
-  if __number_err == null && __value != null && !is_boolean(__value) {
-      __expected = to_int(__number * 1.0)
-      if ."dst_endpoint"."port" == __expected { __consumed = __consumed + ("," + encode_json("dest_port")) }
-  }
   # dst_port: Integer identity (NAN-5073), checked at the exact emitted path, so a coincidentally equal value elsewhere in the event (severity_id, activity_id, another port) cannot consume the key; when the branch does not emit it, it stays in unmapped.
-  __value = __source_flat."dst_port"
-  __number, __number_err = to_float(__value)
-  if __number_err == null && __value != null && !is_boolean(__value) {
-      __expected = to_int(__number * 1.0)
-      if ."dst_endpoint"."port" == __expected { __consumed = __consumed + ("," + encode_json("dst_port")) }
-  }
   # destination_port: Integer identity (NAN-5073), checked at the exact emitted path, so a coincidentally equal value elsewhere in the event (severity_id, activity_id, another port) cannot consume the key; when the branch does not emit it, it stays in unmapped.
-  __value = __source_flat."destination_port"
-  __number, __number_err = to_float(__value)
-  if __number_err == null && __value != null && !is_boolean(__value) {
-      __expected = to_int(__number * 1.0)
-      if ."dst_endpoint"."port" == __expected { __consumed = __consumed + ("," + encode_json("destination_port")) }
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        @timestamp
+      | timestamp
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        level
+      | protocol
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        time
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        datetime
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%Y-%m-%d %H:%M:%S")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        pid
+      | process_id
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1.0)
+              if ."actor"."process"."pid" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        src_port
+      | source_port
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1.0)
+              if ."src_endpoint"."port" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        dest_port
+      | dst_port
+      | destination_port
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1.0)
+              if ."dst_endpoint"."port" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
   __candidates = r'(?x)
