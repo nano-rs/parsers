@@ -432,94 +432,84 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
-  __source_flat = flatten(__source_kv)
   # device_name: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
-  __value = __source_flat."device_name"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("device_name")) }
-  }
   # device_internal_ip: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
-  __value = __source_flat."device_internal_ip"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("device_internal_ip")) }
-  }
   # process_sha256: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
-  __value = __source_flat."process_sha256"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("process_sha256")) }
-  }
   # parent_sha256: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
-  __value = __source_flat."parent_sha256"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("parent_sha256")) }
-  }
   # device_username: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
-  __value = __source_flat."device_username"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("device_username")) }
-  }
   # process_username: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
-  __value = __source_flat."process_username"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("process_username")) }
-  }
   # backend_timestamp: ISO clock converted to epoch milliseconds; only the selected successful clock is consumed.
-  __value = __source_flat."backend_timestamp"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("backend_timestamp")) }
-  }
   # first_event_timestamp: ISO clock converted to epoch milliseconds; only the selected successful clock is consumed.
-  __value = __source_flat."first_event_timestamp"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("first_event_timestamp")) }
-  }
   # create_time: ISO clock converted to epoch milliseconds; only the selected successful clock is consumed.
-  __value = __source_flat."create_time"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("create_time")) }
-  }
   # sensor_action: Finding branch translates sensor enforcement into disposition.
-  __value = __source_flat."sensor_action"
-  if __value != null {
-      __expected = get!({"deny": 2, "block": 2, "terminate": 2, "terminate_process": 2, "quarantine": 3, "delete": 5, "allow": 1}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."disposition_id" == __expected { __consumed = __consumed + ("," + encode_json("sensor_action")) }
-      }
-  }
   # workflow.state: Finding branch normalizes workflow lifecycle status.
-  __value = __source_flat."workflow.state"
-  if __value != null {
-      __expected = get!({"open": 1, "new": 1, "in_progress": 2, "closed": 4, "resolved": 4, "dismissed": 3}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."status_id" == __expected { __consumed = __consumed + ("," + encode_json("workflow.state")) }
-      }
-  }
   # severity: Vendor severity is normalized to the OCSF severity enumeration.
-  __value = __source_flat."severity"
-  if __value != null {
-      __expected = get!({"0": 1, "1": 2, "2": 2, "3": 2, "4": 3, "5": 3, "6": 4, "7": 4, "8": 5, "9": 5, "10": 5}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."severity_id" == __expected { __consumed = __consumed + ("," + encode_json("severity")) }
-      }
-  }
   # report.severity: Vendor severity is normalized to the OCSF severity enumeration.
-  __value = __source_flat."report.severity"
-  if __value != null {
-      __expected = get!({"0": 1, "1": 2, "2": 2, "3": 2, "4": 3, "5": 3, "6": 4, "7": 4, "8": 5, "9": 5, "10": 5}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."severity_id" == __expected { __consumed = __consumed + ("," + encode_json("report.severity")) }
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        device_name
+      | device_internal_ip
+      | process_sha256
+      | parent_sha256
+      | device_username
+      | process_username
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        backend_timestamp
+      | first_event_timestamp
+      | create_time
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        sensor_action
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"deny": 2, "block": 2, "terminate": 2, "terminate_process": 2, "quarantine": 3, "delete": 5, "allow": 1}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."disposition_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        workflow\.state
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"open": 1, "new": 1, "in_progress": 2, "closed": 4, "resolved": 4, "dismissed": 3}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."status_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        severity
+      | report\.severity
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"0": 1, "1": 2, "2": 2, "3": 2, "4": 3, "5": 3, "6": 4, "7": 4, "8": 5, "9": 5, "10": 5}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."severity_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
       }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.

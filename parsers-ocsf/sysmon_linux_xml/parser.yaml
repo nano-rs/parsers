@@ -440,20 +440,31 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
-  __source_flat = flatten(__source_kv)
   # system.TimeCreated.@SystemTime: XML system clock converted to event milliseconds.
-  __value = __source_flat."system.TimeCreated.@SystemTime"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("system.TimeCreated.@SystemTime")) }
-  }
   # event_data.Protocol: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
-  __value = __source_flat."event_data.Protocol"
-  if __value != null {
-      __expected = get!({"tcp": 6, "udp": 17, "icmp": 1, "icmpv6": 58, "ipv6-icmp": 58}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."connection_info"."protocol_num" == __expected { __consumed = __consumed + ("," + encode_json("event_data.Protocol")) }
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        system\.TimeCreated\.@SystemTime
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        event_data\.Protocol
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"tcp": 6, "udp": 17, "icmp": 1, "icmpv6": 58, "ipv6-icmp": 58}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."connection_info"."protocol_num" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
       }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.

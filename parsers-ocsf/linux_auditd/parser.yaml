@@ -619,19 +619,30 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
-  __source_flat = flatten(__source_kv)
   # success: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."success"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("success")) }
-  }
   # nametype: Parser normalizes the caption case; verify the emitted caption.
-  __value = __source_flat."nametype"
-  if __value != null {
-      __expected = get!({"create": "Create"}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."activity_name" == __expected { __consumed = __consumed + ("," + encode_json("nametype")) }
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        success
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        nametype
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"create": "Create"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."activity_name" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
       }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.

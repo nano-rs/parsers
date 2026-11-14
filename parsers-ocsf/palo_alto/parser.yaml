@@ -793,52 +793,72 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
-  __source_flat = flatten(__source_kv)
   # receive_time: PAN receive time converted in the existing runtime timezone.
-  __value = __source_flat."receive_time"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%Y/%m/%d %H:%M:%S")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("receive_time")) }
-  }
   # auth_evt: Parser normalizes the caption case; verify the emitted caption.
-  __value = __source_flat."auth_evt"
-  if __value != null {
-      __expected = get!({"failure": "Failure"}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."status" == __expected { __consumed = __consumed + ("," + encode_json("auth_evt")) }
-      }
-  }
   # gp_status: Parser normalizes the caption case; verify the emitted caption.
-  __value = __source_flat."gp_status"
-  if __value != null {
-      __expected = get!({"failure": "Failure"}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."status" == __expected { __consumed = __consumed + ("," + encode_json("gp_status")) }
-      }
-  }
   # pan_sev: Parser normalizes the caption case; verify the emitted caption.
-  __value = __source_flat."pan_sev"
-  if __value != null {
-      __expected = get!({"informational": "Informational"}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."severity" == __expected { __consumed = __consumed + ("," + encode_json("pan_sev")) }
-      }
-  }
   # pan_sev: Parser normalizes the caption case; verify the emitted caption.
-  __value = __source_flat."pan_sev"
-  if __value != null {
-      __expected = get!({"critical": "Critical"}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."severity" == __expected { __consumed = __consumed + ("," + encode_json("pan_sev")) }
-      }
-  }
   # action: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
-  __value = __source_flat."action"
-  if __value != null {
-      __expected = get!({"allow": 1, "allowed": 1, "accept": 1, "accepted": 1, "permit": 1, "permitted": 1, "pass": 1, "passed": 1, "deny": 2, "denied": 2, "block": 2, "blocked": 2, "reject": 2, "rejected": 2, "drop": 2, "dropped": 2, "log": 3, "observed": 3}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."action_id" == __expected { __consumed = __consumed + ("," + encode_json("action")) }
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        receive_time
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%Y/%m/%d %H:%M:%S")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        auth_evt
+      | gp_status
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"failure": "Failure"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."status" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        pan_sev
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"informational": "Informational"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."severity" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        pan_sev
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"critical": "Critical"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."severity" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        action
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"allow": 1, "allowed": 1, "accept": 1, "accepted": 1, "permit": 1, "permitted": 1, "pass": 1, "passed": 1, "deny": 2, "denied": 2, "block": 2, "blocked": 2, "reject": 2, "rejected": 2, "drop": 2, "dropped": 2, "log": 3, "observed": 3}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."action_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
       }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.

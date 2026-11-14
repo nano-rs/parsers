@@ -456,52 +456,50 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
-  __source_flat = flatten(__source_kv)
   # filter.routeDirection: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."filter.routeDirection"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("filter.routeDirection")) }
-  }
   # filter.modules.spam.disposition: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."filter.modules.spam.disposition"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("filter.modules.spam.disposition")) }
-  }
   # threatStatus: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."threatStatus"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("threatStatus")) }
-  }
   # ts: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-  __value = __source_flat."ts"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("ts")) }
-  }
   # messageTime: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-  __value = __source_flat."messageTime"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("messageTime")) }
-  }
   # clickTime: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-  __value = __source_flat."clickTime"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("clickTime")) }
-  }
   # threatStatus: Parser normalizes the caption case; verify the emitted caption.
-  __value = __source_flat."threatStatus"
-  if __value != null {
-      __expected = get!({"blocked": "Blocked"}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."disposition" == __expected { __consumed = __consumed + ("," + encode_json("threatStatus")) }
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        filter\.routeDirection
+      | filter\.modules\.spam\.disposition
+      | threatStatus
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        ts
+      | messageTime
+      | clickTime
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        threatStatus
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"blocked": "Blocked"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."disposition" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
       }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.

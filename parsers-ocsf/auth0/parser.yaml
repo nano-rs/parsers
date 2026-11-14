@@ -336,28 +336,44 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
-  __source_flat = flatten(__source_kv)
   # date: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-  __value = __source_flat."date"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("date")) }
-  }
   # details.request.method: Parser normalizes the caption case; verify the emitted caption.
-  __value = __source_flat."details.request.method"
-  if __value != null {
-      __expected = get!({"patch": "PATCH"}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."http_request"."http_method" == __expected { __consumed = __consumed + ("," + encode_json("details.request.method")) }
-      }
-  }
   # strategy: Parser normalizes the caption case; verify the emitted caption.
-  __value = __source_flat."strategy"
-  if __value != null {
-      __expected = get!({"auth0": "Auth0"}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."metadata"."log_provider" == __expected { __consumed = __consumed + ("," + encode_json("strategy")) }
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        date
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        details\.request\.method
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"patch": "PATCH"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."http_request"."http_method" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        strategy
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"auth0": "Auth0"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."metadata"."log_provider" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
       }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.

@@ -530,18 +530,20 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
-  __source_flat = flatten(__source_kv)
   # fw_action: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."fw_action"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("fw_action")) }
-  }
   # proto: Parser case-normalizes this parsed field when represented in output.
-  __value = __source_flat."proto"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("proto")) }
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        fw_action
+      | proto
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
   __candidates = r'(?x)

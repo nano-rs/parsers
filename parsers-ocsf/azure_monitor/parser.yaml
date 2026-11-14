@@ -773,87 +773,103 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
-  __source_flat = flatten(__source_kv)
   # time: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-  __value = __source_flat."time"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("time")) }
-  }
   # properties.createdDateTime: Sign-in event clock, preferred over the record time; verified against the emitted clock.
-  __value = __source_flat."properties.createdDateTime"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("properties.createdDateTime")) }
-  }
   # properties.activityDateTime: Audit event clock, preferred over the record time; verified against the emitted clock.
-  __value = __source_flat."properties.activityDateTime"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("properties.activityDateTime")) }
-  }
   # level: Azure record level normalized to OCSF severity; consume only when the expected ID is emitted.
-  __value = __source_flat."level"
-  if __value != null {
-      __expected = get!({"informational": 1, "information": 1, "warning": 3, "error": 4, "critical": 5}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."severity_id" == __expected { __consumed = __consumed + ("," + encode_json("level")) }
-      }
-  }
   # Level: Windows-style numeric record level normalized to OCSF severity; consume only when the expected ID is emitted.
-  __value = __source_flat."Level"
-  if __value != null {
-      __expected = get!({"4": 1, "3": 3, "2": 4, "1": 5}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."severity_id" == __expected { __consumed = __consumed + ("," + encode_json("Level")) }
-      }
-  }
   # properties.Severity: Defender for Cloud alert severity drives the finding severity; consume only when the expected ID is emitted.
-  __value = __source_flat."properties.Severity"
-  if __value != null {
-      __expected = get!({"informational": 1, "low": 2, "medium": 3, "high": 4}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."severity_id" == __expected { __consumed = __consumed + ("," + encode_json("properties.Severity")) }
-      }
-  }
   # properties.riskLevelDuringSignIn: Parser normalizes the caption case; verify the emitted caption.
-  __value = __source_flat."properties.riskLevelDuringSignIn"
-  if __value != null {
-      __expected = get!({"low": "Low", "medium": "Medium", "high": "High"}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."risk_level" == __expected { __consumed = __consumed + ("," + encode_json("properties.riskLevelDuringSignIn")) }
-      }
-  }
   # properties.result: Entra audit result normalized to the OCSF status caption; verify the emitted caption.
-  __value = __source_flat."properties.result"
-  if __value != null {
-      __expected = get!({"success": "Success", "failure": "Failure"}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."status" == __expected { __consumed = __consumed + ("," + encode_json("properties.result")) }
-      }
-  }
   # resultType: Activity Log result normalized to the OCSF status caption; verify the emitted caption.
-  __value = __source_flat."resultType"
-  if __value != null {
-      __expected = get!({"success": "Success", "failure": "Failure"}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."status" == __expected { __consumed = __consumed + ("," + encode_json("resultType")) }
-      }
-  }
   # callerIpAddress: Parser lowercases IPs (nano lowercases at ingest); consume only when the normalized value is emitted.
-  __value = __source_flat."callerIpAddress"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("callerIpAddress")) }
-  }
   # properties.ipAddress: Parser lowercases IPs (nano lowercases at ingest); consume only when the normalized value is emitted.
-  __value = __source_flat."properties.ipAddress"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("properties.ipAddress")) }
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        time
+      | properties\.createdDateTime
+      | properties\.activityDateTime
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        level
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"informational": 1, "information": 1, "warning": 3, "error": 4, "critical": 5}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."severity_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        Level
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"4": 1, "3": 3, "2": 4, "1": 5}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."severity_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        properties\.Severity
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"informational": 1, "low": 2, "medium": 3, "high": 4}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."severity_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        properties\.riskLevelDuringSignIn
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"low": "Low", "medium": "Medium", "high": "High"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."risk_level" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        properties\.result
+      | resultType
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"success": "Success", "failure": "Failure"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."status" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        callerIpAddress
+      | properties\.ipAddress
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
   __candidates = r'(?x)

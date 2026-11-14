@@ -1,48 +1,54 @@
-# One template per transform kind. scripts/residual_spill.py unrolls each
-# field-coverage.yaml rule into straight-line VRL (NAN-5351): a static read of
-# the flattened source replaces a per-rule copy of it, and no rule table is
-# parsed per event. Placeholders: __SOURCE__ (the source key as a VRL path
-# segment), __SOURCE_STRING__ (the same key as a VRL string), __FORMAT__,
-# __FACTOR__, __VALUES__, and __MATCH__ (the emitted target equals __expected,
-# or __expected is a represented value when the rule names no target).
+# One template per transform kind. scripts/residual_spill.py groups the
+# field-coverage.yaml rules that render to the same body and emits ONE loop
+# over the flattened source, in which each group is a whole-key regex test
+# around its body (NAN-5351 runtime, NAN-5298 compile cost). Inside the loop
+# `key` is the flattened source key and `value` its value, so no rule table
+# is parsed per event and the source is copied once, not once per rule.
+# Unrolling every rule into straight-line VRL was as fast per event, but each
+# `if` in a large program makes Vector's VRL type checker clone and merge the
+# whole type state, which doubled compile (reload) time for the parsers with
+# the most rules. Placeholders: __FORMAT__, __FACTOR__, __VALUES__, and
+# __MATCH__ (the emitted target equals __expected, or __expected is a
+# represented value when the rule names no target).
 # A rule consumes its source only when the source is valid for the kind AND
-# the converted value actually appears in the emitted branch. The enum template
-# skips an absent source: the old loop looked it up as "", which no enum maps
-# (the generator checks).
+# the converted value actually appears in the emitted branch. An absent source
+# is never visited, which matches the unrolled form: no kind consumes a null
+# (the enum template skips one; the old loop looked it up as "", which no enum
+# maps, and the generator checks).
 #
 # kind: lowercase
-__value = __source_flat.__SOURCE__
+__value = value
 if is_string(__value) {
     __expected = downcase(string!(__value))
-    if __MATCH__ { __consumed = __consumed + ("," + encode_json(__SOURCE_STRING__)) }
+    if __MATCH__ { __consumed = __consumed + ("," + encode_json(key)) }
 }
 # kind: epoch_ms
-__value = __source_flat.__SOURCE__
+__value = value
 __clock, __clock_err = parse_timestamp(string(__value) ?? "", __FORMAT__)
 if __clock_err == null {
     __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-    if __MATCH__ { __consumed = __consumed + ("," + encode_json(__SOURCE_STRING__)) }
+    if __MATCH__ { __consumed = __consumed + ("," + encode_json(key)) }
 }
 # kind: scale
-__value = __source_flat.__SOURCE__
+__value = value
 __number, __number_err = to_float(__value)
 if __number_err == null && __value != null && !is_boolean(__value) {
     __expected = to_int(__number * __FACTOR__)
-    if __MATCH__ { __consumed = __consumed + ("," + encode_json(__SOURCE_STRING__)) }
+    if __MATCH__ { __consumed = __consumed + ("," + encode_json(key)) }
 }
 # kind: hex
-__value = __source_flat.__SOURCE__
+__value = value
 __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
 __integer, __integer_err = parse_int(__hex, base: 16)
 if is_string(__value) && starts_with(downcase(string(__value) ?? ""), "0x") && __integer_err == null {
     __expected = __integer
-    if __MATCH__ { __consumed = __consumed + ("," + encode_json(__SOURCE_STRING__)) }
+    if __MATCH__ { __consumed = __consumed + ("," + encode_json(key)) }
 }
 # kind: enum
-__value = __source_flat.__SOURCE__
+__value = value
 if __value != null {
     __expected = get!(__VALUES__, [downcase(to_string(__value) ?? "")])
     if __expected != null {
-        if __MATCH__ { __consumed = __consumed + ("," + encode_json(__SOURCE_STRING__)) }
+        if __MATCH__ { __consumed = __consumed + ("," + encode_json(key)) }
     }
 }

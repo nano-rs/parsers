@@ -378,44 +378,48 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
-  __source_flat = flatten(__source_kv)
   # scheme: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."scheme"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("scheme")) }
-  }
   # action: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."action"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("action")) }
-  }
   # threat_tier: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."threat_tier"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("threat_tier")) }
-  }
   # client_ip: Parser lowercases this source value; consume only when the normalized value is emitted.
-  __value = __source_flat."client_ip"
-  if is_string(__value) {
-      __expected = downcase(string!(__value))
-      if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json("client_ip")) }
-  }
   # timestamp: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-  __value = __source_flat."timestamp"
-  __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-  if __clock_err == null {
-      __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("timestamp")) }
-  }
   # action: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
-  __value = __source_flat."action"
-  if __value != null {
-      __expected = get!({"allow": 1, "allowed": 1, "accept": 1, "accepted": 1, "permit": 1, "permitted": 1, "pass": 1, "passed": 1, "deny": 2, "denied": 2, "block": 2, "blocked": 2, "reject": 2, "rejected": 2, "drop": 2, "dropped": 2, "log": 3, "observed": 3}, [downcase(to_string(__value) ?? "")])
-      if __expected != null {
-          if ."action_id" == __expected { __consumed = __consumed + ("," + encode_json("action")) }
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        scheme
+      | action
+      | threat_tier
+      | client_ip
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        timestamp
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        action
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"allow": 1, "allowed": 1, "accept": 1, "accepted": 1, "permit": 1, "permitted": 1, "pass": 1, "passed": 1, "deny": 2, "denied": 2, "block": 2, "blocked": 2, "reject": 2, "rejected": 2, "drop": 2, "dropped": 2, "log": 3, "observed": 3}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."action_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
       }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.

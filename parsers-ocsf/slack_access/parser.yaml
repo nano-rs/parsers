@@ -220,20 +220,21 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
-  __source_flat = flatten(__source_kv)
   # date_last: Slack access last-observed Unix seconds converted to milliseconds.
-  __value = __source_flat."date_last"
-  __number, __number_err = to_float(__value)
-  if __number_err == null && __value != null && !is_boolean(__value) {
-      __expected = to_int(__number * 1000.0)
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("date_last")) }
-  }
   # date_first: Existing unit conversion by 1000 verified against time; unused clock fallbacks remain residual.
-  __value = __source_flat."date_first"
-  __number, __number_err = to_float(__value)
-  if __number_err == null && __value != null && !is_boolean(__value) {
-      __expected = to_int(__number * 1000.0)
-      if ."time" == __expected { __consumed = __consumed + ("," + encode_json("date_first")) }
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        date_last
+      | date_first
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
   __candidates = r'(?x)
