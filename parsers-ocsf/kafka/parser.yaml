@@ -1,0 +1,608 @@
+name: kafka_ocsf
+display_name: Apache Kafka (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Apache Kafka broker and controller logs (server.log, controller.log,
+  state-change.log, kafka-authorizer.log) into complete OCSF 1.9.0 records.
+  Accepts Kafka's log4j layout `[2024-05-02 10:11:12,345] INFO message (logger)`
+  and the `2024-05-02 10:11:12,345 INFO logger: message` layout some
+  distributions use. A `[Component key=value]` context prefix is split off.
+    authorizer "Principal = User:x is Denied operation = ..."  -> API Activity 6003,
+                                                                 Failure, action Denied
+    authorizer "... is Allowed operation = ..." (DEBUG)        -> API Activity 6003, Success
+    "Failed authentication with /<ip> (...)" (SASL / SSL)      -> Authentication 3002 Logon, Failure
+    "Successfully authenticated client: authenticationID=..."  -> Authentication 3002 Logon, Success
+    KafkaServer / BrokerServer / KafkaRaftServer started,
+    shut down completed                                        -> Application Lifecycle 6002
+    any other ERROR / FATAL line                               -> Application Error 6008
+    any other line                                             -> Base Event 0
+  The authorizer's resource (`Topic:LITERAL:orders`) becomes resources[] with the
+  pattern type kept, the principal (`User:alice`) becomes actor.user, and the
+  client host becomes src_endpoint. Log timestamps carry no zone and are read as UTC.
+match_values:
+  - kafka
+category: application
+vendor: "Apache Software Foundation"
+product: "Apache Kafka"
+parser_vrl: |
+  # Apache Kafka server / controller / authorizer log -> OCSF 1.9.0.
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+  parsed = false
+  log_time = ""
+  level = ""
+  logger = ""
+  body = ""
+
+  m, merr = parse_regex(raw_log, r'(?s)^\x5B(?P<log_time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3})\x5D (?P<level>[A-Z]+)\s+(?P<body>.*?)(?: \x28(?P<logger>[A-Za-z0-9_.$]+)\x29)?\s*$')
+  if merr != null {
+      m, merr = parse_regex(raw_log, r'(?s)^(?P<log_time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3})\s+(?P<level>[A-Z]+)\s+(?P<logger>[A-Za-z0-9_.$]+):\s+(?P<body>.*?)\s*$')
+  }
+  if merr == null {
+      parsed = true
+      kv = filter(object!(m)) -> |_k, v| { v != null && v != "" }
+      log_time = string(kv.log_time) ?? ""
+      level = string(kv.level) ?? ""
+      logger = string(kv.logger) ?? ""
+      body = string(kv.body) ?? ""
+      # The message itself is kept as `message`, not as a residual copy of the line.
+      __source_kv = { "log_time": log_time, "level": level }
+      if logger != "" { __source_kv.logger = logger }
+  }
+
+  product = { "name": "Apache Kafka", "vendor_name": "Apache Software Foundation" }
+
+  if !parsed {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("kafka|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "server",
+              "log_provider": "Apache Kafka",
+              "product": product
+          },
+          "unmapped": { "parse_error": "not a Kafka log4j line" }
+      }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+  } else {
+      time_ms = 0
+      tp, tperr = parse_timestamp(replace(log_time, ",", "."), "%Y-%m-%d %H:%M:%S%.3f", timezone: "UTC")
+      if tperr == null { time_ms = to_unix_timestamp(tp, unit: "milliseconds") }
+
+      # ---- optional "[Component key=value, ...]" or "[Controller 0]:" context prefix ----
+      msg = body
+      context = ""
+      cm, cmerr = parse_regex(body, r'(?s)^\x5B(?P<context>[^\x5D]+)\x5D:?\s+(?P<msg>.*)$')
+      if cmerr == null {
+          context = string!(cm.context)
+          msg = string!(cm.msg)
+          __source_kv.context = context
+      }
+
+      lvl = upcase(level)
+      severity_id = 1
+      severity = "Informational"
+      if lvl == "WARN" { severity_id = 3; severity = "Medium" }
+      if lvl == "ERROR" { severity_id = 4; severity = "High" }
+      if lvl == "FATAL" { severity_id = 6; severity = "Fatal" }
+
+      class_uid = 0
+      activity_id = 99
+      activity_name = "Other"
+      status_id = 0
+      status_str = "Unknown"
+      status_detail = ""
+      log_name = "server"
+      ocsf = {}
+      profiles = []
+
+      az, azerr = parse_regex(msg, r'Principal = (?P<principal>\S+) is (?P<result>Allowed|Denied) [Oo]peration = (?P<operation>\S+) from host = (?P<host>\S+) on resource = (?P<resource>\S+) for request = (?P<request>\S+) with resourceRefCount = (?P<ref_count>\d+)(?: based on rule (?P<rule>.+))?')
+      af, aferr = parse_regex(msg, r'(?s)^Failed (?P<reauth>re-)?authentication with (?P<peer>\S+)(?: \x28channelId=(?P<channel_id>[^\x29]*)\x29)? \x28(?P<reason>.*)\x29$')
+      asu, asuerr = parse_regex(msg, r'^Successfully authenticated client: authenticationID=(?P<authentication_id>[^;]+); authorizationID=(?P<authorization_id>[^;.]+(?:\.[^;.]+)*)\.?$')
+
+      if azerr == null {
+          # ================= authorizer decision -> API Activity (6003) =================
+          log_name = "authorizer"
+          class_uid = 6003
+          principal = string!(az.principal)
+          op = string!(az.operation)
+          host = string!(az.host)
+          resource = string!(az.resource)
+          request = string!(az.request)
+          __source_kv = merge(__source_kv, { "principal": principal, "result": string!(az.result), "operation": op, "host": host, "resource": resource, "request": request, "ref_count": to_int(az.ref_count) ?? 0 })
+          rule = string(az.rule) ?? ""
+          if rule != "" { __source_kv.rule = rule }
+          opu = upcase(op)
+          if opu == "CREATE" || opu == "CREATE_TOKENS" { activity_id = 1; activity_name = "Create" }
+          if includes(["READ", "DESCRIBE", "DESCRIBE_CONFIGS", "DESCRIBE_TOKENS"], opu) { activity_id = 2; activity_name = "Read" }
+          if includes(["WRITE", "ALTER", "ALTER_CONFIGS", "IDEMPOTENT_WRITE", "CLUSTER_ACTION"], opu) { activity_id = 3; activity_name = "Update" }
+          if opu == "DELETE" { activity_id = 4; activity_name = "Delete" }
+          pp = split(principal, ":", limit: 2)
+          ptype = string(pp[0]) ?? ""
+          pname = string(pp[1]) ?? principal
+          actor_user = { "name": pname }
+          if ptype == "User" { actor_user.type_id = 1; actor_user.type = "User" }
+          ocsf.actor = { "user": actor_user }
+          rp = split(resource, ":", limit: 3)
+          res = { "type": string(rp[0]) ?? resource }
+          if length(rp) == 3 {
+              res.name = string(rp[2]) ?? ""
+              res.labels = ["pattern_type:" + (string(rp[1]) ?? "")]
+          } else if length(rp) == 2 {
+              res.name = string(rp[1]) ?? ""
+          }
+          ocsf.resources = [res]
+          ocsf.api = { "operation": op, "service": { "name": "Apache Kafka" }, "request": { "uid": request } }
+          if is_ipv4(host) || is_ipv6(host) { ocsf.src_endpoint = { "ip": host } } else { ocsf.src_endpoint = { "hostname": host } }
+          if string!(az.result) == "Denied" {
+              status_id = 2; status_str = "Failure"; status_detail = "Denied"
+              if severity_id < 3 { severity_id = 3; severity = "Medium" }
+              profiles = ["security_control"]
+              ocsf.action_id = 2; ocsf.action = "Denied"
+              ocsf.disposition_id = 2; ocsf.disposition = "Blocked"
+          } else {
+              status_id = 1; status_str = "Success"
+              profiles = ["security_control"]
+              ocsf.action_id = 1; ocsf.action = "Allowed"
+              ocsf.disposition_id = 1; ocsf.disposition = "Allowed"
+          }
+      } else if aferr == null || asuerr == null {
+          # ================= SASL / SSL authentication -> Authentication (3002) =================
+          class_uid = 3002
+          activity_id = 1
+          activity_name = "Logon"
+          user = { "name": "unknown" }
+          src = {}
+          if aferr == null {
+              status_id = 2; status_str = "Failure"
+              peer = string!(af.peer)
+              reason = string!(af.reason)
+              status_detail = reason
+              if severity_id < 2 { severity_id = 2; severity = "Low" }
+              __source_kv = merge(__source_kv, { "peer": peer, "reason": reason })
+              chan = string(af.channel_id) ?? ""
+              if chan != "" { __source_kv.channel_id = chan }
+              if exists(af.reauth) && af.reauth != null { __source_kv.reauth = "re-"; ocsf.is_new_logon = false }
+              # Peer is "/192.0.2.10" or "hostname/192.0.2.10".
+              pparts = split(peer, "/", limit: 2)
+              phost = string(pparts[0]) ?? ""
+              pip = string(pparts[1]) ?? ""
+              if is_ipv4(pip) || is_ipv6(pip) { src.ip = pip }
+              if phost != "" { src.hostname = phost }
+              mech = parse_regex(reason, r'SASL mechanism (?P<mech>[A-Z0-9_-]+)') ?? {}
+              mname = string(mech.mech) ?? ""
+              if mname != "" {
+                  ocsf.auth_protocol_id = 99; ocsf.auth_protocol = mname
+                  if mname == "GSSAPI" { ocsf.auth_protocol_id = 2; ocsf.auth_protocol = "Kerberos" }
+              } else if contains(reason, "SSL") {
+                  ocsf.auth_protocol_id = 99; ocsf.auth_protocol = "TLS"
+              }
+          } else {
+              status_id = 1; status_str = "Success"
+              aid = strip_whitespace(string!(asu.authentication_id))
+              zid = strip_whitespace(string!(asu.authorization_id))
+              __source_kv = merge(__source_kv, { "authentication_id": aid, "authorization_id": zid })
+              user = { "name": aid }
+              if zid != aid { ocsf.actor = { "user": { "name": zid } } }
+              # SaslServerCallbackHandler is the GSSAPI (Kerberos) callback handler.
+              if ends_with(logger, "SaslServerCallbackHandler") { ocsf.auth_protocol_id = 2; ocsf.auth_protocol = "Kerberos" }
+          }
+          ocsf.user = user
+          ocsf.service = { "name": "Apache Kafka" }
+          ocsf.is_remote = true
+          if length(src) > 0 { ocsf.src_endpoint = src }
+      } else {
+          is_server = ends_with(logger, "KafkaServer") || ends_with(logger, "KafkaRaftServer") || ends_with(logger, "BrokerServer") || ends_with(logger, "ControllerServer")
+          ml = downcase(msg)
+          if is_server && (ml == "started" || ml == "kafka server started" || contains(ml, "transition from starting to started")) {
+              class_uid = 6002; activity_id = 3; activity_name = "Start"; status_id = 1; status_str = "Success"
+              ocsf.app = product
+          } else if is_server && (ml == "shut down completed" || ml == "shutdown completed") {
+              class_uid = 6002; activity_id = 4; activity_name = "Stop"; status_id = 1; status_str = "Success"
+              ocsf.app = product
+          } else if lvl == "ERROR" || lvl == "FATAL" {
+              class_uid = 6008; activity_id = 1; activity_name = "General Error"; status_id = 2; status_str = "Failure"
+          }
+          if contains(logger, "controller") || starts_with(context, "Controller") { log_name = "controller" }
+          if logger == "state.change.logger" { log_name = "state-change" }
+      }
+
+      cls_name = "Base Event"
+      cat_uid = 0
+      cat_name = "Uncategorized"
+      if class_uid == 3002 { cls_name = "Authentication"; cat_uid = 3; cat_name = "Identity & Access Management" }
+      if class_uid == 6002 { cls_name = "Application Lifecycle"; cat_uid = 6; cat_name = "Application Activity" }
+      if class_uid == 6003 { cls_name = "API Activity"; cat_uid = 6; cat_name = "Application Activity" }
+      if class_uid == 6008 { cls_name = "Application Error"; cat_uid = 6; cat_name = "Application Activity" }
+
+      ocsf.class_uid = class_uid
+      ocsf.class_name = cls_name
+      ocsf.category_uid = cat_uid
+      ocsf.category_name = cat_name
+      ocsf.activity_id = activity_id
+      ocsf.activity_name = activity_name
+      ocsf.type_uid = class_uid * 100 + activity_id
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.status_id = status_id
+      ocsf.status = status_str
+      if status_detail != "" { ocsf.status_detail = status_detail }
+      if !exists(ocsf.message) { ocsf.message = msg }
+      ocsf.time = time_ms
+      ocsf.raw_data = raw_log
+      meta = {
+          "version": "1.9.0",
+          "uid": sha2("kafka|raw|" + raw_log, variant: "SHA-256"),
+          "log_name": log_name,
+          "log_provider": "Apache Kafka",
+          "log_level": level,
+          "product": product
+      }
+      if length(profiles) > 0 { meta.profiles = profiles }
+      if logger != "" { meta.loggers = [{ "name": logger }] }
+      ocsf.metadata = meta
+
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    authentication_id
+  | authorization_id
+  | host
+  | level
+  | logger
+  | operation
+  | reason
+  | request
+  | result
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  - raw: '[2024-05-02 10:11:12,345] INFO Principal = User:alice is Denied operation = READ from host = 192.0.2.10 on resource = Topic:LITERAL:orders for request = Fetch with resourceRefCount = 1 based on rule DefaultDeny (kafka.authorizer.logger)'
+    expect:
+      class_uid: 6003
+      activity_id: 2
+      status_id: 2
+      action_id: 2
+      "actor.user.name": "alice"
+      "src_endpoint.ip": "192.0.2.10"
+      "resources.0.name": "orders"
+      time: 1714644672345
+  - raw: '[2024-05-02 10:12:01,002] INFO [SocketServer listenerType=BROKER, nodeId=1] Failed authentication with /203.0.113.7 (channelId=192.0.2.5:9094-203.0.113.7:51234-12) (Authentication failed during authentication due to invalid credentials with SASL mechanism SCRAM-SHA-512) (org.apache.kafka.common.network.Selector)'
+    expect:
+      class_uid: 3002
+      status_id: 2
+      "src_endpoint.ip": "203.0.113.7"
+      auth_protocol: "SCRAM-SHA-512"
+  - raw: '2025-01-01 12:39:15,875 INFO org.apache.kafka.common.security.authenticator.SaslServerCallbackHandler: [data-plane-kafka-network-thread-543-ListenerName(SASL_SSL)-SASL_SSL-32]: Successfully authenticated client: authenticationID=svc@EXAMPLE.COM; authorizationID=svc@EXAMPLE.COM.'
+    expect:
+      class_uid: 3002
+      status_id: 1
+      "user.name": "svc@EXAMPLE.COM"
+  - raw: '[2017-08-04 10:48:21,048] INFO [controller-event-thread]: Starting (kafka.controller.ControllerEventManager$ControllerEventThread)'
+    expect:
+      class_uid: 0
+      "metadata.log_name": "controller"
+  - raw: '[2024-05-02 10:00:05,771] INFO [KafkaServer id=1] started (kafka.server.KafkaServer)'
+    expect:
+      class_uid: 6002
+      activity_id: 3
+  - raw: 'Exception in thread "main" java.lang.OutOfMemoryError: Java heap space'
+    expect:
+      class_uid: 0
+      "unmapped.parse_fallback": "unparsable input"
+  # NAN-3702: metadata.uid is sha256("kafka|raw|" + raw), so the same record
+  # parsed twice gets the same uid (a random uid could never match).
+  - raw: "NAN-3702 determinism probe: not a kafka record"
+    expect:
+      "metadata.uid": "50d3c2949d97dd3b875a66d1660361c57adba4ed640479d5b3b0e0c7b038dea4"

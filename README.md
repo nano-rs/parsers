@@ -55,6 +55,7 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Cisco Umbrella](parsers-ocsf/cisco_umbrella) | `cisco_umbrella` | Cisco | CSV | DNS and proxy logs with domain categorization and identity |
 | [Infoblox DHCP](parsers-ocsf/infoblox_dhcp) | `infoblox_dhcp` | Infoblox | Syslog | DISCOVER, OFFER, REQUEST, ACK, RELEASE, NAK, INFORM |
 | [Conduit MITM Proxy](parsers-ocsf/conduit_proxy) | `conduit_proxy` | Conduit | JSON | HTTP/HTTPS requests with TLS interception status, threat scoring, DLP |
+| [Envoy / Istio](parsers-ocsf/envoy) | `envoy` | Envoy Proxy | Text (Envoy / Istio default) / JSON | Access logs: HTTP requests with response flags and code details, Istio upstream cluster and direction, mTLS peer principals, TCP proxy connections and RBAC denials |
 
 ### Network Security Monitoring
 
@@ -123,6 +124,9 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Apache HTTP Server](parsers-ocsf/apache) | `apache_access` | Apache | Combined/common log | Client IP, method, status, bytes, user agent, referrer |
 | [Nginx](parsers-ocsf/nginx) | `nginx` | Nginx | Combined / JSON / error | Access and error logs with upstream and proxy support |
 | [Squid Proxy](parsers-ocsf/squid_proxy) | `squid_proxy` | Squid Project | Access log | Cache hit/miss, URL extraction, HTTP metadata |
+| [MongoDB](parsers-ocsf/mongodb) | `mongodb` | MongoDB | JSON (4.4+ structured log, auditLog) | Authentication success and failure, connections, slow queries, start and shutdown, audit authCheck denials, collection and user changes |
+| [Elasticsearch / OpenSearch](parsers-ocsf/elasticsearch) | `elasticsearch` | Elastic / OpenSearch | JSON (server, audit, slow log) | Security audit (authentication, access granted / denied, run-as, IP filter, user changes), OpenSearch audit categories, search and indexing slow logs, node start / stop and errors |
+| [Apache Kafka](parsers-ocsf/kafka) | `kafka` | Apache | log4j text | Authorizer denials (`Principal = User:x is Denied ...`), SASL / SSL authentication failures and successes, broker lifecycle and errors |
 | [nano Platform API](parsers-ocsf/nano-platform-api) | `nano-platform-api` | nano | JSON (pino) | nano platform API logs: level mapping, request/response context |
 | [nano Operational Logs](parsers-ocsf/nano_operational) | `nano_operational` | nano | JSON (tracing) | nano service operational + tracing logs (api, jobs, search) |
 

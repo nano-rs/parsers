@@ -1,0 +1,66 @@
+source: json
+transforms:
+- source: t.$date
+  kind: epoch_ms
+  target: time
+  reason: Structured log clock (ISO 8601 in an extended JSON $date) converted to event milliseconds.
+- source: ts.$date
+  kind: epoch_ms
+  target: time
+  reason: Audit log clock (ISO 8601 in an extended JSON $date) converted to event milliseconds.
+- source: s
+  kind: enum
+  target: metadata.log_level
+  values:
+    f: Fatal
+    e: Error
+    w: Warning
+    i: Info
+    d1: Debug
+    d2: Debug
+    d3: Debug
+    d4: Debug
+    d5: Debug
+  reason: MongoDB severity letter mapped to the log level name; consume only when the
+    emitted level matches.
+- source: result
+  kind: enum
+  target: status_detail
+  values:
+    '11': UserNotFound
+    '13': Unauthorized
+    '18': AuthenticationFailed
+  reason: Audit result error code mapped to the MongoDB error code name written as
+    status_detail.
+consumed_candidates:
+- atype
+- attr.appName
+- attr.authenticationDatabase
+- attr.client
+- attr.db
+- attr.durationMillis
+- attr.errMsg
+- attr.error
+- attr.mechanism
+- attr.principalName
+- attr.remote
+- attr.session_remote
+- attr.user
+- c
+- ctx
+- id
+- local.ip
+- local.port
+- local.unix
+- msg
+- param.command
+- param.db
+- param.mechanism
+- param.user
+- remote.ip
+- remote.port
+- remote.unix
+- ts.$date.$numberLong
+consumed_reason: Only source keys read by this parser are eligible for exact-value
+  consumption; the selected branch must emit the value. Unknown keys always spill,
+  even when their value equals an OCSF default.

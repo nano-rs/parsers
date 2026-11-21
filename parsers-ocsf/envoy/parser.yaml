@@ -1,0 +1,683 @@
+name: envoy_ocsf
+display_name: Envoy / Istio Access Logs (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Envoy proxy access logs, including Istio sidecar and gateway logs, into
+  complete OCSF 1.9.0 records. Accepts three shapes: Istio's default TEXT format
+  (with response code details, termination details, upstream cluster, upstream
+  and downstream addresses, SNI and route), Envoy's built-in default text format,
+  and the JSON access log (Istio `accessLogEncoding: JSON` keys, or an Envoy
+  `json_format` that uses the same key names).
+    HTTP entries                      -> HTTP Activity 4002 (activity from the method)
+    TCP proxy entries ("- - -", no
+    protocol)                          -> Network Activity 4001 (Traffic, Fail on a
+                                          response flag, Refuse on an RBAC denial)
+    anything else                     -> Base Event 0 with unmapped.parse_fallback
+  The client is src_endpoint (downstream remote address), the upstream host is
+  dst_endpoint, and the address Envoy accepted the connection on is proxy.
+  Istio mTLS peer principals (`downstream_peer_uri_san`, `upstream_peer_uri_san`,
+  or the `*_peer_principal` spelling) become src_endpoint.svc_name and
+  dst_endpoint.svc_name. The Istio upstream cluster
+  (`outbound|9080||reviews.default.svc.cluster.local`) sets the connection
+  direction and the destination service hostname. Response flags are status_code,
+  response code details are status_detail.
+match_values:
+  - envoy
+category: network
+vendor: "Envoy Proxy"
+product: "Envoy"
+parser_vrl: |
+  # Envoy / Istio access log -> OCSF 1.9.0 HTTP Activity (4002) / Network Activity (4001) / Base Event (0)
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+  e = {}
+  shape = ""
+
+  parsed, perr = parse_json(raw_log)
+  if perr == null && is_object(parsed) {
+      pj = object!(parsed)
+      __source_kv = pj
+      if exists(pj.start_time) && (exists(pj.response_code) || exists(pj.downstream_remote_address) || exists(pj.bytes_sent)) {
+          shape = "json"
+          e = pj
+      }
+  } else {
+      # Istio default TEXT format (meshConfig.accessLogFormat unset).
+      m, merr = parse_regex(raw_log, r'^\x5B(?P<start_time>[^\x5D]+)\x5D "(?P<method>\S+) (?P<path>\S+) (?P<protocol>\S+)" (?P<response_code>\d+) (?P<response_flags>\S+) (?P<response_code_details>\S+) (?P<connection_termination_details>\S+) "(?P<upstream_transport_failure_reason>[^"]*)" (?P<bytes_received>\d+) (?P<bytes_sent>\d+) (?P<duration>\S+) (?P<upstream_service_time>\S+) "(?P<x_forwarded_for>[^"]*)" "(?P<user_agent>[^"]*)" "(?P<request_id>[^"]*)" "(?P<authority>[^"]*)" "(?P<upstream_host>[^"]*)" (?P<upstream_cluster>\S+) (?P<upstream_local_address>\S+) (?P<downstream_local_address>\S+) (?P<downstream_remote_address>\S+) (?P<requested_server_name>\S+) (?P<route_name>\S+)\s*$')
+      if merr == null {
+          shape = "istio_text"
+      } else {
+          # Envoy's built-in default format.
+          m, merr = parse_regex(raw_log, r'^\x5B(?P<start_time>[^\x5D]+)\x5D "(?P<method>\S+) (?P<path>\S+) (?P<protocol>\S+)" (?P<response_code>\d+) (?P<response_flags>\S+) (?P<bytes_received>\d+) (?P<bytes_sent>\d+) (?P<duration>\S+) (?P<upstream_service_time>\S+) "(?P<x_forwarded_for>[^"]*)" "(?P<user_agent>[^"]*)" "(?P<request_id>[^"]*)" "(?P<authority>[^"]*)" "(?P<upstream_host>[^"]*)"\s*$')
+          if merr == null { shape = "envoy_text" }
+      }
+      if shape != "" {
+          # "-" is Envoy's placeholder for an absent operator value.
+          e = filter(object!(m)) -> |_k, v| { v != null && v != "" && v != "-" }
+          __source_kv = e
+      }
+  }
+
+  if shape == "" {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("envoy|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "access",
+              "log_provider": "Envoy",
+              "product": { "name": "Envoy", "vendor_name": "Envoy Proxy" }
+          },
+          "unmapped": { "parse_error": "not an Envoy access log line" }
+      }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+  } else {
+      # A JSON value can be null, a number or a "-" placeholder: normalize to text.
+      method = to_string(e.method) ?? ""
+      if method == "-" { method = "" }
+      path = to_string(e.path) ?? ""
+      if path == "-" { path = "" }
+      protocol = to_string(e.protocol) ?? ""
+      if protocol == "-" { protocol = "" }
+      code = to_int(e.response_code) ?? 0
+      flags = to_string(e.response_flags) ?? ""
+      if flags == "-" { flags = "" }
+      details = to_string(e.response_code_details) ?? ""
+      if details == "-" { details = "" }
+      term = to_string(e.connection_termination_details) ?? ""
+      if term == "-" { term = "" }
+      # -1 = absent: to_int(null) would read as 0, which is a real value.
+      bytes_rx = -1
+      if e.bytes_received != null { bytes_rx = to_int(e.bytes_received) ?? -1 }
+      bytes_tx = -1
+      if e.bytes_sent != null { bytes_tx = to_int(e.bytes_sent) ?? -1 }
+      duration_ms = -1
+      if e.duration != null { duration_ms = to_int(e.duration) ?? -1 }
+      ust = -1
+      if e.upstream_service_time != null { ust = to_int(e.upstream_service_time) ?? -1 }
+      xff = to_string(e.x_forwarded_for) ?? ""
+      if xff == "-" { xff = "" }
+      ua = to_string(e.user_agent) ?? ""
+      if ua == "-" { ua = "" }
+      req_id = to_string(e.request_id) ?? ""
+      if req_id == "-" { req_id = "" }
+      authority = to_string(e.authority) ?? ""
+      if authority == "-" { authority = "" }
+      cluster = to_string(e.upstream_cluster) ?? ""
+      if cluster == "-" { cluster = "" }
+      sni = to_string(e.requested_server_name) ?? ""
+      if sni == "-" { sni = "" }
+      down_peer = string(e.downstream_peer_uri_san) ?? string(e.downstream_peer_principal) ?? ""
+      if down_peer == "-" { down_peer = "" }
+      up_peer = string(e.upstream_peer_uri_san) ?? string(e.upstream_peer_principal) ?? ""
+      if up_peer == "-" { up_peer = "" }
+
+      # ---- addresses: ip:port, [v6]:port, or tcp://ip:port ----
+      addr_re = r'^(?:[a-z]+://)?(?:\x5B(?P<ip6>[0-9A-Fa-f:.]+)\x5D|(?P<ip4>[0-9]{1,3}(?:\.[0-9]{1,3}){3})):(?P<port>[0-9]+)$'
+      src_ep = {}
+      a = parse_regex(to_string(e.downstream_remote_address) ?? "", addr_re) ?? {}
+      aip = string(a.ip4) ?? string(a.ip6) ?? ""
+      if aip != "" { src_ep.ip = aip }
+      aport = to_int(a.port) ?? 0
+      if aport > 0 { src_ep.port = aport }
+      if down_peer != "" { src_ep.svc_name = down_peer }
+
+      dst_ep = {}
+      a = parse_regex(to_string(e.upstream_host) ?? "", addr_re) ?? {}
+      aip = string(a.ip4) ?? string(a.ip6) ?? ""
+      if aip != "" {
+          dst_ep.ip = aip
+          aport = to_int(a.port) ?? 0
+          if aport > 0 { dst_ep.port = aport }
+      }
+      proxy_ep = {}
+      a = parse_regex(to_string(e.downstream_local_address) ?? "", addr_re) ?? {}
+      aip = string(a.ip4) ?? string(a.ip6) ?? ""
+      if aip != "" {
+          proxy_ep.ip = aip
+          aport = to_int(a.port) ?? 0
+          if aport > 0 { proxy_ep.port = aport }
+      }
+      # No upstream host (no healthy upstream, no route): the listener address is
+      # what the client was trying to reach.
+      if !exists(dst_ep.ip) && exists(proxy_ep.ip) {
+          dst_ep = proxy_ep
+          proxy_ep = {}
+      }
+      # An inbound sidecar forwards to the address it accepted on: one endpoint, not a proxy hop.
+      if exists(proxy_ep.ip) && proxy_ep.ip == dst_ep.ip && proxy_ep.port == dst_ep.port { proxy_ep = {} }
+      if up_peer != "" { dst_ep.svc_name = up_peer }
+
+      # ---- Istio upstream cluster: direction|port|subset|service FQDN ----
+      direction_id = 0
+      direction = ""
+      if contains(cluster, "|") {
+          cp = split(cluster, "|")
+          cdir = string(cp[0]) ?? ""
+          if cdir == "inbound" { direction_id = 1; direction = "Inbound" }
+          if cdir == "outbound" { direction_id = 2; direction = "Outbound" }
+          csvc = string(cp[3]) ?? ""
+          if csvc != "" && !exists(dst_ep.hostname) { dst_ep.hostname = csvc }
+      }
+
+      time_ms = 0
+      ts, tserr = parse_timestamp(to_string(e.start_time) ?? "", "%+")
+      if tserr == null { time_ms = to_unix_timestamp(ts, unit: "milliseconds") }
+
+      is_rbac = contains(details, "rbac_access_denied") || contains(term, "rbac_access_denied")
+      is_tcp = protocol == "" && method == ""
+      is_istio = shape == "istio_text" || contains(cluster, "|") || starts_with(sni, "outbound_")
+
+      ocsf = {}
+      if is_tcp {
+          # ---------------- TCP proxy entry -> Network Activity (4001) ----------------
+          activity_id = 6
+          activity_name = "Traffic"
+          status_id = 1
+          status_str = "Success"
+          severity_id = 1
+          severity = "Informational"
+          if is_rbac {
+              activity_id = 5; activity_name = "Refuse"
+              status_id = 2; status_str = "Failure"
+              severity_id = 3; severity = "Medium"
+          } else if flags != "" {
+              activity_id = 4; activity_name = "Fail"
+              status_id = 2; status_str = "Failure"
+              severity_id = 2; severity = "Low"
+          }
+          ocsf = {
+              "class_uid": 4001,
+              "class_name": "Network Activity",
+              "category_uid": 4,
+              "category_name": "Network Activity",
+              "activity_id": activity_id,
+              "activity_name": activity_name,
+              "type_uid": 400100 + activity_id,
+              "status_id": status_id,
+              "status": status_str,
+              "severity_id": severity_id,
+              "severity": severity
+          }
+          if length(src_ep) == 0 && length(dst_ep) == 0 { dst_ep = { "name": "unknown" } }
+      } else {
+          # ---------------- HTTP entry -> HTTP Activity (4002) ----------------
+          activity_id = 99
+          activity_name = "Other"
+          if method == "CONNECT" { activity_id = 1; activity_name = "Connect" }
+          if method == "DELETE"  { activity_id = 2; activity_name = "Delete" }
+          if method == "GET"     { activity_id = 3; activity_name = "Get" }
+          if method == "HEAD"    { activity_id = 4; activity_name = "Head" }
+          if method == "OPTIONS" { activity_id = 5; activity_name = "Options" }
+          if method == "POST"    { activity_id = 6; activity_name = "Post" }
+          if method == "PUT"     { activity_id = 7; activity_name = "Put" }
+          if method == "TRACE"   { activity_id = 8; activity_name = "Trace" }
+          if method == "PATCH"   { activity_id = 9; activity_name = "Patch" }
+
+          status_id = 0
+          status_str = "Unknown"
+          if code >= 100 && code < 400 { status_id = 1; status_str = "Success" }
+          if code >= 400 || (code == 0 && flags != "") { status_id = 2; status_str = "Failure" }
+          severity_id = 1
+          severity = "Informational"
+          if code >= 400 && code < 500 { severity_id = 2; severity = "Low" }
+          if code >= 500 || (code == 0 && flags != "") { severity_id = 3; severity = "Medium" }
+          if is_rbac { severity_id = 3; severity = "Medium" }
+
+          url_obj = {}
+          up = split(path, "?", limit: 2)
+          url_obj.path = string(up[0]) ?? ""
+          if url_obj.path == "" { url_obj.path = "/" }
+          qs = string(up[1]) ?? ""
+          if qs != "" { url_obj.query_string = qs }
+          if authority != "" { url_obj.hostname = authority }
+          req = { "url": url_obj }
+          if method != "" { req.http_method = method }
+          if protocol != "" { req.version = protocol }
+          if ua != "" { req.user_agent = ua }
+          if req_id != "" { req.uid = req_id }
+          if xff != "" {
+              xffs = filter(map_values(split(xff, ",")) -> |x| { strip_whitespace(string!(x)) }) -> |_i, x| { is_ipv4(string!(x)) || is_ipv6(string!(x)) }
+              if length(xffs) > 0 { req.x_forwarded_for = xffs }
+          }
+          resp = { "code": code }
+          if ust >= 0 { resp.latency = ust }
+          if bytes_tx >= 0 { resp.length = bytes_tx }
+          ocsf = {
+              "class_uid": 4002,
+              "class_name": "HTTP Activity",
+              "category_uid": 4,
+              "category_name": "Network Activity",
+              "activity_id": activity_id,
+              "activity_name": activity_name,
+              "type_uid": 400200 + activity_id,
+              "status_id": status_id,
+              "status": status_str,
+              "severity_id": severity_id,
+              "severity": severity,
+              "http_request": req,
+              "http_response": resp,
+              "http_status": code
+          }
+          if protocol != "" { ocsf.app_protocol_name = protocol }
+      }
+
+      if length(src_ep) > 0 { ocsf.src_endpoint = src_ep }
+      if length(dst_ep) > 0 { ocsf.dst_endpoint = dst_ep }
+      if length(proxy_ep) > 0 { ocsf.proxy = proxy_ep }
+      conn = { "protocol_name": "tcp", "protocol_num": 6 }
+      if direction_id > 0 { conn.direction_id = direction_id; conn.direction = direction } else { conn.direction_id = 0; conn.direction = "Unknown" }
+      ocsf.connection_info = conn
+      # NAN-2995: bytes_in = destination -> source, bytes_out = source -> destination.
+      # bytes_sent goes back to the downstream client (src), so it is bytes_in.
+      traffic = {}
+      if bytes_tx >= 0 { traffic.bytes_in = bytes_tx }
+      if bytes_rx >= 0 { traffic.bytes_out = bytes_rx }
+      if length(traffic) > 0 { ocsf.traffic = traffic }
+      if duration_ms >= 0 { ocsf.duration = duration_ms }
+      if flags != "" { ocsf.status_code = flags }
+      if details != "" { ocsf.status_detail = details } else if term != "" { ocsf.status_detail = term }
+      ocsf.time = time_ms
+      ocsf.raw_data = raw_log
+
+      provider = "Envoy"
+      if is_istio { provider = "Istio" }
+      ocsf.metadata = {
+          "version": "1.9.0",
+          "uid": sha2("envoy|raw|" + raw_log, variant: "SHA-256"),
+          "log_name": "access",
+          "log_provider": provider,
+          "log_format": shape,
+          "product": { "name": "Envoy", "vendor_name": "Envoy Proxy" }
+      }
+      if req_id != "" { ocsf.metadata.correlation_uid = req_id }
+
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # start_time: Envoy START_TIME (RFC 3339) converted to event milliseconds.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        start_time
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    authority
+  | bytes_received
+  | bytes_sent
+  | connection_termination_details
+  | downstream_peer_principal
+  | downstream_peer_uri_san
+  | duration
+  | method
+  | path
+  | protocol
+  | request_id
+  | response_code
+  | response_code_details
+  | response_flags
+  | upstream_peer_principal
+  | upstream_peer_uri_san
+  | upstream_service_time
+  | user_agent
+  | x_forwarded_for
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  - raw: '[2022-07-20T09:52:24.955Z] "GET /details/0 HTTP/1.1" 200 - via_upstream - "-" 0 178 2 1 "-" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.5060.114 Safari/537.36" "00000000-0000-0000-0000-000000000001" "details:9080" "10.0.2.10:9080" inbound|9080|| 127.0.0.6:47889 10.0.2.10:9080 10.0.1.7:39696 outbound_.9080_._.details.default.svc.cluster.local default'
+    expect:
+      class_uid: 4002
+      activity_id: 3
+      status_id: 1
+      "src_endpoint.ip": "10.0.1.7"
+      "dst_endpoint.ip": "10.0.2.10"
+      "connection_info.direction_id": 1
+  - raw: '[2022-09-01T13:15:57.905Z] "GET /productpage HTTP/1.1" 503 UH no_healthy_upstream - "-" 0 19 0 - "192.0.2.60" "Mozilla/5.0" "00000000-0000-0000-0000-000000000002" "203.0.113.88" "-" outbound|9080||productpage.default.svc.cluster.local - 10.0.2.10:8080 192.0.2.60:21742 - -'
+    expect:
+      class_uid: 4002
+      status_id: 2
+      status_code: "UH"
+      severity_id: 3
+      "dst_endpoint.hostname": "productpage.default.svc.cluster.local"
+  - raw: '[2016-04-15T20:17:00.310Z] "POST /api/v1/locations HTTP/2" 204 - 154 0 226 100 "192.0.2.28" "nsq2http" "00000000-0000-0000-0000-000000000003" "locations" "tcp://10.0.2.1:80"'
+    expect:
+      class_uid: 4002
+      activity_id: 6
+      "dst_endpoint.ip": "10.0.2.1"
+      "traffic.bytes_out": 154
+  - raw: '[2024-03-11T08:01:12.442Z] "- - -" 0 - - - "-" 1024 2048 5121 - "-" "-" "-" "-" "10.0.3.21:3306" outbound|3306||mysql.db.svc.cluster.local 10.0.1.9:41234 10.96.0.15:3306 10.0.1.9:41230 - -'
+    expect:
+      class_uid: 4001
+      activity_id: 6
+      "traffic.bytes_in": 2048
+  - raw: '{"authority":"reviews:9080","bytes_received":0,"bytes_sent":358,"connection_termination_details":null,"downstream_local_address":"10.0.1.5:9080","downstream_remote_address":"[2001:db8::4e36]:5000","duration":15,"method":"GET","path":"/reviews/0","protocol":"HTTP/1.1","request_id":"00000000-0000-0000-0000-000000000004","requested_server_name":"outbound_.9080_._.reviews.default.svc.cluster.local","response_code":200,"response_code_details":"via_upstream","response_flags":"-","route_name":"default","start_time":"2022-09-08T12:51:05.656Z","upstream_cluster":"inbound|9080||","upstream_host":"10.0.1.5:9080","upstream_local_address":"127.0.0.6:37685","upstream_service_time":"14","upstream_transport_failure_reason":null,"user_agent":"curl/7.79.1","x_forwarded_for":null,"downstream_peer_uri_san":"spiffe://cluster.local/ns/default/sa/bookinfo-productpage"}'
+    expect:
+      class_uid: 4002
+      "src_endpoint.ip": "2001:db8::4e36"
+      "src_endpoint.svc_name": "spiffe://cluster.local/ns/default/sa/bookinfo-productpage"
+  - raw: 'envoy: this is not an access log line'
+    expect:
+      class_uid: 0
+      "unmapped.parse_fallback": "unparsable input"
+  # NAN-3702: metadata.uid is sha256("envoy|raw|" + raw), so the same record
+  # parsed twice gets the same uid (a random uid could never match).
+  - raw: "NAN-3702 determinism probe: not a envoy record"
+    expect:
+      "metadata.uid": "8752834700c929c5a46e6e79367002bda6ca2305f97fb2863384bdc889619899"
