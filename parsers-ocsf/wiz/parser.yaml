@@ -1,0 +1,1201 @@
+name: wiz_ocsf
+display_name: Wiz Issues, Detections and Findings (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Wiz records from the GraphQL API and from Wiz automation webhooks into
+  complete OCSF 1.9.0 findings with the security_control profile (plus cloud
+  when the cloud platform is known, and host when an actor principal is set).
+  The class follows the record type: a vulnerability finding (vulnerableAsset,
+  CVE name) is a "Vulnerability Finding" (2002) with the CVE, CVSS score, EPSS,
+  affected package and fixed version; a cloud configuration finding (rule +
+  result) is a "Compliance Finding" (2003) with the rule short id as control,
+  PASS / FAIL as compliance status and the framework names as standards; an
+  Issue (issuesV2 node or Issues webhook), a Detection (Detections webhook) or
+  a Threat (Wiz Defend threat with ruleMatch / triggeringEvents) is a
+  "Detection Finding" (2004) carrying the control or rule as the analytic,
+  MITRE tactics and techniques as attacks, the primary actor as actor.user (or
+  a network address as the evidence source IP) and the triggering events'
+  process tree and source IP as evidences. Severity (INFORMATIONAL / LOW /
+  MEDIUM / HIGH / CRITICAL) maps to severity_id 1-5; status OPEN is New,
+  IN_PROGRESS In Progress, REJECTED / IGNORED Suppressed and RESOLVED
+  Resolved (activity Close); a webhook trigger type of Updated is an Update.
+  The affected cloud resource (entitySnapshot, resource, primaryResource or
+  vulnerableAsset) becomes resources[] with its tags, and its subscription
+  becomes cloud.account. A Defend or webhook envelope carries one record;
+  API pages must be split one node per event upstream. Anything else falls
+  back to Base Event with the raw record kept.
+match_values:
+  - wiz
+category: cloud
+vendor: "Wiz"
+product: "Wiz"
+parser_vrl: |
+  # Wiz issues, detections, threats, vulnerability findings and cloud
+  # configuration findings -> OCSF 1.9.0 Detection (2004) / Vulnerability
+  # (2002) / Compliance (2003) Finding, or Base Event (0)
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
+
+  parsed, err = parse_json(raw_log)
+  __source_kv = object(parsed) ?? {}
+  e = object(parsed) ?? {}
+  trig = object(e.trigger) ?? {}
+  trig_source = upcase(to_string(trig.source) ?? "")
+
+  # ---- which Wiz record ----
+  shape = "unknown"
+  if is_object(e.vulnerableAsset) || (e.CVEDescription != null && e.name != null) {
+      shape = "vulnerability"
+  } else if is_object(e.rule) && e.result != null {
+      shape = "configuration"
+  } else if is_object(e.issue) && (is_object(e.control) || trig_source == "ISSUES") {
+      shape = "issue_webhook"
+  } else if trig_source == "DETECTIONS" || e.tdrId != null {
+      shape = "detection"
+  } else if is_object(e.entitySnapshot) && (is_array(e.sourceRules) || is_object(e.sourceRule)) {
+      shape = "issue"
+  } else if is_object(e.ruleMatch) || is_object(e.triggeringEvents) || is_object(e.primaryActor) {
+      shape = "threat"
+  }
+
+  rec_id = to_string(e.id) ?? ""
+  if shape == "issue_webhook" { rec_id = to_string(get(e, ["issue", "id"]) ?? "") ?? "" }
+
+  if err != null || !is_object(parsed) || shape == "unknown" || rec_id == "" {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": "Unrecognized Wiz record",
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("wiz|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "wiz",
+              "product": { "name": "Wiz", "vendor_name": "Wiz" }
+          }
+      }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+  } else {
+      class_uid = 2004
+      class_name = "Detection Finding"
+      if shape == "vulnerability" { class_uid = 2002; class_name = "Vulnerability Finding" }
+      if shape == "configuration" { class_uid = 2003; class_name = "Compliance Finding" }
+
+      uid = rec_id
+      title = ""
+      desc = ""
+      sev_raw = upcase(to_string(e.severity) ?? "")
+      status_raw = upcase(to_string(e.status) ?? "")
+      created_str = to_string(e.createdAt) ?? ""
+      updated_str = to_string(e.updatedAt) ?? ""
+      first_str = ""
+      last_str = ""
+      src_url = ""
+      types = []
+      analytic = {}
+      data_sources = []
+      rsrc = {}
+      acct_uid = ""
+      acct_name = ""
+      provider = ""
+      region = ""
+      actor_src = {}
+      tev = []
+      remediation_text = ""
+      log_name = "issues"
+      attacks = []
+      feature = ""
+
+      if shape == "issue" {
+          rules = array(e.sourceRules) ?? []
+          if is_object(e.sourceRule) { rules = [e.sourceRule] }
+          r0 = object(get(rules, [0]) ?? {}) ?? {}
+          title = to_string(r0.name) ?? ""
+          desc = to_string(r0.description) ?? ""
+          rid = to_string(r0.id) ?? ""
+          if rid != "" || title != "" {
+              analytic = { "uid": rid, "name": title, "type_id": 1, "type": "Rule" }
+              if rid == "" { del(analytic.uid) }
+              if title == "" { del(analytic.name) }
+              rcat = to_string(get(r0, ["__typename"]) ?? "") ?? ""
+              if rcat != "" { analytic.category = rcat }
+          }
+          rst = to_string(r0.sourceType) ?? ""
+          if rst != "" { data_sources = [rst] }
+          remediation_text = to_string(r0.resolutionRecommendation) ?? ""
+          itype = to_string(e.type) ?? ""
+          if itype != "" { types = [itype] }
+          for_each(array(r0.securitySubCategories) ?? []) -> |_i, sc| {
+              fw = to_string(get(sc, ["category", "framework", "name"]) ?? "") ?? ""
+              if contains(downcase(fw), "mitre") {
+                  tname = to_string(get(sc, ["category", "name"]) ?? "") ?? ""
+                  qname = to_string(get(sc, ["title"]) ?? "") ?? ""
+                  atk = {}
+                  if tname != "" { atk.tactic = { "name": tname } }
+                  if qname != "" { atk.technique = { "name": qname } }
+                  if length(atk) > 0 { attacks = push(attacks, atk) }
+              }
+          }
+          rsrc = object(e.entitySnapshot) ?? {}
+          provider = to_string(rsrc.cloudPlatform) ?? ""
+          acct_uid = to_string(rsrc.subscriptionExternalId) ?? ""
+          acct_name = to_string(rsrc.subscriptionName) ?? ""
+          region = to_string(rsrc.region) ?? ""
+          if status_raw == "RESOLVED" { last_str = to_string(e.resolvedAt) ?? "" }
+      } else if shape == "issue_webhook" {
+          iss = object(e.issue) ?? {}
+          ctl = object(e.control) ?? {}
+          title = to_string(ctl.name) ?? ""
+          desc = to_string(ctl.description) ?? ""
+          sev_raw = upcase(to_string(iss.severity) ?? "")
+          if sev_raw == "" { sev_raw = upcase(to_string(ctl.severity) ?? "") }
+          status_raw = upcase(to_string(iss.status) ?? "")
+          created_str = to_string(iss.created) ?? ""
+          src_url = to_string(iss.link) ?? ""
+          cid = to_string(ctl.id) ?? ""
+          if cid != "" || title != "" {
+              analytic = { "type_id": 1, "type": "Rule" }
+              if cid != "" { analytic.uid = cid }
+              if title != "" { analytic.name = title }
+          }
+          types = ["Issue"]
+          remediation_text = to_string(ctl.resolutionRecommendationPlainText) ?? ""
+          if remediation_text == "" { remediation_text = to_string(ctl.resolutionRecommendation) ?? "" }
+          rsrc = object(e.resource) ?? {}
+          provider = to_string(rsrc.cloudPlatform) ?? ""
+          acct_uid = to_string(rsrc.subscriptionId) ?? ""
+          acct_name = to_string(rsrc.subscriptionName) ?? ""
+          region = to_string(rsrc.region) ?? ""
+          feature = to_string(trig.ruleName) ?? ""
+          log_name = "issues webhook"
+      } else if shape == "detection" {
+          title = to_string(e.title) ?? ""
+          desc = to_string(e.description) ?? ""
+          src_url = to_string(e.threatURL) ?? ""
+          if src_url == "" { src_url = to_string(e.detectionUrl) ?? "" }
+          tdr = to_string(e.tdrId) ?? ""
+          analytic = { "type_id": 1, "type": "Rule" }
+          if tdr != "" { analytic.uid = tdr }
+          if title != "" { analytic.name = title }
+          tsrc = to_string(e.tdrSource) ?? ""
+          if tsrc != "" { data_sources = [tsrc] }
+          types = ["Detection"]
+          tf = object(e.timeframe) ?? {}
+          first_str = to_string(tf.start) ?? ""
+          last_str = to_string(tf.end) ?? ""
+          tactics = array(e.mitreTactics) ?? []
+          techniques = array(e.mitreTechniques) ?? []
+          tactic0 = to_string(get(tactics, [0]) ?? "") ?? ""
+          for_each(techniques) -> |_i, t| {
+              ts = to_string(t) ?? ""
+              if ts != "" {
+                  atk = {}
+                  if contains(ts, ".") {
+                      atk.sub_technique = { "uid": ts }
+                      atk.technique = { "uid": to_string(get(split(ts, "."), [0]) ?? ts) ?? ts }
+                  } else {
+                      atk.technique = { "uid": ts }
+                  }
+                  if length(tactics) == 1 && tactic0 != "" { atk.tactic = { "uid": tactic0 } }
+                  attacks = push(attacks, atk)
+              }
+          }
+          if length(techniques) == 0 || length(tactics) > 1 {
+              for_each(tactics) -> |_i, t| {
+                  ts = to_string(t) ?? ""
+                  if ts != "" { attacks = push(attacks, { "tactic": { "uid": ts } }) }
+              }
+          }
+          rsrc = object(e.primaryResource) ?? {}
+          ca = object(rsrc.cloudAccount) ?? {}
+          provider = to_string(ca.cloudPlatform) ?? ""
+          acct_uid = to_string(ca.externalId) ?? ""
+          acct_name = to_string(ca.name) ?? ""
+          region = to_string(rsrc.region) ?? ""
+          if provider == "" {
+              co = object(get(array(e.cloudOrganizations) ?? [], [0]) ?? {}) ?? {}
+              provider = to_string(co.cloudProvider) ?? ""
+          }
+          actor_src = object(e.primaryActor) ?? {}
+          if is_object(e.triggeringEvent) { tev = [e.triggeringEvent] }
+          if is_array(e.triggeringEvents) { tev = array(e.triggeringEvents) ?? [] }
+          feature = to_string(trig.ruleName) ?? ""
+          log_name = "detections webhook"
+      } else if shape == "threat" {
+          rule = object(get(e, ["ruleMatch", "rule"]) ?? {}) ?? {}
+          title = to_string(rule.name) ?? ""
+          desc = to_string(e.description) ?? ""
+          if title == "" { title = desc }
+          rid = to_string(rule.id) ?? ""
+          analytic = { "type_id": 1, "type": "Rule" }
+          if rid != "" { analytic.uid = rid }
+          if title != "" { analytic.name = title }
+          for_each(array(e.origins) ?? []) -> |_i, o| {
+              os = to_string(o) ?? ""
+              if os != "" { data_sources = push(data_sources, os) }
+          }
+          ttype = to_string(e.type) ?? ""
+          if ttype != "" { types = [ttype] }
+          rsrc = object(e.primaryResource) ?? {}
+          ca = object(get(array(e.cloudAccounts) ?? [], [0]) ?? {}) ?? {}
+          provider = to_string(ca.cloudProvider) ?? ""
+          acct_uid = to_string(ca.externalId) ?? ""
+          acct_name = to_string(ca.name) ?? ""
+          region = to_string(rsrc.region) ?? ""
+          actor_src = object(e.primaryActor) ?? {}
+          tev = array(get(e, ["triggeringEvents", "nodes"]) ?? []) ?? []
+          log_name = "threats"
+      } else if shape == "vulnerability" {
+          title = to_string(e.name) ?? ""
+          desc = to_string(e.description) ?? ""
+          sev_raw = upcase(to_string(e.vendorSeverity) ?? "")
+          if sev_raw == "" { sev_raw = upcase(to_string(e.CVSSSeverity) ?? "") }
+          first_str = to_string(e.firstDetectedAt) ?? ""
+          last_str = to_string(e.lastDetectedAt) ?? ""
+          src_url = to_string(e.portalUrl) ?? ""
+          ds = to_string(e.dataSourceName) ?? ""
+          if ds != "" { data_sources = [ds] }
+          types = ["Vulnerability"]
+          remediation_text = to_string(e.remediation) ?? ""
+          rsrc = object(e.vulnerableAsset) ?? {}
+          provider = to_string(rsrc.cloudPlatform) ?? ""
+          acct_uid = to_string(rsrc.subscriptionExternalId) ?? ""
+          acct_name = to_string(rsrc.subscriptionName) ?? ""
+          region = to_string(rsrc.region) ?? ""
+          log_name = "vulnerability findings"
+      } else {
+          rule = object(e.rule) ?? {}
+          title = to_string(rule.name) ?? ""
+          desc = to_string(rule.description) ?? ""
+          rid = to_string(rule.id) ?? ""
+          analytic = { "type_id": 1, "type": "Rule" }
+          if rid != "" { analytic.uid = rid }
+          if title != "" { analytic.name = title }
+          first_str = to_string(e.firstSeenAt) ?? ""
+          created_str = to_string(e.analyzedAt) ?? ""
+          types = ["Cloud Configuration"]
+          remediation_text = to_string(e.remediation) ?? ""
+          if remediation_text == "" { remediation_text = to_string(rule.remediationInstructions) ?? "" }
+          rsrc = object(e.resource) ?? {}
+          sub = object(rsrc.subscription) ?? {}
+          provider = to_string(sub.cloudProvider) ?? ""
+          acct_uid = to_string(sub.externalId) ?? ""
+          acct_name = to_string(sub.name) ?? ""
+          region = to_string(rsrc.region) ?? ""
+          log_name = "cloud configuration findings"
+      }
+
+      # ---- times ----
+      created_ms = 0
+      if created_str != "" {
+          t, terr = parse_timestamp(created_str, "%+")
+          if terr == null { created_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+      updated_ms = 0
+      if updated_str != "" {
+          t, terr = parse_timestamp(updated_str, "%+")
+          if terr == null { updated_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+      first_ms = 0
+      if first_str != "" {
+          t, terr = parse_timestamp(first_str, "%+")
+          if terr == null { first_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+      last_ms = 0
+      if last_str != "" {
+          t, terr = parse_timestamp(last_str, "%+")
+          if terr == null { last_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+      time_ms = updated_ms
+      if last_ms > time_ms { time_ms = last_ms }
+      if time_ms == 0 { time_ms = created_ms }
+      if time_ms == 0 { time_ms = first_ms }
+
+      # ---- severity ----
+      severity_id = 0
+      severity = "Unknown"
+      if sev_raw == "INFORMATIONAL" || sev_raw == "INFO" || sev_raw == "NONE" { severity_id = 1; severity = "Informational" }
+      if sev_raw == "LOW" { severity_id = 2; severity = "Low" }
+      if sev_raw == "MEDIUM" { severity_id = 3; severity = "Medium" }
+      if sev_raw == "HIGH" { severity_id = 4; severity = "High" }
+      if sev_raw == "CRITICAL" { severity_id = 5; severity = "Critical" }
+
+      # ---- lifecycle ----
+      status_id = 0
+      status_str = "Unknown"
+      if status_raw == "OPEN" { status_id = 1; status_str = "New" }
+      if status_raw == "IN_PROGRESS" { status_id = 2; status_str = "In Progress" }
+      if status_raw == "REJECTED" || status_raw == "IGNORED" { status_id = 3; status_str = "Suppressed" }
+      if status_raw == "RESOLVED" || status_raw == "FIXED" { status_id = 4; status_str = "Resolved" }
+      activity_id = 1
+      activity_name = "Create"
+      ttype = upcase(to_string(trig.type) ?? "")
+      if ttype == "UPDATED" || ttype == "REOPENED" || (ttype == "" && updated_ms > created_ms && created_ms > 0) || status_id == 2 { activity_id = 2; activity_name = "Update" }
+      if status_id == 4 || status_id == 3 || ttype == "RESOLVED" { activity_id = 3; activity_name = "Close" }
+
+      if title == "" { title = uid }
+      finding_info = { "uid": uid, "title": title }
+      if desc != "" { finding_info.desc = desc }
+      if length(types) > 0 { finding_info.types = types }
+      if created_ms > 0 { finding_info.created_time = created_ms }
+      if updated_ms > 0 { finding_info.modified_time = updated_ms }
+      if first_ms > 0 { finding_info.first_seen_time = first_ms }
+      if last_ms > 0 { finding_info.last_seen_time = last_ms }
+      if src_url != "" { finding_info.src_url = src_url }
+      if length(analytic) > 0 { finding_info.analytic = analytic }
+      if length(data_sources) > 0 { finding_info.data_sources = data_sources }
+      if length(attacks) > 0 { finding_info.attacks = attacks }
+      tid = to_string(e.threatId) ?? ""
+      if tid != "" { finding_info.uid_alt = tid }
+
+      # ---- the affected cloud resource ----
+      res = {}
+      rid2 = to_string(rsrc.id) ?? ""
+      if rid2 != "" { res.uid = rid2 }
+      rname = to_string(rsrc.name) ?? ""
+      if rname != "" { res.name = rname }
+      rtype = to_string(rsrc.type) ?? ""
+      if rtype != "" { res.type = rtype }
+      ralt = to_string(rsrc.providerUniqueId) ?? ""
+      if ralt == "" { ralt = to_string(rsrc.providerId) ?? "" }
+      if ralt == "" { ralt = to_string(rsrc.externalId) ?? "" }
+      if ralt != "" { res.uid_alt = ralt }
+      if region != "" { res.region = region }
+      if provider != "" { res.provider = provider }
+      rns = to_string(rsrc.kubernetesNamespaceName) ?? ""
+      if rns != "" { res.namespace = rns }
+      rtags = []
+      if is_object(rsrc.tags) {
+          for_each(object(rsrc.tags) ?? {}) -> |k, v| { rtags = push(rtags, { "name": k, "value": to_string(v) ?? "" }) }
+      } else {
+          for_each(array(rsrc.tags) ?? []) -> |_i, tg| {
+              tk = to_string(get(tg, ["key"]) ?? "") ?? ""
+              if tk != "" { rtags = push(rtags, { "name": tk, "value": to_string(get(tg, ["value"]) ?? "") ?? "" }) }
+          }
+      }
+      if length(rtags) > 0 { res.tags = rtags }
+      rips = array(rsrc.ipAddresses) ?? []
+      rip = to_string(get(rips, [0]) ?? "") ?? ""
+      if match(rip, ip_re) { res.ip = rip }
+      if length(res) > 0 && !exists(res.uid) && !exists(res.name) { res.uid = ralt }
+
+      cloud = {}
+      if provider != "" {
+          cloud.provider = provider
+          if acct_uid != "" { cloud.account = { "uid": acct_uid } }
+          if acct_name != "" {
+              if acct_uid != "" { cloud.account.name = acct_name } else { cloud.account = { "name": acct_name } }
+          }
+          if region != "" { cloud.region = region }
+      }
+
+      # ---- the actor: a principal, or a network address ----
+      actor = {}
+      actor_ip = ""
+      atype = upcase(to_string(actor_src.type) ?? "")
+      aname = to_string(actor_src.name) ?? ""
+      if atype == "NETWORK_ADDRESS" {
+          actor_ip = aname
+      } else if aname != "" && atype != "UNKNOWN" {
+          au = { "name": aname }
+          aid = to_string(actor_src.id) ?? ""
+          if aid != "" { au.uid = aid }
+          amail = to_string(actor_src.email) ?? ""
+          if amail != "" { au.email_addr = amail }
+          if atype != "" { au.type = to_string(actor_src.nativeType) ?? atype }
+          if atype == "USER_ACCOUNT" { au.type_id = 1 } else if atype == "SERVICE_ACCOUNT" { au.type_id = 3 } else { au.type_id = 99 }
+          if au.type_id != 99 { del(au.type) }
+          if au.type_id == 99 && !exists(au.type) { au.type = atype }
+          actor.user = au
+      }
+
+      # ---- triggering events: source IP, process ----
+      evidences = []
+      for_each(tev) -> |_i, ev| {
+          evo = {}
+          eip = to_string(get(ev, ["actorIP"]) ?? "") ?? ""
+          if eip == "" { eip = actor_ip }
+          if match(eip, ip_re) {
+              sep = { "ip": eip }
+              meta = object(get(ev, ["actorIPMeta"]) ?? {}) ?? {}
+              ccountry = to_string(meta.country) ?? ""
+              if ccountry != "" { sep.location = { "country": ccountry } }
+              asn = to_int(meta.autonomousSystemNumber) ?? 0
+              if asn > 0 {
+                  sep.autonomous_system = { "number": asn }
+                  asorg = to_string(meta.autonomousSystemOrganization) ?? ""
+                  if asorg != "" { sep.autonomous_system.name = asorg }
+              }
+              evo.src_endpoint = sep
+          }
+          pt = object(get(array(get(ev, ["runtimeDetails", "processTree"]) ?? []) ?? [], [0]) ?? {}) ?? {}
+          pcmd = to_string(pt.command) ?? ""
+          ppath = to_string(pt.path) ?? ""
+          if pcmd == "" { pcmd = to_string(get(ev, ["commandLine"]) ?? "") ?? "" }
+          if ppath == "" { ppath = to_string(get(ev, ["runtimeProgram", "name"]) ?? "") ?? "" }
+          if pcmd != "" || ppath != "" {
+              # A Wiz sensor process carries no pid in these records; pid 0 marks it unknown.
+              proc = { "pid": to_int(pt.id) ?? 0 }
+              if pcmd != "" { proc.cmd_line = pcmd }
+              if ppath != "" {
+                  pparts = split(ppath, "/")
+                  pbase = to_string(get(pparts, [length(pparts) - 1]) ?? "") ?? ""
+                  if pbase == "" { pbase = ppath }
+                  proc.name = pbase
+                  proc.file = { "path": ppath, "name": pbase, "type_id": 1, "type": "Regular File" }
+                  phash = to_string(pt.hash) ?? ""
+                  if length(phash) == 40 { proc.file.hashes = [{ "algorithm_id": 2, "algorithm": "SHA-1", "value": downcase(phash) }] }
+              }
+              puser = to_string(pt.username) ?? ""
+              if puser != "" {
+                  proc.user = { "name": puser }
+                  puid = to_string(pt.userId) ?? ""
+                  if puid != "" { proc.user.uid = puid }
+              }
+              parent = to_string(get(ev, ["parentRuntimeProgram", "name"]) ?? "") ?? ""
+              if parent != "" { proc.parent_process = { "pid": 0, "file": { "path": parent, "name": to_string(get(split(parent, "/"), [-1]) ?? parent) ?? parent, "type_id": 1, "type": "Regular File" } } }
+              evo.process = proc
+          }
+          if length(evo) > 0 {
+              evname = to_string(get(ev, ["name"]) ?? "") ?? ""
+              if evname != "" { evo.name = evname }
+              evuid = to_string(get(ev, ["id"]) ?? "") ?? ""
+              if evuid != "" { evo.uid = evuid }
+              evidences = push(evidences, evo)
+          }
+      }
+      if length(evidences) == 0 && match(actor_ip, ip_re) { evidences = [{ "src_endpoint": { "ip": actor_ip } }] }
+
+      profiles = ["security_control"]
+      if length(cloud) > 0 { profiles = ["cloud", "security_control"] }
+      product = { "name": "Wiz", "vendor_name": "Wiz" }
+      if feature != "" { product.feature = { "name": feature } }
+      record_uid = uid
+      if updated_str != "" { record_uid = uid + "|" + updated_str } else if last_str != "" { record_uid = uid + "|" + last_str }
+
+      ocsf = {
+          "class_uid": class_uid,
+          "class_name": class_name,
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": title,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": profiles,
+              "uid": record_uid,
+              "original_event_uid": uid,
+              "log_name": log_name,
+              "log_provider": "Wiz",
+              "product": product
+          },
+          "finding_info": finding_info
+      }
+      if length(cloud) > 0 { ocsf.cloud = cloud }
+      if length(res) > 0 { ocsf.resources = [res] }
+      if length(actor) > 0 && class_uid == 2004 {
+          # actor is bound to the host profile on the finding classes.
+          ocsf.actor = actor
+          ocsf.metadata.profiles = push(profiles, "host")
+      }
+      if length(evidences) > 0 && class_uid != 2002 { ocsf.evidences = evidences }
+      if remediation_text != "" && class_uid != 2002 { ocsf.remediation = { "desc": remediation_text } }
+      if status_raw != "" && status_id == 0 { ocsf.status_detail = status_raw }
+
+      if class_uid == 2002 {
+          vuln = { "title": title, "vendor_name": "Wiz" }
+          vsev = to_string(e.vendorSeverity) ?? ""
+          if vsev != "" { vuln.severity = vsev }
+          if desc != "" { vuln.desc = desc }
+          if first_ms > 0 { vuln.first_seen_time = first_ms }
+          if last_ms > 0 { vuln.last_seen_time = last_ms }
+          if is_boolean(e.hasExploit) { vuln.is_exploit_available = e.hasExploit }
+          link = to_string(e.link) ?? ""
+          if link != "" { vuln.references = [link] }
+          if remediation_text != "" { vuln.remediation = { "desc": remediation_text } }
+          fixed = to_string(e.fixedVersion) ?? ""
+          vuln.is_fix_available = fixed != ""
+          pkg_name = to_string(e.detailedName) ?? ""
+          pkg_ver = to_string(e.version) ?? ""
+          if pkg_name != "" && pkg_ver != "" {
+              pkg = { "name": pkg_name, "version": pkg_ver }
+              if fixed != "" { pkg.fixed_in_version = fixed }
+              lpath = to_string(e.locationPath) ?? ""
+              if lpath != "" { pkg.path = lpath }
+              vuln.affected_packages = [pkg]
+          }
+          if match(title, r'^(?i)CVE-\d{4}-\d+$') {
+              cve = { "uid": upcase(title) }
+              cdesc = to_string(e.CVEDescription) ?? ""
+              if cdesc != "" { cve.desc = cdesc }
+              score = to_float(e.score) ?? -1.0
+              if e.score != null && score >= 0.0 {
+                  cve.cvss = [{ "base_score": score, "version": "3", "depth": "Base", "vendor_name": "Wiz" }]
+                  csev = to_string(e.CVSSSeverity) ?? ""
+                  if csev != "" { cve.cvss[0].severity = csev }
+              }
+              ep = to_float(e.epssProbability) ?? -1.0
+              if e.epssProbability != null && ep >= 0.0 {
+                  cve.epss = { "score": to_string(ep) }
+                  epp = to_float(e.epssPercentile) ?? -1.0
+                  if e.epssPercentile != null && epp >= 0.0 { cve.epss.percentile = epp }
+              }
+              vuln.cve = cve
+          } else {
+              vuln.advisory = { "uid": title, "title": title }
+          }
+          ocsf.vulnerabilities = [vuln]
+          if length(res) > 0 { ocsf.resource = res }
+          if upcase(rtype) == "VIRTUAL_MACHINE" && length(res) > 0 {
+              dev = { "type_id": 6, "type": "Virtual" }
+              if rname != "" { dev.name = rname }
+              if rid2 != "" { dev.uid = rid2 }
+              if exists(res.ip) { dev.ip = res.ip }
+              osn = to_string(rsrc.operatingSystem) ?? ""
+              if osn != "" {
+                  lo = downcase(osn)
+                  os_tid = 0
+                  os_t = "Unknown"
+                  if contains(lo, "windows") { os_tid = 100; os_t = "Windows" } else if contains(lo, "linux") { os_tid = 200; os_t = "Linux" }
+                  dev.os = { "name": osn, "type_id": os_tid, "type": os_t }
+              }
+              ocsf.device = dev
+          }
+          ocsf.is_alert = severity_id >= 4 && status_id == 1
+      } else if class_uid == 2003 {
+          result = upcase(to_string(e.result) ?? "")
+          comp = { "status": result, "status_id": 99 }
+          if result == "PASS" { comp.status_id = 1 }
+          if result == "FAIL" { comp.status_id = 3 }
+          rshort = to_string(get(e, ["rule", "shortId"]) ?? "") ?? ""
+          if rshort != "" { comp.control = rshort }
+          stds = []
+          reqs = []
+          for_each(array(e.securitySubCategories) ?? []) -> |_i, sc| {
+              fw = to_string(get(sc, ["category", "framework", "name"]) ?? "") ?? ""
+              if fw != "" && !includes(stds, fw) { stds = push(stds, fw) }
+              st = to_string(get(sc, ["title"]) ?? "") ?? ""
+              if st != "" { reqs = push(reqs, st) }
+          }
+          if length(stds) > 0 { comp.standards = stds }
+          if length(reqs) > 0 { comp.requirements = reqs }
+          ocsf.compliance = comp
+          if length(res) > 0 { ocsf.resource = res }
+          ocsf.is_alert = result == "FAIL" && status_id != 4
+      } else {
+          ocsf.is_alert = status_id != 4 && status_id != 3
+      }
+
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # createdAt: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # analyzedAt: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # issue.created: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # updatedAt: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # firstDetectedAt: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # firstSeenAt: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # timeframe.start: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # lastDetectedAt: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # timeframe.end: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # resolvedAt: A resolved issue's resolution time is its last-seen time; consume only when emitted.
+  # severity: The Wiz severity normalized to the OCSF severity; consume only when the expected ID is emitted.
+  # issue.severity: The webhook issue severity normalized to the OCSF severity; consume only when the expected ID is emitted.
+  # control.severity: The control severity, used when the issue carries none; consume only when the expected ID is emitted.
+  # status: The Wiz status normalized to the OCSF finding status; consume only when the expected ID is emitted.
+  # issue.status: The webhook issue status normalized to the OCSF finding status; consume only when the expected ID is emitted.
+  # trigger.type: The webhook trigger type drives the OCSF activity; consume only when that activity is emitted.
+  # result: The configuration check result normalized to the OCSF compliance status; consume only when the expected ID is emitted.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        createdAt
+      | analyzedAt
+      | issue\.created
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."finding_info"."created_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        updatedAt
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."finding_info"."modified_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        firstDetectedAt
+      | firstSeenAt
+      | timeframe\.start
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."finding_info"."first_seen_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        lastDetectedAt
+      | timeframe\.end
+      | resolvedAt
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."finding_info"."last_seen_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        severity
+      | issue\.severity
+      | control\.severity
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"informational": 1, "info": 1, "none": 1, "low": 2, "medium": 3, "high": 4, "critical": 5}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."severity_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        status
+      | issue\.status
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"open": 1, "in_progress": 2, "rejected": 3, "ignored": 3, "resolved": 4, "fixed": 4}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."status_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        trigger\.type
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"created": 1, "updated": 2, "reopened": 2, "resolved": 3}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."activity_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        result
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"pass": 1, "fail": 3}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."compliance"."status_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    CVEDescription
+  | CVSSSeverity
+  | control\.description
+  | control\.id
+  | control\.name
+  | control\.resolutionRecommendation
+  | control\.resolutionRecommendationPlainText
+  | cloudAccounts
+  | dataSourceName
+  | description
+  | detailedName
+  | detectionUrl
+  | entitySnapshot\.cloudPlatform
+  | entitySnapshot\.id
+  | entitySnapshot\.kubernetesNamespaceName
+  | entitySnapshot\.name
+  | entitySnapshot\.providerId
+  | entitySnapshot\.region
+  | entitySnapshot\.subscriptionExternalId
+  | entitySnapshot\.subscriptionName
+  | entitySnapshot\.externalId
+  | entitySnapshot\.type
+  | epssPercentile
+  | epssProbability
+  | fixedVersion
+  | hasExploit
+  | id
+  | issue\.id
+  | issue\.link
+  | link
+  | locationPath
+  | mitreTactics
+  | mitreTechniques
+  | name
+  | origins
+  | portalUrl
+  | primaryActor\.email
+  | primaryActor\.id
+  | primaryActor\.name
+  | primaryActor\.externalId
+  | primaryActor\.nativeType
+  | primaryActor\.type
+  | primaryResource\.cloudAccount\.cloudPlatform
+  | primaryResource\.cloudAccount\.externalId
+  | primaryResource\.cloudAccount\.name
+  | primaryResource\.externalId
+  | primaryResource\.id
+  | primaryResource\.kubernetesNamespaceName
+  | primaryResource\.name
+  | primaryResource\.providerUniqueId
+  | primaryResource\.region
+  | primaryResource\.type
+  | remediation
+  | resource\.cloudPlatform
+  | resource\.externalId
+  | resource\.id
+  | resource\.name
+  | resource\.providerId
+  | resource\.region
+  | resource\.subscription\.cloudProvider
+  | resource\.subscription\.externalId
+  | resource\.subscription\.name
+  | resource\.subscriptionId
+  | resource\.subscriptionName
+  | resource\.tags
+  | resource\.type
+  | result
+  | rule\.description
+  | rule\.id
+  | rule\.name
+  | rule\.remediationInstructions
+  | rule\.shortId
+  | ruleMatch\.rule\.id
+  | ruleMatch\.rule\.name
+  | score
+  | tdrId
+  | tdrSource
+  | threatId
+  | threatURL
+  | title
+  | trigger\.ruleName
+  | triggeringEvent\.actorIP
+  | triggeringEvent\.actorIPMeta\.autonomousSystemNumber
+  | triggeringEvent\.actorIPMeta\.autonomousSystemOrganization
+  | triggeringEvent\.actorIPMeta\.country
+  | triggeringEvent\.id
+  | triggeringEvent\.name
+  | type
+  | vendorSeverity
+  | version
+  | vulnerableAsset\.cloudPlatform
+  | vulnerableAsset\.id
+  | vulnerableAsset\.ipAddresses
+  | vulnerableAsset\.name
+  | vulnerableAsset\.operatingSystem
+  | vulnerableAsset\.providerUniqueId
+  | vulnerableAsset\.region
+  | vulnerableAsset\.subscriptionExternalId
+  | vulnerableAsset\.subscriptionName
+  | vulnerableAsset\.type
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+# Sample provenance (sidecar samples/ directory). Account and subscription
+# ids, IPs, emails and ticket hosts are replaced with documentation values;
+# long descriptions are shortened.
+#   wiz_issue_threat_detection.json, wiz_issue_control_resolved.json (status
+#   set to RESOLVED): Elastic integrations Wiz issue fixture
+#     https://github.com/elastic/integrations/blob/main/packages/wiz/data_stream/issue/_dev/test/pipeline/test-issue.log
+#   wiz_vuln_vm_open.json, wiz_vuln_container_image_resolved.json (status set
+#   to RESOLVED): Elastic integrations Wiz vulnerability fixture
+#     https://github.com/elastic/integrations/blob/main/packages/wiz/data_stream/vulnerability/_dev/test/pipeline/test-vulnerability.log
+#   wiz_ccf_fail_pod.json, wiz_ccf_pass_root_user.json: Elastic integrations
+#     Wiz cloud configuration finding fixture
+#     https://github.com/elastic/integrations/blob/main/packages/wiz/data_stream/cloud_configuration_finding/_dev/test/pipeline/test-cloud-configuration-finding.log
+#   wiz_detection_webhook_timestomp.json: Elastic integrations Wiz Defend
+#     Detections webhook fixture (the webhook body)
+#     https://github.com/elastic/integrations/blob/main/packages/wiz/data_stream/defend/_dev/test/pipeline/test-defend.json
+#   wiz_threat_guardduty_bruteforce.json, wiz_threat_sensor_sshd.json: Elastic
+#     integrations Wiz Defend v2 threat fixture
+#     https://github.com/elastic/integrations/blob/main/packages/wiz/data_stream/defend_v2/_dev/test/pipeline/test-defend-v2.log
+#   wiz_issues_webhook_created.json: an Issues automation webhook body built
+#     from the documented Wiz.IssuesWebhook field set (trigger, issue,
+#     resource, control)
+#     https://docs.panther.com/data-onboarding/supported-logs/wiz/wiz-webhook
+#   junk.json: a JSON record that is not a Wiz record, Base Event fallback
+samples:
+  - raw: '{"id":"5e95ff50-5490-514e-87f7-11e56f3230ff","name":"CVE-2020-35523","CVEDescription":"An integer overflow flaw was found in libtiff.","CVSSSeverity":"HIGH","score":7.8,"hasExploit":false,"status":"OPEN","vendorSeverity":"HIGH","firstDetectedAt":"2022-05-01T11:36:10.063767Z","lastDetectedAt":"2023-08-16T18:40:57Z","remediation":"yum update libtiff","detailedName":"libtiff","version":"4.0.3-35.amzn2","fixedVersion":"4.0.3-35.amzn2.0.1","epssProbability":0.1,"epssPercentile":46.2,"vulnerableAsset":{"id":"c828de0d-4c42-5b1c-946b-2edee094d0b3","type":"VIRTUAL_MACHINE","name":"test-4","region":"us-east-1","providerUniqueId":"arn:aws:ec2:us-east-1:123456789012:instance/i-0a0f7e1451da5f4a3","cloudPlatform":"AWS","subscriptionName":"wiz-integrations","subscriptionExternalId":"123456789012","operatingSystem":"Linux","ipAddresses":["203.0.113.12"]}}'
+    expect:
+      class_uid: 2002
+      activity_id: 1
+      severity_id: 4
+      status_id: 1
+      vulnerabilities.0.cve.uid: CVE-2020-35523
+      vulnerabilities.0.cve.cvss.0.base_score: "7.8"
+      vulnerabilities.0.affected_packages.0.fixed_in_version: 4.0.3-35.amzn2.0.1
+      vulnerabilities.0.is_fix_available: true
+      cloud.account.uid: "123456789012"
+      resource.ip: 203.0.113.12
+      device.type_id: 6
+      is_alert: true
+  - raw: '{"id":"1243196d-a365-589a-a8aa-13817c9877b2","analyzedAt":"2024-08-07T12:55:52.012378Z","updatedAt":"2024-08-07T12:55:52.012378Z","severity":"HIGH","result":"FAIL","status":"OPEN","resource":{"id":"f0f4163d-cbd7-517c-ba9e-f96bb90ab5ea","name":"Root user","nativeType":"rootUser","providerId":"arn:aws:iam::123456789012:root","type":"USER_ACCOUNT","subscription":{"cloudProvider":"AWS","externalId":"123456789012","name":"wiz-integrations"},"tags":[]},"rule":{"id":"563ed717-4fb6-47fd-929e-9c794e201d0a","shortId":"IAM-006","name":"Root account access keys should not exist"},"securitySubCategories":[{"title":"1.4 Ensure no root user account access key exists","category":{"name":"1 Identity and Access Management","framework":{"name":"CIS Amazon Web Services Foundations Benchmark"}}}]}'
+    expect:
+      class_uid: 2003
+      compliance.status_id: 3
+      compliance.control: IAM-006
+      compliance.standards.0: CIS Amazon Web Services Foundations Benchmark
+      resource.uid_alt: arn:aws:iam::123456789012:root
+      is_alert: true
+  - raw: '{"trigger":{"source":"DETECTIONS","type":"Created","ruleId":"a08fe977-3f54-48bf-adcf-f76994739c1f","ruleName":"Detections Webhook Test Rule"},"id":"6a440e9b-c8d8-5482-a0e9-da714359aecf","threatId":"733edfe5-db25-5b14-ac58-dc69d6005c81","title":"Timestomping technique was detected","severity":"MEDIUM","createdAt":"2025-01-21T18:52:16.819883668Z","tdrId":"46fd0cdc-252e-5e69-be6e-66e4851d7ae4","tdrSource":"WIZ_SENSOR","mitreTactics":["TA0005"],"mitreTechniques":["T1070.006"],"primaryActor":{"id":"4e1bd57f-49b2-47a8-a4a7-0e66fe0b770e","name":"test-actor","type":"SERVICE_ACCOUNT","email":"test-actor@example.com"},"primaryResource":{"id":"da259b23-de77-5adb-8336-8c4071696305","name":"test-container","type":"CONTAINER","region":"us-east-1","cloudAccount":{"cloudPlatform":"AWS","externalId":"123456789012"}},"triggeringEvent":{"id":"2b46aa0d-9f46-5cb9-a6ae-e83ca514144a","actorIP":"198.51.100.192","runtimeDetails":{"processTree":[{"command":"touch -r /usr/bin /tmp/uga","path":"/usr/bin/touch","id":"1560","username":"root","userId":"0"}]}}}'
+    expect:
+      class_uid: 2004
+      severity_id: 3
+      finding_info.attacks.0.sub_technique.uid: T1070.006
+      finding_info.attacks.0.technique.uid: T1070
+      finding_info.attacks.0.tactic.uid: TA0005
+      actor.user.name: test-actor
+      actor.user.type_id: 3
+      evidences.0.src_endpoint.ip: 198.51.100.192
+      evidences.0.process.cmd_line: touch -r /usr/bin /tmp/uga
+      evidences.0.process.pid: 1560
+      cloud.provider: AWS
+  - raw: '{"id":"fff9cffd-64a7-412c-9535-cf837f4b0b40","type":"TOXIC_COMBINATION","severity":"CRITICAL","status":"RESOLVED","createdAt":"2023-08-01T07:56:09.903743Z","updatedAt":"2023-08-14T06:06:18.331647Z","resolvedAt":"2023-08-14T06:06:18.331647Z","sourceRules":[{"__typename":"Control","id":"wc-id-1335","name":"EKS principals with privilege escalation permissions"}],"entitySnapshot":{"id":"e507d472-b7da-5f05-9b25-72a271336b14","name":"system:aggregate-to-edit","type":"ACCESS_ROLE","cloudPlatform":"Kubernetes","subscriptionExternalId":"123456789012","subscriptionName":"demo-integrations","region":"us-01"}}'
+    expect:
+      class_uid: 2004
+      activity_id: 3
+      status_id: 4
+      finding_info.analytic.uid: wc-id-1335
+      resources.0.name: system:aggregate-to-edit
+      is_alert: false
+  - raw: '{"hello":"world"}'
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: unparsable input

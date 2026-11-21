@@ -1,0 +1,925 @@
+name: teleport_ocsf
+display_name: Teleport Audit Events (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Teleport audit events (the JSON audit log, Event Handler / fluentd
+  export, or the events API; one event per line keyed by event + code) into
+  OCSF 1.9.0. user.login and auth (SSH certificate checks) are
+  "Authentication" (3002) Logon with the login method as auth_protocol (OIDC
+  OpenID, SAML, GitHub OAuth 2.0, local) and SSO claims (email, groups) on the
+  user; session.start / session.end and the db / app / Windows desktop session
+  start and end events are Logon / Logoff where the OS or database login is
+  the user, the Teleport user is the actor and sid is the session. exec and
+  session.command (enhanced session recording) are "Process Activity" (1007)
+  Launch with the command line, program, path, pid / ppid, login and exit
+  code on the Teleport node as device. scp and sftp are "File System
+  Activity" (1001), the transfer direction or SFTP operation choosing Read /
+  Create / Update / Delete / Rename / Open / Set or Get Attributes. user.create
+  / update / delete / password_change and access requests are "User
+  Management" (3007), an approved request as Assign Roles with the requested
+  roles as privileges (Account Change 3001 is deprecated in OCSF 1.9);
+  role.created / updated / deleted are "Entity Management" (3004). Every other
+  event (cert.create, kube.request, resource CRUD, locks, connectors, access
+  request reviews without a requester) is "API Activity" (6003) with the
+  event name as api.operation and the create / update / delete suffix or the
+  Kubernetes verb as the activity. addr.remote is src_endpoint and addr.local
+  / server_addr, server_hostname and server_id the Teleport node; the code
+  suffix (I / W / E) and the success flag give the status, and a W or E code
+  is Medium severity. Anything else falls back to Base Event with the raw
+  record kept.
+match_values:
+  - teleport
+category: security
+vendor: "Teleport"
+product: "Teleport"
+parser_vrl: |
+  # Teleport audit events -> OCSF 1.9.0 Authentication (3002), Process
+  # Activity (1007), File System Activity (1001), User Management (3007),
+  # Entity Management (3004), API Activity (6003) or Base Event (0)
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
+
+  parsed, err = parse_json(raw_log)
+  __source_kv = object(parsed) ?? {}
+  e = object(parsed) ?? {}
+  event = to_string(e.event) ?? ""
+  code = to_string(e.code) ?? ""
+
+  if err != null || !is_object(parsed) || event == "" || code == "" {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": "Unrecognized Teleport record",
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("teleport|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "audit",
+              "product": { "name": "Teleport", "vendor_name": "Teleport" }
+          }
+      }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+  } else {
+      time_ms = 0
+      ts = to_string(e.time) ?? ""
+      if ts != "" {
+          t, terr = parse_timestamp(ts, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- outcome: the success flag, else the code suffix (I / W / E) ----
+      suffix = upcase(to_string(slice(code, -1) ?? ""))
+      ok = suffix == "I"
+      if is_boolean(e.success) { ok = bool(e.success) ?? ok }
+      status_id = 1
+      status_str = "Success"
+      if !ok { status_id = 2; status_str = "Failure" }
+      severity_id = 1
+      severity = "Informational"
+      if !ok || suffix == "W" || suffix == "E" { severity_id = 3; severity = "Medium" }
+      error = to_string(e.error) ?? ""
+      if error == "" { error = to_string(e.exitError) ?? "" }
+
+      tp_user = to_string(e.user) ?? ""
+      login = to_string(e.login) ?? ""
+      sid = to_string(e.sid) ?? ""
+      cluster = to_string(e.cluster_name) ?? ""
+
+      # ---- endpoints: addr.remote is the client, addr.local the Teleport node ----
+      src = {}
+      rm, rerr = parse_regex(to_string(get(e, ["addr.remote"]) ?? "") ?? "", r'^\x5B?(?P<ip>.+?)\x5D?:(?P<port>\d+)$')
+      if rerr == null && match(string!(rm.ip), ip_re) { src.ip = string!(rm.ip); src.port = to_int(rm.port) ?? 0 }
+      dst = {}
+      lm, lerr = parse_regex(to_string(get(e, ["addr.local"]) ?? "") ?? "", r'^\x5B?(?P<ip>.+?)\x5D?:(?P<port>\d+)$')
+      if lerr != null { lm, lerr = parse_regex(to_string(e.server_addr) ?? "", r'^\x5B?(?P<ip>.+?)\x5D?:(?P<port>\d+)$') }
+      if lerr == null && match(string!(lm.ip), ip_re) { dst.ip = string!(lm.ip); dst.port = to_int(lm.port) ?? 0 }
+      shost = to_string(e.server_hostname) ?? ""
+      if shost != "" { dst.hostname = shost }
+      suid = to_string(e.server_id) ?? ""
+      if suid != "" { dst.uid = suid }
+
+      actor = {}
+      if tp_user != "" { actor.user = { "name": tp_user } }
+      if sid != "" { actor.session = { "uid": sid } }
+      ukind = to_int(e.user_kind) ?? 0
+      if ukind == 1 && exists(actor.user) { actor.user.type_id = 1; actor.user.type = "User" }
+      if ukind == 2 && exists(actor.user) { actor.user.type_id = 99; actor.user.type = "Bot" }
+
+      metadata = {
+          "version": "1.9.0",
+          "uid": to_string(e.uid) ?? sha2("teleport|raw|" + raw_log, variant: "SHA-256"),
+          "event_code": code,
+          "log_name": "audit",
+          "product": { "name": "Teleport", "vendor_name": "Teleport" }
+      }
+      if metadata.uid == "" { metadata.uid = sha2("teleport|raw|" + raw_log, variant: "SHA-256") }
+      if cluster != "" { metadata.log_provider = cluster }
+      if sid != "" { metadata.correlation_uid = sid }
+
+      message = event
+      if error != "" { message = event + ": " + error }
+      emsg = to_string(e.message) ?? ""
+      if emsg != "" { message = emsg }
+
+      kind = "api"
+      if event == "user.login" || event == "auth" || ends_with(event, "session.start") || ends_with(event, "session.end") { kind = "auth" }
+      if event == "exec" || event == "session.command" { kind = "process" }
+      if event == "scp" || event == "sftp" { kind = "file" }
+      if starts_with(event, "user.") && event != "user.login" { kind = "user" }
+      if event == "access_request.create" || (starts_with(event, "access_request.") && tp_user != "" && event != "access_request.search") { kind = "user" }
+      if starts_with(event, "role.") { kind = "entity" }
+
+      dev = { "type_id": 0, "type": "Unknown" }
+      if suid != "" { dev.uid = suid }
+      if shost != "" { dev.hostname = shost }
+      if exists(dst.ip) { dev.ip = dst.ip }
+      kc = to_string(e.kubernetes_cluster) ?? ""
+      if kc != "" { dev.name = kc }
+      if !exists(dev.uid) && !exists(dev.hostname) && !exists(dev.ip) && !exists(dev.name) { dev.name = cluster }
+      if dev.name == "" { dev.name = "unknown" }
+
+      base = {
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": message,
+          "raw_data": raw_log,
+          "metadata": metadata
+      }
+      if error != "" { base.status_detail = error }
+
+      if kind == "auth" {
+          activity_id = 1
+          activity_name = "Logon"
+          if ends_with(event, "session.end") { activity_id = 2; activity_name = "Logoff" }
+          subject = tp_user
+          if login != "" { subject = login }
+          dbu = to_string(e.db_user) ?? ""
+          if dbu != "" { subject = dbu }
+          user = { "name": subject }
+          if subject == "" { user.name = "unknown" }
+          attrs = object(e.attributes) ?? {}
+          umail = to_string(attrs.email) ?? ""
+          if umail != "" { user.email_addr = umail }
+          ugroups = []
+          for_each(array(attrs.groups) ?? []) -> |_i, g| {
+              gs = to_string(g) ?? ""
+              if gs != "" { ugroups = push(ugroups, { "name": gs }) }
+          }
+          if length(ugroups) > 0 { user.groups = ugroups }
+          ocsf = merge(base, {
+              "class_uid": 3002,
+              "class_name": "Authentication",
+              "category_uid": 3,
+              "category_name": "Identity & Access Management",
+              "activity_id": activity_id,
+              "activity_name": activity_name,
+              "type_uid": 300200 + activity_id,
+              "user": user
+          })
+          # A node / database / app session: the Teleport user acts, the
+          # login (OS, database user) is the account logged into.
+          if subject != tp_user && length(actor) > 0 { ocsf.actor = actor }
+          method = downcase(to_string(e.method) ?? "")
+          if method != "" {
+              pid = 99
+              pname = method
+              if method == "oidc" { pid = 4; pname = "OpenID" }
+              if method == "saml" { pid = 5; pname = "SAML" }
+              if method == "github" { pid = 6; pname = "OAUTH 2.0" }
+              ocsf.auth_protocol_id = pid
+              ocsf.auth_protocol = pname
+          }
+          svc = {}
+          dbs = to_string(e.db_service) ?? ""
+          app = to_string(e.app_name) ?? ""
+          if dbs != "" { svc.name = dbs } else if app != "" { svc.name = app } else if cluster != "" { svc.name = cluster } else { svc.name = "teleport" }
+          ocsf.service = svc
+          if length(src) > 0 { ocsf.src_endpoint = src }
+          if length(dst) > 0 {
+              ocsf.dst_endpoint = dst
+              ocsf.is_remote = true
+          }
+          sess = {}
+          if sid != "" { sess.uid = sid }
+          sstart = to_string(e.session_start) ?? ""
+          if sstart != "" {
+              st, sterr = parse_timestamp(sstart, "%+")
+              if sterr == null { sess.created_time = to_unix_timestamp(st, unit: "milliseconds") }
+          }
+          if length(sess) > 0 { ocsf.session = sess }
+          if is_object(e.mfa_device) { ocsf.is_mfa = true }
+          . = ocsf
+      } else if kind == "process" {
+          proc = { "pid": to_int(e.pid) ?? 0 }
+          program = to_string(e.program) ?? ""
+          ppath = to_string(e.path) ?? ""
+          cmd = to_string(e.command) ?? ""
+          argv = array(e.argv) ?? []
+          if cmd == "" && program != "" {
+              cmd = program
+              for_each(argv) -> |_i, a| { cmd = cmd + " " + (to_string(a) ?? "") }
+          }
+          if cmd != "" { proc.cmd_line = cmd }
+          if program != "" { proc.name = program }
+          if ppath != "" {
+              pparts = split(ppath, "/")
+              pbase = to_string(get(pparts, [length(pparts) - 1]) ?? "") ?? ""
+              if pbase == "" { pbase = ppath }
+              proc.file = { "path": ppath, "name": pbase, "type_id": 1, "type": "Regular File" }
+              if !exists(proc.name) { proc.name = pbase }
+          }
+          ppid = to_int(e.ppid) ?? 0
+          if ppid > 0 { proc.parent_process = { "pid": ppid } }
+          if login != "" { proc.user = { "name": login } }
+          if sid != "" { proc.session = { "uid": sid } }
+          if length(actor) == 0 { actor.app_name = "teleport" }
+          ocsf = merge(base, {
+              "class_uid": 1007,
+              "class_name": "Process Activity",
+              "category_uid": 1,
+              "category_name": "System Activity",
+              "activity_id": 1,
+              "activity_name": "Launch",
+              "type_uid": 100701,
+              "actor": actor,
+              "device": dev,
+              "process": proc
+          })
+          rc = to_int(e.return_code) ?? null
+          if rc == null { rc = to_int(e.exitCode) ?? null }
+          if rc != null { ocsf.exit_code = rc }
+          . = ocsf
+      } else if kind == "file" {
+          fpath = to_string(e.path) ?? ""
+          action = to_string(e.action) ?? ""
+          activity_id = 99
+          activity_name = "Other"
+          ftype_id = 1
+          ftype = "Regular File"
+          if action == "download" || action == "3" || action == "10" || action == "17" { activity_id = 2; activity_name = "Read" }
+          if action == "upload" || action == "18" { activity_id = 1; activity_name = "Create" }
+          if action == "12" { activity_id = 1; activity_name = "Create"; ftype_id = 2; ftype = "Folder" }
+          if action == "4" { activity_id = 3; activity_name = "Update" }
+          if action == "11" { activity_id = 4; activity_name = "Delete" }
+          if action == "13" { activity_id = 4; activity_name = "Delete"; ftype_id = 2; ftype = "Folder" }
+          if action == "16" { activity_id = 5; activity_name = "Rename" }
+          if action == "7" || action == "8" { activity_id = 6; activity_name = "Set Attributes" }
+          if action == "5" || action == "6" || action == "14" || action == "15" { activity_id = 8; activity_name = "Get Attributes" }
+          if action == "1" { activity_id = 14; activity_name = "Open" }
+          if action == "9" { activity_id = 14; activity_name = "Open"; ftype_id = 2; ftype = "Folder" }
+          if action == "10" { ftype_id = 2; ftype = "Folder" }
+          fparts = split(fpath, "/")
+          fname = to_string(get(fparts, [length(fparts) - 1]) ?? "") ?? ""
+          if fname == "" { fname = fpath }
+          if fname == "" { fname = "unknown" }
+          file = { "name": fname, "type_id": ftype_id, "type": ftype }
+          if fpath != "" { file.path = fpath }
+          if length(actor) == 0 { actor.app_name = "teleport" }
+          if login != "" && exists(actor.user) { actor.user.account = { "name": login } }
+          ocsf = merge(base, {
+              "class_uid": 1001,
+              "class_name": "File System Activity",
+              "category_uid": 1,
+              "category_name": "System Activity",
+              "activity_id": activity_id,
+              "activity_name": activity_name,
+              "type_uid": 100100 + activity_id,
+              "actor": actor,
+              "device": dev,
+              "file": file
+          })
+          tpath = to_string(e.target_path) ?? ""
+          if tpath != "" {
+              tparts = split(tpath, "/")
+              ocsf.file_result = { "path": tpath, "name": to_string(get(tparts, [length(tparts) - 1]) ?? tpath) ?? tpath, "type_id": ftype_id, "type": ftype }
+          }
+          . = ocsf
+      } else if kind == "user" {
+          activity_id = 99
+          activity_name = "Other"
+          subject = tp_user
+          tname = to_string(e.name) ?? ""
+          if event == "user.create" { activity_id = 1; activity_name = "Create"; if tname != "" { subject = tname } }
+          if event == "user.update" { activity_id = 2; activity_name = "Update"; if tname != "" { subject = tname } }
+          if event == "user.delete" { activity_id = 3; activity_name = "Delete"; if tname != "" { subject = tname } }
+          if event == "user.password_change" { activity_id = 8; activity_name = "Password Change" }
+          state = upcase(to_string(e.state) ?? "")
+          if starts_with(event, "access_request.") {
+              activity_name = "Access Request"
+              if state == "APPROVED" { activity_id = 16; activity_name = "Assign Roles" }
+          }
+          if subject == "" { subject = "unknown" }
+          privs = []
+          for_each(array(e.roles) ?? []) -> |_i, r| {
+              rs = to_string(r) ?? ""
+              if rs != "" { privs = push(privs, rs) }
+          }
+          ocsf = merge(base, {
+              "class_uid": 3007,
+              "class_name": "User Management",
+              "category_uid": 3,
+              "category_name": "Identity & Access Management",
+              "activity_id": activity_id,
+              "activity_name": activity_name,
+              "type_uid": 300700 + activity_id,
+              "user": { "name": subject }
+          })
+          conn = to_string(e.connector) ?? ""
+          if conn != "" { ocsf.user.domain = conn }
+          if length(privs) > 0 { ocsf.privileges = privs }
+          updby = to_string(e.updated_by) ?? ""
+          if updby != "" {
+              actor.user = { "name": updby }
+          } else if subject == tp_user && starts_with(event, "access_request.") {
+              actor = {}
+          }
+          if length(actor) > 0 && (subject != tp_user || updby != "") { ocsf.actor = actor }
+          if length(src) > 0 { ocsf.src_endpoint = src }
+          rid = to_string(e.id) ?? ""
+          if rid != "" { ocsf.resources = [{ "uid": rid, "type": "access_request" }] }
+          if state != "" { ocsf.status_code = state }
+          . = ocsf
+      } else if kind == "entity" {
+          activity_id = 99
+          activity_name = "Other"
+          if ends_with(event, ".created") || ends_with(event, ".create") { activity_id = 1; activity_name = "Create" }
+          if ends_with(event, ".updated") || ends_with(event, ".update") { activity_id = 3; activity_name = "Update" }
+          if ends_with(event, ".deleted") || ends_with(event, ".delete") { activity_id = 4; activity_name = "Delete" }
+          ename = to_string(e.name) ?? ""
+          if ename == "" { ename = "unknown" }
+          ocsf = merge(base, {
+              "class_uid": 3004,
+              "class_name": "Entity Management",
+              "category_uid": 3,
+              "category_name": "Identity & Access Management",
+              "activity_id": activity_id,
+              "activity_name": activity_name,
+              "type_uid": 300400 + activity_id,
+              "entity": { "name": ename, "type": "role" }
+          })
+          if length(actor) > 0 { ocsf.actor = actor }
+          if length(src) > 0 { ocsf.src_endpoint = src }
+          . = ocsf
+      } else {
+          activity_id = 99
+          activity_name = "Other"
+          if match(event, r'\.(?:create|created|issued|join|enroll)$') || event == "cert.create" { activity_id = 1; activity_name = "Create" }
+          if match(event, r'\.(?:update|updated|search|review)$') { activity_id = 3; activity_name = "Update" }
+          if match(event, r'\.(?:delete|deleted|delete_all_members)$') { activity_id = 4; activity_name = "Delete" }
+          if event == "access_request.search" { activity_id = 2; activity_name = "Read" }
+          verb = upcase(to_string(e.verb) ?? "")
+          if verb == "GET" || verb == "LIST" || verb == "WATCH" { activity_id = 2; activity_name = "Read" }
+          if verb == "POST" || verb == "CREATE" { activity_id = 1; activity_name = "Create" }
+          if verb == "PUT" || verb == "PATCH" || verb == "UPDATE" { activity_id = 3; activity_name = "Update" }
+          if verb == "DELETE" { activity_id = 4; activity_name = "Delete" }
+          if !exists(actor.user) {
+              iu = to_string(get(e, ["identity", "user"]) ?? "") ?? ""
+              updby = to_string(e.updated_by) ?? ""
+              if iu != "" { actor.user = { "name": iu } } else if updby != "" { actor.user = { "name": updby } }
+          }
+          if length(actor) == 0 { actor.app_name = "teleport" }
+          api = { "operation": event, "request": { "uid": metadata.uid } }
+          svc = {}
+          if cluster != "" { svc.name = cluster }
+          proto = to_string(e.proto) ?? ""
+          if proto != "" { svc.name = proto }
+          if length(svc) > 0 { api.service = svc }
+          if error != "" { api.response = { "error": error } }
+          if length(src) == 0 { src = { "name": "unknown" } }
+          ocsf = merge(base, {
+              "class_uid": 6003,
+              "class_name": "API Activity",
+              "category_uid": 6,
+              "category_name": "Application Activity",
+              "activity_id": activity_id,
+              "activity_name": activity_name,
+              "type_uid": 600300 + activity_id,
+              "actor": actor,
+              "api": api,
+              "src_endpoint": src
+          })
+          if length(dst) > 0 { ocsf.dst_endpoint = dst }
+          rpath = to_string(e.request_path) ?? ""
+          if rpath != "" || verb != "" {
+              hreq = {}
+              if verb != "" { hreq.http_method = verb }
+              if rpath != "" { hreq.url = { "path": rpath } }
+              ocsf.http_request = hreq
+          }
+          rcode = to_int(e.response_code) ?? 0
+          if rcode > 0 { ocsf.http_response = { "code": rcode } }
+          res = {}
+          rname = to_string(e.resource_name) ?? ""
+          if rname == "" { rname = to_string(e.name) ?? "" }
+          if rname != "" { res.name = rname }
+          rkind = to_string(e.resource_kind) ?? ""
+          if rkind != "" { res.type = rkind }
+          rns = to_string(e.resource_namespace) ?? ""
+          if rns != "" { res.namespace = rns }
+          rid = to_string(e.id) ?? ""
+          if rid != "" { res.uid = rid }
+          if exists(res.name) || exists(res.uid) { ocsf.resources = [res] }
+          ctype = to_string(e.cert_type) ?? ""
+          if ctype != "" { ocsf.api.request.flags = [ctype] }
+          . = ocsf
+      }
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # time: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # session_start: Successful ISO timestamp conversion of the session start to the emitted millisecond clock.
+  # method: The SSO connector type normalized to the OCSF auth protocol; consume only when the expected ID is emitted.
+  # verb: The Kubernetes verb drives the API Activity; the method itself also lands in http_request.http_method.
+  # action: The scp direction or Teleport SFTPAction number drives the File System Activity; consume only when that activity is emitted.
+  # success: The success flag is the OCSF status; consume only when the expected ID is emitted.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        time
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        session_start
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."session"."created_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        method
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"oidc": 4, "saml": 5, "github": 6}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."auth_protocol_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        verb
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"get": 2, "list": 2, "watch": 2, "post": 1, "create": 1, "put": 3, "patch": 3, "update": 3, "delete": 4}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."activity_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        action
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"download": 2, "upload": 1, "1": 14, "3": 2, "4": 3, "5": 8, "6": 8, "7": 6, "8": 6, "9": 14, "10": 2, "11": 4, "12": 1, "13": 4, "14": 8, "15": 8, "16": 5, "17": 2, "18": 1}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."activity_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        success
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"true": 1, "false": 2}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."status_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    addr\.local
+  | addr\.remote
+  | argv
+  | attributes\.email
+  | attributes\.groups
+  | cert_type
+  | cluster_name
+  | code
+  | command
+  | connector
+  | db_service
+  | db_user
+  | error
+  | event
+  | exitCode
+  | exitError
+  | id
+  | identity\.user
+  | kubernetes_cluster
+  | login
+  | message
+  | name
+  | path
+  | pid
+  | ppid
+  | program
+  | proto
+  | request_path
+  | resource_kind
+  | resource_name
+  | resource_namespace
+  | response_code
+  | return_code
+  | roles
+  | server_addr
+  | server_hostname
+  | server_id
+  | sid
+  | state
+  | target_path
+  | uid
+  | updated_by
+  | user
+  | app_name
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+# Sample provenance (sidecar samples/ directory). Client and node IPs, cluster
+# names, emails, IdP hosts and personal user names are replaced with
+# documentation values; OIDC token claims are shortened.
+#   every tp_*.json sample: Elastic integrations Teleport audit fixtures
+#     https://github.com/elastic/integrations/blob/main/packages/teleport/data_stream/audit/_dev/test/pipeline/test-teleport-all-events.log
+#     https://github.com/elastic/integrations/blob/main/packages/teleport/data_stream/audit/_dev/test/pipeline/test-teleport-generated.log
+#   event codes and SFTP action numbers: Teleport audit event reference
+#     https://goteleport.com/docs/reference/deployment/monitoring/audit/
+#     https://github.com/gravitational/teleport/blob/master/api/proto/teleport/legacy/types/events/events.proto
+#   tp_db_session_start_denied.json uses the {"message": ...} wrapper because
+#     the event has its own message key
+#   junk.json: a Teleport service log line, Base Event fallback
+samples:
+  - raw: '{"code":"T1000W","error":"user(name=\"fsdfsdf\") not found","event":"user.login","method":"local","success":false,"time":"2019-04-22T18:06:32Z","uid":"597bf08b-75b2-4dda-a578-e387c5ce9b76","user":"fsdfsdf"}'
+    expect:
+      class_uid: 3002
+      activity_id: 1
+      type_uid: 300201
+      status_id: 2
+      severity_id: 3
+      user.name: fsdfsdf
+      auth_protocol: local
+      service.name: teleport
+  - raw: '{"addr.local":"192.0.2.130:3022","addr.remote":"203.0.113.11:51454","code":"T2000I","ei":0,"event":"session.start","login":"root","namespace":"default","server_id":"de3800ea-69d9-4d72-a108-97e57f8eb393","sid":"56408539-6536-11e9-80a1-427cfde50f5a","size":"80:25","time":"2019-04-22T19:39:26.676Z","uid":"84c07a99-856c-419f-9de5-15560451a116","user":"admin@example.com"}'
+    expect:
+      class_uid: 3002
+      status_id: 1
+      user.name: root
+      actor.user.name: admin@example.com
+      src_endpoint.ip: 203.0.113.11
+      src_endpoint.port: 51454
+      dst_endpoint.port: 3022
+      session.uid: 56408539-6536-11e9-80a1-427cfde50f5a
+  - raw: '{"argv":["google.com"],"code":"T4000I","event":"session.command","login":"root","path":"/bin/ping","pid":2653,"ppid":2660,"program":"ping","return_code":0,"server_id":"96f2bed2-ebd1-494a-945c-2fd57de41644","sid":"44c6cea8-362f-11ea-83aa-125400432324","time":"2020-01-13T18:05:53.919Z","uid":"734930bb-00e6-4ee6-8798-37f1e9473fac","user":"bob"}'
+    expect:
+      class_uid: 1007
+      type_uid: 100701
+      process.cmd_line: ping google.com
+      process.pid: 2653
+      process.parent_process.pid: 2660
+      process.user.name: root
+      actor.user.name: bob
+      device.uid: 96f2bed2-ebd1-494a-945c-2fd57de41644
+      exit_code: 0
+  - raw: '{"id":"66b827b2-1b0b-512b-965d-6c789388d3c9","code":"T5000I","event":"access_request.create","time":"2020-06-05T19:26:53Z","uid":"68a83a99-73ce-4bd7-bbf7-99103c2ba6a0","user":"carol","state":"PENDING","roles":["admin"]}'
+    expect:
+      class_uid: 3007
+      activity_id: 99
+      user.name: carol
+      privileges.0: admin
+      status_code: PENDING
+  - raw: '{"action":4,"addr.local":"192.0.2.105:3022","addr.remote":"127.0.0.1:41106","code":"TS004I","event":"sftp","login":"root","path":"/tmp/file","server_hostname":"im-a-server-hostname","time":"2019-04-22T19:41:23Z","uid":"16bfdc34-2766-a5d3-dfd6f7ff7ad6","user":"root"}'
+    expect:
+      class_uid: 1001
+      activity_id: 3
+      file.path: /tmp/file
+      file.name: file
+      device.hostname: im-a-server-hostname
+  - raw: "INFO [AUTH:1] Auth service is starting on 0.0.0.0:3025."
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: unparsable input

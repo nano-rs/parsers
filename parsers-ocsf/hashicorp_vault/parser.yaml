@@ -1,0 +1,753 @@
+name: hashicorp_vault_ocsf
+display_name: HashiCorp Vault Audit (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses HashiCorp Vault audit device entries (file, socket or syslog device;
+  one JSON request or response entry per line, an optional syslog header is
+  skipped) into OCSF 1.9.0. A login (request.path auth/<mount>/login[/<user>]
+  or an OIDC / JWT callback) is "Authentication" (3002) Logon with the issued
+  identity as user (display_name, entity_id, the username from the path or
+  token metadata), the auth mount as service and auth_protocol (OIDC / JWT
+  OpenID, LDAP, SAML, RADIUS, Kerberos, else the mount type), and the issued
+  token's accessor / hashed client token / issue time / TTL as the session.
+  Every other entry is "API Activity" (6003): request.operation create / read
+  and list / update and patch / delete maps to Create / Read / Update / Delete
+  (others such as help or renew are Other with the operation name), the
+  calling token's identity is actor.user, its policies and granting policies
+  are actor.authorizations (plus a denied decision on permission denied), the
+  mount is api.service and the request path is the resource with its
+  namespace. Both classes carry request.remote_address / remote_port as
+  src_endpoint, request.id as metadata.correlation_uid (pairing a request
+  entry with its response), the entry type as metadata.type and the error as
+  status_detail. A response is Success, an entry with an error is Failure
+  (permission denied and invalid credentials are Medium severity) and a
+  request entry without one is Unknown. HMAC'd values (hmac-sha256:...) are
+  kept exactly as Vault wrote them and never decoded; a client token is only
+  copied into a column when it is hashed. Anything else falls back to Base
+  Event with the raw record kept.
+match_values:
+  - hashicorp_vault
+category: security
+vendor: "HashiCorp"
+product: "Vault"
+parser_vrl: |
+  # HashiCorp Vault audit device (file / socket / syslog JSON) -> OCSF 1.9.0
+  # API Activity (6003), Authentication (3002) for login paths, Base Event (0)
+  # HMAC'd values ("hmac-sha256:...") are kept exactly as Vault wrote them;
+  # the parser never attempts to reverse them.
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
+
+  # A syslog audit device prefixes the JSON with a syslog header.
+  body = raw_log
+  if !match(body, r'^\s*\x7B') {
+      jm, jerr = parse_regex(body, r'^[^\x7B]*?(?P<json>\x7B.*)$')
+      if jerr == null { body = string!(jm.json) }
+  }
+  parsed, err = parse_json(body)
+  __source_kv = object(parsed) ?? {}
+  e = object(parsed) ?? {}
+  req = object(e.request) ?? {}
+  entry_type = downcase(to_string(e.type) ?? "")
+  path = to_string(req.path) ?? ""
+  req_id = to_string(req.id) ?? ""
+
+  if err != null || !is_object(parsed) || length(req) == 0 || (entry_type != "request" && entry_type != "response") {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": "Unrecognized Vault audit record",
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("hashicorp_vault|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "audit",
+              "product": { "name": "Vault", "vendor_name": "HashiCorp" }
+          }
+      }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+  } else {
+      auth = object(e.auth) ?? {}
+      resp = object(e.response) ?? {}
+      resp_auth = object(resp.auth) ?? {}
+      operation = downcase(to_string(req.operation) ?? "")
+      error = to_string(e.error) ?? ""
+      mount_type = to_string(req.mount_type) ?? ""
+      if mount_type == "" { mount_type = to_string(resp.mount_type) ?? "" }
+      mount_point = to_string(req.mount_point) ?? ""
+      if mount_point == "" { mount_point = to_string(resp.mount_point) ?? "" }
+      is_login = match(path, r'^auth/.+/(?:login|callback)(?:/|$)')
+
+      time_ms = 0
+      ts = to_string(e.time) ?? ""
+      if ts != "" {
+          t, terr = parse_timestamp(ts, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- outcome: a request entry has none yet unless Vault refused it ----
+      status_id = 0
+      status_str = "Unknown"
+      if entry_type == "response" { status_id = 1; status_str = "Success" }
+      if error != "" { status_id = 2; status_str = "Failure" }
+      severity_id = 1
+      severity = "Informational"
+      if error != "" { severity_id = 2; severity = "Low" }
+      if contains(downcase(error), "permission denied") || contains(downcase(error), "invalid username or password") { severity_id = 3; severity = "Medium" }
+
+      # ---- source endpoint ----
+      src = {}
+      rip = to_string(req.remote_address) ?? ""
+      if match(rip, ip_re) { src.ip = rip }
+      rport = to_int(req.remote_port) ?? 0
+      if rport > 0 { src.port = rport }
+      if !exists(src.ip) {
+          fwd = to_string(e.forwarded_from) ?? ""
+          if fwd != "" { src.name = fwd } else { src.name = "unknown" }
+      }
+
+      ua_list = array(get(req, ["headers", "user-agent"]) ?? []) ?? []
+      ua = to_string(get(ua_list, [0]) ?? "") ?? ""
+
+      # ---- the principal (the token used, or the identity a login issued) ----
+      principal = auth
+      if is_login && length(resp_auth) > 0 { principal = resp_auth }
+      display = to_string(principal.display_name) ?? ""
+      entity = to_string(principal.entity_id) ?? ""
+      user = {}
+      if display != "" { user.name = display }
+      if entity != "" { user.uid = entity }
+      uname_meta = to_string(get(principal, ["metadata", "username"]) ?? "") ?? ""
+      if uname_meta != "" && !starts_with(uname_meta, "hmac-") { user.display_name = uname_meta }
+      umail = to_string(get(principal, ["metadata", "email"]) ?? "") ?? ""
+      if umail != "" && !starts_with(umail, "hmac-") { user.email_addr = umail }
+      if is_login && !exists(user.name) {
+          # The login path names the user for userpass / ldap / okta / radius.
+          lm, lerr = parse_regex(path, r'^auth/.+/login/(?P<name>[^/]+)$')
+          if lerr == null { user.name = string!(lm.name) }
+      }
+      if !exists(user.name) && !exists(user.uid) { user.name = "unauthenticated" }
+
+      session = {}
+      acc = to_string(principal.accessor) ?? ""
+      if acc != "" { session.uid = acc }
+      ctok = to_string(principal.client_token) ?? ""
+      # Only a hashed token is ever copied into a column; with log_raw the
+      # value would be a live token, so it is left to the redacted spill.
+      if starts_with(ctok, "hmac-") { session.credential_uid = ctok }
+      tissued = to_string(principal.token_issue_time) ?? ""
+      if tissued != "" {
+          it, iterr = parse_timestamp(tissued, "%+")
+          if iterr == null {
+              session.created_time = to_unix_timestamp(it, unit: "milliseconds")
+              ttl = to_int(principal.token_ttl) ?? 0
+              if ttl > 0 { session.expiration_time = session.created_time + ttl * 1000 }
+          }
+      }
+      if length(session) > 0 { session.issuer = "vault" }
+
+      authz = []
+      for_each(array(get(principal, ["policy_results", "granting_policies"]) ?? []) ?? []) -> |_i, gp| {
+          gpn = to_string(get(gp, ["name"]) ?? "") ?? ""
+          if gpn != "" {
+              pol = { "name": gpn }
+              gpt = to_string(get(gp, ["type"]) ?? "") ?? ""
+              if gpt != "" { pol.type = gpt }
+              authz = push(authz, { "decision": "allowed", "policy": pol })
+          }
+      }
+      if length(authz) == 0 {
+          for_each(array(principal.policies) ?? []) -> |_i, pn| {
+              pns = to_string(pn) ?? ""
+              if pns != "" { authz = push(authz, { "policy": { "name": pns } }) }
+          }
+      }
+      if error != "" && contains(downcase(error), "permission denied") {
+          authz = push(authz, { "decision": "denied" })
+      }
+
+      ns = to_string(get(req, ["namespace", "path"]) ?? "") ?? ""
+      if ns == "" { ns = to_string(get(req, ["namespace", "id"]) ?? "") ?? "" }
+
+      metadata = {
+          "version": "1.9.0",
+          "uid": req_id + "|" + entry_type,
+          "log_name": "audit",
+          "log_provider": "Vault audit device",
+          "type": entry_type,
+          "product": { "name": "Vault", "vendor_name": "HashiCorp" }
+      }
+      if req_id == "" { metadata.uid = sha2("hashicorp_vault|raw|" + raw_log, variant: "SHA-256") } else { metadata.correlation_uid = req_id }
+      mrv = to_string(req.mount_running_version) ?? ""
+      if mrv != "" { metadata.product.version = mrv }
+
+      message = operation + " " + path
+      if error != "" { message = message + ": " + error }
+
+      if is_login {
+          proto_id = 99
+          proto = mount_type
+          if mount_type == "oidc" || mount_type == "jwt" { proto_id = 4; proto = "OpenID" }
+          if mount_type == "ldap" { proto_id = 12; proto = "LDAP" }
+          if mount_type == "saml" { proto_id = 5; proto = "SAML" }
+          if mount_type == "radius" { proto_id = 10; proto = "RADIUS" }
+          if mount_type == "kerberos" { proto_id = 2; proto = "Kerberos" }
+          if proto == "" { proto_id = 0; proto = "Unknown" }
+          svc = { "name": "vault" }
+          if mount_point != "" { svc.name = mount_point }
+          macc = to_string(req.mount_accessor) ?? ""
+          if macc != "" { svc.uid = macc }
+          ocsf = {
+              "class_uid": 3002,
+              "class_name": "Authentication",
+              "category_uid": 3,
+              "category_name": "Identity & Access Management",
+              "activity_id": 1,
+              "activity_name": "Logon",
+              "type_uid": 300201,
+              "severity_id": severity_id,
+              "severity": severity,
+              "status_id": status_id,
+              "status": status_str,
+              "time": time_ms,
+              "message": message,
+              "raw_data": raw_log,
+              "metadata": metadata,
+              "user": user,
+              "src_endpoint": src,
+              "service": svc,
+              "auth_protocol_id": proto_id,
+              "auth_protocol": proto,
+              "is_remote": true
+          }
+          if length(session) > 0 { ocsf.session = session }
+          if error != "" { ocsf.status_detail = error }
+          if ua != "" { ocsf.http_request = { "user_agent": ua } }
+          if ns != "" { ocsf.metadata.tenant_uid = ns }
+          . = ocsf
+      } else {
+          activity_id = 99
+          activity_name = "Other"
+          if operation == "create" { activity_id = 1; activity_name = "Create" }
+          if operation == "read" || operation == "list" { activity_id = 2; activity_name = "Read" }
+          if operation == "update" || operation == "patch" { activity_id = 3; activity_name = "Update" }
+          if operation == "delete" { activity_id = 4; activity_name = "Delete" }
+
+          api = { "operation": operation, "request": { "uid": req_id } }
+          if req_id == "" { api.request.uid = metadata.uid }
+          svc = {}
+          if mount_point != "" { svc.name = mount_point } else if mount_type != "" { svc.name = mount_type }
+          macc = to_string(req.mount_accessor) ?? ""
+          if macc == "" { macc = to_string(resp.mount_accessor) ?? "" }
+          if macc != "" { svc.uid = macc }
+          if length(svc) > 0 { api.service = svc }
+          if error != "" { api.response = { "error": error } }
+
+          actor = { "user": user }
+          if length(session) > 0 { actor.session = session }
+          if length(authz) > 0 { actor.authorizations = authz }
+
+          res = { "uid": path, "name": path, "type": "Vault path" }
+          if path == "" { res.uid = "/"; res.name = "/" }
+          if mount_type != "" { res.type = mount_type }
+          if ns != "" { res.namespace = ns }
+
+          ocsf = {
+              "class_uid": 6003,
+              "class_name": "API Activity",
+              "category_uid": 6,
+              "category_name": "Application Activity",
+              "activity_id": activity_id,
+              "activity_name": activity_name,
+              "type_uid": 600300 + activity_id,
+              "severity_id": severity_id,
+              "severity": severity,
+              "status_id": status_id,
+              "status": status_str,
+              "time": time_ms,
+              "message": message,
+              "raw_data": raw_log,
+              "metadata": metadata,
+              "actor": actor,
+              "api": api,
+              "src_endpoint": src,
+              "resources": [res]
+          }
+          if activity_id == 99 && operation != "" { ocsf.activity_name = operation }
+          if error != "" { ocsf.status_detail = error }
+          if ua != "" { ocsf.http_request = { "user_agent": ua } }
+          if ns != "" { ocsf.metadata.tenant_uid = ns }
+          . = ocsf
+      }
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # time: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # auth.token_issue_time: The token issue time becomes the session's created_time; consume only when that clock is emitted.
+  # response.auth.token_issue_time: The issued token's issue time becomes the login session's created_time; consume only when that clock is emitted.
+  # request.operation: The Vault operation drives the API Activity; consume only when that activity is emitted.
+  # type: The entry type is metadata.type (lowercased); consume only when emitted.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        time
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        auth\.token_issue_time
+      | response\.auth\.token_issue_time
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        request\.operation
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"create": 1, "read": 2, "list": 2, "update": 3, "patch": 3, "delete": 4}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."activity_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        type
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"request": "request", "response": "response"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."metadata"."type" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    auth\.accessor
+  | auth\.client_token
+  | auth\.display_name
+  | auth\.entity_id
+  | auth\.metadata\.email
+  | auth\.metadata\.username
+  | auth\.policies
+  | auth\.policy_results\.granting_policies
+  | auth\.token_ttl
+  | error
+  | forwarded_from
+  | request\.headers\.user\-agent
+  | request\.id
+  | request\.mount_accessor
+  | request\.mount_point
+  | request\.mount_running_version
+  | request\.mount_type
+  | request\.namespace\.id
+  | request\.namespace\.path
+  | request\.operation
+  | request\.path
+  | request\.remote_address
+  | request\.remote_port
+  | response\.auth\.accessor
+  | response\.auth\.client_token
+  | response\.auth\.display_name
+  | response\.auth\.entity_id
+  | response\.auth\.metadata\.email
+  | response\.auth\.metadata\.username
+  | response\.auth\.policies
+  | response\.auth\.token_ttl
+  | response\.mount_accessor
+  | response\.mount_point
+  | response\.mount_type
+  | type
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+# Sample provenance (sidecar samples/ directory). Remote addresses, emails and
+# OIDC account ids are replaced with documentation values; HMAC strings are
+# kept as published.
+#   vault_request_token_lookup_self.json, vault_response_token_lookup_self.json:
+#     Vault audit log entry schema, full entry examples
+#     https://github.com/hashicorp/web-unified-docs/blob/main/content/vault/v2.x/content/docs/audit/schema.mdx
+#   vault_request_capabilities_self_oidc.json,
+#   vault_response_pki_issue_permission_denied.json,
+#   vault_response_kv_read_secret.json: Elastic integrations hashicorp_vault
+#     audit fixture
+#     https://github.com/elastic/integrations/blob/main/packages/hashicorp_vault/data_stream/audit/_dev/test/pipeline/test-audit.log
+#   vault_response_kv_update_error_all_fields.json: Elastic integrations
+#     hashicorp_vault every-field fixture
+#     https://github.com/elastic/integrations/blob/main/packages/hashicorp_vault/data_stream/audit/_dev/test/pipeline/test-faked-all-fields.log
+#   vault_response_userpass_login_success.json,
+#   vault_response_userpass_login_failed.json, vault_request_approle_login.json:
+#     login entries built from the documented schema (auth / request /
+#     response objects) and its userpass-alice example identity
+#     https://github.com/hashicorp/web-unified-docs/blob/main/content/vault/v2.x/content/docs/audit/schema.mdx
+#     https://developer.hashicorp.com/vault/api-docs/auth/userpass#login
+#   junk.json: a Vault server banner line, Base Event fallback
+samples:
+  - raw: '{"auth":{"accessor":"hmac-sha256:3348fe9b24b078f97d747363dda2d55bb0445e90b512e9f68f48d289fed798b3","client_token":"hmac-sha256:c39c69748f0894cb4cd0333c779e72343ba45af287649d0fbcc37e9b079abe5d","display_name":"userpass-alice","entity_id":"62ff123b-7609-1ed9-5707-ea621da72de7","metadata":{"username":"alice"},"policies":["default"],"policy_results":{"allowed":true,"granting_policies":[{"type":""},{"name":"default","namespace_id":"root","type":"acl"}]},"token_policies":["default"],"token_issue_time":"2025-06-04T16:01:31-04:00","token_ttl":2764800,"token_type":"service"},"request":{"id":"79cc9b26-488f-eabf-2a97-303ed3bef0d6","mount_point":"auth/token/","mount_type":"token","namespace":{"id":"root"},"operation":"read","path":"auth/token/lookup-self","remote_address":"127.0.0.1","remote_port":64199},"time":"2025-06-04T20:02:46.117181Z","type":"request"}'
+    expect:
+      class_uid: 6003
+      activity_id: 2
+      type_uid: 600302
+      status_id: 0
+      actor.user.name: userpass-alice
+      actor.session.credential_uid: hmac-sha256:c39c69748f0894cb4cd0333c779e72343ba45af287649d0fbcc37e9b079abe5d
+      actor.authorizations.0.policy.name: default
+      api.operation: read
+      api.service.name: auth/token/
+      resources.0.uid: auth/token/lookup-self
+      src_endpoint.port: 64199
+      metadata.correlation_uid: 79cc9b26-488f-eabf-2a97-303ed3bef0d6
+  - raw: '{"time":"2021-12-30T17:11:12.468537924Z","type":"response","auth":{"policy_results":{"allowed":false}},"request":{"id":"7b9c1a54-0000-4000-8000-000000000004","operation":"update","mount_type":"pki","path":"internal-ca/issue/internal-server","remote_address":"192.0.2.34"},"response":{"mount_type":"pki"},"error":"1 error occurred:\n\t* permission denied\n\n"}'
+    expect:
+      class_uid: 6003
+      activity_id: 3
+      status_id: 2
+      severity_id: 3
+      actor.user.name: unauthenticated
+      actor.authorizations.0.decision: denied
+  - raw: '{"auth":{"accessor":"hmac-sha256:3348fe9b24b078f97d747363dda2d55bb0445e90b512e9f68f48d289fed798b3","client_token":"hmac-sha256:c39c69748f0894cb4cd0333c779e72343ba45af287649d0fbcc37e9b079abe5d","display_name":"userpass-alice","entity_id":"62ff123b-7609-1ed9-5707-ea621da72de7","metadata":{"username":"alice"},"policies":["default"],"token_issue_time":"2025-06-04T16:01:31-04:00","token_ttl":2764800,"token_type":"service"},"request":{"id":"0b6a4bd2-6f0c-8d0e-2d2c-6a3b1ff0c9e1","operation":"update","mount_point":"auth/userpass/","mount_type":"userpass","path":"auth/userpass/login/alice","data":{"password":"hmac-sha256:7f1c0d2b5e9a4c3f8e6d1b0a9c8e7f6d5c4b3a291807f6e5d4c3b2a190807f6e"},"remote_address":"192.0.2.50","remote_port":51234},"response":{"auth":{"accessor":"hmac-sha256:3348fe9b24b078f97d747363dda2d55bb0445e90b512e9f68f48d289fed798b3","client_token":"hmac-sha256:c39c69748f0894cb4cd0333c779e72343ba45af287649d0fbcc37e9b079abe5d","display_name":"userpass-alice","entity_id":"62ff123b-7609-1ed9-5707-ea621da72de7","metadata":{"username":"alice"},"policies":["default"],"token_type":"service","token_ttl":2764800,"token_issue_time":"2025-06-04T16:01:31-04:00"},"mount_type":"userpass"},"time":"2025-06-04T20:01:31.771912Z","type":"response"}'
+    expect:
+      class_uid: 3002
+      activity_id: 1
+      type_uid: 300201
+      status_id: 1
+      user.name: userpass-alice
+      user.display_name: alice
+      service.name: auth/userpass/
+      auth_protocol_id: 99
+      auth_protocol: userpass
+      session.uid: hmac-sha256:3348fe9b24b078f97d747363dda2d55bb0445e90b512e9f68f48d289fed798b3
+      session.expiration_time: 1751832091000
+      src_endpoint.ip: 192.0.2.50
+  - raw: '{"request":{"id":"5c1e0c0d-9e3b-4c1a-bf7e-0a6f2d9b1c44","operation":"update","mount_point":"auth/ldap/","mount_type":"ldap","path":"auth/ldap/login/mallory","remote_address":"198.51.100.77"},"error":"invalid username or password","time":"2025-06-04T20:05:12.104331Z","type":"response"}'
+    expect:
+      class_uid: 3002
+      status_id: 2
+      severity_id: 3
+      user.name: mallory
+      auth_protocol_id: 12
+      status_detail: invalid username or password
+  - raw: "==> Vault server started! Log data will stream in below:"
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: unparsable input
