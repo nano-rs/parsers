@@ -1,0 +1,74 @@
+source: json
+transforms:
+- source: ts
+  kind: scale
+  factor: 1000
+  target: time
+  reason: Caddy's default ts is epoch seconds (float); OCSF time is epoch milliseconds.
+- source: ts
+  kind: epoch_ms
+  target: time
+  reason: With time_format iso8601/rfc3339, ts is an RFC 3339 string converted to event milliseconds.
+- source: duration
+  kind: scale
+  factor: 1000
+  target: duration
+  reason: Caddy reports duration in seconds (float); OCSF duration is milliseconds.
+- source: level
+  kind: enum
+  target: severity_id
+  values:
+    debug: 1
+    info: 1
+    warn: 3
+    error: 4
+    dpanic: 5
+    panic: 5
+    fatal: 6
+  reason: zap level normalized to OCSF severity_id; consumed only when that ID is emitted.
+- source: request.tls.version
+  kind: enum
+  target: tls.version
+  values:
+    '769': TLS 1.0
+    '770': TLS 1.1
+    '771': TLS 1.2
+    '772': TLS 1.3
+  reason: Go crypto/tls numeric version decoded to its name.
+- source: request.tls.cipher_suite
+  kind: enum
+  target: tls.cipher
+  values:
+    '4865': TLS_AES_128_GCM_SHA256
+    '4866': TLS_AES_256_GCM_SHA384
+    '4867': TLS_CHACHA20_POLY1305_SHA256
+    '49195': TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+    '49196': TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+    '49199': TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    '49200': TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+    '52392': TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+    '52393': TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+  reason: Go crypto/tls numeric cipher suite (IANA value) decoded to its IANA name.
+consumed_candidates:
+- bytes_read
+- err_id
+- error
+- level
+- logger
+- msg
+- request.client_ip
+- request.headers.Content-Type
+- request.headers.Referer
+- request.headers.User-Agent
+- request.method
+- request.proto
+- request.remote_ip
+- request.remote_port
+- request.tls.server_name
+- resp_headers.Content-Type
+- size
+- status
+- user_id
+consumed_reason: Only source keys read by this parser are eligible for exact-value
+  consumption; the selected branch must emit the value. Unknown keys always spill,
+  even when their value equals an OCSF default.

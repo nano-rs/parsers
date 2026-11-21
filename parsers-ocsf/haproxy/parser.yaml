@@ -1,0 +1,668 @@
+name: haproxy_ocsf
+display_name: HAProxy (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses HAProxy logs into complete OCSF 1.9.0 records. HTTP mode lines
+  (`option httplog`, `option httpslog`, with or without captured headers and
+  cookies) become "HTTP Activity" (class_uid 4002); TCP mode lines
+  (`option tcplog`), the default "Connect from" format and frontend
+  connection error lines (`error-log-format` default) become "Network
+  Activity" (class_uid 4001). The syslog header (PRI, timestamp, host,
+  `haproxy[pid]:`) is optional, so lines read from a file, journald or a
+  syslog relay all parse. The frontend is the load balancer
+  (`load_balancer.name`), the backend and server land on dst_endpoint
+  (`svc_name` / `name`), the termination state is `status_code`, and the
+  timers drive `duration` (Ta for HTTP, Tt for TCP). accept_date carries no
+  UTC offset; it is read as UTC and kept verbatim in metadata.original_time.
+  Unrecognized lines become Base Event (class_uid 0) with the raw line kept
+  and `unmapped.parse_fallback` set. The whole OCSF object is emitted on the
+  root.
+match_values:
+  - haproxy
+category: network
+vendor: "HAProxy Technologies"
+product: "HAProxy"
+parser_vrl: |
+  # HAProxy -> OCSF 1.9.0 HTTP Activity (4002) / Network Activity (4001) / Base Event (0)
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+
+  # ---- optional syslog header ------------------------------------------
+  h = parse_regex(raw_log, r'^(?:<(?P<syslog_pri>\d{1,3})>)?(?:(?P<syslog_time>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(?P<syslog_host>\S+)\s+)?(?:(?P<process_name>[\w.-]+)\[(?P<pid>\d+)\]:\s+)?(?P<body>.*)$') ?? {}
+  body = string(h.body) ?? raw_log
+  hdr = h
+  __discard = del(hdr.body)
+
+  # ---- body formats, most specific first ---------------------------------
+  kind = ""
+  m = parse_regex(body, r'^(?P<client_ip>\S+?):(?P<client_port>\d+|-)\s+\[(?P<accept_date>[^\x5D]+)\]\s+(?P<frontend_name>\S+)\s+(?P<backend_name>[^/\s]+)/(?P<server_name>\S+)\s+(?:(?P<server_extra>\S+)\s+)?(?P<time_request>-?\d+)/(?P<time_queue>-?\d+)/(?P<time_connect>-?\d+)/(?P<time_response>-?\d+)/(?P<time_active>\+?-?\d+)\s+(?P<status_code>-?\d+)\s+(?P<bytes_read>\+?\d+)\s+(?P<captured_request_cookie>\S+)\s+(?P<captured_response_cookie>\S+)\s+(?P<termination_state>\S+)\s+(?P<actconn>\d+)/(?P<feconn>\d+)/(?P<beconn>\d+)/(?P<srv_conn>\d+)/(?P<retries>\+?\d+)\s+(?P<srv_queue>\d+)/(?P<backend_queue>\d+)(?:\s+\{(?P<captured_request_headers>[^\x7D]*)\})?(?:\s+\{(?P<captured_response_headers>[^\x7D]*)\})?\s+"(?P<http_request>[^"]*)"(?:\s+(?P<fc_err>\d+)/(?P<ssl_fc_err>\d+)/(?P<ssl_c_err>\d+)/(?P<ssl_c_ca_err>\d+)/(?P<ssl_fc_is_resumed>\d+)\s+(?P<ssl_fc_sni>[^/\s]*)/(?P<ssl_version>[^/\s]*)/(?P<ssl_ciphers>\S*))?\s*$') ?? {}
+  if length(m) > 0 {
+      kind = "http"
+  } else {
+      m = parse_regex(body, r'^(?P<client_ip>\S+?):(?P<client_port>\d+|-)\s+\[(?P<accept_date>[^\x5D]+)\]\s+(?P<frontend_name>\S+)\s+(?P<backend_name>[^/\s]+)/(?P<server_name>\S+)\s+(?P<time_queue>-?\d+)/(?P<time_connect>-?\d+)/(?P<time_total>\+?-?\d+)\s+(?P<bytes_read>\+?\d+)\s+(?P<termination_state>\S+)\s+(?P<actconn>\d+)/(?P<feconn>\d+)/(?P<beconn>\d+)/(?P<srv_conn>\d+)/(?P<retries>\+?\d+)\s+(?P<srv_queue>\d+)/(?P<backend_queue>\d+)\s*$') ?? {}
+      if length(m) > 0 {
+          kind = "tcp"
+      } else {
+          m = parse_regex(body, r'^(?P<client_ip>\S+?):(?P<client_port>\d+|-)\s+\[(?P<accept_date>[^\x5D]+)\]\s+(?P<frontend_name>[^/\s]+)/(?P<bind_name>[^:\s]+):\s+(?P<error_message>.+)$') ?? {}
+          if length(m) > 0 {
+              kind = "error"
+          } else {
+              m = parse_regex(body, r'^Connect from (?P<client_ip>\S+?):(?P<client_port>\d+) to (?P<frontend_ip>\S+?):(?P<frontend_port>\d+) \x28(?P<frontend_name>[^/\s]+)/(?P<mode>\w+)\x29\s*$') ?? {}
+              if length(m) > 0 { kind = "connect" }
+          }
+      }
+  }
+  # Optional groups that did not participate come back null; they are not source fields.
+  if kind != "" { __source_kv = compact(merge(hdr, m), string: false) }
+
+  # ---- severity from the syslog PRI, when the line carries one ----------
+  severity_id = 1
+  severity = "Informational"
+  pri_str = string(hdr.syslog_pri) ?? ""
+  pri = to_int(pri_str) ?? -1
+  if pri_str != "" && pri >= 0 {
+      sev = mod(pri, 8)
+      if sev == 0 { severity_id = 6; severity = "Fatal" }
+      if sev == 1 || sev == 2 { severity_id = 5; severity = "Critical" }
+      if sev == 3 { severity_id = 4; severity = "High" }
+      if sev == 4 { severity_id = 3; severity = "Medium" }
+      if sev == 5 { severity_id = 2; severity = "Low" }
+  }
+
+  # ---- shared fields ------------------------------------------------------
+  time_ms = 0
+  accept_date = string(m.accept_date) ?? ""
+  if accept_date != "" {
+      t, terr = parse_timestamp(accept_date, "%d/%b/%Y:%H:%M:%S%.f", timezone: "UTC")
+      if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+  }
+  client_ip = string(m.client_ip) ?? ""
+  client_port = to_int(m.client_port) ?? 0
+  src_endpoint = {}
+  if is_ipv4(client_ip) || is_ipv6(client_ip) { src_endpoint.ip = downcase(client_ip) }
+  if exists(src_endpoint.ip) && client_port > 0 { src_endpoint.port = client_port }
+
+  frontend = string(m.frontend_name) ?? ""
+  backend = string(m.backend_name) ?? ""
+  server = string(m.server_name) ?? ""
+  dst_endpoint = {}
+  if backend != "" { dst_endpoint.svc_name = backend }
+  if server != "" && server != "<NOSRV>" && server != "<STATS>" { dst_endpoint.name = server }
+
+  bytes_read = to_int(replace(string(m.bytes_read) ?? "", "+", "")) ?? 0
+  term = string(m.termination_state) ?? ""
+  term_ok = term == "" || starts_with(term, "-")
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": sha2("haproxy|raw|" + raw_log, variant: "SHA-256"),
+      "profiles": ["host", "load_balancer"],
+      "log_name": "haproxy",
+      "product": { "name": "HAProxy", "vendor_name": "HAProxy Technologies" }
+  }
+  if accept_date != "" { metadata.original_time = accept_date }
+  pname = string(hdr.process_name) ?? ""
+  if pname != "" { metadata.log_provider = pname }
+
+  device = {}
+  shost = string(hdr.syslog_host) ?? ""
+  if is_ipv4(shost) || is_ipv6(shost) {
+      device = { "ip": downcase(shost), "type_id": 0 }
+  } else if shost != "" {
+      device = { "hostname": shost, "type_id": 0 }
+  }
+
+  lb = {}
+  if frontend != "" { lb.name = frontend }
+
+  if kind == "http" {
+      # ---------------- HTTP Activity (4002) ----------------
+      req = string(m.http_request) ?? ""
+      method = ""
+      target = ""
+      version = ""
+      rp = split(req, " ")
+      if length(rp) >= 2 {
+          method = upcase(string(rp[0]) ?? "")
+          target = string(rp[1]) ?? ""
+      }
+      if length(rp) >= 3 { version = string(rp[2]) ?? "" }
+
+      url_obj = {}
+      if starts_with(target, "http://") || starts_with(target, "https://") {
+          u, uerr = parse_url(target)
+          if uerr == null {
+              url_obj.url_string = target
+              if u.scheme != "" { url_obj.scheme = u.scheme }
+              uhost = string(u.host) ?? ""
+              if uhost != "" { url_obj.hostname = downcase(uhost) }
+              if u.path != "" { url_obj.path = u.path }
+              uport = to_int(u.port)
+              if uport > 0 { url_obj.port = uport }
+          }
+      }
+      if !exists(url_obj.url_string) && target != "" {
+          up = split(target, "?", limit: 2)
+          url_obj.path = string(up[0]) ?? "/"
+          if length(up) == 2 { url_obj.query_string = string(up[1]) ?? "" }
+      } else if exists(url_obj.url_string) {
+          up = split(target, "?", limit: 2)
+          if length(up) == 2 { url_obj.query_string = string(up[1]) ?? "" }
+      }
+      if !exists(url_obj.path) && !exists(url_obj.url_string) { url_obj.path = "/" }
+
+      sni = string(m.ssl_fc_sni) ?? ""
+      if sni != "" && sni != "-" && !exists(url_obj.hostname) { url_obj.hostname = downcase(sni) }
+
+      activity_id = 99
+      activity_name = "Other"
+      if method == "CONNECT" { activity_id = 1; activity_name = "Connect" }
+      if method == "DELETE"  { activity_id = 2; activity_name = "Delete" }
+      if method == "GET"     { activity_id = 3; activity_name = "Get" }
+      if method == "HEAD"    { activity_id = 4; activity_name = "Head" }
+      if method == "OPTIONS" { activity_id = 5; activity_name = "Options" }
+      if method == "POST"    { activity_id = 6; activity_name = "Post" }
+      if method == "PUT"     { activity_id = 7; activity_name = "Put" }
+      if method == "TRACE"   { activity_id = 8; activity_name = "Trace" }
+      if method == "PATCH"   { activity_id = 9; activity_name = "Patch" }
+
+      code = to_int(m.status_code) ?? -1
+      status_id = 0
+      status_str = "Unknown"
+      if code >= 200 && code < 400 && term_ok { status_id = 1; status_str = "Success" }
+      if code >= 400 || (code > 0 && !term_ok) || code == -1 { status_id = 2; status_str = "Failure" }
+      if code >= 500 && severity_id < 2 { severity_id = 2; severity = "Low" }
+
+      http_request = { "url": url_obj }
+      if method != "" { http_request.http_method = method }
+      if version != "" { http_request.version = version }
+
+      http_response = { "code": 0 }
+      if code > 0 { http_response.code = code; http_response.status = status_str }
+      if bytes_read > 0 { http_response.length = bytes_read }
+
+      ta = to_int(replace(string(m.time_active) ?? "", "+", "")) ?? -1
+      tresp = to_int(m.time_response) ?? -1
+
+      ocsf = {
+          "class_uid": 4002,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": 400200 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "http_request": http_request,
+          "http_response": http_response
+      }
+      if term != "" { ocsf.status_code = term }
+      if ta >= 0 { ocsf.duration = ta }
+      if tresp >= 0 { ocsf.http_response.latency = tresp }
+      # OCSF 1.9 network_traffic: bytes_in = destination -> source (the response to the client).
+      if bytes_read > 0 { ocsf.traffic = { "bytes_in": bytes_read } }
+      if length(src_endpoint) > 0 { ocsf.src_endpoint = src_endpoint }
+      if length(dst_endpoint) > 0 { ocsf.dst_endpoint = dst_endpoint }
+      if code > 0 { lb.code = code }
+      if length(dst_endpoint) > 0 { lb.dst_endpoint = dst_endpoint }
+      if length(lb) > 0 { ocsf.load_balancer = lb }
+      if length(device) > 0 { ocsf.device = device }
+
+      # ---- option httpslog TLS block ----
+      tls_version = string(m.ssl_version) ?? ""
+      tls_cipher = string(m.ssl_ciphers) ?? ""
+      if tls_version != "" && tls_version != "-" {
+          tls_obj = { "version": tls_version }
+          if tls_cipher != "" && tls_cipher != "-" { tls_obj.cipher = tls_cipher }
+          if sni != "" && sni != "-" { tls_obj.sni = sni }
+          ocsf.tls = tls_obj
+      }
+      . = ocsf
+  } else if kind != "" {
+      # ---------------- Network Activity (4001) ----------------
+      activity_id = 6
+      activity_name = "Traffic"
+      status_id = 1
+      status_str = "Success"
+      if kind == "connect" {
+          activity_id = 1
+          activity_name = "Open"
+      } else if kind == "error" {
+          activity_id = 4
+          activity_name = "Fail"
+          status_id = 2
+          status_str = "Failure"
+          if severity_id < 2 { severity_id = 2; severity = "Low" }
+      } else {
+          # TCP log: written when the session ends. The first termination flag
+          # says who ended it: '-' normal, c/s a timeout, C/S an abort, the rest
+          # a proxy-side decision (P/R/I/D/K/U).
+          activity_id = 2
+          activity_name = "Close"
+          first = slice(term, 0, 1) ?? ""
+          if term == "SC" || starts_with(term, "SC") {
+              activity_id = 4; activity_name = "Fail"
+          } else if first == "C" || first == "S" {
+              activity_id = 3; activity_name = "Reset"
+          } else if includes(["P", "R", "I", "D", "K", "U"], first) {
+              activity_id = 4; activity_name = "Fail"
+          }
+          if !term_ok { status_id = 2; status_str = "Failure" }
+      }
+
+      if kind == "connect" {
+          fe_ip = string(m.frontend_ip) ?? ""
+          fe_port = to_int(m.frontend_port) ?? 0
+          if is_ipv4(fe_ip) || is_ipv6(fe_ip) { dst_endpoint.ip = downcase(fe_ip) }
+          if fe_port > 0 { dst_endpoint.port = fe_port }
+      }
+
+      ocsf = {
+          "class_uid": 4001,
+          "class_name": "Network Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": 400100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "connection_info": { "protocol_name": "tcp", "protocol_num": 6, "direction_id": 1, "direction": "Inbound" }
+      }
+      if length(src_endpoint) > 0 { ocsf.src_endpoint = src_endpoint }
+      if length(dst_endpoint) > 0 { ocsf.dst_endpoint = dst_endpoint }
+      if term != "" { ocsf.status_code = term }
+      errmsg = string(m.error_message) ?? ""
+      if errmsg != "" { ocsf.status_detail = errmsg; ocsf.message = errmsg }
+      tt = to_int(replace(string(m.time_total) ?? "", "+", "")) ?? -1
+      if tt >= 0 { ocsf.duration = tt }
+      if bytes_read > 0 { ocsf.traffic = { "bytes_in": bytes_read } }
+      if length(dst_endpoint) > 0 { lb.dst_endpoint = dst_endpoint }
+      if length(lb) > 0 { ocsf.load_balancer = lb }
+      if length(device) > 0 { ocsf.device = device }
+      . = ocsf
+  } else {
+      # ---------------- Base Event (0) ----------------
+      # Not a recognized HAProxy format (a custom log-format, a startup notice):
+      # keep the line queryable rather than forcing it into a network class.
+      ocsf = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "raw_data": raw_log,
+          "message": body,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("haproxy|raw|" + raw_log, variant: "SHA-256"),
+              "log_name": "haproxy",
+              "log_level": "error",
+              "product": { "name": "HAProxy", "vendor_name": "HAProxy Technologies" }
+          }
+      }
+      . = ocsf
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    accept_date
+  | backend_name
+  | bytes_read
+  | client_ip
+  | client_port
+  | error_message
+  | frontend_ip
+  | frontend_name
+  | frontend_port
+  | process_name
+  | server_name
+  | ssl_ciphers
+  | ssl_fc_sni
+  | ssl_version
+  | status_code
+  | syslog_host
+  | termination_state
+  | time_active
+  | time_response
+  | time_total
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  - raw: 'Feb  6 12:14:14 localhost haproxy[14389]: 192.0.2.2:33317 [06/Feb/2009:12:14:14.655] http-in static/srv1 10/0/30/69/109 200 2750 - - ---- 1/1/1/1/0 0/0 {www.example.com} {} "GET /index.html HTTP/1.1"'
+    expect:
+      class_uid: 4002
+      activity_id: 3
+      "http_response.code": 200
+      "src_endpoint.ip": "192.0.2.2"
+      duration: 109
+      "load_balancer.name": "http-in"
+  - raw: 'Feb  6 12:12:56 localhost haproxy[14387]: 192.0.2.2:33313 [06/Feb/2009:12:12:51.443] fnt bck/srv1 0/0/5007 212 -- 0/0/0/0/3 0/0'
+    expect:
+      class_uid: 4001
+      activity_id: 2
+      duration: 5007
+      "traffic.bytes_in": 212
+  - raw: 'Dec  3 18:27:14 localhost haproxy[6103]: 192.0.2.1:56059 [03/Dec/2012:17:35:10.380] frt/f1: Connection error during SSL handshake'
+    expect:
+      class_uid: 4001
+      activity_id: 4
+      status_id: 2
+  - raw: 'not a haproxy line'
+    expect:
+      class_uid: 0
+      "unmapped.parse_fallback": "unparsable input"

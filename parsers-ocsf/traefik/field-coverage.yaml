@@ -1,0 +1,97 @@
+source: mixed
+transforms:
+- source: StartUTC
+  kind: epoch_ms
+  target: time
+  reason: Request start clock (RFC 3339) converted to event milliseconds.
+- source: StartLocal
+  kind: epoch_ms
+  target: time
+  reason: Request start clock (RFC 3339) converted to event milliseconds when StartUTC is absent.
+- source: time
+  kind: epoch_ms
+  target: time
+  reason: Log record clock (RFC 3339) converted to event milliseconds.
+- source: start_local
+  kind: epoch_ms
+  target: time
+  format: '%d/%b/%Y:%H:%M:%S %z'
+  reason: CLF timestamp with explicit offset converted to event milliseconds.
+- source: Duration
+  kind: scale
+  factor: 0.000001
+  target: duration
+  reason: Traefik reports Duration in nanoseconds; OCSF duration is milliseconds.
+- source: OriginDuration
+  kind: scale
+  factor: 0.000001
+  target: http_response.latency
+  reason: Traefik reports OriginDuration in nanoseconds; http_response.latency is milliseconds.
+- source: level
+  kind: enum
+  target: severity_id
+  values:
+    trace: 1
+    trc: 1
+    debug: 1
+    dbg: 1
+    info: 1
+    inf: 1
+    warn: 3
+    warning: 3
+    wrn: 3
+    error: 4
+    err: 4
+    fatal: 6
+    ftl: 6
+    panic: 6
+    pnc: 6
+  reason: Traefik log level normalized to OCSF severity_id; consumed only when that ID is emitted.
+consumed_candidates:
+- BackendName
+- BackendURL.Host
+- ClientAddr
+- ClientHost
+- ClientPort
+- ClientUsername
+- DownstreamContentSize
+- DownstreamStatus
+- FrontendName
+- RequestContentSize
+- RequestHost
+- RequestMethod
+- RequestPath
+- RequestPort
+- RequestProtocol
+- RequestScheme
+- RouterName
+- ServiceAddr
+- ServiceName
+- ServiceURL
+- ServiceURL.Host
+- TLSCipher
+- TLSVersion
+- downstream_Content-Type
+- client_host
+- client_username
+- downstream_content_size
+- downstream_status
+- duration
+- error
+- level
+- message
+- msg
+- request_Referer
+- request_User-Agent
+- request_method
+- request_path
+- request_protocol
+- request_referer
+- request_user_agent
+- router_name
+- service_url
+- start_local
+- trace_id
+consumed_reason: Only source keys read by this parser are eligible for exact-value
+  consumption; the selected branch must emit the value. Unknown keys always spill,
+  even when their value equals an OCSF default.
