@@ -1,0 +1,804 @@
+name: juniper_junos_ocsf
+display_name: Juniper Junos (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses general Juniper Junos device syslog (routers, switches and the
+  control plane of any Junos box) into OCSF 1.9.0, in both the default BSD
+  form ("Mon dd hh:mm:ss host process[pid]: TAG: text") and the
+  structured-data form (RFC 5424 with [junos@2636 ...] parameters). Routing:
+  UI_LOGIN_EVENT and UI_AUTH_EVENT -> Authentication (3002) Logon success,
+  UI_LOGOUT_EVENT -> Logoff; LOGIN_FAILED, SSHD_LOGIN_FAILED,
+  LOGIN_PAM_MAX_RETRIES and sshd "Failed password" -> Logon failure, sshd
+  "Accepted" -> Logon success; UI_COMMIT, UI_COMMIT_COMPLETED,
+  UI_LOAD_EVENT, UI_DBASE_LOGIN_EVENT / LOGOUT_EVENT and UI_CMDLINE_READ_LINE
+  -> API Activity (6003) with the operation or CLI command in api.operation
+  (commit and load are Update, show commands are Read); SNMP_TRAP_LINK_DOWN
+  / UP, LACP_INTF_DOWN and other link state tags -> Base Event (0) with the
+  interface in device.network_interfaces. Every other tag (SNMPD_AUTH_FAILURE,
+  RPD_*, CHASSISD_*, ...) is a Base Event with the tag in metadata.event_code.
+  SRX security logs (RT_FLOW, RT_IDP, RT_UTM) belong to the separate
+  juniper_srx parser; sent here they stay Base Events. A line with no syslog
+  header is a Base Event marked with unmapped.parse_fallback.
+match_values:
+  - juniper_junos
+category: network
+vendor: "Juniper"
+product: "Junos OS"
+parser_vrl: |
+  # Juniper Junos -> OCSF 1.9.0 Authentication (3002) / API Activity (6003) / Base Event (0)
+  raw_log = if is_string(.message) { string!(.message) } else { encode_json(.) }
+  __raw_body = raw_log
+  __source_kv = {}
+
+  time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
+  header_ok = false
+  host = ""
+  prog = ""
+  tag = ""
+  msg = raw_log
+  sev_num = 6
+  sd = {}
+
+  # ---- RFC 5424 (structured-data) first, then BSD ----
+  h5, h5e = parse_regex(raw_log, r'^<(?P<pri>\d{1,3})>1?\s*(?P<ts>\d{4}-\d{2}-\d{2}T\S+)\s+(?P<host>\S+)\s+(?P<prog>\S+)\s+(?P<pid>\S+)\s+(?P<msgid>\S+)\s+(?P<sd>-|(?:\x5B(?:[^\x5D\\]|\\.)*\x5D)+)\s?(?P<msg>.*)$')
+  if h5e == null {
+      header_ok = true
+      hdr = { "pri": h5.pri, "ts": h5.ts, "host": h5.host }
+      if h5.prog != "-" { hdr.prog = h5.prog; prog = string!(h5.prog) }
+      if h5.pid != "-" { hdr.pid = h5.pid }
+      if h5.msgid != "-" { hdr.tag = h5.msgid; tag = string!(h5.msgid) }
+      __source_kv.header = hdr
+      host = string!(h5.host)
+      msg = string!(h5.msg)
+      sev_num = mod(to_int(h5.pri) ?? 6, 8)
+      t5, t5e = parse_timestamp(string!(h5.ts), "%+")
+      if t5e == null { time_ms = to_unix_timestamp(t5, unit: "milliseconds") }
+      if h5.sd != "-" {
+          sdm, sde = parse_regex(string!(h5.sd), r'^\x5B(?P<sdid>[^\s\x5D]+)')
+          if sde == null { hdr.sd_id = sdm.sdid; __source_kv.header = hdr }
+          pairs = parse_regex_all(string!(h5.sd), r'(?P<k>[A-Za-z0-9_.-]+)="(?P<v>(?:[^"\\]|\\.)*)"') ?? []
+          for_each(pairs) -> |_i, pr| {
+              k = string(pr.k) ?? ""
+              v = string(pr.v) ?? ""
+              # RFC 5424 PARAM-VALUE escapes; an escaped closing bracket is left as sent
+              v = replace(replace(v, "\\\"", "\""), "\\\\", "\\")
+              if k != "" { sd = set!(sd, [k], v) }
+          }
+          if length(sd) > 0 { __source_kv.sd = sd }
+      }
+  } else {
+      h3, h3e = parse_regex(raw_log, r'^(?:<(?P<pri>\d{1,3})>)?(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}\s+(?:\d{4}\s+)?\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:\s+\d{4})?|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s+(?P<host>[^\s:\x5B]+)\s+(?P<prog>/?[A-Za-z0-9_./-]+?)(?:\x5B(?P<pid>\d+)\x5D)?:\s*(?P<msg>.*)$')
+      if h3e == null {
+          header_ok = true
+          hdr = compact(object!(h3), string: true, null: true)
+          __d = del(hdr.msg)
+          __source_kv.header = hdr
+          host = string!(h3.host)
+          prog = replace(string!(h3.prog), r'^/', "")
+          msg = string!(h3.msg)
+          if h3.pri != null { sev_num = mod(to_int(h3.pri) ?? 6, 8) }
+          ts_str = replace(string!(h3.ts), r'\s+', " ")
+          tsx, tsxe = parse_timestamp(ts_str, "%+")
+          if tsxe != null { tsx, tsxe = parse_timestamp(ts_str, "%b %d %H:%M:%S %Y", timezone: "UTC") }
+          if tsxe != null { tsx, tsxe = parse_timestamp(ts_str, "%b %d %Y %H:%M:%S", timezone: "UTC") }
+          if tsxe != null { tsx, tsxe = parse_timestamp(ts_str + " " + format_timestamp!(now(), "%Y"), "%b %d %H:%M:%S%.f %Y", timezone: "UTC") }
+          if tsxe == null { time_ms = to_unix_timestamp(tsx, unit: "milliseconds") }
+          tgm, tge = parse_regex(msg, r'^(?P<tag>[A-Z][A-Z0-9_]{2,}[A-Z0-9])\s*:\s*(?P<text>.*)$')
+          if tge == null {
+              tag = string!(tgm.tag)
+              hdr.tag = tgm.tag
+              __source_kv.header = hdr
+              msg = string!(tgm.text)
+          }
+      }
+  }
+
+  severity_id = 1
+  severity = "Informational"
+  if sev_num == 0 { severity_id = 6; severity = "Fatal" }
+  if sev_num == 1 || sev_num == 2 { severity_id = 5; severity = "Critical" }
+  if sev_num == 3 { severity_id = 4; severity = "High" }
+  if sev_num == 4 { severity_id = 3; severity = "Medium" }
+  if sev_num == 5 { severity_id = 2; severity = "Low" }
+
+  route = "base"
+  activity_id = 99
+  activity_name = "Other"
+  status_id = 0
+  status_str = "Unknown"
+  action_id = 0
+  action = "Unknown"
+  disposition_id = 0
+  disposition = "Unknown"
+  user_name = ""
+  src_ip = ""
+  src_port = 0
+  dst_ip = ""
+  dst_port = 0
+  priv = ""
+  client_mode = ""
+  api_op = ""
+  iface = ""
+  ev = {}
+
+  # structured-data values win; the BSD text is parsed per tag below
+  user_name = string(sd.username) ?? ""
+  src_ip = string(sd."source-address") ?? ""
+
+  if tag == "UI_LOGIN_EVENT" {
+      route = "auth"
+      lm, le = parse_regex(msg, r'^User\s+\x27(?P<user>[^\x27]*)\x27\s+login,\s+class\s+\x27(?P<class>[^\x27]*)\x27(?:\s+\x5B(?P<login_pid>\d+)\x5D)?(?:,\s+ssh-connection\s+\x27(?P<ssh>[^\x27]*)\x27)?(?:,\s+client-mode\s+\x27(?P<mode>[^\x27]*)\x27)?')
+      if le == null {
+          ev = compact(object!(lm), string: true, null: true)
+          user_name = string!(lm.user)
+          priv = string!(lm.class)
+          client_mode = string(lm.mode) ?? ""
+      }
+      if priv == "" { priv = string(sd."class-name") ?? "" }
+      if client_mode == "" { client_mode = string(sd."client-mode") ?? "" }
+      ssh = string(ev.ssh) ?? string(sd."ssh-connection") ?? ""
+      cm, ce = parse_regex(ssh, r'^(?P<src_ip>[0-9A-Fa-f.:]+)\s+(?P<src_port>\d+)\s+(?P<dst_ip>[0-9A-Fa-f.:]+)\s+(?P<dst_port>\d+)$')
+      if ce == null {
+          src_ip = string!(cm.src_ip); src_port = to_int(cm.src_port) ?? 0
+          dst_ip = string!(cm.dst_ip); dst_port = to_int(cm.dst_port) ?? 0
+      }
+      activity_id = 1; activity_name = "Logon"
+      status_id = 1; status_str = "Success"
+      action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed"
+  } else if tag == "UI_AUTH_EVENT" {
+      route = "auth"
+      am, ae = parse_regex(msg, r'^Authenticated user\s+\x27(?P<user>[^\x27]*)\x27\s+at permission level\s+\x27(?P<level>[^\x27]*)\x27')
+      if ae == null {
+          ev = object!(am)
+          user_name = string!(am.user)
+          priv = string!(am.level)
+      }
+      if priv == "" { priv = string(sd."authentication-level") ?? "" }
+      activity_id = 1; activity_name = "Logon"
+      status_id = 1; status_str = "Success"
+      action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed"
+  } else if tag == "UI_LOGOUT_EVENT" {
+      route = "auth"
+      om, oe = parse_regex(msg, r'^User\s+\x27(?P<user>[^\x27]*)\x27\s+logout')
+      if oe == null { ev = object!(om); user_name = string!(om.user) }
+      activity_id = 2; activity_name = "Logoff"
+      status_id = 1; status_str = "Success"
+  } else if tag == "LOGIN_FAILED" || tag == "SSHD_LOGIN_FAILED" || tag == "LOGIN_PAM_MAX_RETRIES" {
+      route = "auth"
+      fm, fe = parse_regex(msg, r'(?:Login failed for user|authenticating user)\s+\x27?(?P<user>[^\x27\s]+)\x27?(?:\s+from host\s+\x27?(?P<src>[^\x27\s]+)\x27?)?')
+      if fe == null {
+          ev = compact(object!(fm), string: true, null: true)
+          user_name = string!(fm.user)
+          s = string(fm.src) ?? ""
+          if is_ipv4(s) || is_ipv6(s) { src_ip = s } else if s != "" { ev.src_host = s }
+      }
+      activity_id = 1; activity_name = "Logon"
+      status_id = 2; status_str = "Failure"
+      action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
+  } else if tag == "" && prog == "sshd" {
+      sm, se = parse_regex(msg, r'^(?P<result>Accepted|Failed)\s+(?P<method>\S+)\s+for\s+(?:invalid user\s+)?(?P<user>\S+)\s+from\s+(?P<src_ip>[0-9A-Fa-f.:]+)\s+port\s+(?P<src_port>\d+)')
+      if se == null {
+          route = "auth"
+          ev = object!(sm)
+          user_name = string!(sm.user)
+          src_ip = string!(sm.src_ip)
+          src_port = to_int(sm.src_port) ?? 0
+          dst_port = 22
+          activity_id = 1; activity_name = "Logon"
+          if sm.result == "Accepted" {
+              status_id = 1; status_str = "Success"
+              action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed"
+          } else {
+              status_id = 2; status_str = "Failure"
+              action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
+          }
+      }
+  } else if tag == "UI_COMMIT" {
+      route = "api"
+      activity_id = 3; activity_name = "Update"
+      km, ke = parse_regex(msg, r'^User\s+\x27(?P<user>[^\x27]*)\x27\s+requested\s+\x27(?P<command>[^\x27]*)\x27\s+operation(?:\s+\x28comment:\s*(?P<comment>.*?)\x29)?')
+      if ke == null {
+          ev = compact(object!(km), string: true, null: true)
+          user_name = string!(km.user)
+          api_op = string!(km.command)
+      }
+      if api_op == "" { api_op = string(sd.command) ?? "commit" }
+  } else if tag == "UI_COMMIT_COMPLETED" {
+      route = "api"
+      activity_id = 3; activity_name = "Update"
+      api_op = "commit complete"
+  } else if tag == "UI_LOAD_EVENT" {
+      route = "api"
+      activity_id = 3; activity_name = "Update"
+      dm, de = parse_regex(msg, r'^User\s+\x27(?P<user>[^\x27]*)\x27\s+is performing a\s+\x27(?P<command>[^\x27]*)\x27')
+      if de == null { ev = object!(dm); user_name = string!(dm.user); api_op = string!(dm.command) }
+      if api_op == "" { api_op = "load" }
+  } else if tag == "UI_DBASE_LOGIN_EVENT" || tag == "UI_DBASE_LOGOUT_EVENT" {
+      route = "api"
+      bm, be = parse_regex(msg, r'^User\s+\x27(?P<user>[^\x27]*)\x27\s+(?P<command>entering|exiting) configuration mode')
+      if be == null { ev = object!(bm); user_name = string!(bm.user) }
+      api_op = if tag == "UI_DBASE_LOGIN_EVENT" { "enter configuration mode" } else { "exit configuration mode" }
+  } else if tag == "UI_CMDLINE_READ_LINE" {
+      route = "api"
+      rm, re = parse_regex(msg, r'^User\s+\x27(?P<user>[^\x27]*)\x27,\s+command\s+\x27(?P<command>.*?)\s*\x27\s*$')
+      if re == null { ev = object!(rm); user_name = string!(rm.user); api_op = strip_whitespace(string!(rm.command)) }
+      if api_op == "" { api_op = string(sd.command) ?? "" }
+      if starts_with(api_op, "show") { activity_id = 2; activity_name = "Read" }
+  } else if match(tag, r'LINK_(?:DOWN|UP)$|INTF_(?:DOWN|UP)$') {
+      im, ie = parse_regex(msg, r'ifIndex\s+(?P<if_index>\d+),\s+ifAdminStatus\s+(?P<admin_status>[^,]+),\s+ifOperStatus\s+(?P<oper_status>[^,]+),\s+ifName\s+(?P<interface>\S+)')
+      if ie == null {
+          ev = object!(im)
+          iface = string!(im.interface)
+      } else {
+          xm, xe = parse_regex(msg, r'^(?P<interface>[a-z]{2,4}-\d+/\d+/\d+(?:[.:]\d+)*|ae\d+(?:\.\d+)?|st0\.\d+)\b')
+          if xe == null { ev = object!(xm); iface = string!(xm.interface) }
+      }
+      if iface == "" { iface = string(sd."interface-name") ?? "" }
+  }
+  if length(ev) > 0 { __source_kv.event = ev }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": sha2("juniper_junos|raw|" + raw_log, variant: "SHA-256"),
+      "log_name": "juniper_junos",
+      "product": { "name": "Junos OS", "vendor_name": "Juniper" }
+  }
+  if tag != "" { metadata.event_code = tag }
+  if prog != "" { metadata.log_provider = prog }
+
+  device = {}
+  if host != "" { device = { "hostname": host, "type_id": 12, "type": "Router" } }
+
+  base = {
+      "time": time_ms,
+      "raw_data": raw_log,
+      "metadata": metadata,
+      "severity_id": severity_id,
+      "severity": severity
+  }
+  if header_ok {
+      base.message = msg
+      __source_kv.message = msg
+  }
+
+  if route == "auth" && user_name != "" {
+      if status_id == 2 && severity_id < 3 { severity_id = 3; severity = "Medium" }
+      . = merge(base, {
+          "class_uid": 3002, "class_name": "Authentication",
+          "category_uid": 3, "category_name": "Identity & Access Management",
+          "activity_id": activity_id, "activity_name": activity_name,
+          "type_uid": 300200 + activity_id,
+          "severity_id": severity_id, "severity": severity,
+          "status_id": status_id, "status": status_str,
+          "user": { "name": user_name },
+          "service": { "name": "Junos management" }
+      })
+      if action_id > 0 {
+          .action_id = action_id; .action = action
+          .disposition_id = disposition_id; .disposition = disposition
+          .metadata.profiles = ["security_control"]
+      }
+      if priv != "" { .user.groups = [{ "name": priv }] }
+      if client_mode != "" { .logon_type = client_mode; .logon_type_id = 99 }
+      src = {}
+      if src_ip != "" { src.ip = src_ip; .is_remote = true }
+      if src_port > 0 { src.port = src_port }
+      if exists(ev.src_host) { src.hostname = ev.src_host }
+      if length(src) > 0 { .src_endpoint = src }
+      dst = {}
+      if dst_ip != "" { dst.ip = dst_ip }
+      if dst_port > 0 { dst.port = dst_port }
+      if host != "" { dst.hostname = host }
+      if exists(dst.ip) || exists(dst.hostname) { .dst_endpoint = dst }
+  } else if route == "api" {
+      actor = {}
+      if user_name != "" { actor.user = { "name": user_name } }
+      if prog != "" { actor.process = { "name": prog } }
+      pidn = to_int(string(__source_kv.header.pid) ?? "") ?? 0
+      if prog != "" && pidn > 0 { actor.process.pid = pidn }
+      if api_op == "" { api_op = tag }
+      # src_endpoint is required; Junos logs no client address on these, and
+      # the operation ran on the device itself.
+      src = {}
+      if host != "" { src.hostname = host } else { src.svc_name = "cli" }
+      . = merge(base, {
+          "class_uid": 6003, "class_name": "API Activity",
+          "category_uid": 6, "category_name": "Application Activity",
+          "activity_id": activity_id, "activity_name": activity_name,
+          "type_uid": 600300 + activity_id,
+          "status_id": 1, "status": "Success",
+          "actor": actor,
+          "api": { "operation": api_op, "service": { "name": "Junos mgd" } },
+          "src_endpoint": src
+      })
+  } else {
+      . = merge(base, {
+          "class_uid": 0, "class_name": "Base Event",
+          "category_uid": 0, "category_name": "Uncategorized",
+          "activity_id": 99, "activity_name": "Other",
+          "type_uid": 99,
+          "status_id": 0, "status": "Unknown"
+      })
+      if !header_ok { . = set!(., ["unmapped", "parse_fallback"], "unparsable input") }
+      if iface != "" {
+          if length(device) == 0 { device = { "type_id": 12, "type": "Router" } }
+          device.network_interfaces = [{ "name": iface }]
+      }
+  }
+  if length(device) > 0 {
+      .device = device
+      .metadata.profiles = push(array(.metadata.profiles) ?? [], "host")
+  }
+
+  .
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # header.ts: RFC 5424 / RFC 3339 header clock converted to event milliseconds; BSD clocks without a year remain residual.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        header\.ts
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    header\.host
+  | header\.prog
+  | header\.pid
+  | header\.tag
+  | sd\.username
+  | sd\.source\-address
+  | sd\.class\-name
+  | sd\.client\-mode
+  | sd\.interface\-name
+  | sd\.command
+  | event\.user
+  | event\.class
+  | event\.level
+  | event\.mode
+  | event\.src
+  | event\.src_ip
+  | event\.src_port
+  | event\.command
+  | event\.interface
+  | message
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # Sources (addresses, hosts and users replaced with documentation values):
+  #   napalm-logs Junos fixtures:
+  #     https://github.com/napalm-automation/napalm-logs/tree/develop/tests/config/junos
+  #   Elastic juniper_srx system fixtures (structured-data form of non-flow Junos tags):
+  #     https://github.com/elastic/integrations/blob/main/packages/juniper_srx/data_stream/log/_dev/test/pipeline/test-system.log
+  #   Juniper Common Criteria guide, SSH login / logout event sequence:
+  #     https://www.juniper.net/documentation/us/en/software/ccfips24.4/cc-security-branch/topics/task/login-logout-events-using-ssh.html
+  #   Juniper, Check the Commands That Users Are Entering (UI_CMDLINE_READ_LINE):
+  #     https://www.juniper.net/documentation/us/en/software/junos/network-mgmt/topics/concept/users-commands-entered-checking.html
+  #   Juniper System Log Explorer message formats (LOGIN_FAILED, UI_LOGIN_EVENT):
+  #     https://apps.juniper.net/syslog-explorer/
+  - raw: "Dec 20 23:17:53 bilbo mgd[16648]: UI_AUTH_EVENT: Authenticated user 'op' at permission level 'j-operator'"
+    expect:
+      class_uid: 3002
+      activity_id: 1
+      status_id: 1
+      user.name: op
+      user.groups.0.name: j-operator
+      device.hostname: bilbo
+  - raw: "Dec 20 23:17:53 bilbo mgd[16648]: UI_LOGIN_EVENT: User 'op' login, class 'j-operator' [16648], ssh-connection '192.0.2.10 1673 192.0.2.1 22', client-mode 'cli'"
+    expect:
+      class_uid: 3002
+      activity_id: 1
+      src_endpoint.ip: 192.0.2.10
+      src_endpoint.port: 1673
+      dst_endpoint.port: 22
+      logon_type: cli
+  - raw: "Dec 20 23:18:10 bilbo mgd[16648]: UI_CMDLINE_READ_LINE: User 'op', command 'show interfaces terse '"
+    expect:
+      class_uid: 6003
+      activity_id: 2
+      api.operation: show interfaces terse
+      actor.user.name: op
+  - raw: "Dec 20 23:21:02 bilbo mgd[16648]: UI_LOGOUT_EVENT: User 'op' logout"
+    expect:
+      class_uid: 3002
+      activity_id: 2
+  - raw: '<189>1 2024-03-04T11:05:00.000Z rtr01 mgd 4200 UI_LOGIN_EVENT [junos@2636.1.1.1.2.18 username="netops" class-name="j-super-user" local-peer="" pid="4200" ssh-connection="198.51.100.40 50122 192.0.2.1 22" client-mode="cli"] User ''netops'' login, class ''j-super-user'' [4200], ssh-connection ''198.51.100.40 50122 192.0.2.1 22'', client-mode ''cli'''
+    expect:
+      class_uid: 3002
+      user.name: netops
+      src_endpoint.ip: 198.51.100.40
+      time: 1709550300000
+  # failures
+  - raw: '<37>1 2023-05-09T15:00:06.756+10:00 fw01.example.com sshd - SSHD_LOGIN_FAILED [junos@2636.1.1.1.2.129 username="admin" source-address="198.51.100.7"]'
+    expect:
+      class_uid: 3002
+      status_id: 2
+      action_id: 2
+      user.name: admin
+      src_endpoint.ip: 198.51.100.7
+  - raw: '<38>Dec 20 23:16:41 bilbo sshd[16640]: Failed password for root from 203.0.113.9 port 52044 ssh2'
+    expect:
+      class_uid: 3002
+      status_id: 2
+      src_endpoint.port: 52044
+  - raw: '<38>Dec 20 23:17:50 bilbo sshd[16641]: Accepted password for op from 192.0.2.10 port 1673 ssh2'
+    expect:
+      class_uid: 3002
+      status_id: 1
+  - raw: '<36>Mar  4 11:02:41 rtr01 login[4123]: LOGIN_FAILED: Login failed for user jdoe from host 198.51.100.33'
+    expect:
+      class_uid: 3002
+      status_id: 2
+      user.name: jdoe
+      src_endpoint.ip: 198.51.100.33
+  # configuration (napalm-logs CONFIGURATION_* and USER_ENTER_CONFIG_MODE)
+  - raw: "<189>Jul 20 21:44:00 vmx01 mgd[7729]: UI_COMMIT: User 'luke' requested 'commit synchronize' operation (comment: hello)"
+    expect:
+      class_uid: 6003
+      activity_id: 3
+      api.operation: commit synchronize
+      actor.user.name: luke
+      actor.process.pid: 7729
+  - raw: '<189>Jul 20 21:44:00 vmx01 mgd[7729]: UI_COMMIT_COMPLETED: commit complete'
+    expect:
+      class_uid: 6003
+      api.operation: commit complete
+  - raw: "<189>Jul 20 21:44:00 vmx01 mgd[7729]: UI_LOAD_EVENT: User 'luke' is performing a 'rollback 3'"
+    expect:
+      class_uid: 6003
+      api.operation: rollback 3
+  - raw: "<189>Jul 20 21:44:00 vmx01 mgd[7729]: UI_DBASE_LOGIN_EVENT: User 'luke' entering configuration mode"
+    expect:
+      class_uid: 6003
+      activity_id: 99
+      api.operation: enter configuration mode
+  - raw: '<14>1 2024-10-30T09:51:12.123Z rtr-edge-01 mgd 1234 UI_COMMIT_COMPLETED [junos@2636.1.1.1.2.1 message="commit complete"]'
+    expect:
+      class_uid: 6003
+      time: 1730281872123
+  # link state (napalm-logs INTERFACE_DOWN / UP / LACP_INTERFACE_DOWN, Elastic test-system.log)
+  - raw: '<28>Jul 20 21:45:59 vmx01 mib2d[2424]: SNMP_TRAP_LINK_DOWN: ifIndex 502, ifAdminStatus down(2), ifOperStatus down(2), ifName xe-0/0/0'
+    expect:
+      class_uid: 0
+      metadata.event_code: SNMP_TRAP_LINK_DOWN
+      device.network_interfaces.0.name: xe-0/0/0
+      severity_id: 3
+  - raw: '<28>Jul 20 21:45:59 vmx01 mib2d[2424]: SNMP_TRAP_LINK_UP: ifIndex 502, ifAdminStatus up(1), ifOperStatus up(1), ifName xe-0/0/0'
+    expect:
+      class_uid: 0
+      device.network_interfaces.0.name: xe-0/0/0
+  - raw: '<175>2020-11-04T07:05:36+00:00 some-switch lacpd[12694]: LACP_INTF_DOWN: ae105: Interface marked down due to lacp timeout on member et-0/0/25:3'
+    expect:
+      class_uid: 0
+      device.network_interfaces.0.name: ae105
+      time: 1604473536000
+  - raw: '<28>1 2023-05-08T14:25:07.466+10:00 fw01.example.com mib2d 8956 SNMP_TRAP_LINK_DOWN [junos@2636.1.1.1.2.129 snmp-interface-index="508" admin-status="up(1)" operational-status="down(2)" interface-name="st0.60"]'
+    expect:
+      class_uid: 0
+      device.network_interfaces.0.name: st0.60
+  # other tags and untagged lines -> Base Event
+  - raw: '<37>1 2023-05-10T00:10:24.232+10:00 fw01.example.com snmpd 8959 SNMPD_AUTH_FAILURE [junos@2636.1.1.1.2.129 function-name="nsa_log_community" message="unauthorized SNMP community" source-address="198.51.100.56" destination-address="192.0.2.128" index1="j5Cx6eSkKF7A"]'
+    expect:
+      class_uid: 0
+      metadata.event_code: SNMPD_AUTH_FAILURE
+  - raw: '<28>Nov 20 16:58:04 re0-gw2.example.net rpd[3167]: bgp_listen_accept:4984: NOTIFICATION sent to 2001:db8:124::f1:12:1+51528 (proto): code 6 (Cease) subcode 5 (Connection Rejected), Reason: Connection attempt from unconfigured neighbor: 2001:db8:124::f1:12:1+51528'
+    expect:
+      class_uid: 0
+      metadata.log_provider: rpd
+  - raw: '<4>Jul 20 21:23:00 vmx01 /kernel: tcp_auth_ok: Packet from 192.0.2.254:61664 wrong MD5 digest'
+    expect:
+      class_uid: 0
+      metadata.log_provider: kernel
+      severity_id: 3
+  - raw: '<25>Jun 21 14:03:12 vmx01 eswd[2902]: ESWD_BPDU_BLOCK_ERROR_DISABLED: ge-0/0/17.0: bpdu-block disabled port'
+    expect:
+      class_uid: 0
+      metadata.event_code: ESWD_BPDU_BLOCK_ERROR_DISABLED
+  # SRX flow logs belong to juniper_srx; here they stay Base Events
+  - raw: '<14>1 2024-10-30T09:50:00.000Z srx-edge-01 RT_FLOW - RT_FLOW_SESSION_CLOSE [junos@2636.1.1.1.2.129 reason="TCP FIN" source-address="192.0.2.10" source-port="51515" destination-address="198.51.100.80" destination-port="443"]'
+    expect:
+      class_uid: 0
+      metadata.event_code: RT_FLOW_SESSION_CLOSE
+  - raw: 'garbage that is not a Junos line'
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: unparsable input

@@ -1,0 +1,595 @@
+name: fail2ban_ocsf
+display_name: Fail2ban (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses the Fail2ban server log (fail2ban.log, or the same lines forwarded
+  through syslog or the systemd journal) into OCSF 1.9.0. Every jail verdict
+  becomes a Detection Finding (2004) keyed on the jail and the offending
+  address: Ban, Reban and Restore Ban are activity Create with action Denied
+  (disposition Blocked), "already banned" is activity Update, Unban is
+  activity Close with status Resolved, and a filter Found match is a separate
+  Low severity finding (activity Create, action Observed) keyed on the
+  line itself. The jail is finding_info.analytic.name and the
+  address is the evidence src_endpoint.ip. Server, jail start/stop, Ignore
+  and every other line becomes a Base Event (0) with the logger, level and
+  message kept. Timestamps are read as UTC because fail2ban.log carries no
+  offset. A line with no recognizable fail2ban shape is a Base Event marked
+  with unmapped.parse_fallback.
+match_values:
+  - fail2ban
+category: security
+vendor: "Fail2ban"
+product: "Fail2ban"
+parser_vrl: |
+  # Fail2ban -> OCSF 1.9.0 Detection Finding (2004) / Base Event (0)
+  raw_log = if is_string(.message) { string!(.message) } else { encode_json(.) }
+  __raw_body = raw_log
+  __source_kv = {}
+
+  time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
+  header_ok = false
+  host = ""
+  logger = ""
+  level = ""
+  msg = raw_log
+
+  # ---- header: ISO clock (fail2ban.log), BSD syslog or the short journal form ----
+  hm, he = parse_regex(raw_log, r'^(?:<(?P<pri>\d{1,3})>)?(?:(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[,.]\d{1,6})?)\s+|(?P<syslog_ts>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(?P<host>[^\s\x5B]+)\s+|(?P<jhost>[A-Za-z0-9._-]+)\s+(?P<jdaemon>fail2ban(?:-server)?)\x5B(?P<jpid>\d+)\x5D:\s+)?(?:(?P<daemon>fail2ban(?:-server)?)(?:\x5B(?P<daemon_pid>\d+)\x5D)?:\s+)?(?:(?P<logger>fail2ban\.[A-Za-z0-9_.]+)\s*(?:\x5B(?P<pid>\d+)\x5D)?:\s+(?P<level>[A-Z]+)\s+)?(?P<msg>.*)$')
+  if he == null {
+      hdr = compact(object!(hm), string: true, null: true)
+      __d = del(hdr.msg)
+      if hm.ts != null || hm.syslog_ts != null || hm.jdaemon != null || hm.daemon != null || hm.logger != null {
+          header_ok = true
+          __source_kv.header = hdr
+          msg = string(hm.msg) ?? ""
+          if hm.host != null { host = string!(hm.host) }
+          if hm.jhost != null { host = string!(hm.jhost) }
+          logger = string(hm.logger) ?? ""
+          level = string(hm.level) ?? ""
+          if hm.ts != null {
+              ts_str = replace(string!(hm.ts), ",", ".")
+              t1, t1e = parse_timestamp(ts_str, "%Y-%m-%d %H:%M:%S%.f", timezone: "UTC")
+              if t1e != null { t1, t1e = parse_timestamp(ts_str, "%Y-%m-%dT%H:%M:%S%.f", timezone: "UTC") }
+              if t1e == null { time_ms = to_unix_timestamp(t1, unit: "milliseconds") }
+          } else if hm.syslog_ts != null {
+              bsd = replace(string!(hm.syslog_ts), r'\s+', " ")
+              t2, t2e = parse_timestamp(bsd + " " + format_timestamp!(now(), "%Y"), "%b %d %H:%M:%S %Y", timezone: "UTC")
+              if t2e == null { time_ms = to_unix_timestamp(t2, unit: "milliseconds") }
+          }
+      }
+  }
+
+  # ---- level -> severity for non-finding lines ----
+  severity_id = 1
+  severity = "Informational"
+  lv = upcase(level)
+  if lv == "CRITICAL" { severity_id = 5; severity = "Critical" }
+  if lv == "ERROR" { severity_id = 4; severity = "High" }
+  if lv == "WARNING" { severity_id = 3; severity = "Medium" }
+  if lv == "NOTICE" { severity_id = 2; severity = "Low" }
+
+  route = "base"
+  verb = ""
+  jail = ""
+  ip = ""
+  found_time = ""
+  if header_ok {
+      vm, ve = parse_regex(msg, r'^\x5B(?P<jail>[^\x5D]+)\x5D\s+(?P<verb>Restore Ban|Reban|Ban|Unban|Found)\s+(?P<ip>[0-9A-Fa-f.:]+)(?:\s+-\s+(?P<found_time>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}))?(?:,\s+action\s+\x27(?P<ban_action>[^\x27]*)\x27)?\s*$')
+      if ve == null {
+          route = "finding"
+          __source_kv.jail_event = compact(object!(vm), string: true, null: true)
+          jail = string!(vm.jail)
+          verb = string!(vm.verb)
+          ip = string!(vm.ip)
+          found_time = string(vm.found_time) ?? ""
+      } else {
+          am, ae = parse_regex(msg, r'^\x5B(?P<jail>[^\x5D]+)\x5D\s+(?P<ip>[0-9A-Fa-f.:]+)\s+already banned\s*$')
+          if ae == null {
+              route = "finding"
+              __source_kv.jail_event = { "jail": am.jail, "ip": am.ip }
+              jail = string!(am.jail)
+              verb = "already banned"
+              ip = string!(am.ip)
+          }
+      }
+  }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": sha2("fail2ban|raw|" + raw_log, variant: "SHA-256"),
+      "log_name": "fail2ban",
+      "product": { "name": "Fail2ban", "vendor_name": "Fail2ban" }
+  }
+  if logger != "" { metadata.log_provider = logger }
+  if level != "" { metadata.log_level = level }
+
+  base = {
+      "time": time_ms,
+      "raw_data": raw_log,
+      "metadata": metadata
+  }
+
+  if route == "finding" {
+      activity_id = 1
+      activity_name = "Create"
+      action_id = 2
+      action = "Denied"
+      disposition_id = 2
+      disposition = "Blocked"
+      status_id = 1
+      status_str = "New"
+      fseverity_id = 3
+      fseverity = "Medium"
+      finding_uid = sha2("fail2ban|" + jail + "|" + ip, variant: "SHA-256")
+      title = "fail2ban banned " + ip + " in jail " + jail
+      if verb == "Restore Ban" {
+          title = "fail2ban restored the ban on " + ip + " in jail " + jail
+      } else if verb == "Reban" {
+          title = "fail2ban rebanned " + ip + " in jail " + jail
+      } else if verb == "already banned" {
+          activity_id = 2; activity_name = "Update"
+          status_id = 2; status_str = "In Progress"
+          fseverity_id = 2; fseverity = "Low"
+          title = "fail2ban saw already banned " + ip + " in jail " + jail
+      } else if verb == "Unban" {
+          activity_id = 3; activity_name = "Close"
+          action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed"
+          status_id = 4; status_str = "Resolved"
+          fseverity_id = 1; fseverity = "Informational"
+          title = "fail2ban unbanned " + ip + " in jail " + jail
+      } else if verb == "Found" {
+          action_id = 3; action = "Observed"; disposition_id = 17; disposition = "Logged"
+          fseverity_id = 2; fseverity = "Low"
+          finding_uid = sha2("fail2ban|found|" + raw_log, variant: "SHA-256")
+          title = "fail2ban filter matched " + ip + " in jail " + jail
+      }
+      . = merge(base, {
+          "class_uid": 2004, "class_name": "Detection Finding",
+          "category_uid": 2, "category_name": "Findings",
+          "activity_id": activity_id, "activity_name": activity_name,
+          "type_uid": 200400 + activity_id,
+          "severity_id": fseverity_id, "severity": fseverity,
+          "status_id": status_id, "status": status_str,
+          "action_id": action_id, "action": action,
+          "disposition_id": disposition_id, "disposition": disposition,
+          "message": msg,
+          "finding_info": {
+              "uid": finding_uid,
+              "title": title,
+              "types": [verb],
+              "analytic": { "name": jail, "type_id": 1, "type": "Rule" }
+          },
+          "evidences": [{ "src_endpoint": { "ip": ip } }],
+          "observables": [{ "name": "evidences.src_endpoint.ip", "type": "IP Address", "type_id": 2, "value": ip }]
+      })
+      .metadata.profiles = ["security_control"]
+      .metadata.event_code = verb
+      if found_time != "" {
+          ft, fte = parse_timestamp(replace(found_time, "T", " "), "%Y-%m-%d %H:%M:%S", timezone: "UTC")
+          if fte == null { .finding_info.first_seen_time = to_unix_timestamp(ft, unit: "milliseconds") }
+      }
+  } else {
+      . = merge(base, {
+          "class_uid": 0, "class_name": "Base Event",
+          "category_uid": 0, "category_name": "Uncategorized",
+          "activity_id": 99, "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": severity_id, "severity": severity,
+          "status_id": 0, "status": "Unknown"
+      })
+      if header_ok {
+          .message = msg
+          __source_kv.message = msg
+      } else {
+          . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+      }
+  }
+  if host != "" { .device = { "hostname": host, "type_id": 1, "type": "Server" } }
+
+  .
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    header\.host
+  | header\.jhost
+  | header\.logger
+  | header\.level
+  | jail_event\.jail
+  | jail_event\.verb
+  | jail_event\.ip
+  | message
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # Sources:
+  #   Fail2ban's own fixture for fail2ban.log lines (the recidive filter reads them):
+  #     https://github.com/fail2ban/fail2ban/blob/master/fail2ban/tests/files/logs/recidive
+  #   Message formats from the Fail2ban server source:
+  #     https://github.com/fail2ban/fail2ban/blob/master/fail2ban/server/actions.py
+  #       "[%s] %sBan %s" (Ban / Restore Ban), "[%s] %s already banned", "[%s] Reban %s%s"
+  #     https://github.com/fail2ban/fail2ban/blob/master/fail2ban/server/filter.py
+  #       "[%s] Found %s - %s", "[%s] Ignore %s by %s"
+  # Addresses and hosts replaced with documentation values.
+  # fail2ban.log, current layout (padded logger, [PID], padded level)
+  - raw: '2024-01-15 10:23:45,123 fail2ban.actions        [1234]: NOTICE  [sshd] Ban 192.0.2.10'
+    expect:
+      class_uid: 2004
+      activity_id: 1
+      action_id: 2
+      disposition_id: 2
+      finding_info.analytic.name: sshd
+      evidences.0.src_endpoint.ip: 192.0.2.10
+      time: 1705314225123
+      metadata.event_code: Ban
+  # fail2ban.log, 0.8 layout without PID (recidive fixture)
+  - raw: '2006-02-13 15:52:30,388 fail2ban.actions: NOTICE [sendmail] Ban 192.0.2.4'
+    expect:
+      class_uid: 2004
+      activity_id: 1
+      finding_info.analytic.name: sendmail
+  # Unban closes the same finding (same uid as the Ban above)
+  - raw: '2006-02-13 16:07:31,183 fail2ban.actions: NOTICE [sendmail] Unban 192.0.2.4'
+    expect:
+      class_uid: 2004
+      activity_id: 3
+      action_id: 1
+      status_id: 4
+      severity_id: 1
+  # filter match
+  - raw: '2024-01-15 10:23:40,456 fail2ban.filter         [1234]: INFO    [sshd] Found 192.0.2.10 - 2024-01-15 10:23:40'
+    expect:
+      class_uid: 2004
+      activity_id: 1
+      action_id: 3
+      severity_id: 2
+      finding_info.first_seen_time: 1705314220000
+  - raw: '2024-01-15 10:24:01,002 fail2ban.actions        [1234]: NOTICE  [sshd] 192.0.2.10 already banned'
+    expect:
+      class_uid: 2004
+      activity_id: 2
+      metadata.event_code: already banned
+  - raw: '2024-01-15 09:00:02,345 fail2ban.actions        [1234]: NOTICE  [recidive] Restore Ban 203.0.113.50'
+    expect:
+      class_uid: 2004
+      activity_id: 1
+      finding_info.analytic.name: recidive
+  - raw: "2024-01-15 09:30:00,000 fail2ban.actions        [1234]: NOTICE  [sshd] Reban 203.0.113.51, action 'nftables-allports'"
+    expect:
+      class_uid: 2004
+      metadata.event_code: Reban
+  - raw: '2024-01-15 11:02:13,876 fail2ban.actions        [1234]: NOTICE  [nginx-http-auth] Ban 2001:db8::25'
+    expect:
+      class_uid: 2004
+      evidences.0.src_endpoint.ip: 2001:db8::25
+  # BSD syslog forwarding (recidive fixture "syslog example")
+  - raw: 'Sep 16 00:44:55 spaceman.example.com fail2ban.actions: NOTICE [jail] Ban 198.51.100.7'
+    expect:
+      class_uid: 2004
+      device.hostname: spaceman.example.com
+  # systemd journal with daemon name (recidive fixture)
+  - raw: 'Mar 05 08:41:28 test.example.org fail2ban-server[11524]: fail2ban.actions        [11524]: NOTICE  [postfix-auth] Ban 192.0.2.2'
+    expect:
+      class_uid: 2004
+      finding_info.analytic.name: postfix-auth
+      device.hostname: test.example.org
+  # systemd journal short variant (recidive fixture, gh-3693)
+  - raw: 'host1 fail2ban[15699]: [postfix-sasl] Ban 192.0.2.3'
+    expect:
+      class_uid: 2004
+      evidences.0.src_endpoint.ip: 192.0.2.3
+      device.hostname: host1
+  # Ignore and server lines -> Base Event
+  - raw: '2024-01-15 10:23:41,000 fail2ban.filter         [1234]: INFO    [sshd] Ignore 192.0.2.1 by ip'
+    expect:
+      class_uid: 0
+      message: '[sshd] Ignore 192.0.2.1 by ip'
+  - raw: '2024-01-15 08:59:59,001 fail2ban.server         [1234]: INFO    Starting Fail2ban v1.0.2'
+    expect:
+      class_uid: 0
+      metadata.log_provider: fail2ban.server
+  - raw: "2024-01-15 09:00:00,512 fail2ban.jail           [1234]: INFO    Jail 'sshd' started"
+    expect:
+      class_uid: 0
+      severity_id: 1
+  - raw: "2024-01-15 10:23:45,130 fail2ban.utils          [1234]: ERROR   7f2a3c1e4b90 -- returned 1"
+    expect:
+      class_uid: 0
+      severity_id: 4
+  # Malformed line -> Base Event with the fallback marker
+  - raw: 'this is not a fail2ban line'
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: unparsable input
