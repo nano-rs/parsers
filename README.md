@@ -32,6 +32,8 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Windows Event Log (XML)](parsers-ocsf/windows_event_xml) | `windows_event` | Microsoft | Native XML | 30+ EventIDs parsed from raw Windows Event XML |
 | [Windows Event Log (Text)](parsers-ocsf/windows_event_text) | `windows_event` | Microsoft | Rendered text | Splunk UF / wevtutil format with section-aware body parsing |
 | [Linux auditd](parsers-ocsf/linux_auditd) | `linux_auditd` | Linux | key=value | SYSCALL, EXECVE, PATH, USER_AUTH, USER_LOGIN, AVC (SELinux), NETFILTER |
+| [Falco](parsers-ocsf/falco) | `falco` | The Falco Project | JSON (json_output, Falcosidekick) | Runtime security alerts as Detection Finding: rule, priority, MITRE tags, process / file / container evidence, Kubernetes pod and k8s_audit caller |
+| [osquery](parsers-ocsf/osquery) | `osquery` | osquery | JSON (results + status logs) | Differential / snapshot results by query: processes, process_events, listening_ports, logged_in_users, file_events (FIM); other queries kept as Base Event with columns; status log |
 | [systemd-journald](parsers-ocsf/linux_journald) | `linux_journald` | systemd | JSON (journalctl -o json) | Priority, facility, unit, originating process, transport; sshd, sudo and netfilter sub-parsing |
 | [LimaCharlie EDR](parsers-ocsf/limacharlie) | `limacharlie` | LimaCharlie | JSON | Sensor telemetry: process, network, DNS, file, module, registry, auth, detections |
 | [Moat](parsers-ocsf/moat_edr) | `moat_edr` | Omarchy | JSON (NDJSON envelope) | Supply-chain sensor: alerts with correlation chains and AI triage, alert updates, package-install receipts, shipper heartbeat, plus the opt-in process / network / file telemetry classes. OCSF only |
@@ -69,7 +71,9 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 |--------|-------------|--------|--------|-------------|
 | [AWS CloudTrail](parsers-ocsf/aws_cloudtrail) | `aws_cloudtrail` | Amazon | JSON | API calls, user identity, resources, error tracking |
 | [AWS VPC Flow Logs](parsers-ocsf/aws_vpc_flow) | `aws_vpc_flow` | Amazon | Space-delimited / JSON | VPC network flow logs v2-v5 with protocol mapping |
+| [AWS Route 53 Resolver](parsers-ocsf/aws_route53_resolver) | `aws_route53_resolver` | Amazon | JSON | Resolver query logs as DNS Activity: query, answers, rcode, source instance / endpoint, DNS Firewall verdicts |
 | [AWS GuardDuty](parsers-ocsf/aws_guardduty) | `aws_guardduty` | Amazon | JSON | Threat findings: network, IAM, S3, malware detections |
+| [AWS Security Hub](parsers-ocsf/aws_security_hub) | `aws_security_hub` | Amazon | JSON (ASFF, EventBridge envelope) | Findings from Security Hub controls, GuardDuty, Inspector, Macie and Config as Detection, Vulnerability or Compliance Finding |
 | [AWS WAF](parsers-ocsf/aws_waf) | `aws_waf` | Amazon | JSON | WAF v2 access logs: rule matches, rate limiting, bot control |
 | [AWS ALB Access Logs](parsers-ocsf/aws_alb) | `aws_alb` | Amazon | Space-delimited | Application Load Balancer request logs with routing details |
 | [AWS S3 Access Logs](parsers-ocsf/aws_s3_access) | `aws_s3_access` | Amazon | Space-delimited | S3 server access logs: bucket operations, requester identity |
@@ -78,6 +82,7 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Azure Monitor diagnostic export](parsers-ocsf/azure_monitor) | `azure_monitor` | Microsoft | JSON (Diagnostic Settings → Event Hubs / storage) | One lane for a mixed hub, dispatched on `category`: Activity Log (all 8 categories; Defender for Cloud alerts as Detection Finding), Entra ID sign-ins (interactive, non-interactive, service principal, managed identity) and Entra ID audit (user / group / role management). Unknown categories kept whole as Base Event. OCSF only |
 | [Azure Firewall](parsers-ocsf/azure_firewall) | `azure_firewall` | Microsoft | JSON | Network rules, application rules, threat intel, DNS proxy |
 | [GCP Audit Log](parsers-ocsf/gcp_audit) | `gcp_audit` | Google | JSON | IAM changes, API calls, resource operations, authorization |
+| [GCP VPC Flow Logs](parsers-ocsf/gcp_vpc_flow) | `gcp_vpc_flow` | Google | JSON (Cloud Logging LogEntry) | VPC flows (logName `vpc_flows` only): 5-tuple, bytes / packets, VM, VPC, subnet, geo and ASN per side |
 | [Kubernetes Audit](parsers-ocsf/kubernetes_audit) | `kubernetes_audit` | CNCF | JSON | API server audit: resource operations, RBAC, user identity |
 | [Microsoft 365](parsers-ocsf/microsoft_365) | `microsoft_365` | Microsoft | JSON | Exchange, SharePoint, Azure AD, DLP, Teams audit events |
 | [Google Workspace Audit](parsers-ocsf/google_workspace) | `gws_login` | Google | JSON | Admin SDK Reports: login, admin console, OAuth token, Drive activity |

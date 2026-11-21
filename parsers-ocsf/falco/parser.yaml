@@ -1,0 +1,667 @@
+name: falco_ocsf
+display_name: Falco (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Falco runtime security alerts (json_output: true, as written to a file,
+  stdout, http_output or forwarded by Falcosidekick) into complete OCSF 1.9.0
+  "Detection Finding" (class_uid 2004) records carrying the host and container
+  profiles. The rule lands on finding_info.title / analytic, the priority on
+  severity (Emergency / Alert / Critical -> Critical, Error -> High, Warning ->
+  Medium, Notice -> Low, Informational / Debug -> Informational), MITRE tags
+  (mitre_<tactic>, TA####, T####) on finding_info.attacks, the tags on
+  metadata.labels, the rule source on finding_info.data_sources, and the
+  output_fields on evidences[]: the process (name, pid, cmd_line, executable,
+  parent, user), the file descriptor name (fd.name) as a file, the
+  container (id, name, image), Kubernetes namespace and pod on resources[], and
+  for the k8s_audit source the requesting user on actor. Non-JSON output (a
+  plain text alert line) falls back to Base Event with the raw line kept.
+match_values:
+  - falco
+category: endpoint
+vendor: "The Falco Project"
+product: "Falco"
+parser_vrl: |
+  # Falco JSON alert -> OCSF 1.9.0 Detection Finding (class_uid 2004)
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+
+  parsed, err = parse_json(raw_log)
+  __source_kv = object(parsed) ?? {}
+  p = object(parsed) ?? {}
+  rule = to_string(p.rule) ?? ""
+
+  if err != null || !is_object(parsed) || rule == "" {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": raw_log,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("falco|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "falco",
+              "product": { "name": "Falco", "vendor_name": "The Falco Project" }
+          }
+      }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+  } else {
+      of = object(p.output_fields) ?? {}
+
+      # ---- time (RFC 3339 with nanoseconds) ----
+      time_ms = 0
+      ts_str = to_string(p.time) ?? ""
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- priority -> severity ----
+      prio = downcase(to_string(p.priority) ?? "")
+      severity_id = 0
+      severity = "Unknown"
+      if prio == "emergency" || prio == "alert" || prio == "critical" { severity_id = 5; severity = "Critical" }
+      if prio == "error" { severity_id = 4; severity = "High" }
+      if prio == "warning" { severity_id = 3; severity = "Medium" }
+      if prio == "notice" { severity_id = 2; severity = "Low" }
+      if prio == "informational" || prio == "info" || prio == "debug" { severity_id = 1; severity = "Informational" }
+
+      # ---- MITRE ATT&CK from tags ----
+      tags = array(p.tags) ?? []
+      techniques = []
+      tactic_names = []
+      tactic_uids = []
+      for_each(tags) -> |_i, tag| {
+          tg = to_string(tag) ?? ""
+          if match(tg, r'^T\d{4}(?:\.\d{3})?$') { techniques = push(techniques, tg) }
+          if match(tg, r'^TA\d{4}$') { tactic_uids = push(tactic_uids, tg) }
+          if starts_with(tg, "mitre_") {
+              tn = replace(slice!(tg, 6), "_", " ")
+              tactic_names = push(tactic_names, tn)
+          }
+      }
+      tactics = []
+      for_each(tactic_names) -> |_i, tn| {
+          tname = string!(tn)
+          words = split(tname, " ")
+          title = []
+          for_each(words) -> |_j, wd| {
+              w = downcase(string!(wd))
+              if w != "and" && length(w) > 0 { w = upcase(slice!(w, 0, 1)) + slice!(w, 1) }
+              title = push(title, w)
+          }
+          tactics = push(tactics, { "name": join!(title, " ") })
+      }
+      for_each(tactic_uids) -> |_i, tu| { tactics = push(tactics, { "uid": string!(tu) }) }
+      attacks = []
+      for_each(techniques) -> |_i, tech| {
+          atk = { "technique": { "uid": string!(tech) } }
+          if length(tactics) > 0 { atk.tactics = tactics }
+          attacks = push(attacks, atk)
+      }
+      if length(attacks) == 0 {
+          for_each(tactics) -> |_i, tac| { attacks = push(attacks, { "tactic": tac }) }
+      }
+
+      source = to_string(p.source) ?? ""
+      uuid = to_string(p.uuid) ?? ""
+      finding_uid = uuid
+      if finding_uid == "" { finding_uid = sha2("falco|raw|" + raw_log, variant: "SHA-256") }
+
+      finding_info = {
+          "uid": finding_uid,
+          "title": rule,
+          "analytic": { "name": rule, "type_id": 1, "type": "Rule" },
+          "product": { "name": "Falco", "vendor_name": "The Falco Project" }
+      }
+      if source != "" { finding_info.data_sources = [source] }
+      if time_ms > 0 { finding_info.created_time = time_ms }
+      if length(attacks) > 0 { finding_info.attacks = attacks }
+
+      # ---- evidence from output_fields ----
+      ev = {}
+      process = {}
+      pname = to_string(get(of, ["proc.name"]) ?? "") ?? ""
+      if pname != "" { process.name = pname }
+      ppid_raw = get(of, ["proc.pid"]) ?? null
+      if ppid_raw != null {
+          ppid = to_int(ppid_raw) ?? -1
+          if ppid >= 0 { process.pid = ppid }
+      }
+      pcmd = to_string(get(of, ["proc.cmdline"]) ?? "") ?? ""
+      if pcmd != "" { process.cmd_line = pcmd }
+      pexe = to_string(get(of, ["proc.exepath"]) ?? "") ?? ""
+      if pexe != "" {
+          pparts = split(pexe, "/")
+          pbase = to_string(get(pparts, [length(pparts) - 1]) ?? "") ?? ""
+          if pbase == "" { pbase = pexe }
+          process.file = { "path": pexe, "name": pbase, "type_id": 1, "type": "Regular File" }
+      }
+      cwd = to_string(get(of, ["proc.cwd"]) ?? "") ?? ""
+      if cwd != "" { process.working_directory = cwd }
+      parent = {}
+      parent_name = to_string(get(of, ["proc.pname"]) ?? "") ?? ""
+      if parent_name != "" { parent.name = parent_name }
+      parent_pid_raw = get(of, ["proc.ppid"]) ?? null
+      if parent_pid_raw != null {
+          parent_pid = to_int(parent_pid_raw) ?? -1
+          if parent_pid >= 0 { parent.pid = parent_pid }
+      }
+      parent_cmd = to_string(get(of, ["proc.pcmdline"]) ?? "") ?? ""
+      if parent_cmd != "" { parent.cmd_line = parent_cmd }
+      # The OCSF process object needs one of pid / uid / cpid. Most stock Falco
+      # rule outputs carry no proc.pid, so pid 0 marks it unknown (the repo's
+      # convention, as in crowdstrike_falcon) rather than dropping the process.
+      if length(keys(parent)) > 0 {
+          if !exists(parent.pid) { parent.pid = 0 }
+          process.parent_process = parent
+      }
+      user = {}
+      uname = to_string(get(of, ["user.name"]) ?? "") ?? ""
+      if uname != "" { user.name = uname }
+      uid_raw = get(of, ["user.uid"]) ?? null
+      if uid_raw != null {
+          uid_num = to_int(uid_raw) ?? -1
+          if uid_num >= 0 { user.uid = to_string(uid_num) }
+      }
+      if length(keys(user)) > 0 { process.user = user }
+      if length(keys(process)) > 0 {
+          if !exists(process.pid) { process.pid = 0 }
+          ev.process = process
+      }
+
+      fd_name = to_string(get(of, ["fd.name"]) ?? "") ?? ""
+      if starts_with(fd_name, "/") {
+          fparts = split(fd_name, "/")
+          fbase = to_string(get(fparts, [length(fparts) - 1]) ?? "") ?? ""
+          if fbase == "" { fbase = fd_name }
+          ev.file = { "path": fd_name, "name": fbase, "type_id": 0, "type": "Unknown" }
+      }
+
+      container = {}
+      cid = to_string(get(of, ["container.id"]) ?? "") ?? ""
+      if cid != "" && cid != "host" { container.uid = cid }
+      cname = to_string(get(of, ["container.name"]) ?? "") ?? ""
+      if cname != "" && cname != "host" { container.name = cname }
+      crepo = to_string(get(of, ["container.image.repository"]) ?? "") ?? ""
+      ctag = to_string(get(of, ["container.image.tag"]) ?? "") ?? ""
+      cimg_id = to_string(get(of, ["container.image.id"]) ?? "") ?? ""
+      if crepo != "" || cimg_id != "" {
+          img = { "uid": cimg_id }
+          if cimg_id == "" { img.uid = crepo }
+          if crepo != "" { img.name = crepo }
+          if ctag != "" { img.tag = ctag }
+          container.image = img
+      }
+      if ctag != "" { container.tag = ctag }
+
+      resources = []
+      k8s_ns = to_string(get(of, ["k8s.ns.name"]) ?? "") ?? ""
+      k8s_pod = to_string(get(of, ["k8s.pod.name"]) ?? "") ?? ""
+      if k8s_pod != "" {
+          res = { "type": "Kubernetes Pod", "name": k8s_pod }
+          if k8s_ns != "" { res.namespace = k8s_ns }
+          resources = push(resources, res)
+          if length(keys(container)) > 0 { container.orchestrator = "Kubernetes" }
+      } else if k8s_ns != "" {
+          resources = push(resources, { "type": "Kubernetes Namespace", "name": k8s_ns })
+      }
+      if length(keys(container)) > 0 { ev.container = container }
+
+      # ---- k8s_audit source: the API caller and the target object ----
+      actor = {}
+      ka_user = to_string(get(of, ["ka.user.name"]) ?? "") ?? ""
+      if ka_user != "" {
+          actor.user = { "name": ka_user }
+          ev.actor = actor
+      }
+      ka_target = to_string(get(of, ["ka.target.name"]) ?? "") ?? ""
+      if ka_target != "" {
+          kres = { "name": ka_target }
+          ka_res = to_string(get(of, ["ka.target.resource"]) ?? "") ?? ""
+          if ka_res != "" { kres.type = ka_res }
+          ka_ns = to_string(get(of, ["ka.target.namespace"]) ?? "") ?? ""
+          if ka_ns != "" { kres.namespace = ka_ns }
+          resources = push(resources, kres)
+      }
+
+      evt_type = to_string(get(of, ["evt.type"]) ?? "") ?? ""
+      if evt_type != "" { ev.name = evt_type }
+
+      hostname = to_string(p.hostname) ?? ""
+
+      ocsf = {
+          "class_uid": 2004,
+          "class_name": "Detection Finding",
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": 1,
+          "activity_name": "Create",
+          "type_uid": 200401,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": 1,
+          "status": "New",
+          "is_alert": true,
+          "time": time_ms,
+          "message": to_string(p.output) ?? rule,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["host", "container"],
+              "uid": finding_uid,
+              "log_name": "falco",
+              "log_provider": "Falco",
+              "product": { "name": "Falco", "vendor_name": "The Falco Project" }
+          },
+          "finding_info": finding_info
+      }
+      if uuid != "" { ocsf.metadata.original_event_uid = uuid }
+      if length(tags) > 0 { ocsf.metadata.labels = tags }
+      if hostname != "" {
+          ocsf.device = { "hostname": hostname, "type_id": 0, "type": "Unknown" }
+      }
+      if length(keys(actor)) > 0 { ocsf.actor = actor }
+      if length(resources) > 0 { ocsf.resources = resources }
+      if length(keys(ev)) > 0 { ocsf.evidences = [ev] }
+
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # time: Successful RFC 3339 timestamp conversion to the selected event clock in milliseconds.
+  # priority: Falco rule priority normalized to the OCSF severity; consume only when the expected ID is emitted.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        time
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        priority
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"emergency": 5, "alert": 5, "critical": 5, "error": 4, "warning": 3, "notice": 2, "informational": 1, "info": 1, "debug": 1}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."severity_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    hostname
+  | output
+  | output_fields\.container\.id
+  | output_fields\.container\.image\.id
+  | output_fields\.container\.image\.repository
+  | output_fields\.container\.image\.tag
+  | output_fields\.container\.name
+  | output_fields\.evt\.type
+  | output_fields\.fd\.name
+  | output_fields\.k8s\.ns\.name
+  | output_fields\.k8s\.pod\.name
+  | output_fields\.ka\.target\.name
+  | output_fields\.ka\.target\.namespace
+  | output_fields\.ka\.target\.resource
+  | output_fields\.ka\.user\.name
+  | output_fields\.proc\.cmdline
+  | output_fields\.proc\.cwd
+  | output_fields\.proc\.exepath
+  | output_fields\.proc\.name
+  | output_fields\.proc\.pcmdline
+  | output_fields\.proc\.pid
+  | output_fields\.proc\.pname
+  | output_fields\.proc\.ppid
+  | output_fields\.user\.name
+  | output_fields\.user\.uid
+  | priority
+  | rule
+  | source
+  | tags
+  | time
+  | uuid
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+# Sample provenance (sidecar samples/ directory). Host names and container
+# names are replaced with documentation values.
+#   falco_warning_sensitive_file.json, falco_informational_system_user.json,
+#   falco_notice_k8s_terminal_shell.json, falco_critical_drop_execute.json:
+#     Elastic integrations test fixture
+#     https://github.com/elastic/integrations/blob/main/packages/falco/data_stream/alerts/_dev/test/pipeline/test-falco.log
+#   falco_k8s_audit_exec_pod.json: built from the k8saudit plugin rule
+#     "Attach/Exec Pod" output template (priority NOTICE, source k8s_audit)
+#     https://github.com/falcosecurity/plugins/blob/main/plugins/k8saudit/rules/k8s_audit_rules.yaml
+#   falco_error_write_binary_dir.json: built from the "Write below binary dir"
+#     rule output template (priority ERROR) and the supported-fields reference
+#     https://github.com/falcosecurity/rules/blob/main/rules/falco-sandbox_rules.yaml
+#     https://falco.org/docs/reference/rules/supported-fields/
+#   junk.json: a non-JSON line, Base Event fallback
+samples:
+  - raw: '{"hostname":"node-01.example.com","output":"2024-05-07T18:54:19.341081180+0000: Warning Sensitive file opened for reading by non-trusted program (file=/etc/shadow)","priority":"Warning","rule":"Read sensitive file untrusted","source":"syscall","tags":["T1555","container","filesystem","host","maturity_stable","mitre_credential_access"],"time":"2024-05-07T18:54:19.341081180Z","output_fields":{"container.id":"9656db3bb358","container.name":"event-generator-1","evt.type":"openat","fd.name":"/etc/shadow","proc.cmdline":"event-generator run --loop","proc.exepath":"/bin/event-generator","proc.name":"event-generator","proc.pname":"containerd-shim","user.loginuid":-1,"user.name":"root","user.uid":0}}'
+    expect:
+      class_uid: 2004
+      severity_id: 3
+      finding_info.title: Read sensitive file untrusted
+      finding_info.attacks.0.technique.uid: T1555
+      finding_info.attacks.0.tactics.0.name: Credential Access
+      evidences.0.file.path: /etc/shadow
+      evidences.0.process.name: event-generator
+      evidences.0.container.uid: 9656db3bb358
+      device.hostname: node-01.example.com
+  - raw: "Falco internal: Runtime error: event drop detected"
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: unparsable input
