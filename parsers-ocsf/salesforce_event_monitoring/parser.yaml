@@ -1,0 +1,906 @@
+name: salesforce_event_monitoring_ocsf
+display_name: Salesforce Event Monitoring (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Salesforce Shield Event Monitoring into complete OCSF 1.9.0 records.
+  Two sources, one record per message:
+    EventLogFile (ELF) rows, keyed by EVENT_TYPE. Either a JSON object with
+    the ELF column names (a collector applied the header), or the CSV header
+    line plus ONE data row in the same message. The CSV column order is
+    header-driven (LogFileFieldNames): it differs by event type and API
+    version, so a bare CSV row without its header is not guessed at and is
+    kept as a Base Event. A message carrying more rows is parsed for the
+    first row only and marked with unmapped.parse_fallback.
+    Real-Time Event Monitoring objects (LoginEvent, LoginAsEvent, LogoutEvent,
+    ApiEvent, ReportEvent, LightningUriEvent) and LoginHistory, typed by
+    attributes.type when the export carries it, else by their fields.
+  Routing:
+    Login, LoginEvent, LoginHistory       -> Authentication 3002 (Logon)
+    LoginAs, LoginAsEvent                 -> Authentication 3002 (Account Switch, Impersonate; Medium)
+    Logout, LogoutEvent                   -> Authentication 3002 (Logoff)
+    Report, ReportExport, ReportEvent     -> Datastore Activity 6005 (Read; exports Medium)
+    ApiEvent with a SOQL Query            -> Datastore Activity 6005 (Query); the
+                                             query is bounded to 4096 characters in
+                                             query_info.query_string
+    API, RestApi, Apex*, URI, LightningUriEvent
+    and every other event type            -> API Activity 6003
+  ORGANIZATION_ID is metadata.tenant_uid; REQUEST_ID (ELF) or EventIdentifier
+  (real-time) is metadata.uid.
+match_values:
+  - salesforce_event_monitoring
+category: cloud
+vendor: "Salesforce"
+product: "Salesforce"
+parser_vrl: |
+  # Salesforce Event Monitoring (EventLogFile rows, Real-Time Event Monitoring) -> OCSF 1.9.0.
+  raw_log = string!(.message)
+  __raw_body = raw_log
+  __source_kv = {}
+  parsed, err = parse_json(raw_log)
+  r = {}
+  fmt = ""
+  fallback = ""
+  if err == null && is_object(parsed) {
+      r = object!(parsed)
+      if exists(r.EVENT_TYPE) {
+          fmt = "elf"
+      } else if exists(r.EventDate) || exists(r.EventIdentifier) || exists(r.LoginHistoryId) || is_object(r.attributes) {
+          fmt = "rtem"
+      } else {
+          fallback = "JSON object is neither an EventLogFile row nor an Event Monitoring event"
+      }
+      __source_kv = r
+  } else if err == null {
+      fallback = "not a JSON object"
+  } else {
+      # EventLogFile CSV is header-driven: the column order is the file's own
+      # header (LogFileFieldNames) and differs by event type and API version,
+      # so a row is only decoded together with its header line.
+      lines = split(replace(raw_log, "\r", ""), "\n")
+      first = ""
+      if length(lines) > 0 { first = string!(lines[0]) }
+      if !match(first, r'^"?EVENT_TYPE"?,') {
+          fallback = "EventLogFile CSV row without its header line (column layout unknown)"
+      } else if length(lines) < 2 || string!(lines[1]) == "" {
+          fallback = "EventLogFile CSV header line without a data row"
+      } else {
+          header = parse_csv(first) ?? []
+          row = parse_csv(string!(lines[1])) ?? []
+          if length(header) == 0 || length(header) != length(row) {
+              fallback = "EventLogFile CSV row does not match its header"
+          } else {
+              for_each(header) -> |i, name| {
+                  r = set!(r, [string!(name)], get!(row, [i]))
+              }
+              fmt = "elf"
+              __source_kv = r
+              if length(lines) > 2 && string!(lines[2]) != "" { fallback = "multi-row EventLogFile CSV: only the first row is parsed" }
+          }
+      }
+  }
+
+  if fmt == "" {
+      # Not decodable: an OCSF Base Event with the raw body kept.
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("salesforce_event_monitoring|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "Salesforce Event Monitoring",
+              "log_provider": "Salesforce",
+              "product": { "name": "Salesforce", "vendor_name": "Salesforce" }
+          },
+          "unmapped": { "parse_error": fallback }
+      }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+  } else {
+      email_re = r'^[^@\s]+@[^@\s]+\.[^@\s]+$'
+      # ---- one vocabulary for both wire forms ----
+      et = ""
+      ts = ""
+      user_name = ""
+      user_id = ""
+      src_ip = ""
+      session_key = ""
+      login_key = ""
+      evt_uid = ""
+      org_id = ""
+      user_agent = ""
+      http_method = ""
+      path = ""
+      op = ""
+      api_version = ""
+      entity = ""
+      query = ""
+      report_id = ""
+      report_name = ""
+      status_text = ""
+      failed = false
+      status_code = 0
+      delegated_name = ""
+      delegated_id = ""
+      login_url = ""
+      record_id = ""
+      loc = {}
+      if fmt == "elf" {
+          et = string(r.EVENT_TYPE) ?? ""
+          ts = string(r.TIMESTAMP_DERIVED) ?? ""
+          user_name = string(r.USER_NAME) ?? ""
+          if user_name == "" { user_name = string(r.USERNAME) ?? "" }
+          user_id = string(r.USER_ID_DERIVED) ?? ""
+          if user_id == "" { user_id = string(r.USER_ID) ?? "" }
+          src_ip = string(r.CLIENT_IP) ?? ""
+          if src_ip == "" { src_ip = string(r.SOURCE_IP) ?? "" }
+          session_key = string(r.SESSION_KEY) ?? ""
+          login_key = string(r.LOGIN_KEY) ?? ""
+          evt_uid = string(r.REQUEST_ID) ?? ""
+          org_id = string(r.ORGANIZATION_ID) ?? ""
+          user_agent = string(r.BROWSER_TYPE) ?? ""
+          http_method = string(r.METHOD) ?? ""
+          path = string(r.URI) ?? ""
+          op = string(r.METHOD_NAME) ?? ""
+          api_version = string(r.API_VERSION) ?? ""
+          entity = string(r.ENTITY_NAME) ?? ""
+          if entity == "" { entity = string(r.ENTITY) ?? "" }
+          report_id = string(r.REPORT_ID_DERIVED) ?? ""
+          if report_id == "" { report_id = string(r.REPORT_ID) ?? "" }
+          delegated_name = string(r.DELEGATED_USER_NAME) ?? ""
+          delegated_id = string(r.DELEGATED_USER_ID_DERIVED) ?? ""
+          if delegated_id == "" { delegated_id = string(r.DELEGATED_USER_ID) ?? "" }
+          login_status = string(r.LOGIN_STATUS) ?? ""
+          req_status = string(r.REQUEST_STATUS) ?? ""
+          if login_status != "" && login_status != "LOGIN_NO_ERROR" { failed = true; status_text = login_status }
+          if req_status == "F" || req_status == "f" || req_status == "Failed" { failed = true }
+          if (string(r.SUCCESS) ?? "") == "0" { failed = true }
+          status_code = to_int(r.STATUS_CODE) ?? 0
+          if status_code >= 400 { failed = true }
+      } else {
+          rtype = ""
+          if is_object(r.attributes) { rtype = string(r.attributes.type) ?? "" }
+          if rtype == "" {
+              if exists(r.ReportId) { rtype = "ReportEvent" }
+              if exists(r.PageUrl) { rtype = "LightningUriEvent" }
+              if exists(r.Query) || (exists(r.QueriedEntities) && exists(r.ApiType)) { rtype = "ApiEvent" }
+              if rtype == "" && (exists(r.LoginType) || exists(r.LoginUrl)) { rtype = "LoginEvent" }
+          }
+          et = rtype
+          ts = string(r.EventDate) ?? ""
+          if ts == "" { ts = string(r.CreatedDate) ?? "" }
+          user_name = string(r.Username) ?? ""
+          user_id = string(r.UserId) ?? ""
+          src_ip = string(r.SourceIp) ?? ""
+          session_key = string(r.SessionKey) ?? ""
+          login_key = string(r.LoginKey) ?? ""
+          evt_uid = string(r.EventIdentifier) ?? ""
+          if evt_uid == "" { evt_uid = string(r.Id) ?? "" }
+          user_agent = string(r.UserAgent) ?? ""
+          http_method = string(r.HttpMethod) ?? ""
+          path = string(r.PageUrl) ?? ""
+          op = string(r.Operation) ?? ""
+          api_version = string(r.ApiVersion) ?? ""
+          if api_version == "N/A" { api_version = "" }
+          entity = string(r.QueriedEntities) ?? ""
+          query = string(r.Query) ?? ""
+          report_id = string(r.ReportId) ?? ""
+          report_name = string(r.Name) ?? ""
+          record_id = string(r.RecordId) ?? ""
+          login_url = string(r.LoginUrl) ?? ""
+          delegated_name = string(r.DelegatedUsername) ?? ""
+          status_text = string(r.Status) ?? ""
+          if status_text != "" && status_text != "Success" { failed = true }
+          city = string(r.City) ?? ""
+          if city != "" { loc.city = city }
+          country = string(r.CountryIso) ?? ""
+          if country != "" { loc.country = country }
+          region = string(r.Subdivision) ?? ""
+          if region != "" { loc.region = region }
+          postal = string(r.PostalCode) ?? ""
+          if postal != "" { loc.postal_code = postal }
+          if is_float(r.LoginLatitude) { loc.lat = r.LoginLatitude }
+          if is_float(r.LoginLongitude) { loc.long = r.LoginLongitude }
+      }
+
+      # ---- time ----
+      time_ms = 0
+      clock, clock_err = parse_timestamp(ts, "%+")
+      if clock_err == null {
+          time_ms = to_unix_timestamp(clock, unit: "milliseconds")
+      } else if fmt == "elf" {
+          # EventLogFile TIMESTAMP is GMT, e.g. 20130715233322.670.
+          clock2, clock2_err = parse_timestamp(string(r.TIMESTAMP) ?? "", "%Y%m%d%H%M%S%.f")
+          if clock2_err == null { time_ms = to_unix_timestamp(clock2, unit: "milliseconds") }
+      }
+
+      # ---- principals and endpoint ----
+      user = {}
+      if user_name != "" { user.name = user_name }
+      if user_id != "" { user.uid = user_id }
+      if match(user_name, email_re) { user.email_addr = user_name }
+      if length(user) == 0 { user = { "name": "unknown" } }
+      src_ep = { "hostname": "unknown" }
+      if is_ipv4(src_ip) || is_ipv6(src_ip) { src_ep = { "ip": src_ip } }
+      if length(loc) > 0 { src_ep.location = loc }
+      session = {}
+      if session_key != "" { session.uid = session_key }
+      if login_key != "" {
+          if exists(session.uid) { session.uid_alt = login_key } else { session.uid = login_key }
+      }
+
+      # ---- family routing ----
+      family = "api"
+      if et == "Login" || et == "LoginEvent" || et == "LoginHistory" { family = "login" }
+      if et == "LoginAs" || et == "LoginAsEvent" { family = "loginas" }
+      if et == "Logout" || et == "LogoutEvent" { family = "logout" }
+      if et == "Report" || et == "ReportExport" || et == "ReportEvent" { family = "report" }
+      if et == "ApiEvent" && query != "" { family = "query" }
+
+      status_id = 1
+      status_str = "Success"
+      severity_id = 1
+      severity = "Informational"
+      if failed { status_id = 2; status_str = "Failure"; severity_id = 2; severity = "Low" }
+      if family == "loginas" || et == "ReportExport" || (et == "ReportEvent" && contains(downcase(op), "export")) { severity_id = 3; severity = "Medium" }
+
+      ocsf = {}
+      if family == "login" || family == "loginas" || family == "logout" {
+          activity_id = 1
+          activity_name = "Logon"
+          if family == "logout" { activity_id = 2; activity_name = "Logoff" }
+          ocsf.class_uid = 3002
+          ocsf.class_name = "Authentication"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.user = user
+          if family == "loginas" {
+              # An admin logged in AS the user: the user is USER_ID, the admin
+              # is the DELEGATED_USER.
+              activity_id = 7
+              activity_name = "Account Switch"
+              ocsf.account_switch_type_id = 2
+              ocsf.account_switch_type = "Impersonate"
+              admin = {}
+              if delegated_name != "" { admin.name = delegated_name }
+              if match(delegated_name, email_re) { admin.email_addr = delegated_name }
+              if delegated_id != "" { admin.uid = delegated_id }
+              if length(admin) > 0 { ocsf.actor = { "user": admin } }
+          }
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          ocsf.service = { "name": "Salesforce" }
+          ocsf.is_remote = true
+          if status_text != "" && failed { ocsf.status_detail = status_text }
+          if user_agent != "" { ocsf.http_request = { "user_agent": user_agent } }
+          if login_url != "" { ocsf.dst_endpoint = { "hostname": login_url } }
+          if length(session) > 0 { ocsf.session = session }
+      } else if family == "report" || family == "query" {
+          activity_id = 1
+          activity_name = "Read"
+          if family == "query" { activity_id = 4; activity_name = "Query" }
+          ocsf.class_uid = 6005
+          ocsf.class_name = "Datastore Activity"
+          ocsf.category_uid = 6
+          ocsf.category_name = "Application Activity"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          actor = { "user": user }
+          if length(session) > 0 { actor.session = session }
+          ocsf.actor = actor
+          tbl = {}
+          if family == "report" {
+              if report_id != "" { tbl.uid = report_id }
+              if report_name != "" { tbl.name = report_name }
+          } else if entity != "" {
+              tbl.name = entity
+          }
+          if length(tbl) == 0 { tbl.name = "unknown" }
+          ocsf.table = tbl
+          if family == "query" {
+              qinfo = { "uid": evt_uid, "query_string": query }
+              if length(query) > 4096 {
+                  qinfo.query_string = slice!(query, 0, 4096)
+                  ocsf.metadata_truncated = length(query)
+              }
+              ocsf.query_info = qinfo
+          }
+      } else {
+          verb = downcase(op + " " + http_method)
+          activity_id = 99
+          activity_name = "Other"
+          if contains(verb, "get") || contains(verb, "query") || contains(verb, "read") || et == "LightningUriEvent" || et == "URI" || et == "LightningPageView" { activity_id = 2; activity_name = "Read" }
+          if contains(verb, "post") || contains(verb, "insert") || contains(verb, "create") { activity_id = 1; activity_name = "Create" }
+          if contains(verb, "patch") || contains(verb, "put") || contains(verb, "update") || contains(verb, "upsert") { activity_id = 3; activity_name = "Update" }
+          if contains(verb, "delete") { activity_id = 4; activity_name = "Delete" }
+          ocsf.class_uid = 6003
+          ocsf.class_name = "API Activity"
+          ocsf.category_uid = 6
+          ocsf.category_name = "Application Activity"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          operation = op
+          if operation == "" { operation = et }
+          if operation == "" { operation = "unknown" }
+          api = { "operation": operation, "service": { "name": "Salesforce" } }
+          if api_version != "" { api.version = api_version }
+          ocsf.api = api
+          actor = { "user": user }
+          if length(session) > 0 { actor.session = session }
+          ocsf.actor = actor
+          req = {}
+          if http_method != "" { req.http_method = http_method }
+          if path != "" { req.url = { "path": path } }
+          if user_agent != "" { req.user_agent = user_agent }
+          if length(req) > 0 { ocsf.http_request = req }
+          if status_code > 0 { ocsf.http_response = { "code": status_code } }
+          res = []
+          if entity != "" { res = push(res, { "name": entity, "type": "sObject" }) }
+          if record_id != "" { res = push(res, { "uid": record_id, "type": "Record" }) }
+          if length(res) > 0 { ocsf.resources = res }
+      }
+
+      ocsf.src_endpoint = src_ep
+      ocsf.status_id = status_id
+      ocsf.status = status_str
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.type_uid = to_int(ocsf.class_uid) * 100 + to_int(ocsf.activity_id)
+      ocsf.time = time_ms
+      msg = et
+      if msg == "" { msg = "salesforce_event" }
+      ocsf.message = msg
+      ocsf.raw_data = raw_log
+
+      if evt_uid == "" { evt_uid = sha2("salesforce_event_monitoring|raw|" + raw_log, variant: "SHA-256") }
+      log_name = "Salesforce EventLogFile"
+      if fmt == "rtem" { log_name = "Salesforce Real-Time Event Monitoring" }
+      md = {
+          "version": "1.9.0",
+          "uid": evt_uid,
+          "log_name": log_name,
+          "log_provider": "Salesforce",
+          "product": { "name": "Salesforce", "vendor_name": "Salesforce" }
+      }
+      if et != "" { md.event_code = et }
+      if org_id != "" { md.tenant_uid = org_id }
+      if exists(ocsf.metadata_truncated) {
+          md.is_truncated = true
+          md.untruncated_size = ocsf.metadata_truncated
+          __discard = del(ocsf.metadata_truncated)
+      }
+      ocsf.metadata = md
+      if fallback != "" { ocsf.unmapped = { "parse_fallback": fallback } }
+
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # TIMESTAMP_DERIVED: EventLogFile ISO TIMESTAMP_DERIVED converted to the event clock in milliseconds.
+  # EventDate: Real-time event ISO EventDate converted to the event clock in milliseconds.
+  # CreatedDate: Record CreatedDate, used only when EventDate is absent.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        TIMESTAMP_DERIVED
+      | EventDate
+      | CreatedDate
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. EventLogFile TIMESTAMP (yyyyMMddHHmmss.SSS) is parsed into time when TIMESTAMP_DERIVED is absent but always spills, because the coverage checker has no portable form for it.
+  __candidates = r'(?x)
+  \A(?:
+    API_VERSION
+  | ApiVersion
+  | BROWSER_TYPE
+  | CLIENT_IP
+  | City
+  | CountryIso
+  | DELEGATED_USER_ID
+  | DELEGATED_USER_ID_DERIVED
+  | DELEGATED_USER_NAME
+  | ENTITY
+  | ENTITY_NAME
+  | EVENT_TYPE
+  | EventIdentifier
+  | HttpMethod
+  | Id
+  | LOGIN_KEY
+  | LOGIN_STATUS
+  | LoginKey
+  | LoginLatitude
+  | LoginLongitude
+  | LoginUrl
+  | METHOD
+  | METHOD_NAME
+  | NAME
+  | Name
+  | ORGANIZATION_ID
+  | Operation
+  | PageUrl
+  | PostalCode
+  | QueriedEntities
+  | Query
+  | RecordId
+  | REPORT_ID
+  | REPORT_ID_DERIVED
+  | REQUEST_ID
+  | ReportId
+  | SESSION_KEY
+  | SOURCE_IP
+  | STATUS_CODE
+  | SessionKey
+  | SourceIp
+  | Status
+  | Subdivision
+  | URI
+  | USERNAME
+  | USER_ID
+  | USER_ID_DERIVED
+  | USER_NAME
+  | UserAgent
+  | UserId
+  | Username
+  | attributes\.type
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # ELF Login row (header applied, JSON), source: https://github.com/elastic/integrations/blob/main/packages/salesforce/data_stream/login/_dev/test/pipeline/test-login-eventlogfile.log, fields per https://developer.salesforce.com/docs/atlas.en-us.object_reference.meta/object_reference/sforce_api_objects_eventlogfile_login.htm
+  - raw: "{\"API_TYPE\":\"f\",\"API_VERSION\":\"9998.0\",\"AUTHENTICATION_METHOD_REFERENCE\":\"\",\"BROWSER_TYPE\":\"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.12; rv%3A50.0) Gecko/20100101 Firefox/50.0\",\"CIPHER_SUITE\":\"ECDHE-RSA-AES256-GCM-SHA384\",\"CLIENT_IP\":\"192.0.2.10\",\"CPU_TIME\":\"63\",\"DB_TOTAL_TIME\":\"93531912\",\"EVENT_TYPE\":\"Login\",\"LOGIN_KEY\":\"NK2oPJrJze8tH+vC\",\"LOGIN_STATUS\":\"LOGIN_NO_ERROR\",\"ORGANIZATION_ID\":\"00D5j000000VI3n\",\"REQUEST_ID\":\"4lGJ1R0ZSWVXwFl1cJIRH-\",\"REQUEST_STATUS\":\"Success\",\"RUN_TIME\":\"156\",\"SESSION_KEY\":\"\",\"SOURCE_IP\":\"192.0.2.10\",\"TIMESTAMP\":\"20220913052243.429\",\"TIMESTAMP_DERIVED\":\"2022-09-13T05:22:43.429Z\",\"TLS_PROTOCOL\":\"TLSv1.2\",\"URI\":\"/index.jsp\",\"URI_ID_DERIVED\":\"s4heK3WbH-lcJIL3-n\",\"USER_ID\":\"0056j000000utlQAAR\",\"USER_ID_DERIVED\":\"0056j000000utlQAAR\",\"USER_NAME\":\"user.name@example.com\",\"USER_TYPE\":\"Standard\"}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "user.email_addr": "user.name@example.com"
+      "src_endpoint.ip": "192.0.2.10"
+      "metadata.uid": "4lGJ1R0ZSWVXwFl1cJIRH-"
+      "metadata.tenant_uid": "00D5j000000VI3n"
+      "metadata.version": "1.9.0"
+  # ELF Login failure (LOGIN_STATUS error code), built from the Login row above; LOGIN_STATUS values per https://developer.salesforce.com/docs/atlas.en-us.object_reference.meta/object_reference/sforce_api_objects_eventlogfile_login.htm
+  - raw: "{\"API_TYPE\":\"f\",\"API_VERSION\":\"9998.0\",\"AUTHENTICATION_METHOD_REFERENCE\":\"\",\"BROWSER_TYPE\":\"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.12; rv%3A50.0) Gecko/20100101 Firefox/50.0\",\"CIPHER_SUITE\":\"ECDHE-RSA-AES256-GCM-SHA384\",\"CLIENT_IP\":\"203.0.113.66\",\"CPU_TIME\":\"63\",\"DB_TOTAL_TIME\":\"93531912\",\"EVENT_TYPE\":\"Login\",\"LOGIN_KEY\":\"NK2oPJrJze8tH+vC\",\"LOGIN_STATUS\":\"LOGIN_ERROR_INVALID_PASSWORD\",\"ORGANIZATION_ID\":\"00D5j000000VI3n\",\"REQUEST_ID\":\"4lGJ1R0ZSWVXwFl1cJIRJ-\",\"REQUEST_STATUS\":\"Failure\",\"RUN_TIME\":\"156\",\"SESSION_KEY\":\"\",\"SOURCE_IP\":\"203.0.113.66\",\"TIMESTAMP\":\"20220913052301.112\",\"TIMESTAMP_DERIVED\":\"2022-09-13T05:23:01.112Z\",\"TLS_PROTOCOL\":\"TLSv1.2\",\"URI\":\"/index.jsp\",\"URI_ID_DERIVED\":\"s4heK3WbH-lcJIL3-n\",\"USER_ID\":\"0056j000000utlQAAR\",\"USER_ID_DERIVED\":\"0056j000000utlQAAR\",\"USER_NAME\":\"user.name@example.com\",\"USER_TYPE\":\"Standard\"}"
+    expect:
+      "class_uid": 3002
+      "status_id": 2
+      "status_detail": "LOGIN_ERROR_INVALID_PASSWORD"
+      "metadata.version": "1.9.0"
+  # ELF LoginAs (admin impersonation, Medium), source: https://github.com/panther-labs/panther-analysis/blob/main/rules/salesforce_rules/salesforce_admin_login_as_user.yml, fields per https://developer.salesforce.com/docs/atlas.en-us.object_reference.meta/object_reference/sforce_api_objects_eventlogfile_loginas.htm
+  - raw: "{\"CLIENT_IP\":\"203.0.113.12\",\"CPU_TIME\":\"19\",\"DELEGATED_USER_ID\":\"0054x000001L78a\",\"DELEGATED_USER_ID_DERIVED\":\"0054x000001L78aAAC\",\"DELEGATED_USER_NAME\":\"admin.user@example.com\",\"EVENT_TYPE\":\"LoginAs\",\"LOGIN_KEY\":\"n5sqLw+tah0tY/q9\",\"ORGANIZATION_ID\":\"00D000000000123\",\"REQUEST_ID\":\"4dmdpWcNWWjoaQWObxO2k-\",\"RUN_TIME\":\"1088\",\"SESSION_KEY\":\"f6wkL1crc62p7/Vj\",\"TIMESTAMP\":\"20260818090503.392\",\"TIMESTAMP_DERIVED\":\"2026-08-18T09:05:03.392Z\",\"URI\":\"/secur/logout.jsp\",\"URI_ID_DERIVED\":\"\",\"USER_ID\":\"0055f00000CyENt\",\"USER_ID_DERIVED\":\"0055f00000CyENtAAN\"}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 7
+      "account_switch_type_id": 2
+      "actor.user.email_addr": "admin.user@example.com"
+      "severity_id": 3
+      "metadata.version": "1.9.0"
+  # ELF Logout, source: https://github.com/elastic/integrations/blob/main/packages/salesforce/data_stream/logout/_dev/test/pipeline/test-logout-eventlogfile.log
+  - raw: "{\"EVENT_TYPE\":\"Logout\",\"TIMESTAMP\":\"20211019050707.13\",\"REQUEST_ID\":\"4exLFFQZNa5xxFl1cJNwOV\",\"ORGANIZATION_ID\":\"00D5j000000VI3n\",\"USER_ID\":\"0056j000000utlQAAR\",\"USER_TYPE\":\"X\",\"SESSION_TYPE\":\"C\",\"SESSION_LEVEL\":\"1\",\"BROWSER_TYPE\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.81 Safari/537.36\",\"PLATFORM_TYPE\":\"1015\",\"RESOLUTION_TYPE\":\"9999\",\"APP_TYPE\":\"1000\",\"CLIENT_VERSION\":\"9998\",\"API_TYPE\":\"fo\",\"API_VERSION\":\"54.0\",\"USER_INITIATED_LOGOUT\":\"1\",\"SESSION_KEY\":\"/b1/C123g6WXplkT\",\"LOGIN_KEY\":\"OK123uSUIZVr9YzF\",\"TIMESTAMP_DERIVED\":\"2021-10-19T05:07:07.128Z\",\"USER_ID_DERIVED\":\"0056j000000utlQAAR\",\"CLIENT_IP\":\"192.0.2.10\"}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  # ELF ApexExecution, source: https://github.com/elastic/integrations/blob/main/packages/salesforce/data_stream/apex/_dev/test/pipeline/test-apex.log
+  - raw: "{\"CALLOUT_TIME\":\"0\",\"CLIENT_IP\":\"192.0.2.30\",\"CPU_TIME\":\"174\",\"DB_TOTAL_TIME\":\"12\",\"ENTRY_POINT\":\"Salesforce Migration\",\"EVENT_TYPE\":\"ApexExecution\",\"EXEC_TIME\":\"25\",\"IS_LONG_RUNNING_REQUEST\":\"0\",\"LOGIN_KEY\":\"QfNecrLXSII6fsBq\",\"NUMBER_SOQL_QUERIES\":\"1\",\"ORGANIZATION_ID\":\"00D5j000000VI3n\",\"QUIDDITY\":\"QTXF\",\"REQUEST_ID\":\"4lc-XEdmLH121-l1cJ0001\",\"RUN_TIME\":\"291\",\"SESSION_KEY\":\"d7DEqANa7nNZZVD\",\"TIMESTAMP\":\"20230101170000.885\",\"TIMESTAMP_DERIVED\":\"2023-01-01T17:00:00.885Z\",\"URI\":\"/home/home.jsp\",\"URI_ID_DERIVED\":\"AQB00530000009M943\",\"USER_ID\":\"0055j000000u123\",\"USER_ID_DERIVED\":\"0055j000000utlP001\"}"
+    expect:
+      "class_uid": 6003
+      "api.operation": "ApexExecution"
+      "metadata.version": "1.9.0"
+  # ELF ApexCallout (GET), source: https://github.com/elastic/integrations/blob/main/packages/salesforce/data_stream/apex/_dev/test/pipeline/test-apex.log
+  - raw: "{\"CLIENT_IP\":\"192.0.2.30\",\"CPU_TIME\":\"10\",\"EVENT_TYPE\":\"ApexCallout\",\"LOGIN_KEY\":\"QfNecrLXSII6fsBq\",\"METHOD\":\"GET\",\"ORGANIZATION_ID\":\"00D5j000000XY0P\",\"REQUEST_ID\":\"00D5j00XYZBDS\",\"REQUEST_SIZE\":\"10\",\"RESPONSE_SIZE\":\"61\",\"RUN_TIME\":\"237\",\"SESSION_KEY\":\"DDKHdl+8yn/LIXzz\",\"SUCCESS\":\"1\",\"TIME\":\"227\",\"TIMESTAMP\":\"20230101055317.461\",\"TIMESTAMP_DERIVED\":\"2023-01-01T05:53:17.461Z\",\"TYPE\":\"OData\",\"URI\":\"CALLOUT-LOG\",\"URI_ID_DERIVED\":\"AQB00530000009M943\",\"URL\":\"https://odata.example.com/odata/Random\",\"USER_ID\":\"0055j000000PQ01\",\"USER_ID_DERIVED\":\"0055j000000utll12\"}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 2
+      "http_request.http_method": "GET"
+      "metadata.version": "1.9.0"
+  # ELF ApexSoap, source: https://github.com/elastic/integrations/blob/main/packages/salesforce/data_stream/apex/_dev/test/pipeline/test-apex.log
+  - raw: "{\"EVENT_TYPE\":\"ApexSoap\",\"TIMESTAMP\":\"20230104064436.203\",\"REQUEST_ID\":\"4nR74Q97128rIbdV2ampDi-\",\"ORGANIZATION_ID\":\"00D2wpq000GmWPH\",\"USER_ID\":\"0052wpq000ACf2Q\",\"RUN_TIME\":\"322\",\"CPU_TIME\":\"228\",\"URI\":\"APEXSOAP\",\"SESSION_KEY\":\"DDKHdl+8yn/LIXzz\",\"LOGIN_KEY\":\"Zl16H9F+juAl99mI\",\"USER_TYPE\":\"Standard\",\"REQUEST_STATUS\":\"S\",\"DB_TOTAL_TIME\":\"81604961\",\"CLIENT_NAME\":\"CallOptions\",\"CLASS_NAME\":\"ContactResource\",\"METHOD_NAME\":\"getContactIdAndNames\",\"LIMIT_USAGE_PERCENT\":\"1.19\",\"QUERY\":\"Query\",\"TIMESTAMP_DERIVED\":\"2023-01-04T06:44:36.203Z\",\"USER_ID_DERIVED\":\"0052w00000ACf2QAAT\",\"CLIENT_IP\":\"192.0.2.30\",\"URI_ID_DERIVED\":\"DDKHdl+8yn/LIXzz\"}"
+    expect:
+      "class_uid": 6003
+      "api.operation": "getContactIdAndNames"
+      "metadata.version": "1.9.0"
+  # ELF ApexRestApi failure (HTTP 500), source: https://github.com/elastic/integrations/blob/main/packages/salesforce/data_stream/apex/_dev/test/pipeline/test-apex.log
+  - raw: "{\"EVENT_TYPE\":\"ApexRestApi\",\"TIMESTAMP\":\"20230101062453.951\",\"REQUEST_ID\":\"4mbJ2VQY2Jbggkl1cJIIe-\",\"ORGANIZATION_ID\":\"00D5j000000VI3n\",\"USER_ID\":\"0055j000000utlP\",\"RUN_TIME\":\"320\",\"CPU_TIME\":\"206\",\"URI\":\"/showAccounts/\",\"SESSION_KEY\":\"SYWCKuVRFIoMOBSJ\",\"LOGIN_KEY\":\"UOyL83hAn7WpjB7T\",\"USER_TYPE\":\"Standard\",\"REQUEST_STATUS\":\"F\",\"DB_TOTAL_TIME\":\"39254335\",\"METHOD\":\"GET\",\"MEDIA_TYPE\":\"application/json;charset=UTF-8\",\"STATUS_CODE\":\"500\",\"USER_AGENT\":\"9999\",\"ROWS_PROCESSED\":\"0\",\"NUMBER_FIELDS\":\"2\",\"DB_BLOCKS\":\"832\",\"DB_CPU_TIME\":\"20\",\"REQUEST_SIZE\":\"57\",\"RESPONSE_SIZE\":\"234\",\"ENTITY_NAME\":\"Book__c\",\"TIMESTAMP_DERIVED\":\"2023-01-01T06:24:53.951Z\",\"USER_ID_DERIVED\":\"0055j000000utlPAAQ\",\"CLIENT_IP\":\"192.0.2.30\",\"URI_ID_DERIVED\":\"0052w00000ACf2QAAT\"}"
+    expect:
+      "class_uid": 6003
+      "status_id": 2
+      "http_response.code": 500
+      "class_name": "API Activity"
+      "metadata.version": "1.9.0"
+  # ELF API query (SOAP/partner, Data Loader), fields per https://developer.salesforce.com/docs/atlas.en-us.object_reference.meta/object_reference/sforce_api_objects_eventlogfile_api.htm
+  - raw: "{\"EVENT_TYPE\":\"API\",\"TIMESTAMP\":\"20260818101500.120\",\"REQUEST_ID\":\"4nR74Q97128rIbdV2ampAA-\",\"ORGANIZATION_ID\":\"00D000000000123\",\"USER_ID\":\"005000000000123\",\"RUN_TIME\":\"120\",\"CPU_TIME\":\"40\",\"URI\":\"Api\",\"SESSION_KEY\":\"SYWCKuVRFIoMOBSJ\",\"LOGIN_KEY\":\"UOyL83hAn7WpjB7T\",\"USER_TYPE\":\"Standard\",\"REQUEST_STATUS\":\"S\",\"DB_TOTAL_TIME\":\"5000000\",\"METHOD_NAME\":\"query\",\"API_TYPE\":\"P\",\"API_VERSION\":\"59.0\",\"CLIENT_NAME\":\"DataLoader\",\"ENTITY_NAME\":\"Contact\",\"ROWS_PROCESSED\":\"25000\",\"REQUEST_SIZE\":\"512\",\"RESPONSE_SIZE\":\"8388608\",\"TIMESTAMP_DERIVED\":\"2026-08-18T10:15:00.120Z\",\"USER_ID_DERIVED\":\"005000000000123AAA\",\"CLIENT_IP\":\"198.51.100.25\"}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 2
+      "api.operation": "query"
+      "api.version": "59.0"
+      "metadata.version": "1.9.0"
+  # ELF Report run, fields per https://developer.salesforce.com/docs/atlas.en-us.object_reference.meta/object_reference/sforce_api_objects_eventlogfile_report.htm
+  - raw: "{\"EVENT_TYPE\":\"Report\",\"TIMESTAMP\":\"20260818110000.500\",\"REQUEST_ID\":\"4nR74Q97128rIbdV2ampBB-\",\"ORGANIZATION_ID\":\"00D000000000123\",\"USER_ID\":\"005000000000123\",\"RUN_TIME\":\"900\",\"CPU_TIME\":\"300\",\"URI\":\"/00O000000000123\",\"SESSION_KEY\":\"SYWCKuVRFIoMOBSJ\",\"LOGIN_KEY\":\"UOyL83hAn7WpjB7T\",\"REQUEST_STATUS\":\"S\",\"DB_TOTAL_TIME\":\"45000000\",\"ENTITY_NAME\":\"Opportunity\",\"REPORT_ID\":\"00O000000000123\",\"ROW_COUNT\":\"1200\",\"NUMBER_COLUMNS\":\"12\",\"DISPLAY_TYPE\":\"D\",\"RENDERING_TYPE\":\"W\",\"ORIGIN\":\"ReportRunFromLightning\",\"REPORT_ID_DERIVED\":\"00O000000000123EAA\",\"TIMESTAMP_DERIVED\":\"2026-08-18T11:00:00.500Z\",\"USER_ID_DERIVED\":\"005000000000123AAA\",\"CLIENT_IP\":\"198.51.100.25\"}"
+    expect:
+      "class_uid": 6005
+      "activity_id": 1
+      "table.uid": "00O000000000123EAA"
+      "metadata.version": "1.9.0"
+  # ELF ReportExport (Medium), fields per https://developer.salesforce.com/docs/atlas.en-us.object_reference.meta/object_reference/sforce_api_objects_eventlogfile_reportexport.htm
+  - raw: "{\"EVENT_TYPE\":\"ReportExport\",\"TIMESTAMP\":\"20260818110500.000\",\"REQUEST_ID\":\"4nR74Q97128rIbdV2ampCC-\",\"ORGANIZATION_ID\":\"00D000000000123\",\"USER_ID\":\"005000000000123\",\"CLIENT_IP\":\"198.51.100.25\",\"URI\":\"/00O000000000123\",\"CLIENT_INFO\":\"Mozilla/5.0\",\"REPORT_DESCRIPTION\":\"All open opportunities\",\"TIMESTAMP_DERIVED\":\"2026-08-18T11:05:00.000Z\",\"USER_ID_DERIVED\":\"005000000000123AAA\",\"REPORT_ID\":\"00O000000000123\"}"
+    expect:
+      "class_uid": 6005
+      "severity_id": 3
+      "table.uid": "00O000000000123"
+      "metadata.version": "1.9.0"
+  # ELF Login as CSV: header line + one row in one message (header-driven layout); values from https://github.com/elastic/integrations/blob/main/packages/salesforce/data_stream/login/_dev/test/pipeline/test-login-eventlogfile.log, columns per https://developer.salesforce.com/docs/atlas.en-us.object_reference.meta/object_reference/sforce_api_objects_eventlogfile_login.htm
+  - raw: "\"EVENT_TYPE\",\"TIMESTAMP\",\"REQUEST_ID\",\"ORGANIZATION_ID\",\"USER_ID\",\"RUN_TIME\",\"CPU_TIME\",\"URI\",\"SESSION_KEY\",\"LOGIN_KEY\",\"USER_TYPE\",\"REQUEST_STATUS\",\"DB_TOTAL_TIME\",\"LOGIN_STATUS\",\"BROWSER_TYPE\",\"API_TYPE\",\"API_VERSION\",\"USER_NAME\",\"TLS_PROTOCOL\",\"CIPHER_SUITE\",\"AUTHENTICATION_METHOD_REFERENCE\",\"TIMESTAMP_DERIVED\",\"USER_ID_DERIVED\",\"CLIENT_IP\",\"URI_ID_DERIVED\"\n\"Login\",\"20220913052243.429\",\"4lGJ1R0ZSWVXwFl1cJIRH-\",\"00D5j000000VI3n\",\"0056j000000utlQAAR\",\"156\",\"63\",\"/index.jsp\",\"\",\"NK2oPJrJze8tH+vC\",\"Standard\",\"Success\",\"93531912\",\"LOGIN_NO_ERROR\",\"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.12; rv%3A50.0) Gecko/20100101 Firefox/50.0\",\"f\",\"9998.0\",\"user.name@example.com\",\"TLSv1.2\",\"ECDHE-RSA-AES256-GCM-SHA384\",\"\",\"2022-09-13T05:22:43.429Z\",\"0056j000000utlQAAR\",\"192.0.2.10\",\"s4heK3WbH-lcJIL3-n\""
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "user.name": "user.name@example.com"
+      "src_endpoint.ip": "192.0.2.10"
+      "metadata.uid": "4lGJ1R0ZSWVXwFl1cJIRH-"
+      "metadata.version": "1.9.0"
+  # ELF CSV with two data rows: first row parsed, unmapped.parse_fallback marks the rest
+  - raw: "\"EVENT_TYPE\",\"TIMESTAMP\",\"REQUEST_ID\",\"ORGANIZATION_ID\",\"USER_ID\",\"RUN_TIME\",\"CPU_TIME\",\"URI\",\"SESSION_KEY\",\"LOGIN_KEY\",\"USER_TYPE\",\"REQUEST_STATUS\",\"DB_TOTAL_TIME\",\"LOGIN_STATUS\",\"BROWSER_TYPE\",\"API_TYPE\",\"API_VERSION\",\"USER_NAME\",\"TLS_PROTOCOL\",\"CIPHER_SUITE\",\"AUTHENTICATION_METHOD_REFERENCE\",\"TIMESTAMP_DERIVED\",\"USER_ID_DERIVED\",\"CLIENT_IP\",\"URI_ID_DERIVED\"\n\"Login\",\"20220913052243.429\",\"4lGJ1R0ZSWVXwFl1cJIRH-\",\"00D5j000000VI3n\",\"0056j000000utlQAAR\",\"156\",\"63\",\"/index.jsp\",\"\",\"NK2oPJrJze8tH+vC\",\"Standard\",\"Success\",\"93531912\",\"LOGIN_NO_ERROR\",\"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.12; rv%3A50.0) Gecko/20100101 Firefox/50.0\",\"f\",\"9998.0\",\"user.name@example.com\",\"TLSv1.2\",\"ECDHE-RSA-AES256-GCM-SHA384\",\"\",\"2022-09-13T05:22:43.429Z\",\"0056j000000utlQAAR\",\"192.0.2.10\",\"s4heK3WbH-lcJIL3-n\"\n\"Login\",\"20220913052301.112\",\"4lGJ1R0ZSWVXwFl1cJIRJ-\",\"00D5j000000VI3n\",\"0056j000000utlQAAR\",\"156\",\"63\",\"/index.jsp\",\"\",\"NK2oPJrJze8tH+vC\",\"Standard\",\"Failure\",\"93531912\",\"LOGIN_ERROR_INVALID_PASSWORD\",\"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.12; rv%3A50.0) Gecko/20100101 Firefox/50.0\",\"f\",\"9998.0\",\"user.name@example.com\",\"TLSv1.2\",\"ECDHE-RSA-AES256-GCM-SHA384\",\"\",\"2022-09-13T05:23:01.112Z\",\"0056j000000utlQAAR\",\"203.0.113.66\",\"s4heK3WbH-lcJIL3-n\""
+    expect:
+      "class_uid": 3002
+      "unmapped.parse_fallback": "multi-row EventLogFile CSV: only the first row is parsed"
+      "metadata.version": "1.9.0"
+  # ELF CSV row WITHOUT its header: layout unknown, Base Event with the raw row kept
+  - raw: "\"Login\",\"20220913052243.429\",\"4lGJ1R0ZSWVXwFl1cJIRH-\",\"00D5j000000VI3n\",\"0056j000000utlQAAR\",\"156\",\"63\",\"/index.jsp\",\"\",\"NK2oPJrJze8tH+vC\",\"Standard\",\"Success\",\"93531912\",\"LOGIN_NO_ERROR\",\"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.12; rv%3A50.0) Gecko/20100101 Firefox/50.0\",\"f\",\"9998.0\",\"user.name@example.com\",\"TLSv1.2\",\"ECDHE-RSA-AES256-GCM-SHA384\",\"\",\"2022-09-13T05:22:43.429Z\",\"0056j000000utlQAAR\",\"192.0.2.10\",\"s4heK3WbH-lcJIL3-n\""
+    expect:
+      "class_uid": 0
+      "unmapped.parse_fallback": "unparsable input"
+      "metadata.version": "1.9.0"
+  # Real-Time LoginEvent, success with geo, source: https://github.com/elastic/integrations/blob/main/packages/salesforce/data_stream/login/_dev/test/pipeline/test-login-object.log, fields per https://developer.salesforce.com/docs/atlas.en-us.platform_events.meta/platform_events/sforce_api_objects_loginevent.htm
+  - raw: "{\"EventDate\":\"2021-10-19T11:47:22Z\",\"AuthServiceId\":null,\"CountryIso\":\"IN\",\"Platform\":\"Mac OSX\",\"EvaluationTime\":0,\"CipherSuite\":\"ECDHE-RSA-AES256-GCM-SHA384\",\"PostalCode\":\"00000\",\"ClientVersion\":\"N/A\",\"LoginGeoId\":\"04F5j00000FadrI\",\"LoginUrl\":\"login.salesforce.com\",\"LoginHistoryId\":\"0Ya5j00000GLxCdCAL\",\"CreatedById\":\"0055j000000q9s7AAA\",\"SessionKey\":null,\"ApiType\":\"N/A\",\"AuthMethodReference\":null,\"LoginType\":\"Remote Access 2.0\",\"PolicyOutcome\":null,\"Status\":\"Success\",\"AdditionalInfo\":\"{}\",\"ApiVersion\":\"N/A\",\"EventIdentifier\":\"06af6d92-1167-467d-a826-ee8583f7134d\",\"RelatedEventIdentifier\":null,\"LoginLatitude\":21.1888,\"City\":\"Example City\",\"Subdivision\":\"Gujarat\",\"SourceIp\":\"192.0.2.20\",\"Username\":\"user.name@example.com\",\"UserId\":\"0056j000000utlQAAR\",\"CreatedDate\":\"2021-10-19T11:47:30Z\",\"Country\":\"India\",\"LoginLongitude\":72.8293,\"TlsProtocol\":\"TLS 1.2\",\"LoginKey\":\"o3vhFaSRBb0OzpCl\",\"Application\":\"elastic integration\",\"UserType\":\"Standard\",\"PolicyId\":null,\"HttpMethod\":\"POST\",\"SessionLevel\":\"STANDARD\",\"Browser\":\"Chrome\"}"
+    expect:
+      "class_uid": 3002
+      "status_id": 1
+      "src_endpoint.location.country": "IN"
+      "metadata.uid": "06af6d92-1167-467d-a826-ee8583f7134d"
+      "metadata.version": "1.9.0"
+  # Real-Time LoginEvent, failure (Status text), source: https://github.com/elastic/integrations/blob/main/packages/salesforce/data_stream/login/_dev/test/pipeline/test-login-object.log, fields per https://developer.salesforce.com/docs/atlas.en-us.platform_events.meta/platform_events/sforce_api_objects_loginevent.htm
+  - raw: "{\"ApiType\":\"N/A\",\"ApiVersion\":\"N/A\",\"Application\":\"testing_salesforce\",\"Browser\":\"Unknown\",\"CipherSuite\":\"TLS_AES_256_GCM_SHA384\",\"ClientVersion\":\"N/A\",\"CreatedDate\":\"2024-07-08T07:26:22.128+0000\",\"EvaluationTime\":0,\"EventDate\":\"2024-07-08T07:26:18.239+0000\",\"EventIdentifier\":\"95eeec6d-1e93-46c1-882b-88bd28f7f8de\",\"HttpMethod\":\"POST\",\"Id\":\"000000000000000AAA\",\"LoginHistoryId\":\"0YaJ400000H0kYoKAJ\",\"LoginKey\":\"Qv1P3iAGDrGQxSmN\",\"LoginType\":\"Remote Access 2.0\",\"LoginUrl\":\"example-dev-ed.develop.my.salesforce.com\",\"Platform\":\"Unknown\",\"SessionLevel\":\"STANDARD\",\"SourceIp\":\"192.0.2.20\",\"Status\":\"Failed: Missing Consumer Key Parameter\",\"TlsProtocol\":\"TLS 1.3\",\"UserId\":\"0055j00000AT6I1AAL\",\"UserType\":\"Standard\",\"Username\":\"integration@example.com\"}"
+    expect:
+      "class_uid": 3002
+      "status_id": 2
+      "status_detail": "Failed: Missing Consumer Key Parameter"
+      "metadata.version": "1.9.0"
+  # Real-Time ApiEvent with a SOQL query, fields per https://developer.salesforce.com/docs/atlas.en-us.platform_events.meta/platform_events/sforce_api_objects_apievent.htm
+  - raw: "{\"attributes\":{\"type\":\"ApiEvent\",\"url\":\"/services/data/v59.0/sobjects/ApiEvent/0Ya000000000001\"},\"EventDate\":\"2026-08-18T12:00:00.000+0000\",\"EventIdentifier\":\"7c5b3d3e-0000-4000-8000-000000000001\",\"Username\":\"analyst@example.com\",\"UserId\":\"005000000000456AAA\",\"SourceIp\":\"198.51.100.40\",\"SessionKey\":\"vMASKIU6AxEr+Op5\",\"LoginKey\":\"QfNecrLXSII6fsBq\",\"ApiType\":\"REST\",\"ApiVersion\":\"59.0\",\"Application\":\"Workbench\",\"Client\":\"Workbench/\",\"Operation\":\"Query\",\"Query\":\"SELECT Id, Name, Email FROM Contact WHERE CreatedDate = LAST_N_DAYS:30\",\"QueriedEntities\":\"Contact\",\"RowsProcessed\":4200,\"ElapsedTime\":312,\"Platform\":\"Mac OSX\",\"SessionLevel\":\"STANDARD\",\"UserAgent\":\"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)\"}"
+    expect:
+      "class_uid": 6005
+      "activity_id": 4
+      "table.name": "Contact"
+      "query_info.uid": "7c5b3d3e-0000-4000-8000-000000000001"
+      "metadata.version": "1.9.0"
+  # Real-Time ReportEvent export (Medium), fields per https://developer.salesforce.com/docs/atlas.en-us.platform_events.meta/platform_events/sforce_api_objects_reportevent.htm
+  - raw: "{\"attributes\":{\"type\":\"ReportEvent\"},\"EventDate\":\"2026-08-18T12:10:00.000+0000\",\"EventIdentifier\":\"7c5b3d3e-0000-4000-8000-000000000002\",\"Username\":\"analyst@example.com\",\"UserId\":\"005000000000456AAA\",\"SourceIp\":\"198.51.100.40\",\"SessionKey\":\"vMASKIU6AxEr+Op5\",\"LoginKey\":\"QfNecrLXSII6fsBq\",\"ReportId\":\"00O000000000456\",\"Name\":\"Pipeline by Region\",\"Operation\":\"ReportExported\",\"ExportFileFormat\":\"CSV\",\"QueriedEntities\":\"Opportunity\",\"RowsProcessed\":15000,\"NumberOfColumns\":9,\"EventSource\":\"Classic\"}"
+    expect:
+      "class_uid": 6005
+      "activity_id": 1
+      "severity_id": 3
+      "table.name": "Pipeline by Region"
+      "metadata.version": "1.9.0"
+  # Real-Time LightningUriEvent (record view, no attributes.type), fields per https://developer.salesforce.com/docs/atlas.en-us.platform_events.meta/platform_events/sforce_api_objects_lightninguriEvent.htm
+  - raw: "{\"EventDate\":\"2026-08-18T12:20:00.000Z\",\"EventIdentifier\":\"7c5b3d3e-0000-4000-8000-000000000003\",\"Username\":\"analyst@example.com\",\"UserId\":\"005000000000456AAA\",\"SessionKey\":\"vMASKIU6AxEr+Op5\",\"LoginKey\":\"QfNecrLXSII6fsBq\",\"Operation\":\"Read\",\"PageUrl\":\"/lightning/r/Account/001000000000789AAA/view\",\"RecordId\":\"001000000000789AAA\",\"QueriedEntities\":\"Account\",\"AppName\":\"one:one\",\"Duration\":845,\"DeviceSessionId\":\"5a1c2b3d-0000-4000-8000-000000000003\"}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 2
+      "http_request.url.path": "/lightning/r/Account/001000000000789AAA/view"
+      "metadata.version": "1.9.0"
+  # JSON object that is neither an ELF row nor an Event Monitoring event: Base Event
+  - raw: "{\"foo\":\"bar\"}"
+    expect:
+      "class_uid": 0
+      "metadata.version": "1.9.0"
+  # malformed line: Base Event with the raw line kept; deterministic uid
+  - raw: "salesforce: not json"
+    expect:
+      "class_uid": 0
+      "metadata.uid": "9bd8e70dc5991b62712de91541d3289bb88940caf46327fefb751a15dc9db4a3"

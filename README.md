@@ -115,6 +115,11 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [GitHub Audit](parsers-ocsf/github_audit) | `github_audit` | GitHub | JSON | Organization and enterprise audit events |
 | [Slack Audit](parsers-ocsf/slack_audit) | `slack_audit` | Salesforce | JSON | Enterprise Grid audit: login, file, channel, app events |
 | [Slack Access Logs](parsers-ocsf/slack_access) | `slack_access_log` | Salesforce | JSON | Workspace sign-in records from team.accessLogs |
+| [GitLab Audit Events](parsers-ocsf/gitlab_audit) | `gitlab_audit` | GitLab | JSON (streaming, REST API, audit_json.log) | Sign-ins and failures, user lifecycle, 2FA, personal access tokens, group / project membership, project and git activity |
+| [Atlassian Organization Audit](parsers-ocsf/atlassian_audit) | `atlassian_audit` | Atlassian | JSON (Organizations REST API events) | Admin, Jira, Confluence and Bitbucket audit: logins, admin impersonation, API tokens, invites, groups, settings, apps |
+| [Salesforce Event Monitoring](parsers-ocsf/salesforce_event_monitoring) | `salesforce_event_monitoring` | Salesforce | EventLogFile CSV (header-driven) or JSON, Real-Time Event Monitoring JSON | Login, LoginAs, Logout, API, Apex, Report / ReportExport, LoginEvent, ApiEvent (SOQL), ReportEvent, LightningUriEvent |
+| [Snowflake](parsers-ocsf/snowflake) | `snowflake` | Snowflake | JSON (ACCOUNT_USAGE rows) | LOGIN_HISTORY, QUERY_HISTORY with bounded SQL text, ACCESS_HISTORY including user DDL |
+| [Zoom](parsers-ocsf/zoom) | `zoom` | Zoom | JSON (report API, webhooks) | Sign-in / sign-out activity, admin operation logs, user, meeting and recording webhooks |
 
 ### Application
 

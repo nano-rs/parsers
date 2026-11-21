@@ -1,0 +1,748 @@
+name: zoom_ocsf
+display_name: Zoom Activity, Operation Logs and Webhooks (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Zoom audit data into complete OCSF 1.9.0 records. Three wire forms
+  share one lane, one record per message:
+    sign-in / sign-out activity (GET /report/activities `activity_logs[]`,
+    email + type "Sign in" / "Sign out")             -> Authentication 3002
+    admin operation logs (GET /report/operationlogs
+    `operation_logs[]`, operator + category_type)   -> API Activity 6003
+    event subscription webhooks (`event` + `payload`):
+      user.signed_in / user.signed_out               -> Authentication 3002
+      user.created / deleted / activated /
+      deactivated / disassociated / updated /
+      settings_updated / invitation_accepted         -> User Management 3007
+      meeting.*, recording.*, webinar.*, account.*
+      and every other event                          -> API Activity 6003
+  Operation-log changes that turn sign-in two-factor authentication off, or
+  promote a user to an owner or admin role, are raised to Medium. Webhook
+  endpoint.url_validation challenges and unparseable input become a Base
+  Event with the raw body kept.
+match_values:
+  - zoom
+category: cloud
+vendor: "Zoom"
+product: "Zoom"
+parser_vrl: |
+  # Zoom sign-in activity, admin operation logs and webhooks -> OCSF 1.9.0.
+  raw_log = string!(.message)
+  __raw_body = raw_log
+  __source_kv = {}
+  parsed, err = parse_json(raw_log)
+  __source_kv = object(parsed) ?? {}
+
+  kind = ""
+  if err == null && is_object(parsed) {
+      if is_string(parsed.event) && is_object(parsed.payload) {
+          kind = "webhook"
+      } else if exists(parsed.operator) || exists(parsed.category_type) || exists(parsed.operation_detail) {
+          kind = "operation"
+      } else if is_string(parsed.type) && (exists(parsed.email) || exists(parsed.ip_address)) {
+          kind = "activity"
+      }
+  }
+
+  if kind == "" {
+      reason = "not a JSON object"
+      if err == null && is_object(parsed) { reason = "not a Zoom activity, operation log or webhook record" }
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("zoom|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "Zoom",
+              "log_provider": "Zoom",
+              "product": { "name": "Zoom", "vendor_name": "Zoom" }
+          },
+          "unmapped": { "parse_error": reason }
+      }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+  } else {
+      p = object!(parsed)
+      payload = object(p.payload) ?? {}
+      obj = object(payload.object) ?? {}
+      participant = object(obj.participant) ?? {}
+      event = string(p.event) ?? ""
+      email_re = r'^[^@\s]+@[^@\s]+\.[^@\s]+$'
+
+      # ---- time: webhook event_ts (epoch ms), else the record's ISO clock ----
+      time_ms = 0
+      if kind == "webhook" { time_ms = to_int(p.event_ts) ?? 0 }
+      if time_ms == 0 {
+          ts = string(p.time) ?? ""
+          if ts == "" { ts = string(obj.date_time) ?? "" }
+          clock, clock_err = parse_timestamp(ts, "%+")
+          if clock_err == null {
+              time_ms = to_unix_timestamp(clock, unit: "milliseconds")
+          } else {
+              clock2, clock2_err = parse_timestamp(ts, "%Y-%m-%d %H:%M:%S")
+              if clock2_err == null { time_ms = to_unix_timestamp(clock2, unit: "milliseconds") }
+          }
+      }
+
+      # ---- the operator (actor) of an admin action ----
+      operator = string(p.operator) ?? ""
+      if operator == "" { operator = string(payload.operator) ?? "" }
+      actor_user = {}
+      if operator != "" { actor_user.name = operator }
+      if match(operator, email_re) { actor_user.email_addr = operator }
+      operator_id = string(payload.operator_id) ?? ""
+      if operator_id != "" { actor_user.uid = operator_id }
+
+      # ---- source endpoint ----
+      src_ip = string(p.ip_address) ?? ""
+      if src_ip == "" { src_ip = string(obj.ip_address) ?? "" }
+      if src_ip == "" { src_ip = string(participant.public_ip) ?? "" }
+      src_ep = { "hostname": "unknown" }
+      if is_ipv4(src_ip) || is_ipv6(src_ip) { src_ep = { "ip": src_ip } }
+
+      status_id = 1
+      status_str = "Success"
+      severity_id = 1
+      severity = "Informational"
+
+      is_signin = event == "user.signed_in" || event == "user.signed_out" || kind == "activity"
+      user_events = ["user.created", "user.deleted", "user.activated", "user.deactivated", "user.disassociated", "user.updated", "user.settings_updated", "user.invitation_accepted"]
+      is_usermgmt = includes(user_events, event)
+      is_control = event == "endpoint.url_validation"
+
+      ocsf = {}
+      msg = ""
+      if is_control {
+          # Zoom's endpoint validation challenge is a webhook handshake, not
+          # an audit event: Base Event, Other.
+          ocsf.class_uid = 0
+          ocsf.class_name = "Base Event"
+          ocsf.category_uid = 0
+          ocsf.category_name = "Uncategorized"
+          ocsf.activity_id = 99
+          ocsf.activity_name = "Other"
+          status_id = 0
+          status_str = "Unknown"
+          msg = event
+      } else if is_signin {
+          act_type = string(p.type) ?? ""
+          activity_id = 1
+          activity_name = "Logon"
+          if event == "user.signed_out" || downcase(act_type) == "sign out" { activity_id = 2; activity_name = "Logoff" }
+          if contains(downcase(act_type), "fail") { status_id = 2; status_str = "Failure"; severity_id = 2; severity = "Low" }
+          ocsf.class_uid = 3002
+          ocsf.class_name = "Authentication"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          email = string(p.email) ?? ""
+          if email == "" { email = string(obj.email) ?? "" }
+          auth_user = {}
+          if email != "" { auth_user.name = email }
+          if match(email, email_re) { auth_user.email_addr = email }
+          uid = string(obj.id) ?? ""
+          if uid != "" { auth_user.uid = uid }
+          if length(auth_user) == 0 { auth_user = { "name": "unknown" } }
+          ocsf.user = auth_user
+          ocsf.service = { "name": "Zoom" }
+          ocsf.is_remote = true
+          msg = act_type
+          if msg == "" { msg = event }
+      } else if is_usermgmt {
+          activity_id = 2
+          activity_name = "Update"
+          if event == "user.created" || event == "user.invitation_accepted" { activity_id = 1; activity_name = "Create" }
+          if event == "user.deleted" || event == "user.disassociated" { activity_id = 3; activity_name = "Delete" }
+          if event == "user.activated" { activity_id = 4; activity_name = "Enable" }
+          if event == "user.deactivated" { activity_id = 5; activity_name = "Disable" }
+          ocsf.class_uid = 3007
+          ocsf.class_name = "User Management"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          subj = {}
+          subj_email = string(obj.email) ?? ""
+          if subj_email != "" { subj.name = subj_email }
+          if match(subj_email, email_re) { subj.email_addr = subj_email }
+          subj_id = string(obj.id) ?? ""
+          if subj_id != "" { subj.uid = subj_id }
+          if length(subj) == 0 { subj = { "name": "unknown" } }
+          ocsf.user = subj
+          if length(actor_user) > 0 { ocsf.actor = { "user": actor_user } }
+          msg = event
+      } else {
+          # Admin operation logs and every other webhook: API Activity.
+          verb = ""
+          op = ""
+          if kind == "operation" {
+              verb = downcase(string(p.action) ?? "")
+              op = string(p.action) ?? ""
+              msg = string(p.operation_detail) ?? ""
+          } else {
+              verb = event
+              op = event
+              msg = event
+          }
+          activity_id = 99
+          activity_name = "Other"
+          if contains(verb, "add") || contains(verb, "create") || contains(verb, "completed") { activity_id = 1; activity_name = "Create" }
+          if contains(verb, "update") || contains(verb, "renamed") || contains(verb, "recovered") { activity_id = 3; activity_name = "Update" }
+          if contains(verb, "delete") || contains(verb, "trashed") || contains(verb, "remove") { activity_id = 4; activity_name = "Delete" }
+          ocsf.class_uid = 6003
+          ocsf.class_name = "API Activity"
+          ocsf.category_uid = 6
+          ocsf.category_name = "Application Activity"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          if op == "" { op = "unknown" }
+          api = { "operation": op, "service": { "name": "Zoom" } }
+          cat = string(p.category_type) ?? ""
+          if cat != "" { api.group = { "name": cat } }
+          ocsf.api = api
+          # Webhooks without an operator act as the meeting / recording host.
+          host_email = string(obj.host_email) ?? ""
+          host_id = string(obj.host_id) ?? ""
+          if length(actor_user) == 0 && (host_email != "" || host_id != "") {
+              if host_email != "" { actor_user.name = host_email }
+              if match(host_email, email_re) { actor_user.email_addr = host_email }
+              if host_id != "" { actor_user.uid = host_id }
+          }
+          if length(actor_user) == 0 { actor_user = { "name": "unknown" } }
+          ocsf.actor = { "user": actor_user }
+          res = {}
+          res_uid = string(obj.uuid) ?? ""
+          if res_uid == "" { res_uid = to_string(obj.id) ?? "" }
+          if res_uid != "" { res.uid = res_uid }
+          topic = string(obj.topic) ?? ""
+          if topic != "" { res.name = topic }
+          if exists(res.uid) || exists(res.name) {
+              parts = split(event, ".")
+              if length(parts) > 1 { res.type = parts[0] }
+              ocsf.resources = [res]
+          }
+          # Security-relevant admin changes in the operation log.
+          if kind == "operation" {
+              if match(msg, r'(?i)two-factor authentication.*to off') { severity_id = 3; severity = "Medium" }
+              if match(msg, r'(?i)change role.*to (co-owner|owner|admin)') { severity_id = 3; severity = "Medium" }
+          }
+      }
+
+      if !is_control { ocsf.src_endpoint = src_ep }
+      ocsf.status_id = status_id
+      ocsf.status = status_str
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.type_uid = to_int(ocsf.class_uid) * 100 + to_int(ocsf.activity_id)
+      ocsf.time = time_ms
+      if msg == "" { msg = "zoom_event" }
+      ocsf.message = msg
+      ocsf.raw_data = raw_log
+
+      log_name = "Zoom Webhooks"
+      if kind == "activity" { log_name = "Zoom Sign In / Sign Out Activity" }
+      if kind == "operation" { log_name = "Zoom Operation Logs" }
+      md = {
+          "version": "1.9.0",
+          "uid": sha2("zoom|" + raw_log, variant: "SHA-256"),
+          "log_name": log_name,
+          "log_provider": "Zoom",
+          "product": { "name": "Zoom", "vendor_name": "Zoom" }
+      }
+      if event != "" { md.event_code = event }
+      tenant = string(payload.account_id) ?? ""
+      if tenant != "" { md.tenant_uid = tenant }
+      ocsf.metadata = md
+
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # time: ISO activity / operation-log time converted to the event clock in milliseconds.
+  # payload.object.date_time: Webhook object time, used only when event_ts is absent.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        time
+      | payload\.object\.date_time
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    action
+  | category_type
+  | email
+  | event
+  | event_ts
+  | ip_address
+  | operation_detail
+  | operator
+  | payload\.account_id
+  | payload\.object\.email
+  | payload\.object\.host_email
+  | payload\.object\.host_id
+  | payload\.object\.id
+  | payload\.object\.ip_address
+  | payload\.object\.participant\.public_ip
+  | payload\.object\.topic
+  | payload\.object\.uuid
+  | payload\.operator
+  | payload\.operator_id
+  | time
+  | type
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # sign-in activity from a browser, source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/activity/_dev/test/pipeline/test-zoom-activity.log, fields per https://developers.zoom.us/docs/api/rest/reference/zoom-api/methods/#operation/reportSignInSignOutActivities
+  - raw: "{\"client_type\":\"Browser\",\"email\":\"alice@example.com\",\"ip_address\":\"192.0.2.10\",\"time\":\"2024-06-07T10:00:00Z\",\"type\":\"Sign in\",\"version\":\"6.0.0.1000\"}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "user.email_addr": "alice@example.com"
+      "src_endpoint.ip": "192.0.2.10"
+      "metadata.version": "1.9.0"
+  # sign-out activity, source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/activity/_dev/test/pipeline/test-zoom-activity.log, fields per https://developers.zoom.us/docs/api/rest/reference/zoom-api/methods/#operation/reportSignInSignOutActivities
+  - raw: "{\"client_type\":\"Windows\",\"email\":\"dave@example.com\",\"ip_address\":\"192.0.2.20\",\"time\":\"2024-06-07T11:15:00Z\",\"type\":\"Sign out\",\"version\":\"6.0.0.1000\"}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  # sign-in activity without IP or client, source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/activity/_dev/test/pipeline/test-zoom-activity.log, fields per https://developers.zoom.us/docs/api/rest/reference/zoom-api/methods/#operation/reportSignInSignOutActivities
+  - raw: "{\"email\":\"bob@example.com\",\"time\":\"2024-06-07T14:30:00Z\",\"type\":\"Sign in\"}"
+    expect:
+      "class_uid": 3002
+      "src_endpoint.hostname": "unknown"
+      "metadata.version": "1.9.0"
+  # operation log, user activated, source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/operation/_dev/test/pipeline/test-zoom-operation.log, fields per https://developers.zoom.us/docs/api/rest/reference/zoom-api/methods/#operation/reportOperationLogs
+  - raw: "{\"action\":\"Update\",\"category_type\":\"User\",\"operation_detail\":\"Activate User alice@example.com\",\"operator\":\"admin@example.com\",\"time\":\"2024-06-07T10:00:00Z\"}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 3
+      "api.group.name": "User"
+      "actor.user.email_addr": "admin@example.com"
+      "metadata.version": "1.9.0"
+  # operation log, user added, source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/operation/_dev/test/pipeline/test-zoom-operation.log, fields per https://developers.zoom.us/docs/api/rest/reference/zoom-api/methods/#operation/reportOperationLogs
+  - raw: "{\"action\":\"Add\",\"category_type\":\"User\",\"operation_detail\":\"Add User bob@example.com\",\"operator\":\"admin@example.com\",\"time\":\"2024-06-07T11:15:00Z\"}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # operation log, cloud recording deleted, source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/operation/_dev/test/pipeline/test-zoom-operation.log, fields per https://developers.zoom.us/docs/api/rest/reference/zoom-api/methods/#operation/reportOperationLogs
+  - raw: "{\"action\":\"Delete\",\"category_type\":\"Recording\",\"operation_detail\":\"Delete cloud recording for meeting 11122223333\",\"operator\":\"admin@example.com\",\"time\":\"2024-06-07T12:30:00Z\"}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 4
+      "metadata.version": "1.9.0"
+  # operation log without operator, source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/operation/_dev/test/pipeline/test-zoom-operation.log, fields per https://developers.zoom.us/docs/api/rest/reference/zoom-api/methods/#operation/reportOperationLogs
+  - raw: "{\"category_type\":\"Billing\",\"operation_detail\":\"Update billing contact information\",\"time\":\"2024-06-08T10:00:00Z\"}"
+    expect:
+      "class_uid": 6003
+      "actor.user.name": "unknown"
+      "metadata.version": "1.9.0"
+  # operation log, sign-in 2FA turned off (Medium), source: https://github.com/panther-labs/panther-analysis/blob/main/rules/zoom_operation_rules/zoom_two_factor_authentication_disabled.yml (time in the API's ISO form)
+  - raw: "{\"action\":\"Update\",\"category_type\":\"Account\",\"operation_detail\":\"Security  - Sign in with Two-Factor Authentication: from On to Off\",\"operator\":\"example@example.com\",\"time\":\"2026-08-16T18:20:35Z\"}"
+    expect:
+      "class_uid": 6003
+      "severity_id": 3
+      "metadata.version": "1.9.0"
+  # operation log, user promoted to Co-Owner (Medium), source: https://github.com/panther-labs/panther-analysis/blob/main/rules/zoom_operation_rules/zoom_user_promoted_to_privileged_role.yml
+  - raw: "{\"action\":\"Batch Update\",\"category_type\":\"User\",\"operation_detail\":\"Change Role  - homer.simpson@example.com: from User to Co-Owner\",\"operator\":\"example@example.com\",\"time\":\"2026-08-16T18:25:00Z\"}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 3
+      "severity_id": 3
+      "metadata.version": "1.9.0"
+  # user.signed_in webhook, payload per https://developers.zoom.us/docs/api/rest/reference/user/events/#/paths/user.signed_in/post
+  - raw: "{\"event\":\"user.signed_in\",\"event_ts\":1787083200000,\"payload\":{\"account_id\":\"AAAAAABBBB\",\"object\":{\"id\":\"z8yAAAAA8bbbQ\",\"first_name\":\"Jill\",\"last_name\":\"Chill\",\"email\":\"jchill@example.com\",\"date_time\":\"2026-08-18T20:00:00Z\",\"client_type\":\"browser\",\"version\":\"6.1.0\",\"login_type\":0}}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "user.uid": "z8yAAAAA8bbbQ"
+      "metadata.tenant_uid": "AAAAAABBBB"
+      "time": 1787083200000
+      "metadata.version": "1.9.0"
+  # user.signed_out webhook, payload per https://developers.zoom.us/docs/api/rest/reference/user/events/#/paths/user.signed_out/post
+  - raw: "{\"event\":\"user.signed_out\",\"event_ts\":1787086800000,\"payload\":{\"account_id\":\"AAAAAABBBB\",\"object\":{\"id\":\"z8yAAAAA8bbbQ\",\"first_name\":\"Jill\",\"last_name\":\"Chill\",\"email\":\"jchill@example.com\",\"date_time\":\"2026-08-18T21:00:00Z\",\"client_type\":\"browser\",\"version\":\"6.1.0\",\"login_type\":0}}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  # user.created webhook, source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/webhook/_dev/test/pipeline/test-user.json
+  - raw: "{\"event\":\"user.created\",\"payload\":{\"account_id\":\"AAAAAA\",\"creation_type\":\"create\",\"object\":{\"email\":\"henrysemail@example.com\",\"first_name\":\"Henry\",\"id\":\"abcD3ojfdbjfg\",\"last_name\":\"Phan\",\"type\":\"3\"},\"operator\":\"anawesomeuse@example.com\"}}"
+    expect:
+      "class_uid": 3007
+      "activity_id": 1
+      "user.email_addr": "henrysemail@example.com"
+      "metadata.version": "1.9.0"
+  # user.deactivated webhook, source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/webhook/_dev/test/pipeline/test-user.json
+  - raw: "{\"event\":\"user.deactivated\",\"payload\":{\"account_id\":\"AAAAAABBBB\",\"object\":{\"email\":\"henrysemail@example.com\",\"first_name\":\"Henry\",\"id\":\"abcD3ojfdbjfg\",\"last_name\":\"Phan\",\"type\":1},\"operator\":\"anawesomeuse@example.com\",\"operator_id\":\"z8yCxjabcdEFGHfp8uQ\"}}"
+    expect:
+      "class_uid": 3007
+      "activity_id": 5
+      "metadata.version": "1.9.0"
+  # user.settings_updated webhook (old_object diff), source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/webhook/_dev/test/pipeline/test-user.json
+  - raw: "{\"event\":\"user.settings_updated\",\"payload\":{\"account_id\":\"CAl6ByEyAq8KK_CCCCCC\",\"object\":{\"id\":\"uL34AAbbbbAAAAAAQsQ\",\"settings\":{\"in_meeting\":{\"private_chat\":false}}},\"old_object\":{\"id\":\"uL34AAbbbbAAAAAAQsQ\",\"settings\":{\"in_meeting\":{\"private_chat\":true}}},\"operator\":\"iamtheoperat@example.com\",\"operator_id\":\"uLoRgfbbTayCX6r2Q_qQsQ\",\"time_stamp\":1563572826929}}"
+    expect:
+      "class_uid": 3007
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  # user.presence_status_updated (not an admin change), source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/webhook/_dev/test/pipeline/test-user.json
+  - raw: "{\"event\":\"user.presence_status_updated\",\"payload\":{\"account_id\":\"EPjfyjxHMA\",\"object\":{\"date_time\":\"2019-11-26T20:13:57Z\",\"email\":\"sfdhfghfgh@example.com\",\"id\":\"z8ycx1223fq\",\"presence_status\":\"Available\"}}}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 3
+      "metadata.version": "1.9.0"
+  # meeting.created webhook with operator, source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/webhook/_dev/test/pipeline/test-meeting.json
+  - raw: "{\"event\":\"meeting.created\",\"payload\":{\"account_id\":\"o8KK_AAACq6BBEyA70CA\",\"object\":{\"duration\":60,\"host_id\":\"uLoRgfbbTayCX6r2Q_qQsQ\",\"id\":111111111,\"start_time\":\"2019-07-09T17:00:00Z\",\"timezone\":\"America/Los_Angeles\",\"topic\":\"My Meeting\",\"type\":2,\"uuid\":\"czLF6FFFoQOKgAB99DlDb9g==\"},\"operator\":\"someemail@example.com\",\"operator_id\":\"uLoRgfbbTayCX6r2Q_qQsQ\"}}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # meeting.started webhook (host as actor), source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/webhook/_dev/test/pipeline/test-meeting.json
+  - raw: "{\"event\":\"meeting.started\",\"payload\":{\"account_id\":\"o8KK_AAACq6BBEyA70CA\",\"object\":{\"duration\":60,\"host_id\":\"uLoRgfbbTayCX6r2Q_qQsQ\",\"id\":\"111111111\",\"start_time\":\"2019-07-09T17:00:00Z\",\"timezone\":\"America/Los_Angeles\",\"topic\":\"My Meeting\",\"type\":2,\"uuid\":\"czLF6FFFoQOKgAB99DlDb9g==\"}}}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 99
+      "actor.user.uid": "uLoRgfbbTayCX6r2Q_qQsQ"
+      "metadata.version": "1.9.0"
+  # meeting.participant_joined with the participant public IP, source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/webhook/_dev/test/pipeline/test-meeting.json
+  - raw: "{\"event\":\"meeting.participant_joined\",\"event_ts\":1752127174016,\"payload\":{\"account_id\":\"HzozXXXXXXXX\",\"object\":{\"duration\":60,\"host_id\":\"dNvWUbXXXXXXXXXXXXXX\",\"id\":\"986XXXXXXXX\",\"participant\":{\"email\":\"user@example.com\",\"id\":\"8XjrxbGtXXXXXXXXXX\",\"join_time\":\"2025-07-10T05:59:30Z\",\"participant_user_id\":\"8XjrxbGtXXXXXXXXXX\",\"participant_uuid\":\"0E699901-3B16-3698-3388-XXXXXXXXXX\",\"public_ip\":\"192.0.2.144\",\"user_id\":\"123456789\",\"user_name\":\"Display Name of User\"},\"start_time\":\"2025-07-10T05:57:47Z\",\"timezone\":\"Asia/Seoul\",\"topic\":\"Team Meeting\",\"type\":2,\"uuid\":\"pU/13Hdsdfsdfsdf7xZZzpUg==\"}}}"
+    expect:
+      "class_uid": 6003
+      "src_endpoint.ip": "192.0.2.144"
+      "metadata.version": "1.9.0"
+  # recording.completed webhook, source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/webhook/_dev/test/pipeline/test-recording.json
+  - raw: "{\"event\":\"recording.completed\",\"payload\":{\"account_id\":\"lAAAAAAAAAAAAA\",\"object\":{\"duration\":1,\"host_email\":\"somemeail@example.com\",\"host_id\":\"uLobbbbbbbbbb_qQsQ\",\"id\":150000008,\"recording_count\":4,\"recording_files\":[{\"download_url\":\"https://zoom.us/recording/download/80ebRwsfjskf2H3vlSigX0gNlBBBBBBBBBBBBBB\",\"file_size\":282825,\"file_type\":\"MP4\",\"id\":\"8f88599d-19ca-4d2b-a965-1196e777cb3c\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"play_url\":\"https://zoom.us/recording/play/80ebRwsfjskf2H3vlSigX0gNlBBBBBBBBBBBBBB\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\",\"recording_type\":\"shared_screen_with_speaker_view\",\"status\":\"completed\"},{\"download_url\":\"https://zoom.us/recording/download/Oaevut8LSACCCCCCCCnnnnnnnnbbbb\",\"file_size\":246560,\"file_type\":\"M4A\",\"id\":\"a6b332f9-2246-49e5-913e-588adc7f0f5f\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"play_url\":\"https://zoom.us/recording/play/Oaevut8LSACCCCCCCCnnnnnnnnbbbb\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\",\"recording_type\":\"audio_only\",\"status\":\"completed\"},{\"download_url\":\"https://zoom.us/recording/download/2dBBBBBccccDDDDeeee\",\"file_type\":\"TIMELINE\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\"},{\"download_url\":\"https://zoom.us/recording/play/7h0BBBBBBBchfhfhffh_0AAAAbbbbbeeSFcf209m\",\"file_size\":373,\"file_type\":\"TRANSCRIPT\",\"id\":\"97a4f7ca-e7e8-4e3b-b28a-27b42cd33c09\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"play_url\":\"https://zoom.us/recording/play/7h0BBBBBBBchfhfhffh_0AAAAbbbbbeeSFcf209m\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\",\"recording_type\":\"audio_transcript\",\"status\":\"completed\"}],\"share_url\":\"https://zoom.us/recording/share/aaaaaannnnnldglrkgmrmhh\",\"start_time\":\"2019-07-11T20:00:00Z\",\"timezone\":\"America/Los_Angeles\",\"topic\":\"A test meeting\",\"total_size\":529758,\"type\":2,\"uuid\":\"dj12vck6sdTn6yy7qdy3dQg==\"}}}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 1
+      "metadata.version": "1.9.0"
+  # recording.deleted webhook, source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/webhook/_dev/test/pipeline/test-recording.json
+  - raw: "{\"event\":\"recording.deleted\",\"payload\":{\"account_id\":\"lAAAAAAAAAAAAA\",\"object\":{\"duration\":1,\"host_id\":\"uLobbbbbbbbbb_qQsQ\",\"id\":150000008,\"recording_count\":4,\"recording_files\":[{\"download_url\":\"https://zoom.us/recording/download/80ebRwsfjskf2H3vlSigX0gNlBBBBBBBBBBBBBB\",\"file_size\":282825,\"file_type\":\"MP4\",\"id\":\"8f88599d-19ca-4d2b-a965-1196e777cb3c\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"play_url\":\"https://zoom.us/recording/play/80ebRwsfjskf2H3vlSigX0gNlBBBBBBBBBBBBBB\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\",\"recording_type\":\"shared_screen_with_speaker_view\",\"status\":\"completed\"},{\"download_url\":\"https://zoom.us/recording/download/Oaevut8LSACCCCCCCCnnnnnnnnbbbb\",\"file_size\":246560,\"file_type\":\"M4A\",\"id\":\"a6b332f9-2246-49e5-913e-588adc7f0f5f\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"play_url\":\"https://zoom.us/recording/play/Oaevut8LSACCCCCCCCnnnnnnnnbbbb\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\",\"recording_type\":\"audio_only\",\"status\":\"completed\"},{\"download_url\":\"https://zoom.us/recording/download/2dBBBBBccccDDDDeeee\",\"file_type\":\"TIMELINE\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\"},{\"download_url\":\"https://zoom.us/recording/play/7h0BBBBBBBchfhfhffh_0AAAAbbbbbeeSFcf209m\",\"file_size\":373,\"file_type\":\"TRANSCRIPT\",\"id\":\"97a4f7ca-e7e8-4e3b-b28a-27b42cd33c09\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"play_url\":\"https://zoom.us/recording/play/7h0BBBBBBBchfhfhffh_0AAAAbbbbbeeSFcf209m\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\",\"recording_type\":\"audio_transcript\",\"status\":\"completed\"}],\"share_url\":\"https://zoom.us/recording/share/aaaaaannnnnldglrkgmrmhh\",\"start_time\":\"2019-07-11T20:00:00Z\",\"timezone\":\"America/Los_Angeles\",\"topic\":\"A test meeting\",\"total_size\":529758,\"type\":2,\"uuid\":\"dj12vck6sdTn6yy7qdy3dQg==\"}}}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 4
+      "metadata.version": "1.9.0"
+  # endpoint.url_validation challenge (handshake, Base Event Other), shape per https://developers.zoom.us/docs/api/webhooks/#validate-your-webhook-endpoint
+  - raw: "{\"payload\":{\"plainToken\":\"qgg8vlvZRS6UYooatFL8Aw\"},\"event_ts\":1787083200000,\"event\":\"endpoint.url_validation\"}"
+    expect:
+      "class_uid": 0
+      "activity_id": 99
+      "metadata.version": "1.9.0"
+  # malformed line: Base Event with the raw line kept; deterministic uid
+  - raw: "zoom: not json"
+    expect:
+      "class_uid": 0
+      "unmapped.parse_fallback": "unparsable input"
+      "metadata.uid": "dc38da827e34901cf20aad67d0884ec6f174734e4b7cc2459596527f5290a8b3"
