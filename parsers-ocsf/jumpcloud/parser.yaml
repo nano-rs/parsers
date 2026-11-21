@@ -1,0 +1,708 @@
+name: jumpcloud_ocsf
+display_name: JumpCloud Directory Insights (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses JumpCloud Directory Insights events (POST /insights/directory/v1/events,
+  one array element per input event) into complete OCSF 1.9.0 records, routed
+  by event_type:
+    user_login_attempt, admin_login_attempt, sso_auth, radius_auth,
+    ldap_bind, user_login (systems)          -> Authentication 3002
+    user_* / admin_* / systemuser_* account lifecycle, lockout, suspension,
+    password and TOTP enrollment events      -> User Management 3007
+    group_create / group_update / group_delete,
+    user_group_admin_grant / _revoke         -> Group Management 3006
+    any other event with an initiated_by     -> API Activity 6003
+    anything else (mdm, software, agent)     -> Base Event 0, kept whole
+  Account Change 3001 is deprecated in OCSF 1.9 and is not emitted. The
+  `success` boolean drives status; initiated_by is the actor and `resource`
+  (or `username` on auth events) the subject. The service names the protocol:
+  sso -> SAML, radius -> RADIUS, ldap -> LDAP.
+match_values:
+  - jumpcloud
+category: security
+vendor: "JumpCloud"
+product: "Directory Insights"
+parser_vrl: |
+  # JumpCloud Directory Insights JSON -> OCSF 1.9.0.
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+  parsed, err = parse_json(raw_log)
+  __source_kv = object(parsed) ?? {}
+
+  if err != null || !is_object(parsed) || !is_string(parsed.event_type) {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("jumpcloud|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "Directory Insights",
+              "log_provider": "JumpCloud",
+              "product": { "name": "Directory Insights", "vendor_name": "JumpCloud" }
+          },
+          "unmapped": { "parse_error": "not a JumpCloud Directory Insights event" }
+      }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+  } else {
+      p = object!(parsed)
+      event_type = downcase(string(p.event_type) ?? "")
+      svc = downcase(string(p.service) ?? "")
+      init = object(p.initiated_by) ?? {}
+      res = object(p.resource) ?? {}
+      geo = object(p.geoip) ?? {}
+      app = object(p.application) ?? {}
+      sys = object(p.system) ?? {}
+
+      # ---- time ----
+      time_ms = 0
+      t, terr = parse_timestamp(string(p.timestamp) ?? "", "%+")
+      if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+
+      # ---- outcome ----
+      status_id = 0
+      status_str = "Unknown"
+      if is_boolean(p.success) {
+          if bool!(p.success) { status_id = 1; status_str = "Success" } else { status_id = 2; status_str = "Failure" }
+      }
+      err_msg = string(p.error_message) ?? ""
+      if err_msg == "" { err_msg = string(p.failure_reason) ?? "" }
+      if err_msg == "" { err_msg = string(p.outer.error_message) ?? "" }
+
+      severity_id = 1
+      severity = "Informational"
+      if status_id == 2 { severity_id = 2; severity = "Low" }
+      if ends_with(event_type, "_lockout") { severity_id = 3; severity = "Medium" }
+
+      # ---- actor: initiated_by ----
+      email_re = r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'
+      i_type = downcase(string(init.type) ?? "")
+      i_email = string(init.email) ?? ""
+      i_username = string(init.username) ?? ""
+      i_id = string(init.id) ?? ""
+      actor_user = {}
+      if i_email != "" || i_username != "" || i_id != "" {
+          au = { "type_id": 1, "type": "User" }
+          if i_type == "admin" { au = { "type_id": 2, "type": "Admin" } }
+          if i_type == "system" { au = { "type_id": 3, "type": "System" } }
+          if i_username != "" { au.name = i_username } else if i_email != "" { au.name = i_email }
+          if match(i_email, email_re) { au.email_addr = i_email }
+          if i_id != "" { au.uid = i_id }
+          i_full = string(init.name) ?? ""
+          if i_full != "" { au.full_name = i_full }
+          actor_user = au
+      }
+
+      # ---- subject: resource, else username ----
+      subj = {}
+      r_type = downcase(string(res.type) ?? "")
+      r_username = string(res.username) ?? ""
+      r_email = string(res.email) ?? ""
+      if r_email == "" { r_email = string(res.recipient_email) ?? "" }
+      r_id = string(res.id) ?? ""
+      if r_type == "user" || r_type == "systemuser" || r_type == "admin" {
+          su = { "type_id": 1, "type": "User" }
+          if r_type == "admin" { su = { "type_id": 2, "type": "Admin" } }
+          if r_username != "" { su.name = r_username } else if r_email != "" { su.name = r_email }
+          if match(r_email, email_re) { su.email_addr = r_email }
+          if r_id != "" { su.uid = r_id }
+          r_disp = string(res.name) ?? ""
+          if r_disp != "" { su.display_name = r_disp }
+          subj = su
+      }
+      p_username = string(p.username) ?? ""
+
+      # ---- source endpoint ----
+      src_ip = string(p.src_ip) ?? ""
+      if src_ip == "" { src_ip = string(p.client_ip) ?? "" }
+      src_ep = {}
+      if src_ip != "" { src_ep.ip = src_ip }
+      loc = {}
+      cc = string(geo.country_code) ?? ""
+      if cc == "" { cc = string(geo.country_code2) ?? "" }
+      if cc != "" { loc.country = cc }
+      rn = string(geo.region_name) ?? ""
+      if rn != "" { loc.region = rn }
+      la = float(geo.latitude) ?? null
+      if la != null { loc.lat = la }
+      lo = float(geo.longitude) ?? null
+      if lo != null { loc.long = lo }
+      if length(loc) > 0 { src_ep.location = loc }
+
+      # ---- class routing ----
+      class_uid = 0
+      if ends_with(event_type, "_login_attempt") || includes(["sso_auth", "radius_auth", "ldap_bind", "user_login", "user_logout"], event_type) {
+          class_uid = 3002
+      } else if (match(event_type, r'^(user|admin|systemuser)_') && !starts_with(event_type, "user_group_")) || match(event_type, r'^(admin_)?totp_') {
+          class_uid = 3007
+      } else if includes(["group_create", "group_update", "group_delete", "user_group_admin_grant", "user_group_admin_revoke"], event_type) {
+          class_uid = 3006
+      } else if length(actor_user) > 0 {
+          class_uid = 6003
+      }
+
+      ocsf = {}
+      if class_uid == 3002 {
+          activity_id = 1
+          activity_name = "Logon"
+          if event_type == "user_logout" { activity_id = 2; activity_name = "Logoff" }
+          ocsf.class_name = "Authentication"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          # The principal: resource (admin_login_attempt), else the initiator,
+          # else the username presented (radius / ldap / systems).
+          user = {}
+          if length(subj) > 0 {
+              user = subj
+          } else if length(actor_user) > 0 {
+              user = actor_user
+          }
+          if p_username != "" { user.name = p_username }
+          if length(user) == 0 { user = { "name": "unknown" } }
+          ocsf.user = user
+          # 3002 constraint: at_least_one(service, dst_endpoint).
+          service = { "name": "JumpCloud" }
+          if svc == "sso" {
+              an = string(app.display_label) ?? ""
+              if an == "" { an = string(app.name) ?? "" }
+              if an != "" { service = { "name": an } }
+              aid = string(app.id) ?? ""
+              if aid != "" { service.uid = aid }
+              surl = string(app.sso_url) ?? ""
+              if contains(surl, "saml") { ocsf.auth_protocol_id = 5; ocsf.auth_protocol = "SAML" }
+          } else if svc == "radius" {
+              service = { "name": "JumpCloud RADIUS" }
+              ocsf.auth_protocol_id = 10
+              ocsf.auth_protocol = "RADIUS"
+          } else if svc == "ldap" {
+              service = { "name": "JumpCloud LDAP" }
+              ocsf.auth_protocol_id = 12
+              ocsf.auth_protocol = "LDAP"
+          } else if svc == "directory" {
+              service = { "name": "JumpCloud Console" }
+              if starts_with(event_type, "user_") { service = { "name": "JumpCloud User Portal" } }
+          }
+          ocsf.service = service
+          if svc == "systems" {
+              dst = {}
+              hn = string(sys.hostname) ?? ""
+              if hn != "" { dst.hostname = hn }
+              dn = string(sys.displayName) ?? ""
+              if dn != "" { dst.name = dn }
+              sid = string(sys.id) ?? ""
+              if sid != "" { dst.uid = sid }
+              if length(dst) > 0 { ocsf.dst_endpoint = dst }
+          }
+          if is_boolean(p.mfa) { ocsf.is_mfa = bool!(p.mfa) }
+          ocsf.is_remote = true
+      } else if class_uid == 3007 {
+          activity_id = 99
+          activity_name = "Other"
+          base = replace(event_type, r'_provision$', "")
+          if ends_with(base, "_create") { activity_id = 1; activity_name = "Create" }
+          if ends_with(base, "_update") { activity_id = 2; activity_name = "Update" }
+          if ends_with(base, "_delete") && !starts_with(base, "totp_") && !contains(base, "_schedule_") { activity_id = 3; activity_name = "Delete" }
+          if ends_with(base, "_lockout") { activity_id = 6; activity_name = "Lock" }
+          if ends_with(base, "_unlocked") { activity_id = 7; activity_name = "Unlock" }
+          if ends_with(base, "_suspended") { activity_id = 5; activity_name = "Disable" }
+          if ends_with(base, "_unsuspended") || ends_with(base, "_unsuspend") || base == "user_activated" { activity_id = 4; activity_name = "Enable" }
+          if ends_with(base, "_password_change") || base == "user_password_set" { activity_id = 8; activity_name = "Password Change" }
+          if ends_with(base, "_password_reset_request") { activity_id = 9; activity_name = "Password Reset" }
+          if ends_with(base, "totp_finish_enrollment") { activity_id = 12; activity_name = "Enable MFA Factors" }
+          if base == "totp_delete_enrollment" || base == "admin_totp_disable" { activity_id = 13; activity_name = "Disable MFA Factors" }
+          if base == "user_admin_granted" { activity_id = 14; activity_name = "Assign Privileges" }
+          if base == "user_admin_revoked" { activity_id = 15; activity_name = "Remove Privileges" }
+          if contains(base, "_schedule_") { activity_id = 99; activity_name = "Other" }
+          ocsf.class_name = "User Management"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          user = subj
+          if length(user) == 0 && p_username != "" { user = { "name": p_username } }
+          if length(user) == 0 && length(actor_user) > 0 { user = actor_user }
+          if length(user) == 0 { user = { "name": "unknown" } }
+          ocsf.user = user
+          if length(actor_user) > 0 { ocsf.actor = { "user": actor_user } }
+      } else if class_uid == 3006 {
+          activity_id = 99
+          activity_name = "Other"
+          if event_type == "group_create" { activity_id = 6; activity_name = "Create" }
+          if event_type == "group_update" { activity_id = 9; activity_name = "Update" }
+          if event_type == "group_delete" { activity_id = 5; activity_name = "Delete" }
+          if event_type == "user_group_admin_grant" { activity_id = 1; activity_name = "Assign Privileges" }
+          if event_type == "user_group_admin_revoke" { activity_id = 2; activity_name = "Revoke Privileges" }
+          ocsf.class_name = "Group Management"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          g = {}
+          gn = string(res.name) ?? ""
+          if gn != "" { g.name = gn }
+          if r_id != "" { g.uid = r_id }
+          gt = string(res.type) ?? ""
+          if gt != "" { g.type = gt }
+          if length(g) == 0 { g = { "name": "unknown" } }
+          ocsf.group = g
+          if length(actor_user) > 0 { ocsf.actor = { "user": actor_user } }
+      } else if class_uid == 6003 {
+          activity_id = 99
+          activity_name = "Other"
+          if match(event_type, r'_(create|add|include|activate)$') { activity_id = 1; activity_name = "Create" }
+          if match(event_type, r'_(download|run|read|view)$') { activity_id = 2; activity_name = "Read" }
+          if match(event_type, r'_(update|change|enable|disable)$') { activity_id = 3; activity_name = "Update" }
+          if match(event_type, r'_(delete|remove|exclude|deactivate)$') { activity_id = 4; activity_name = "Delete" }
+          ocsf.class_name = "API Activity"
+          ocsf.category_uid = 6
+          ocsf.category_name = "Application Activity"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          api_svc = svc
+          if api_svc == "" { api_svc = "jumpcloud" }
+          ocsf.api = { "operation": event_type, "service": { "name": api_svc } }
+          ocsf.actor = { "user": actor_user }
+          if length(src_ep) == 0 { src_ep = { "hostname": "unknown" } }
+          if r_id != "" || r_type != "" {
+              rd = {}
+              if r_id != "" { rd.uid = r_id }
+              if r_type != "" { rd.type = string(res.type) ?? "" }
+              rname = string(res.name) ?? ""
+              if rname != "" { rd.name = rname }
+              ocsf.resources = [rd]
+          }
+      } else {
+          ocsf.class_name = "Base Event"
+          ocsf.category_uid = 0
+          ocsf.category_name = "Uncategorized"
+          ocsf.activity_id = 0
+          ocsf.activity_name = "Unknown"
+      }
+      ocsf.class_uid = class_uid
+      if length(src_ep) > 0 { ocsf.src_endpoint = src_ep }
+
+      ocsf.status_id = status_id
+      ocsf.status = status_str
+      if err_msg != "" { ocsf.status_detail = err_msg }
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.type_uid = class_uid * 100 + to_int(ocsf.activity_id)
+      ocsf.time = time_ms
+      msg = string(p.message) ?? ""
+      if msg == "" { msg = event_type }
+      ocsf.message = msg
+      ocsf.raw_data = raw_log
+
+      evt_uid = string(p.id) ?? ""
+      if evt_uid == "" { evt_uid = sha2("jumpcloud|raw|" + raw_log, variant: "SHA-256") }
+      meta = {
+          "version": "1.9.0",
+          "uid": evt_uid,
+          "event_code": event_type,
+          "log_name": "Directory Insights",
+          "log_provider": "JumpCloud",
+          "product": { "name": "Directory Insights", "vendor_name": "JumpCloud" }
+      }
+      org = string(p.organization) ?? ""
+      if org != "" { meta.tenant_uid = org }
+      ocsf.metadata = meta
+
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # timestamp: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # event_type: Parser lowercases the event type; consume only when the normalized value is emitted.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        timestamp
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        event_type
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if ."metadata"."event_code" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    application\.display_label
+  | application\.id
+  | application\.name
+  | client_ip
+  | error_message
+  | failure_reason
+  | geoip\.country_code
+  | geoip\.country_code2
+  | geoip\.latitude
+  | geoip\.longitude
+  | geoip\.region_name
+  | id
+  | initiated_by\.email
+  | initiated_by\.id
+  | initiated_by\.name
+  | initiated_by\.username
+  | message
+  | mfa
+  | organization
+  | outer\.error_message
+  | resource\.email
+  | resource\.id
+  | resource\.name
+  | resource\.recipient_email
+  | resource\.type
+  | resource\.username
+  | service
+  | src_ip
+  | success
+  | system\.displayName
+  | system\.hostname
+  | system\.id
+  | username
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  - raw: "{\"id\":\"077ED0A8-1B5F-3EA3-8AAC-E3999451A46D\",\"event_type\":\"radius_auth\",\"nas_mfa_state\":\"enabled\",\"auth_type\":\"pap\",\"eap_type\":\"MSCHAPv2\",\"client_ip\":\"192.0.2.1\",\"geoip\":{\"timezone\":\"America/Los_Angeles\",\"continent_code\":\"NA\",\"region_code\":\"OR\",\"country_code\":\"US\",\"region_name\":\"Oregon\"},\"success\":false,\"username\":\"john.doe\",\"organization\":\"000000000000000000000000\",\"timestamp\":\"2026-10-04T18:10:41Z\",\"error_message\":\"pap: Crypt digest does not match \\\"known good\\\" digest\",\"mfa\":false,\"mfa_meta\":{\"type\":\"totp\"},\"outer\":{\"eap_type\":\"PEAP\",\"error_message\":null,\"username\":\"john.doe\"},\"service\":\"radius\",\"@version\":\"1\"}"
+    expect:
+      "class_uid": "3002"
+      "activity_id": "1"
+      "status_id": "2"
+      "metadata.uid": "077ED0A8-1B5F-3EA3-8AAC-E3999451A46D"
+      "user.name": "john.doe"
+      "src_endpoint.ip": "192.0.2.1"
+  - raw: "{\"id\":\"5c8fcfe0e7eb500001c71101\",\"event_type\":\"user_create\",\"timestamp\":\"2026-10-04T19:00:00Z\",\"organization\":\"000000000000000000000000\",\"resource\":{\"type\":\"user\",\"id\":\"5c86b7149fdce00001d38015\",\"username\":\"new.hire\",\"email\":\"new.hire@example.com\"},\"initiated_by\":{\"type\":\"admin\",\"id\":\"5c86b6cf9fdce00001d3800c\",\"email\":\"admin@example.com\"},\"client_ip\":\"198.51.100.14\",\"success\":true,\"service\":\"directory\",\"@version\":\"1\"}"
+    expect:
+      "class_uid": "3007"
+      "activity_id": "1"
+      "status_id": "1"
+      "metadata.uid": "5c8fcfe0e7eb500001c71101"
+      "user.name": "new.hire"
+      "actor.user.name": "admin@example.com"
+      "src_endpoint.ip": "198.51.100.14"
+  # NAN-3702 (unparseable record, error branch): metadata.uid is sha256("jumpcloud|raw|" + raw), so the
+  # same record parsed twice gets the same uid.
+  - raw: "NAN-3702 determinism probe: not a jumpcloud record"
+    expect:
+      "class_uid": "0"
+      "activity_id": "0"
+      "status_id": "0"
+      "metadata.uid": "a5e4d6ba14c9372b2c405ccd54cd9f18ddaff61547042e606126143e5c7eb029"

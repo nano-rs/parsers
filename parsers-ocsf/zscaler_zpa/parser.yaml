@@ -1,0 +1,737 @@
+name: zscaler_zpa_ocsf
+display_name: Zscaler Private Access (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Zscaler Private Access (ZPA) Log Streaming Service (LSS) records in the
+  JSON log format into complete OCSF 1.9.0 records, routed by shape:
+    User Activity (ConnectionID / ConnectionStatus)  -> Network Activity 4001
+    User Status (SessionStatus, no SessionType)      -> Authentication 3002
+    App Connector Status (SessionType ZPN_ASSISTANT_*)
+                                                     -> Authentication 3002
+    anything else                                    -> Base Event 0, kept whole
+  User Activity: the client is src_endpoint (ClientPublicIP), the application
+  server dst_endpoint, the App Connector proxy_endpoint, and InternalReason
+  drives the outcome. BRK_MT_SETUP_FAIL_REJECTED_BY_POLICY / _NO_POLICY_FOUND /
+  _SAML_EXPIRED / _SCIM_INACTIVE / _TOO_MANY_FAILED_ATTEMPTS and policy-approval
+  rejections are Refuse + Denied; any other *_FAIL* or timeout is Fail; closes,
+  terminations and resets are Close / Reset. Traffic is counted from the
+  client's side (ZENTotalBytesRxClient is bytes_out). User / connector status:
+  ZPN_STATUS_AUTHENTICATED is a Logon, ZPN_STATUS_DISCONNECTED a Logoff,
+  ZPN_STATUS_AUTH_FAILED a failed Logon. Distinct from zscaler_zia (ZIA NSS).
+match_values:
+  - zscaler_zpa
+category: network
+vendor: "Zscaler"
+product: "Private Access"
+parser_vrl: |
+  # Zscaler ZPA LSS JSON -> OCSF 1.9.0.
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+  parsed, err = parse_json(raw_log)
+  __source_kv = object(parsed) ?? {}
+
+  if err != null || !is_object(parsed) {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("zscaler_zpa|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "LSS",
+              "log_provider": "Zscaler",
+              "product": { "name": "Zscaler Private Access", "vendor_name": "Zscaler" }
+          },
+          "unmapped": { "parse_error": "not a ZPA LSS JSON record" }
+      }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+  } else {
+      p = object!(parsed)
+
+      # ---- time: LogTimestamp is "Fri May 31 17:35:42 2019", UTC ----
+      time_ms = 0
+      lt, lterr = parse_timestamp(string(p.LogTimestamp) ?? "", "%a %b %d %H:%M:%S %Y", timezone: "UTC")
+      if lterr == null { time_ms = to_unix_timestamp(lt, unit: "milliseconds") }
+
+      session_type = string(p.SessionType) ?? ""
+      kind = "other"
+      if exists(p.ConnectionID) || exists(p.ConnectionStatus) {
+          kind = "user_activity"
+      } else if starts_with(session_type, "ZPN_ASSISTANT") {
+          kind = "connector_status"
+      } else if exists(p.SessionStatus) {
+          kind = "user_status"
+      }
+
+      loc = {}
+      ocsf = {}
+      log_name = "LSS"
+      class_uid = 0
+      profiles = []
+
+      if kind == "user_activity" {
+          log_name = "User Activity"
+          class_uid = 4001
+          profiles = ["host", "security_control", "network_proxy"]
+          reason = string(p.InternalReason) ?? ""
+          cstatus = downcase(string(p.ConnectionStatus) ?? "")
+          activity_id = 6
+          activity_name = "Traffic"
+          if cstatus == "open" { activity_id = 1; activity_name = "Open" }
+          if cstatus == "close" { activity_id = 2; activity_name = "Close" }
+          status_id = 1
+          status_str = "Success"
+          action_id = 1
+          action = "Allowed"
+          disposition_id = 1
+          disposition = "Allowed"
+          severity_id = 1
+          severity = "Informational"
+          denied = match(reason, r'^BRK_MT_SETUP_FAIL_(REJECTED_BY_POLICY|NO_POLICY_FOUND|SAML_EXPIRED|SCIM_INACTIVE|TOO_MANY_FAILED_ATTEMPTS)')
+          if denied {
+              activity_id = 5; activity_name = "Refuse"
+              status_id = 2; status_str = "Failure"
+              action_id = 2; action = "Denied"
+              disposition_id = 2; disposition = "Blocked"
+              severity_id = 2; severity = "Low"
+          } else if contains(reason, "_FAIL") || reason == "BRK_MT_SETUP_TIMEOUT" || reason == "BRK_MT_AUTH_ALREADY_FAILED" {
+              activity_id = 4; activity_name = "Fail"
+              status_id = 2; status_str = "Failure"
+              severity_id = 2; severity = "Low"
+          } else if starts_with(reason, "BRK_MT_RESET") {
+              activity_id = 3; activity_name = "Reset"
+          } else if starts_with(reason, "BRK_MT_CLOSED") || starts_with(reason, "BRK_MT_TERMINATED") {
+              activity_id = 2; activity_name = "Close"
+          }
+
+          src = {}
+          cpub = string(p.ClientPublicIP) ?? ""
+          cpriv = string(p.ClientPrivateIP) ?? ""
+          if cpub != "" { src.ip = cpub } else if cpriv != "" { src.ip = cpriv }
+          chost = string(p.Hostname) ?? ""
+          if chost != "" { src.hostname = chost }
+          clat = float(p.ClientLatitude) ?? null
+          if clat != null { loc.lat = clat }
+          clong = float(p.ClientLongitude) ?? null
+          if clong != null { loc.long = clong }
+          ccc = string(p.ClientCountryCode) ?? ""
+          if ccc != "" { loc.country = ccc }
+          # location needs a country (or city/region) beside the coordinates.
+          if ccc != "" { src.location = loc }
+          if length(src) == 0 { src = { "hostname": "unknown" } }
+
+          dst = {}
+          sip = string(p.ServerIP) ?? ""
+          host = string(p.Host) ?? ""
+          if sip != "" && sip != "0" { dst.ip = sip }
+          if host != "" {
+              if is_ipv4(host) || is_ipv6(host) {
+                  if !exists(dst.ip) { dst.ip = host }
+              } else {
+                  dst.hostname = host
+              }
+          }
+          sport = to_int(p.ServerPort) ?? 0
+          if sport == 0 { sport = to_int(p.ServicePort) ?? 0 }
+          if sport > 0 { dst.port = sport }
+          app = string(p.Application) ?? ""
+          if app != "" { dst.svc_name = app }
+
+          proto = to_int(p.IPProtocol) ?? -1
+          conn = {}
+          if proto >= 0 {
+              conn.protocol_num = proto
+              if proto == 6 { conn.protocol_name = "tcp" }
+              if proto == 17 { conn.protocol_name = "udp" }
+              if proto == 1 { conn.protocol_name = "icmp" }
+          }
+          conn_id = string(p.ConnectionID) ?? ""
+          if conn_id != "" { conn.uid = conn_id }
+          conn.direction_id = 2
+          conn.direction = "Outbound"
+
+          traffic = {}
+          if is_integer(p.ZENTotalBytesRxClient) { traffic.bytes_out = int!(p.ZENTotalBytesRxClient) }
+          if is_integer(p.ZENTotalBytesTxClient) { traffic.bytes_in = int!(p.ZENTotalBytesTxClient) }
+          if is_integer(p.ZENTotalBytesRxClient) && is_integer(p.ZENTotalBytesTxClient) { traffic.bytes = int!(p.ZENTotalBytesRxClient) + int!(p.ZENTotalBytesTxClient) }
+
+          proxy = {}
+          connector = string(p.Connector) ?? ""
+          if connector != "" { proxy.name = connector }
+          cip = string(p.ConnectorIP) ?? ""
+          if cip != "" { proxy.ip = cip }
+          cport = to_int(p.ConnectorPort) ?? 0
+          if cport > 0 { proxy.port = cport }
+
+          ocsf.class_name = "Network Activity"
+          ocsf.category_uid = 4
+          ocsf.category_name = "Network Activity"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          ocsf.status_id = status_id
+          ocsf.status = status_str
+          ocsf.action_id = action_id
+          ocsf.action = action
+          ocsf.disposition_id = disposition_id
+          ocsf.disposition = disposition
+          ocsf.severity_id = severity_id
+          ocsf.severity = severity
+          if reason != "" { ocsf.status_detail = reason }
+          ocsf.src_endpoint = src
+          if length(dst) > 0 { ocsf.dst_endpoint = dst }
+          ocsf.connection_info = conn
+          if length(traffic) > 0 { ocsf.traffic = traffic }
+          if length(proxy) > 0 { ocsf.proxy_endpoint = proxy }
+          if app != "" { ocsf.app_name = app }
+          pol = string(p.Policy) ?? ""
+          if pol != "" { ocsf.policy = { "name": pol } }
+          uname = string(p.Username) ?? ""
+          actor = {}
+          if uname != "" { actor.user = { "name": uname } }
+          sid = string(p.SessionID) ?? ""
+          if sid != "" { actor.session = { "uid": sid } }
+          if length(actor) > 0 { ocsf.actor = actor }
+          st, sterr = parse_timestamp(string(p.TimestampConnectionStart) ?? "", "%+")
+          if sterr == null { ocsf.start_time = to_unix_timestamp(st, unit: "milliseconds") }
+          et, eterr = parse_timestamp(string(p.TimestampConnectionEnd) ?? "", "%+")
+          if eterr == null { ocsf.end_time = to_unix_timestamp(et, unit: "milliseconds") }
+          ocsf.message = "ZPA connection " + cstatus + " to " + app
+      } else if kind == "user_status" || kind == "connector_status" {
+          class_uid = 3002
+          sstatus = string(p.SessionStatus) ?? ""
+          activity_id = 1
+          activity_name = "Logon"
+          status_id = 0
+          status_str = "Unknown"
+          severity_id = 1
+          severity = "Informational"
+          if sstatus == "ZPN_STATUS_AUTHENTICATED" { status_id = 1; status_str = "Success" }
+          if sstatus == "ZPN_STATUS_DISCONNECTED" { activity_id = 2; activity_name = "Logoff"; status_id = 1; status_str = "Success" }
+          if sstatus == "ZPN_STATUS_AUTH_FAILED" { status_id = 2; status_str = "Failure"; severity_id = 2; severity = "Low" }
+
+          user = {}
+          if kind == "connector_status" {
+              log_name = "App Connector Status"
+              cname = string(p.Connector) ?? ""
+              user = { "name": cname, "type_id": 3, "type": "System" }
+              if cname == "" { user.name = "unknown" }
+              cgroup = string(p.ConnectorGroup) ?? ""
+              if cgroup != "" { user.groups = [{ "name": cgroup }] }
+          } else {
+              log_name = "User Status"
+              uname = string(p.Username) ?? ""
+              user = { "name": uname }
+              if uname == "" { user.name = "unknown" }
+              if match(uname, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') { user.email_addr = uname }
+          }
+
+          src = {}
+          pub = string(p.PublicIP) ?? ""
+          priv = string(p.PrivateIP) ?? ""
+          if pub != "" && pub != "0.0.0.0" { src.ip = pub } else if priv != "" { src.ip = priv }
+          lat = float(p.Latitude) ?? null
+          if lat != null { loc.lat = lat }
+          long = float(p.Longitude) ?? null
+          if long != null { loc.long = long }
+          cc = string(p.CountryCode) ?? ""
+          if cc != "" { loc.country = cc; src.location = loc }
+
+          dst = {}
+          zen = string(p.ZEN) ?? ""
+          if zen != "" { dst.name = zen }
+
+          ocsf.class_name = "Authentication"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          ocsf.status_id = status_id
+          ocsf.status = status_str
+          if sstatus != "" { ocsf.status_detail = sstatus }
+          ocsf.severity_id = severity_id
+          ocsf.severity = severity
+          ocsf.user = user
+          ocsf.service = { "name": "Zscaler Private Access" }
+          if length(src) > 0 { ocsf.src_endpoint = src }
+          if length(dst) > 0 { ocsf.dst_endpoint = dst }
+          ocsf.is_remote = true
+          session = {}
+          sid = string(p.SessionID) ?? ""
+          if sid != "" { session.uid = sid }
+          at, aterr = parse_timestamp(string(p.TimestampAuthentication) ?? "", "%+")
+          if aterr == null { session.created_time = to_unix_timestamp(at, unit: "milliseconds") }
+          if length(session) > 0 { ocsf.session = session }
+          device = {}
+          hn = string(p.Hostname) ?? ""
+          if hn != "" { device.hostname = hn }
+          plat = string(p.Platform) ?? ""
+          if plat != "" { device.os = { "name": plat, "type_id": 0 } }
+          if exists(device.hostname) {
+              device.type_id = 0
+              ocsf.device = device
+              profiles = ["host"]
+          }
+          ocsf.message = user.name + " " + sstatus
+      } else {
+          ocsf.class_name = "Base Event"
+          ocsf.category_uid = 0
+          ocsf.category_name = "Uncategorized"
+          ocsf.activity_id = 0
+          ocsf.activity_name = "Unknown"
+          ocsf.status_id = 0
+          ocsf.status = "Unknown"
+          ocsf.severity_id = 1
+          ocsf.severity = "Informational"
+      }
+      ocsf.class_uid = class_uid
+      ocsf.type_uid = class_uid * 100 + to_int(ocsf.activity_id)
+      ocsf.time = time_ms
+      ocsf.raw_data = raw_log
+      meta = {
+          "version": "1.9.0",
+          "uid": sha2("zscaler_zpa|raw|" + raw_log, variant: "SHA-256"),
+          "log_name": log_name,
+          "log_provider": "Zscaler",
+          "product": { "name": "Zscaler Private Access", "vendor_name": "Zscaler" }
+      }
+      if length(profiles) > 0 { meta.profiles = profiles }
+      sess_c = string(p.SessionID) ?? ""
+      if sess_c != "" { meta.correlation_uid = sess_c }
+      st_code = string(p.SessionType) ?? ""
+      if st_code == "" && kind == "user_status" { st_code = string(p.SessionStatus) ?? "" }
+      if st_code == "" && kind == "user_activity" { st_code = string(p.ConnectionStatus) ?? "" }
+      if st_code != "" { meta.event_code = st_code }
+      ocsf.metadata = meta
+
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # LogTimestamp: Successful LSS LogTimestamp (UTC) conversion to the event clock in milliseconds.
+  # TimestampConnectionStart: Successful ISO timestamp conversion of the connection start in milliseconds.
+  # TimestampConnectionEnd: Successful ISO timestamp conversion of the connection end in milliseconds.
+  # TimestampAuthentication: Successful ISO timestamp conversion of the session authentication time in milliseconds.
+  # ConnectionStatus: Parser lowercases the connection status into the message; consume only when the normalized value is emitted.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        LogTimestamp
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%a %b %d %H:%M:%S %Y")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        TimestampConnectionStart
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."start_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        TimestampConnectionEnd
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."end_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        TimestampAuthentication
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."session"."created_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        ConnectionStatus
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    Application
+  | ClientCountryCode
+  | ClientLatitude
+  | ClientLongitude
+  | ClientPrivateIP
+  | ClientPublicIP
+  | ConnectionID
+  | ConnectionStatus
+  | Connector
+  | ConnectorGroup
+  | ConnectorIP
+  | ConnectorPort
+  | CountryCode
+  | Host
+  | Hostname
+  | IPProtocol
+  | InternalReason
+  | Latitude
+  | Longitude
+  | Platform
+  | Policy
+  | PrivateIP
+  | PublicIP
+  | ServerIP
+  | ServerPort
+  | ServicePort
+  | SessionID
+  | SessionStatus
+  | SessionType
+  | Username
+  | ZEN
+  | ZENTotalBytesRxClient
+  | ZENTotalBytesTxClient
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  - raw: "{\"LogTimestamp\":\"Mon Oct 12 09:31:07 2026\",\"Customer\":\"Example Corp\",\"SessionID\":\"LHJdkjmNDf12nclBsvwA\",\"ConnectionID\":\"SqyZIMkg0JTj7EABsvwA,Q+EjXGdrvbF2lPiBbedm\",\"InternalReason\":\"BRK_MT_SETUP_FAIL_REJECTED_BY_POLICY\",\"ConnectionStatus\":\"close\",\"IPProtocol\":6,\"DoubleEncryption\":0,\"Username\":\"contractor@example.com\",\"ServicePort\":443,\"ClientPublicIP\":\"192.0.2.10\",\"ClientPrivateIP\":\"192.0.2.10\",\"ClientLatitude\":45.0,\"ClientLongitude\":-119.0,\"ClientCountryCode\":\"US\",\"ClientZEN\":\"broker2b.pdx\",\"Policy\":\"Block Contractors - Finance Apps\",\"Connector\":\"\",\"ConnectorZEN\":\"broker2b.pdx\",\"ConnectorIP\":\"\",\"ConnectorPort\":0,\"Host\":\"erp.example.com\",\"Application\":\"Finance ERP\",\"AppGroup\":\"Finance\",\"Server\":\"0\",\"ServerIP\":\"\",\"ServerPort\":443,\"PolicyProcessingTime\":28,\"CAProcessingTime\":1330,\"ConnectorZENSetupTime\":191017,\"ConnectionSetupTime\":192397,\"ServerSetupTime\":465,\"AppLearnTime\":0,\"TimestampConnectionStart\":\"2026-10-12T09:31:07.101Z\",\"TimestampConnectionEnd\":\"2026-10-12T09:31:07.140Z\",\"TimestampCATx\":\"2019-05-30T08:20:42.230Z\",\"TimestampCARx\":\"2019-05-30T08:20:42.231Z\",\"TimestampAppLearnStart\":\"\",\"TimestampZENFirstRxClient\":\"2019-05-30T08:20:42.424Z\",\"TimestampZENFirstTxClient\":\"\",\"TimestampZENLastRxClient\":\"2019-05-31T17:34:27.348Z\",\"TimestampZENLastTxClient\":\"\",\"TimestampConnectorZENSetupComplete\":\"2019-05-30T08:20:42.422Z\",\"TimestampZENFirstRxConnector\":\"\",\"TimestampZENFirstTxConnector\":\"2019-05-30T08:20:42.424Z\",\"TimestampZENLastRxConnector\":\"\",\"TimestampZENLastTxConnector\":\"2019-05-31T17:34:27.348Z\",\"ZENTotalBytesRxClient\":0,\"ZENBytesRxClient\":0,\"ZENTotalBytesTxClient\":0,\"ZENBytesTxClient\":0,\"ZENTotalBytesRxConnector\":0,\"ZENBytesRxConnector\":0,\"ZENTotalBytesTxConnector\":0,\"ZENBytesTxConnector\":0,\"Idp\":\"Example IDP Config\",\"ClientToClient\":\"0\"}"
+    expect:
+      "class_uid": "4001"
+      "activity_id": "5"
+      "status_id": "2"
+      "metadata.uid": "0f9dc4ab7a396edb30f8ba06da0cbc433cd7f0015a8857fc8156a073b0cbeddf"
+      "actor.user.name": "contractor@example.com"
+      "src_endpoint.ip": "192.0.2.10"
+  - raw: "{\"LogTimestamp\":\"Fri May 31 17:34:48 2019\",\"Customer\":\"Example Corp\",\"Username\":\"john.doe@example.com\",\"SessionID\":\"vkczUERSLl88Y+ytH8v5\",\"SessionStatus\":\"ZPN_STATUS_AUTHENTICATED\",\"Version\":\"19.12.0-36-g87dad18\",\"ZEN\":\"broker2b.pdx\",\"CertificateCN\":\"loggerz2x.pde.zpabeta.net\",\"PrivateIP\":\"192.0.2.10\",\"PublicIP\":\"198.51.100.44\",\"Latitude\":45,\"Longitude\":-119,\"CountryCode\":\"US\",\"TimestampAuthentication\":\"2019-05-29T21:18:38.000Z\",\"TimestampUnAuthentication\":\"\",\"TotalBytesRx\":31274866,\"TotalBytesTx\":25424152,\"Idp\":\"IDP Config\",\"Hostname\":\"DESKTOP-99HCSJ1\",\"Platform\":\"windows\",\"ClientType\":\"zpn_client_type_zapp\",\"TrustedNetworks\":\"TN1_stc1\",\"TrustedNetworksNames\":\"145248739466696953\",\"SAMLAttributes\":\"myname:user,myemail:user@example.com\",\"PosturesHit\":[\"sm-posture1\",\"sm-posture2\"],\"PosturesMiss\":[\"sm-posture11\",\"sm-posture12\"],\"ZENLatitude\":47,\"ZENLongitude\":-122,\"ZENCountryCode\":\"\",\"FQDNRegistered\":\"0\",\"FQDNRegisteredError\":\"CUSTOMER_NOT_ENABLED\"}"
+    expect:
+      "class_uid": "3002"
+      "activity_id": "1"
+      "status_id": "1"
+      "metadata.uid": "d680bbf06c523898486c2a27b4fa2956c6ed253f1a91fa084114fbad367587bf"
+      "user.name": "john.doe@example.com"
+      "src_endpoint.ip": "198.51.100.44"
+  # NAN-3702 (unparseable record, error branch): metadata.uid is sha256("zscaler_zpa|raw|" + raw), so the
+  # same record parsed twice gets the same uid.
+  - raw: "NAN-3702 determinism probe: not a zscaler_zpa record"
+    expect:
+      "class_uid": "0"
+      "activity_id": "0"
+      "status_id": "0"
+      "metadata.uid": "a26048845552ce35479f6dd618f92ea6b077242a05619a4346f2d714e7544be3"

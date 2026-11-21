@@ -50,6 +50,7 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [MikroTik RouterOS](parsers-ocsf/routeros) | `routeros` | MikroTik | RFC 3164 syslog | DNS queries/answers, user login/logout/failure, firewall flows, DHCP leases |
 | [SonicWall](parsers-ocsf/sonicwall) | `sonicwall` | SonicWall | key=value syslog | Connections, IPS detection, content filtering, user auth |
 | [Zscaler ZIA](parsers-ocsf/zscaler_zia) | `zscaler_zia` | Zscaler | JSON envelope | Web, firewall, DNS, tunnel, DLP, audit log types |
+| [Zscaler ZPA](parsers-ocsf/zscaler_zpa) | `zscaler_zpa` | Zscaler | JSON (LSS) | Private Access user activity (Network Activity, policy denies), user status and App Connector status (Authentication) |
 | [Broadcom ProxySG](parsers-ocsf/broadcom_proxy) | `broadcom_proxy` | Broadcom | ELFF space-delimited | Web proxy access logs with URL reconstruction |
 | [Cloudflare](parsers-ocsf/cloudflare) | `cloudflare` | Cloudflare | JSON (Logpush) | HTTP requests, firewall events, DNS logs with WAF/bot scoring |
 | [Cisco Umbrella](parsers-ocsf/cisco_umbrella) | `cisco_umbrella` | Cisco | CSV | DNS and proxy logs with domain categorization and identity |
@@ -89,6 +90,10 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Okta](parsers-ocsf/okta) | `okta` | Okta | JSON | System Log API: auth, MFA, user lifecycle, group, policy events |
 | [Duo Security](parsers-ocsf/duo) | `duo` | Cisco | JSON | Authentication, admin actions, MFA with device/geo context |
 | [Auth0](parsers-ocsf/auth0) | `auth0` | Okta | JSON | 20+ event types: login, signup, MFA, token exchange, management API |
+| [PingOne](parsers-ocsf/pingone) | `pingone` | Ping Identity | JSON | Platform audit activities: access allowed / denied, password and OTP checks, sessions, user, password, role and MFA device changes, groups, configuration API activity |
+| [JumpCloud](parsers-ocsf/jumpcloud) | `jumpcloud` | JumpCloud | JSON | Directory Insights: console, SSO, RADIUS, LDAP and system logins, user / admin lifecycle, lockout, password and TOTP events, groups, admin API activity |
+| [OneLogin](parsers-ocsf/onelogin) | `onelogin` | OneLogin | JSON | Events API: 81 event_type_ids mapped (logins, failures, MFA, logouts, user lifecycle, password, role and privilege changes); other ids kept as Base Event |
+| [Keycloak](parsers-ocsf/keycloak) | `keycloak` | Keycloak | JSON / jboss-logging text | User events (LOGIN, LOGIN_ERROR, CODE_TO_TOKEN, ...) and admin events (users, roles, groups, clients) from the REST API, event listeners or the server log |
 | [1Password](parsers-ocsf/onepassword) | `onepassword` | 1Password | JSON | Sign-in attempts, item usage, vault access events |
 | [CyberArk PAM](parsers-ocsf/cyberark) | `cyberark` | CyberArk | CEF syslog | Vault audit, PSM sessions, privileged access events |
 | [Netskope](parsers-ocsf/netskope) | `netskope` | Netskope | JSON | CASB/SSE: app activity, alerts, DLP, network events |

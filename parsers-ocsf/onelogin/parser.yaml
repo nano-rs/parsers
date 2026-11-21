@@ -1,0 +1,633 @@
+name: onelogin_ocsf
+display_name: OneLogin (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses OneLogin events (Events API GET /api/1/events, one `data[]` element per
+  input event, or the same object delivered by an event webhook) into complete
+  OCSF 1.9.0 records, routed by the numeric event_type_id. 81 documented ids
+  are mapped, each checked against OneLogin's event type list
+  (GET /api/1/events/types):
+    logins and failed logins to OneLogin, apps, RADIUS, VLDAP, API, desktop,
+    social and proxy IdPs, MFA challenges and push rejections (5, 6, 8, 9, 68,
+    77, 78, 86, 90, 122, 123, 129, 130, 140, 141, 153, 154, 900-916, 950,
+    1001, 1002, 1010), user assumption (3, 555) and logouts (7, 29, 516, 523,
+    550, 914)                                    -> Authentication 3002
+    user create / update / delete / activate / suspend / lock / unlock,
+    password change and reset, OTP device and authentication factor
+    changes, role and privilege grants and revokes -> User Management 3007
+    any other id                                 -> Base Event 0, with the id
+                                                    kept in metadata.event_code
+  Account Change 3001 is deprecated in OCSF 1.9 and is not emitted. user_* is
+  the subject and actor_user_* the actor (the admin, or the user themselves).
+match_values:
+  - onelogin
+category: security
+vendor: "OneLogin"
+product: "OneLogin"
+parser_vrl: |
+  # OneLogin Events API JSON -> OCSF 1.9.0.
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+  parsed, err = parse_json(raw_log)
+  __source_kv = object(parsed) ?? {}
+
+  if err != null || !is_object(parsed) || parsed.event_type_id == null {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("onelogin|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "Events",
+              "log_provider": "OneLogin",
+              "product": { "name": "OneLogin", "vendor_name": "OneLogin" }
+          },
+          "unmapped": { "parse_error": "not a OneLogin event" }
+      }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+  } else {
+      p = object!(parsed)
+      # [class_uid, activity_id, activity_name, is_failure, OneLogin name]
+      types = {
+        "3": [3002, 7, "Account Switch", false, "USER_ASSUMED_USER"],
+        "4": [3007, 16, "Assign Roles", false, "USER_ASSIGNED_ROLE"],
+        "5": [3002, 1, "Logon", false, "USER_LOGGED_INTO_ONELOGIN"],
+        "6": [3002, 1, "Logon", true, "USER_FAILED_ONELOGIN_LOGIN"],
+        "7": [3002, 2, "Logoff", false, "USER_LOGGED_OUT_OF_ONELOGIN"],
+        "8": [3002, 1, "Logon", false, "USER_LOGGED_INTO_APP"],
+        "9": [3002, 1, "Logon", true, "USER_FAILED_APP_LOGIN"],
+        "10": [3007, 9, "Password Reset", false, "USER_REQUESTED_NEW_PASSWORD"],
+        "11": [3007, 8, "Password Change", false, "USER_CHANGED_PASSWORD"],
+        "12": [3007, 7, "Unlock", false, "UNLOCKED_USER"],
+        "13": [3007, 1, "Create", false, "CREATED_USER"],
+        "14": [3007, 2, "Update", false, "UPDATED_USER"],
+        "15": [3007, 5, "Disable", false, "DEACTIVATED_USER"],
+        "16": [3007, 4, "Enable", false, "ACTIVATED_USER"],
+        "17": [3007, 3, "Delete", false, "DELETED_USER"],
+        "19": [3007, 6, "Lock", false, "USER_LOCKED"],
+        "21": [3007, 5, "Disable", false, "SUSPENDED_USER"],
+        "22": [3007, 12, "Enable MFA Factors", false, "USER_ADDED_OTP_DEVICE"],
+        "24": [3007, 13, "Disable MFA Factors", false, "USER_REMOVED_OTP_DEVICE"],
+        "29": [3002, 2, "Logoff", false, "USER_LOGGED_OUT_OF_APP"],
+        "32": [3007, 4, "Enable", false, "REACTIVATED_USER"],
+        "48": [3007, 1, "Create", false, "IMPORTED_USER"],
+        "49": [3007, 2, "Update", true, "UPDATE_USER_FAILED"],
+        "68": [3002, 1, "Logon", false, "USER_AUTHENTICATED_BY_RADIUS"],
+        "72": [3007, 14, "Assign Privileges", false, "PRIVILEGE_GRANTED_TO_USER"],
+        "73": [3007, 15, "Remove Privileges", false, "PRIVILEGE_REVOKED_FROM_USER"],
+        "77": [3002, 1, "Logon", true, "USER_FAILED_PROXY_LOGIN"],
+        "78": [3002, 1, "Logon", false, "USER_SUCCEEDED_PROXY_LOGIN"],
+        "86": [3002, 1, "Logon", true, "USER_FAILED_REMOTE_AUTHENTICATION"],
+        "90": [3002, 1, "Logon", true, "USER_UNAUTHORIZED_APP_ACCESS"],
+        "106": [3007, 8, "Password Change", true, "USER_CHANGE_PASSWORD_FAILED"],
+        "120": [3007, 7, "Unlock", false, "UNLOCKED_USER_IN_DIRECTORY"],
+        "122": [3002, 1, "Logon", false, "USER_AUTHENTICATED_BY_API"],
+        "123": [3002, 1, "Logon", true, "USER_REJECTED_BY_API"],
+        "129": [3002, 1, "Logon", true, "VLDAP_BIND_FAILURE"],
+        "130": [3002, 1, "Logon", false, "VLDAP_BIND_SUCCESS"],
+        "140": [3002, 1, "Logon", false, "SOCIAL_SIGN_IN"],
+        "141": [3002, 1, "Logon", true, "SOCIAL_SIGN_IN_FAILURE"],
+        "147": [3007, 16, "Assign Roles", false, "USER_MANUALLY_ADDED_TO_ROLE"],
+        "148": [3007, 17, "Remove Roles", false, "USER_MANUALLY_REMOVED_FROM_ROLE"],
+        "149": [3007, 16, "Assign Roles", false, "USER_AUTO_ADDED_TO_ROLE"],
+        "150": [3007, 17, "Remove Roles", false, "USER_AUTO_REMOVED_FROM_ROLE"],
+        "153": [3002, 1, "Logon", false, "MAC_LOGIN_SUCCESS"],
+        "154": [3002, 1, "Logon", true, "MAC_LOGIN_FAILURE"],
+        "170": [3007, 12, "Enable MFA Factors", false, "AUTHENTICATION_FACTOR_CREATED"],
+        "172": [3007, 13, "Disable MFA Factors", false, "AUTHENTICATION_FACTOR_DELETED"],
+        "211": [3007, 8, "Password Change", false, "ADMIN_CHANGED_USER_PASSWORD"],
+        "510": [3007, 8, "Password Change", false, "API_SET_PWD_SALT"],
+        "511": [3007, 8, "Password Change", false, "API_SET_PWD_CLEAR_TEXT"],
+        "513": [3007, 16, "Assign Roles", false, "API_ADD_ROLES"],
+        "514": [3007, 17, "Remove Roles", false, "API_REMOVE_ROLES"],
+        "516": [3002, 2, "Logoff", false, "API_LOGOUT"],
+        "517": [3007, 8, "Password Change", true, "API_SET_PWD_SALT_FAILED"],
+        "518": [3007, 8, "Password Change", true, "API_SET_PWD_CLEAR_TEXT_FAILED"],
+        "520": [3007, 16, "Assign Roles", true, "API_ADD_ROLES_FAILED"],
+        "521": [3007, 17, "Remove Roles", true, "API_REMOVE_ROLES_FAILED"],
+        "523": [3002, 2, "Logoff", true, "API_LOGOUT_FAILED"],
+        "526": [3007, 6, "Lock", true, "API_LOCK_USER_FAILED"],
+        "531": [3007, 6, "Lock", false, "API_LOCK_USER"],
+        "540": [3007, 12, "Enable MFA Factors", false, "API_ADDED_OTP_DEVICE"],
+        "550": [3002, 2, "Logoff", false, "FORCE_LOGOUT_USER"],
+        "551": [3007, 5, "Disable", false, "SUSPENDED_USER_VIA_API"],
+        "552": [3007, 4, "Enable", false, "REACTIVATED_USER_VIA_API"],
+        "553": [3007, 6, "Lock", false, "USER_LOCKED_VIA_API"],
+        "554": [3007, 7, "Unlock", false, "UNLOCKED_USER_VIA_API"],
+        "555": [3002, 7, "Account Switch", false, "EXTERNAL_ASSUME_USER"],
+        "900": [3002, 1, "Logon", false, "ONELOGIN_DESKTOP_MAC_LOGIN_SUCCESS"],
+        "901": [3002, 1, "Logon", true, "ONELOGIN_DESKTOP_MAC_LOGIN_FAILURE"],
+        "904": [3002, 1, "Logon", false, "ONELOGIN_DESKTOP_LOGIN_SUCCESS"],
+        "905": [3002, 1, "Logon", true, "ONELOGIN_DESKTOP_LOGIN_FAILURE"],
+        "906": [3002, 1, "Logon", true, "ONELOGIN_DESKTOP_USER_FAILED_ONELOGIN_LOGIN"],
+        "908": [3002, 1, "Logon", false, "ONELOGIN_DESKTOP_PRO_LOGIN_SUCCESS"],
+        "909": [3002, 1, "Logon", true, "ONELOGIN_DESKTOP_PRO_LOGIN_FAILURE"],
+        "913": [3002, 1, "Logon", false, "ONELOGIN_DESKTOP_TRAY_APP_LOGIN"],
+        "914": [3002, 2, "Logoff", false, "ONELOGIN_DESKTOP_TRAY_APP_LOGOUT"],
+        "915": [3002, 1, "Logon", false, "ONELOGIN_PKI_LOGIN_SUCCESS"],
+        "916": [3002, 1, "Logon", true, "ONELOGIN_PKI_LOGIN_FAILURE"],
+        "950": [3002, 1, "Logon", true, "OL_OTP_PUSH_REJECT"],
+        "1001": [3002, 1, "Logon", false, "USER_LOGIN_CHALLENGE"],
+        "1002": [3002, 1, "Logon", true, "USER_LOGIN_CHALLENGE_FAILED"],
+        "1010": [3002, 1, "Logon", false, "USER_REAUTH_SUCCESS"]
+      }
+
+      type_id_s = to_string(p.event_type_id) ?? ""
+      known = array(get(types, [type_id_s]) ?? null) ?? []
+      class_uid = 0
+      activity_id = 0
+      activity_name = "Unknown"
+      failed = false
+      type_name = ""
+      if length(known) == 5 {
+          class_uid = to_int(known[0]) ?? 0
+          activity_id = to_int(known[1]) ?? 0
+          activity_name = string(known[2]) ?? "Unknown"
+          failed = bool(known[3]) ?? false
+          type_name = string(known[4]) ?? ""
+      }
+
+      # ---- time ----
+      time_ms = 0
+      t, terr = parse_timestamp(string(p.created_at) ?? "", "%+")
+      if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+
+      # ---- outcome / severity ----
+      status_id = 0
+      status_str = "Unknown"
+      if class_uid != 0 {
+          if failed { status_id = 2; status_str = "Failure" } else { status_id = 1; status_str = "Success" }
+      }
+      severity_id = 1
+      severity = "Informational"
+      if status_id == 2 { severity_id = 2; severity = "Low" }
+      if activity_id == 6 && class_uid == 3007 { severity_id = 3; severity = "Medium" }
+      if type_id_s == "950" { severity_id = 3; severity = "Medium" }
+
+      # ---- subject and actor ----
+      email_re = r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'
+      subj = {}
+      u_name = string(p.user_name) ?? ""
+      u_id = to_string(p.user_id) ?? ""
+      if u_name != "" { subj.name = u_name }
+      if u_id != "" { subj.uid = u_id }
+      if match(u_name, email_re) { subj.email_addr = u_name }
+      actor_user = {}
+      a_name = string(p.actor_user_name) ?? ""
+      a_id = to_string(p.actor_user_id) ?? ""
+      if a_name != "" { actor_user.name = a_name }
+      if a_id != "" { actor_user.uid = a_id }
+      if match(a_name, email_re) { actor_user.email_addr = a_name }
+      actor_system = string(p.actor_system) ?? ""
+
+      src_ep = {}
+      ip = string(p.ipaddr) ?? ""
+      if ip != "" { src_ep.ip = ip }
+
+      ocsf = {}
+      if class_uid == 3002 {
+          ocsf.class_name = "Authentication"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          user = subj
+          if length(user) == 0 { user = actor_user }
+          if length(user) == 0 { user = { "name": "unknown" } }
+          ocsf.user = user
+          if length(actor_user) > 0 && actor_user != user { ocsf.actor = { "user": actor_user } }
+          svc = { "name": "OneLogin" }
+          app_name = string(p.app_name) ?? ""
+          app_id = to_string(p.app_id) ?? ""
+          if app_name != "" { svc = { "name": app_name } }
+          if app_id != "" { svc.uid = app_id }
+          ocsf.service = svc
+          if includes(["950", "1001", "1002"], type_id_s) { ocsf.is_mfa = true }
+          if type_id_s == "68" { ocsf.auth_protocol_id = 10; ocsf.auth_protocol = "RADIUS" }
+          if includes(["129", "130", "153", "154"], type_id_s) { ocsf.auth_protocol_id = 12; ocsf.auth_protocol = "LDAP" }
+          ocsf.is_remote = true
+      } else if class_uid == 3007 {
+          ocsf.class_name = "User Management"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          user = subj
+          if length(user) == 0 { user = actor_user }
+          if length(user) == 0 { user = { "name": "unknown" } }
+          ocsf.user = user
+          if length(actor_user) > 0 { ocsf.actor = { "user": actor_user } }
+          if actor_system != "" { ocsf.actor = set!(object(ocsf.actor) ?? {}, ["app_name"], actor_system) }
+      } else {
+          ocsf.class_name = "Base Event"
+          ocsf.category_uid = 0
+          ocsf.category_name = "Uncategorized"
+      }
+      ocsf.class_uid = class_uid
+      ocsf.activity_id = activity_id
+      ocsf.activity_name = activity_name
+      if length(src_ep) > 0 && class_uid != 0 { ocsf.src_endpoint = src_ep }
+
+      ocsf.status_id = status_id
+      ocsf.status = status_str
+      edesc = string(p.error_description) ?? ""
+      if edesc != "" { ocsf.status_detail = edesc }
+      has_risk = false
+      if p.risk_score != null && class_uid != 0 {
+          rs = to_int(p.risk_score) ?? null
+          if rs != null { ocsf.risk_score = rs; has_risk = true }
+      }
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.type_uid = class_uid * 100 + activity_id
+      ocsf.time = time_ms
+      msg = string(p.custom_message) ?? ""
+      if msg == "" { msg = string(p.notes) ?? "" }
+      if msg == "" { msg = type_name }
+      if msg == "" { msg = "OneLogin event type " + type_id_s }
+      ocsf.message = msg
+      ocsf.raw_data = raw_log
+
+      evt_uid = to_string(p.id) ?? ""
+      if evt_uid == "" { evt_uid = to_string(p.uuid) ?? "" }
+      if evt_uid == "" { evt_uid = sha2("onelogin|raw|" + raw_log, variant: "SHA-256") }
+      meta = {
+          "version": "1.9.0",
+          "uid": evt_uid,
+          "event_code": type_id_s,
+          "log_name": "Events",
+          "log_provider": "OneLogin",
+          "product": { "name": "OneLogin", "vendor_name": "OneLogin" }
+      }
+      # risk_score is bound to the security_control profile.
+      if has_risk { meta.profiles = ["security_control"] }
+      acct = to_string(p.account_id) ?? ""
+      if acct != "" { meta.tenant_uid = acct }
+      ocsf.metadata = meta
+
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # created_at: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        created_at
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    account_id
+  | actor_system
+  | actor_user_id
+  | actor_user_name
+  | app_id
+  | app_name
+  | custom_message
+  | error_description
+  | event_type_id
+  | id
+  | ipaddr
+  | notes
+  | risk_score
+  | user_id
+  | user_name
+  | uuid
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  - raw: "{\"id\":888888901,\"created_at\":\"2026-10-12T09:14:03.112Z\",\"account_id\":123456,\"user_id\":77777777,\"event_type_id\":6,\"notes\":\"Authentication method: password.\",\"ipaddr\":\"203.0.113.91\",\"actor_user_id\":77777777,\"assuming_acting_user_id\":null,\"role_id\":null,\"app_id\":null,\"group_id\":null,\"otp_device_id\":null,\"policy_id\":null,\"actor_system\":\"\",\"custom_message\":null,\"role_name\":null,\"app_name\":null,\"group_name\":null,\"actor_user_name\":\"Xavier Wong\",\"user_name\":\"Xavier Wong\",\"policy_name\":null,\"otp_device_name\":null,\"operation_name\":null,\"directory_sync_run_id\":null,\"directory_id\":null,\"resolution\":null,\"client_id\":null,\"resource_type_id\":null,\"error_description\":\"Invalid username or password\",\"proxy_ip\":null,\"risk_score\":71,\"risk_reasons\":\"New device, Unusual location\",\"risk_cookie_id\":null,\"browser_fingerprint\":\"d41d8cd98f00b204e9800998ecf8427e\"}"
+    expect:
+      "class_uid": "3002"
+      "activity_id": "1"
+      "status_id": "2"
+      "metadata.uid": "888888901"
+      "user.name": "Xavier Wong"
+      "src_endpoint.ip": "203.0.113.91"
+  - raw: "{\"id\":888888909,\"created_at\":\"2026-10-12T10:06:00.000Z\",\"account_id\":123456,\"user_id\":88888888,\"event_type_id\":4,\"notes\":null,\"ipaddr\":\"192.0.2.11\",\"actor_user_id\":7777777,\"assuming_acting_user_id\":null,\"role_id\":112233,\"app_id\":null,\"group_id\":null,\"otp_device_id\":null,\"policy_id\":null,\"actor_system\":\"\",\"custom_message\":null,\"role_name\":\"Super Admins\",\"app_name\":null,\"group_name\":null,\"actor_user_name\":\"Admin Example\",\"user_name\":\"Jordan Lee\",\"policy_name\":null,\"otp_device_name\":null,\"operation_name\":null,\"directory_sync_run_id\":null,\"directory_id\":null,\"resolution\":null,\"client_id\":null,\"resource_type_id\":null,\"error_description\":null,\"proxy_ip\":null,\"risk_score\":null,\"risk_reasons\":null,\"risk_cookie_id\":null,\"browser_fingerprint\":null}"
+    expect:
+      "class_uid": "3007"
+      "activity_id": "16"
+      "status_id": "1"
+      "metadata.uid": "888888909"
+      "user.name": "Jordan Lee"
+      "actor.user.name": "Admin Example"
+      "src_endpoint.ip": "192.0.2.11"
+  # NAN-3702 (unparseable record, error branch): metadata.uid is sha256("onelogin|raw|" + raw), so the
+  # same record parsed twice gets the same uid.
+  - raw: "NAN-3702 determinism probe: not a onelogin record"
+    expect:
+      "class_uid": "0"
+      "activity_id": "0"
+      "status_id": "0"
+      "metadata.uid": "06c88d293c05b8ad21e1862f2da7d7db16cf459ecd47ed3f53e6a21e628f74ff"

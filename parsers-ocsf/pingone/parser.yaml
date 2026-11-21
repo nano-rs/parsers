@@ -1,0 +1,692 @@
+name: pingone_ocsf
+display_name: PingOne (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses PingOne platform audit activities (GET /v1/environments/{id}/activities,
+  or the same JSON pushed by a PingOne webhook subscription) into complete OCSF
+  1.9.0 records, routed by action.type:
+    USER.ACCESS_ALLOWED / USER.ACCESS_DENIED, PASSWORD.CHECK_*, OTP.CHECK_*,
+    USER.KERBEROS_*, SESSION.CREATED       -> Authentication 3002 (Logon)
+    SESSION.DELETED, USER.SLO_*            -> Authentication 3002 (Logoff)
+    USER.*, PASSWORD.* (set/reset/lock), ROLE_ASSIGNMENT.*, DEVICE.* (MFA
+    devices)                               -> User Management 3007
+    GROUP.*, MEMBER_OF_GROUP.*             -> Group Management 3006
+    every other action type (configuration of applications, policies,
+    populations, flows, keys, ...)         -> API Activity 6003
+  Account Change 3001 is deprecated in OCSF 1.9 and is not emitted. The outcome
+  comes from result.status, overridden to Failure when the action type itself
+  names a failure (PASSWORD.CHECK_FAILED is logged with status SUCCESS: the
+  audit write succeeded, the password check did not). actors.user is the actor
+  (admin) and the USER entry in resources[] is the subject. One activity per
+  input event: split a paged `_embedded.activities` response upstream.
+  PingFederate audit logs (pipe-delimited / CEF) are a different source and are
+  not handled here.
+match_values:
+  - pingone
+category: security
+vendor: "Ping Identity"
+product: "PingOne"
+parser_vrl: |
+  # PingOne audit activity JSON -> OCSF 1.9.0.
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+  parsed, err = parse_json(raw_log)
+  __source_kv = object(parsed) ?? {}
+
+  if err != null || !is_object(parsed) || !is_object(parsed.action) {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("pingone|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "Audit Activities",
+              "log_provider": "PingOne",
+              "product": { "name": "PingOne", "vendor_name": "Ping Identity" }
+          },
+          "unmapped": { "parse_error": "not a PingOne audit activity" }
+      }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+  } else {
+      p = object!(parsed)
+      act = object(p.action) ?? {}
+      action_type = upcase(string(act.type) ?? "")
+      action_desc = string(act.description) ?? ""
+      actors = object(p.actors) ?? {}
+      a_user = object(actors.user) ?? {}
+      a_client = object(actors.client) ?? {}
+      result = object(p.result) ?? {}
+      src = object(p.source) ?? {}
+      icorr = object(p.internalCorrelation) ?? {}
+      ecorr = object(p.externalCorrelation) ?? {}
+
+      # ---- time: recordedAt (event clock), createdAt (log write) ----
+      time_ms = 0
+      t, terr = parse_timestamp(string(p.recordedAt) ?? "", "%+")
+      if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      logged_ms = 0
+      lt, lterr = parse_timestamp(string(p.createdAt) ?? "", "%+")
+      if lterr == null { logged_ms = to_unix_timestamp(lt, unit: "milliseconds") }
+      if time_ms == 0 { time_ms = logged_ms }
+
+      # ---- outcome ----
+      rstatus = upcase(string(result.status) ?? "")
+      status_id = 0
+      status_str = "Unknown"
+      if rstatus == "SUCCESS" || rstatus == "SUCCEEDED" { status_id = 1; status_str = "Success" }
+      if rstatus == "FAILED" || rstatus == "FAILURE" { status_id = 2; status_str = "Failure" }
+      named_failure = match(action_type, r'(FAILED|DENIED|INVALID|FAILURE|FRAUD_REPORTED|ERROR)')
+      if named_failure { status_id = 2; status_str = "Failure" }
+
+      severity_id = 1
+      severity = "Informational"
+      if status_id == 2 { severity_id = 2; severity = "Low" }
+      if match(action_type, r'^(USER|PASSWORD|DEVICE)\.LOCKED$|FRAUD_REPORTED|PAIRING_FAILED_COMPROMISED') { severity_id = 3; severity = "Medium" }
+
+      # ---- actor (admin or client performing the action) ----
+      email_re = r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'
+      actor = {}
+      au_name = string(a_user.name) ?? ""
+      au_id = string(a_user.id) ?? ""
+      if au_name != "" || au_id != "" {
+          au = { "type_id": 1, "type": "User" }
+          if au_name != "" { au.name = au_name }
+          if au_id != "" { au.uid = au_id }
+          if match(au_name, email_re) { au.email_addr = au_name }
+          actor.user = au
+      }
+      ac_name = string(a_client.name) ?? ""
+      ac_id = string(a_client.id) ?? ""
+      if ac_name != "" { actor.app_name = ac_name }
+      if ac_id != "" { actor.app_uid = ac_id }
+
+      # ---- subject: first USER / GROUP in resources[] ----
+      resources = array(p.resources) ?? []
+      subj = {}
+      have_subj = false
+      grp = {}
+      have_grp = false
+      for_each(resources) -> |_i, rv| {
+          r = object(rv) ?? {}
+          rtype = upcase(string(r.type) ?? "")
+          rname = string(r.name) ?? ""
+          rid = string(r.id) ?? ""
+          if rtype == "USER" && !have_subj {
+              su = { "type_id": 1, "type": "User" }
+              if rname != "" { su.name = rname }
+              if rid != "" { su.uid = rid }
+              if match(rname, email_re) { su.email_addr = rname }
+              subj = su
+              have_subj = true
+          }
+          if (rtype == "GROUP" || rtype == "MEMBER_OF_GROUP") && !have_grp {
+              grp = { "name": rname, "uid": rid }
+              have_grp = true
+          }
+      }
+
+      env_id = string(a_user.environment.id) ?? ""
+      if env_id == "" { env_id = string(a_client.environment.id) ?? "" }
+      if env_id == "" && length(resources) > 0 { env_id = string(resources[0].environment.id) ?? "" }
+
+      # ---- source endpoint ----
+      src_ip = string(src.ipAddress) ?? ""
+      ua = string(src.userAgent) ?? ""
+      src_ep = {}
+      if src_ip != "" { src_ep.ip = src_ip }
+
+      # ---- class routing ----
+      prefix = string(split(action_type, ".")[0]) ?? ""
+      verb = ""
+      vparts = split(action_type, ".")
+      if length(vparts) > 1 { verb = string(vparts[1]) ?? "" }
+      class_uid = 6003
+      if includes(["USER.ACCESS_ALLOWED", "USER.ACCESS_DENIED", "SESSION.CREATED", "SESSION.DELETED", "USER.KERBEROS_SUCCEEDED", "USER.KERBEROS_FAILED"], action_type) || starts_with(action_type, "PASSWORD.CHECK_") || starts_with(action_type, "OTP.CHECK_") || starts_with(action_type, "USER.SLO_") {
+          class_uid = 3002
+      } else if prefix == "USER" || prefix == "PASSWORD" || prefix == "ROLE_ASSIGNMENT" || prefix == "DEVICE" {
+          class_uid = 3007
+      } else if prefix == "GROUP" || prefix == "MEMBER_OF_GROUP" {
+          class_uid = 3006
+      }
+
+      ocsf = {}
+      if class_uid == 3002 {
+          activity_id = 1
+          activity_name = "Logon"
+          if action_type == "SESSION.DELETED" || starts_with(action_type, "USER.SLO_") { activity_id = 2; activity_name = "Logoff" }
+          ocsf.class_name = "Authentication"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          # Authentication carries the principal in `user`: the resource USER,
+          # else the acting user.
+          if have_subj {
+              ocsf.user = subj
+          } else if exists(actor.user) {
+              ocsf.user = actor.user
+          } else {
+              ocsf.user = { "name": "unknown" }
+          }
+          if exists(actor.user) && have_subj && actor.user != subj { ocsf.actor = { "user": actor.user } }
+          svc_name = ac_name
+          if svc_name == "" { svc_name = "PingOne" }
+          svc = { "name": svc_name }
+          if ac_id != "" { svc.uid = ac_id }
+          ocsf.service = svc
+          if starts_with(action_type, "OTP.CHECK_") {
+              ocsf.is_mfa = true
+              ocsf.auth_factors = [{ "factor_type_id": 7, "factor_type": "OTP" }]
+          }
+          if starts_with(action_type, "PASSWORD.CHECK_") { ocsf.auth_factors = [{ "factor_type_id": 11, "factor_type": "Password" }] }
+          if starts_with(action_type, "USER.KERBEROS_") { ocsf.auth_protocol_id = 2; ocsf.auth_protocol = "Kerberos" }
+          ocsf.is_remote = true
+          sid = string(icorr.sessionId) ?? ""
+          if sid != "" { ocsf.session = { "uid": sid } }
+      } else if class_uid == 3007 {
+          activity_id = 99
+          activity_name = "Other"
+          if action_type == "USER.CREATED" { activity_id = 1; activity_name = "Create" }
+          if includes(["USER.UPDATED", "USER.MOVED", "PASSWORD.FORCE_CHANGE", "PASSWORD.UNSET"], action_type) { activity_id = 2; activity_name = "Update" }
+          if action_type == "USER.DELETED" { activity_id = 3; activity_name = "Delete" }
+          if action_type == "USER.LOCKED" || action_type == "PASSWORD.LOCKED" { activity_id = 6; activity_name = "Lock" }
+          if action_type == "USER.UNLOCKED" || action_type == "PASSWORD.UNLOCKED" { activity_id = 7; activity_name = "Unlock" }
+          if action_type == "PASSWORD.SET" || action_type == "PASSWORD.EXTERNAL_SET" { activity_id = 8; activity_name = "Password Change" }
+          if action_type == "PASSWORD.RESET" || action_type == "PASSWORD.RECOVERY" { activity_id = 9; activity_name = "Password Reset" }
+          if action_type == "DEVICE.CREATED" || action_type == "DEVICE.ACTIVATED" { activity_id = 12; activity_name = "Enable MFA Factors" }
+          if action_type == "DEVICE.DELETED" { activity_id = 13; activity_name = "Disable MFA Factors" }
+          if action_type == "ROLE_ASSIGNMENT.CREATED" { activity_id = 16; activity_name = "Assign Roles" }
+          if action_type == "ROLE_ASSIGNMENT.DELETED" { activity_id = 17; activity_name = "Remove Roles" }
+          ocsf.class_name = "User Management"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          if have_subj {
+              ocsf.user = subj
+          } else if exists(actor.user) {
+              ocsf.user = actor.user
+          } else {
+              ocsf.user = { "name": "unknown" }
+          }
+          if length(actor) > 0 { ocsf.actor = actor }
+      } else if class_uid == 3006 {
+          activity_id = 99
+          activity_name = "Other"
+          if action_type == "MEMBER_OF_GROUP.CREATED" { activity_id = 3; activity_name = "Add User" }
+          if action_type == "MEMBER_OF_GROUP.DELETED" { activity_id = 4; activity_name = "Remove User" }
+          if action_type == "GROUP.CREATED" { activity_id = 6; activity_name = "Create" }
+          if action_type == "GROUP.DELETED" { activity_id = 5; activity_name = "Delete" }
+          if action_type == "GROUP.UPDATED" { activity_id = 9; activity_name = "Update" }
+          ocsf.class_name = "Group Management"
+          ocsf.category_uid = 3
+          ocsf.category_name = "Identity & Access Management"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          if have_grp {
+              ocsf.group = grp
+          } else {
+              ocsf.group = { "name": "unknown" }
+          }
+          if have_subj { ocsf.user = subj }
+          if length(actor) > 0 { ocsf.actor = actor }
+      } else {
+          activity_id = 99
+          activity_name = "Other"
+          if verb == "CREATED" { activity_id = 1; activity_name = "Create" }
+          if verb == "READ" { activity_id = 2; activity_name = "Read" }
+          if verb == "UPDATED" { activity_id = 3; activity_name = "Update" }
+          if verb == "DELETED" { activity_id = 4; activity_name = "Delete" }
+          ocsf.class_name = "API Activity"
+          ocsf.category_uid = 6
+          ocsf.category_name = "Application Activity"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          ocsf.api = { "operation": action_type, "service": { "name": "PingOne" } }
+          if length(actor) == 0 { actor = { "app_name": "PingOne" } }
+          ocsf.actor = actor
+          # API Activity requires src_endpoint; the audit record names no
+          # caller address for most configuration events.
+          if length(src_ep) == 0 { src_ep = { "hostname": "unknown" } }
+          res_list = []
+          for_each(resources) -> |_i, rv| {
+              r = object(rv) ?? {}
+              rd = { "type": string(r.type) ?? "" }
+              rn = string(r.name) ?? ""
+              if rn != "" { rd.name = rn }
+              ri = string(r.id) ?? ""
+              if ri != "" { rd.uid = ri }
+              res_list = push(res_list, rd)
+          }
+          if length(res_list) > 0 { ocsf.resources = res_list }
+      }
+      ocsf.class_uid = class_uid
+      if length(src_ep) > 0 { ocsf.src_endpoint = src_ep }
+      if ua != "" { ocsf.http_request = { "user_agent": ua } }
+
+      ocsf.status_id = status_id
+      ocsf.status = status_str
+      rdesc = string(result.description) ?? ""
+      if rdesc != "" { ocsf.status_detail = rdesc }
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.type_uid = class_uid * 100 + to_int(ocsf.activity_id)
+      ocsf.time = time_ms
+      msg = action_desc
+      if msg == "" { msg = action_type }
+      ocsf.message = msg
+      ocsf.raw_data = raw_log
+
+      evt_uid = string(p.id) ?? ""
+      if evt_uid == "" { evt_uid = sha2("pingone|raw|" + raw_log, variant: "SHA-256") }
+      meta = {
+          "version": "1.9.0",
+          "uid": evt_uid,
+          "event_code": action_type,
+          "log_name": "Audit Activities",
+          "log_provider": "PingOne",
+          "product": { "name": "PingOne", "vendor_name": "Ping Identity" }
+      }
+      corr = string(p.correlationId) ?? ""
+      if corr == "" { corr = string(icorr.transactionId) ?? "" }
+      if corr != "" { meta.correlation_uid = corr }
+      if logged_ms > 0 { meta.logged_time = logged_ms }
+      if env_id != "" { meta.tenant_uid = env_id }
+      tags = array(p.tags) ?? []
+      if length(tags) > 0 { meta.labels = tags }
+      ocsf.metadata = meta
+
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # recordedAt: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # createdAt: Successful ISO timestamp conversion of the log write time in milliseconds.
+  # result.status: PingOne result.status normalized to the OCSF status caption; consume only when the emitted caption matches (a named-failure override keeps it residual).
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        recordedAt
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        createdAt
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."metadata"."logged_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        result\.status
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"success": "Success", "succeeded": "Success", "failed": "Failure", "failure": "Failure"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."status" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    action\.description
+  | action\.type
+  | actors\.client\.environment\.id
+  | actors\.client\.id
+  | actors\.client\.name
+  | actors\.user\.environment\.id
+  | actors\.user\.id
+  | actors\.user\.name
+  | correlationId
+  | id
+  | internalCorrelation\.sessionId
+  | internalCorrelation\.transactionId
+  | result\.description
+  | source\.ipAddress
+  | source\.userAgent
+  | tags
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  - raw: "{\"_links\":{\"self\":{\"href\":\"https://api.pingone.com/v1/environments/00000000-0000-0000-0000-000000000000/activities/00000000-0000-4000-8000-000000000101\"}},\"id\":\"00000000-0000-4000-8000-000000000101\",\"recordedAt\":\"2026-11-02T14:05:11.208Z\",\"createdAt\":\"2026-11-02T14:05:11.230Z\",\"correlationId\":\"00000000-0000-4000-8000-000000000102\",\"actors\":{\"client\":{\"id\":\"00000000-0000-4000-8000-000000000103\",\"name\":\"PingOne Admin Console\",\"environment\":{\"id\":\"00000000-0000-0000-0000-000000000000\"},\"type\":\"CLIENT\"},\"user\":{\"id\":\"00000000-0000-4000-8000-000000000104\",\"name\":\"bob@example.com\",\"environment\":{\"id\":\"00000000-0000-0000-0000-000000000000\"},\"population\":{\"id\":\"00000000-0000-4000-8000-000000000105\"},\"type\":\"USER\"}},\"action\":{\"type\":\"USER.ACCESS_DENIED\",\"description\":\"User Access Denied\"},\"resources\":[{\"type\":\"USER\",\"id\":\"00000000-0000-4000-8000-000000000104\",\"name\":\"bob@example.com\",\"environment\":{\"id\":\"00000000-0000-0000-0000-000000000000\"},\"population\":{\"id\":\"00000000-0000-4000-8000-000000000105\"}}],\"result\":{\"status\":\"FAILED\",\"description\":\"Failed role access control\"},\"source\":{\"ipAddress\":\"203.0.113.50\",\"userAgent\":\"Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0\"},\"internalCorrelation\":{\"sessionId\":\"00000000-0000-4000-8000-000000000106\",\"transactionId\":\"00000000-0000-4000-8000-000000000107\"}}"
+    expect:
+      "class_uid": "3002"
+      "activity_id": "1"
+      "status_id": "2"
+      "metadata.uid": "00000000-0000-4000-8000-000000000101"
+      "user.name": "bob@example.com"
+      "src_endpoint.ip": "203.0.113.50"
+  - raw: "{\"_links\":{\"self\":{\"href\":\"https://api.pingone.com/v1/environments/00000000-0000-4000-8000-000000000001/activities/00000000-0000-4000-8000-000000000002\"}},\"id\":\"00000000-0000-4000-8000-000000000002\",\"recordedAt\":\"2022-07-13T21:03:54.524Z\",\"createdAt\":\"2022-07-13T21:03:54.559Z\",\"correlationId\":\"00000000-0000-4000-8000-000000000002\",\"actors\":{\"client\":{\"id\":\"adminui\",\"name\":\"adminui\",\"type\":\"CLIENT\"},\"user\":{\"id\":\"00000000-0000-4000-8000-000000000002\",\"name\":\"admin@example.com\",\"environment\":{\"id\":\"00000000-0000-4000-8000-000000000001\"},\"population\":{},\"href\":\"https://api.pingone.com/v1/environments/00000000-0000-4000-8000-000000000001/users/00000000-0000-4000-8000-000000000002\",\"type\":\"USER\"}},\"action\":{\"type\":\"USER.CREATED\",\"description\":\"User Created\"},\"resources\":[{\"type\":\"USER\",\"id\":\"00000000-0000-4000-8000-000000000002\",\"name\":\"djcdjh\",\"environment\":{\"id\":\"00000000-0000-4000-8000-000000000001\"},\"population\":{\"id\":\"00000000-0000-4000-8000-000000000001\"},\"href\":\"https://api.pingone.com/v1/environments/00000000-0000-4000-8000-000000000001/users/00000000-0000-4000-8000-000000000002\"}],\"result\":{\"status\":\"SUCCESS\",\"description\":\"Created User djcdjh\"}}"
+    expect:
+      "class_uid": "3007"
+      "activity_id": "1"
+      "status_id": "1"
+      "metadata.uid": "00000000-0000-4000-8000-000000000002"
+      "user.name": "djcdjh"
+      "actor.user.name": "admin@example.com"
+  # NAN-3702 (unparseable record, error branch): metadata.uid is sha256("pingone|raw|" + raw), so the
+  # same record parsed twice gets the same uid.
+  - raw: "NAN-3702 determinism probe: not a pingone record"
+    expect:
+      "class_uid": "0"
+      "activity_id": "0"
+      "status_id": "0"
+      "metadata.uid": "b39701d96c41bd0a995541900c99d4207f29c1aebb3530562fa96a13d17aea57"
