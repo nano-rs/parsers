@@ -1,0 +1,653 @@
+name: redis_ocsf
+display_name: Redis (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Redis (and Valkey, which keeps the format) logs into complete OCSF
+  1.9.0 records: server log lines (`pid:role DD Mon YYYY HH:MM:SS.mmm level
+  msg`, plus the `pid:signal-handler (epoch)` form), ACL LOG entries exported as
+  JSON (the fields of `ACL LOG`: reason, context, object, username,
+  client-info, timestamp-created, ...), and MONITOR output lines. Routing per
+  event:
+    ACL LOG reason auth                    -> Authentication 3002 (Logon, Failure)
+    ACL LOG reason command / key / channel -> Datastore Activity 6005 (Failure)
+    MONITOR command lines                  -> Datastore Activity 6005
+    Possible SECURITY ATTACK (cross-protocol scripting) / Error accepting a
+    client connection                     -> Network Activity 4001 (Refuse / Fail)
+    Ready to accept connections / shutdown -> Application Lifecycle 6002
+    warning lines reporting a failure      -> Application Error 6008
+    everything else                        -> Base Event 0
+  Severity follows the Redis level character (`#` warning is Medium). AUTH /
+  HELLO arguments in MONITOR lines are not copied into query_info. Input that
+  matches none of the formats is kept whole as a Base Event marked
+  unmapped.parse_fallback.
+match_values:
+  - redis
+category: application
+vendor: "Redis"
+product: "Redis"
+parser_vrl: |
+  # Redis server log / ACL LOG JSON / MONITOR -> OCSF 1.9.0. Emits the COMPLETE
+  # record on root and never aborts on bad input.
+
+  raw_log = string(.message) ?? ""
+  if raw_log == "" && exists(.message) { raw_log = encode_json(.message) }
+  __raw_body = raw_log
+  __source_kv = {}
+
+  parsed_ok = false
+  log_name = "redis"
+  kind = "base"
+  time_ms = 0
+  ts = ""
+  level = ""
+  msg = ""
+  pid = ""
+  role = ""
+  user = ""
+  client = ""
+  dbi = ""
+  command = ""
+  query = ""
+  detail = ""
+  count = 0
+
+  j, jerr = parse_json(raw_log)
+  if jerr == null && is_object(j) && exists(j.reason) && (exists(j."client-info") || exists(j.username)) {
+      # ---------------- ACL LOG entry (JSON) ----------------
+      parsed_ok = true
+      log_name = "acl_log"
+      __source_kv = object!(j)
+      reason = string(j.reason) ?? ""
+      obj = string(j.object) ?? ""
+      user = string(j.username) ?? ""
+      count = to_int(j.count) ?? 0
+      time_ms = to_int(j."timestamp-created") ?? 0
+      ci = parse_key_value(string(j."client-info") ?? "", key_value_delimiter: "=", field_delimiter: " ") ?? {}
+      client = string(ci.addr) ?? ""
+      dbi = string(ci.db) ?? ""
+      command = string(ci.cmd) ?? ""
+      if reason == "auth" {
+          kind = "auth_fail"
+          msg = "ACL: authentication failed for user " + user
+      } else {
+          kind = "acl_denied"
+          msg = "ACL: " + reason + " denied: " + obj
+          if reason == "command" && obj != "" { command = obj }
+      }
+      ctx = string(j.context) ?? ""
+      detail = "reason=" + reason + " context=" + ctx + " object=" + obj
+  } else {
+      s, serr = parse_regex(raw_log, r'^(?P<pid>\d+):(?P<role>[XCSM]) (?P<time>\d{1,2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2}\.\d{3}) (?P<level>[.*#-]) (?P<msg>.*)$')
+      if serr == null {
+          # ---------------- server log ----------------
+          parsed_ok = true
+          __source_kv = s
+          pid = string(s.pid) ?? ""
+          role = string(s.role) ?? ""
+          ts = string(s.time) ?? ""
+          level = string(s.level) ?? ""
+          msg = string(s.msg) ?? ""
+          t, terr = parse_timestamp(ts, "%d %b %Y %H:%M:%S%.f", timezone: "UTC")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      } else {
+          sh, sherr = parse_regex(raw_log, r'^(?P<pid>\d+):signal-handler \((?P<epoch>\d+)\) (?P<msg>.*)$')
+          if sherr == null {
+              parsed_ok = true
+              __source_kv = sh
+              pid = string(sh.pid) ?? ""
+              level = "#"
+              msg = string(sh.msg) ?? ""
+              time_ms = (to_int(string(sh.epoch) ?? "") ?? 0) * 1000
+          } else {
+              mo, moerr = parse_regex(raw_log, r'^(?P<timestamp>\d{9,10}\.\d{6}) \[(?P<db>\d+) (?P<client>[^\x5D]+)\] (?P<args>.*)$')
+              if moerr == null {
+                  # ---------------- MONITOR ----------------
+                  parsed_ok = true
+                  log_name = "monitor"
+                  kind = "command"
+                  __source_kv = {"timestamp": mo.timestamp, "db": mo.db, "client": mo.client}
+                  ts = string(mo.timestamp) ?? ""
+                  tf = to_float(ts) ?? 0.0
+                  time_ms = to_int(tf * 1000.0)
+                  dbi = string(mo.db) ?? ""
+                  client = string(mo.client) ?? ""
+                  args = string(mo.args) ?? ""
+                  cm, cmerr = parse_regex(args, r'^"(?P<c>[^"]*)"')
+                  if cmerr == null { command = string(cm.c) ?? "" }
+                  if includes(["AUTH", "HELLO"], upcase(command)) {
+                      query = upcase(command) + " <redacted>"
+                  } else {
+                      query = args
+                      __source_kv.args = args
+                  }
+              }
+          }
+      }
+  }
+
+  if time_ms == 0 { time_ms = to_unix_timestamp(now(), unit: "milliseconds") }
+
+  # ---- severity: Redis level characters . debug, - verbose, * notice, # warning ----
+  severity_id = 1
+  severity = "Informational"
+  if level == "#" { severity_id = 3; severity = "Medium" }
+  if kind == "auth_fail" || kind == "acl_denied" { severity_id = 3; severity = "Medium" }
+
+  # ---- server-log message classification ----
+  if kind == "base" && msg != "" {
+      if starts_with(msg, "Ready to accept connections") {
+          kind = "start"
+      } else if match(msg, r'is now ready to exit|^User requested shutdown|^Received SIG\w+ scheduling shutdown|^Received shutdown signal') {
+          kind = "stop"
+      } else if starts_with(msg, "Possible SECURITY ATTACK detected") {
+          kind = "net_refuse"
+          am, amerr = parse_regex(msg, r'Connection from (?P<a>\S+):(?P<p>\d+) aborted')
+          if amerr == null { client = (string(am.a) ?? "") + ":" + (string(am.p) ?? "") }
+      } else if starts_with(msg, "Error accepting a client connection") {
+          kind = "net_fail"
+          am, amerr = parse_regex(msg, r'\(addr=(?P<a>[^ )]*)')
+          if amerr == null { client = string(am.a) ?? "" }
+      } else if starts_with(msg, "Accepted ") {
+          kind = "net_open"
+          client = strip_whitespace(replace(msg, "Accepted ", ""))
+      } else if level == "#" && match(msg, r'(?i)\berror\b|failed|\bcan\x27t\b|\bcannot\b|\bunable\b|MISCONF') {
+          kind = "error"
+      }
+  }
+
+  # client "ip:port" (IPv6 keeps its colons; the port is after the last one)
+  cip = ""
+  cport = 0
+  cp, cperr = parse_regex(client, r'^\x5B?(?P<ip>.*?)\x5D?:(?P<port>\d+)$')
+  if cperr == null { cip = string(cp.ip) ?? ""; cport = to_int(string(cp.port) ?? "") ?? 0 }
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]*:[0-9A-Fa-f:.]+$'
+  src = {}
+  if match(cip, ip_re) { src.ip = cip }
+  if cport > 0 && exists(src.ip) { src.port = cport }
+  if length(src) == 0 && client != "" { src.name = client }
+  dst = { "svc_name": "redis" }
+
+  class_uid = 0
+  class_name = "Base Event"
+  category_uid = 0
+  category_name = "Uncategorized"
+  activity_id = 99
+  activity_name = "Other"
+  status_id = 0
+  status = "Unknown"
+  cmd_up = upcase(command)
+  if kind == "auth_fail" {
+      class_uid = 3002; class_name = "Authentication"; category_uid = 3; category_name = "Identity & Access Management"
+      activity_id = 1; activity_name = "Logon"; status_id = 2; status = "Failure"
+  } else if kind == "acl_denied" || kind == "command" {
+      class_uid = 6005; class_name = "Datastore Activity"; category_uid = 6; category_name = "Application Activity"
+      if includes(["GET", "MGET", "HGET", "HGETALL", "HMGET", "LRANGE", "LINDEX", "SMEMBERS", "SISMEMBER", "ZRANGE", "ZSCORE", "EXISTS", "TTL", "TYPE", "STRLEN", "GETRANGE", "XRANGE", "XREAD", "DUMP"], cmd_up) { activity_id = 1; activity_name = "Read" }
+      if includes(["SET", "SETEX", "SETNX", "MSET", "HSET", "HMSET", "LPUSH", "RPUSH", "SADD", "ZADD", "XADD", "INCR", "INCRBY", "DECR", "APPEND", "EXPIRE", "RESTORE", "RENAME"], cmd_up) { activity_id = 5; activity_name = "Write" }
+      if includes(["DEL", "UNLINK", "FLUSHDB", "FLUSHALL", "HDEL", "LREM", "SREM", "ZREM", "XDEL", "GETDEL"], cmd_up) { activity_id = 7; activity_name = "Delete" }
+      if includes(["KEYS", "SCAN", "HKEYS", "HSCAN", "SSCAN", "ZSCAN", "DBSIZE"], cmd_up) { activity_id = 8; activity_name = "List" }
+      status_id = 1; status = "Success"
+      if kind == "acl_denied" { status_id = 2; status = "Failure" }
+  } else if kind == "net_refuse" || kind == "net_fail" || kind == "net_open" {
+      class_uid = 4001; class_name = "Network Activity"; category_uid = 4; category_name = "Network Activity"
+      activity_id = 5; activity_name = "Refuse"; status_id = 2; status = "Failure"
+      if kind == "net_fail" { activity_id = 4; activity_name = "Fail" }
+      if kind == "net_open" { activity_id = 1; activity_name = "Open"; status_id = 1; status = "Success" }
+  } else if kind == "start" || kind == "stop" {
+      class_uid = 6002; class_name = "Application Lifecycle"; category_uid = 6; category_name = "Application Activity"
+      activity_id = 3; activity_name = "Start"; status_id = 1; status = "Success"
+      if kind == "stop" { activity_id = 4; activity_name = "Stop" }
+  } else if kind == "error" {
+      class_uid = 6008; class_name = "Application Error"; category_uid = 6; category_name = "Application Activity"
+      activity_id = 1; activity_name = "General Error"; status_id = 2; status = "Failure"
+  }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": sha2("redis|raw|" + raw_log, variant: "SHA-256"),
+      "log_name": log_name,
+      "log_provider": "redis-server",
+      "product": { "name": "Redis", "vendor_name": "Redis" }
+  }
+  if ts != "" { metadata.original_time = ts }
+  if level != "" { metadata.log_level = level }
+
+  . = {
+      "class_uid": class_uid,
+      "class_name": class_name,
+      "category_uid": category_uid,
+      "category_name": category_name,
+      "activity_id": activity_id,
+      "activity_name": activity_name,
+      "type_uid": class_uid * 100 + activity_id,
+      "severity_id": severity_id,
+      "severity": severity,
+      "status_id": status_id,
+      "status": status,
+      "time": time_ms,
+      "raw_data": raw_log,
+      "metadata": metadata
+  }
+  if msg != "" { .message = msg }
+  if detail != "" { .status_detail = detail }
+  if count > 0 { .count = count }
+
+  if class_uid == 3002 {
+      u = user
+      if u == "" { u = "unknown" }
+      .user = { "name": u }
+      .service = { "name": "redis" }
+      .dst_endpoint = dst
+      if length(src) > 0 { .src_endpoint = src }
+      .logon_type_id = 3
+      .logon_type = "Network"
+  } else if class_uid == 6005 {
+      actor = {}
+      if user != "" { actor.user = { "name": user } }
+      if length(actor) == 0 { actor.app_name = "redis-cli" }
+      .actor = actor
+      if length(src) == 0 { src.name = "unknown" }
+      .src_endpoint = src
+      .dst_endpoint = dst
+      database = { "type_id": 6, "type": "NoSQL" }
+      if dbi != "" { database.uid = dbi } else { database.uid = "unknown" }
+      .database = database
+      .type_id = 1
+      .type = "Database"
+      if query != "" || command != "" {
+          qs = query
+          if qs == "" { qs = command }
+          qn = cmd_up
+          if qn == "" { qn = "command" }
+          .query_info = { "query_string": qs, "name": qn }
+      }
+  } else if class_uid == 4001 {
+      if length(src) > 0 { .src_endpoint = src }
+      .dst_endpoint = dst
+  } else if class_uid == 6002 {
+      .app = { "name": "Redis", "vendor_name": "Redis" }
+  }
+
+  if !parsed_ok {
+      .metadata.log_level = "error"
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+  }
+  .
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # epoch: Signal-handler Unix seconds converted to event milliseconds.
+  # timestamp: MONITOR Unix seconds with microseconds converted to event milliseconds.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        epoch
+      | timestamp
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    args
+  | client
+  | count
+  | db
+  | level
+  | msg
+  | object
+  | timestamp\-created
+  | time
+  | timestamp
+  | username
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+# Runtime samples (NAN-2327): one per event shape this parser routes. The
+# sidecar corpus in samples/ (sources in samples/README.md) is the full set.
+samples:
+  # server_ready
+  - raw: "1:M 20 Nov 2026 10:00:00.105 * Ready to accept connections tcp"
+    expect:
+      "class_uid": 6002
+      "activity_id": 3
+  # signal_handler_sigterm
+  - raw: "1:signal-handler (1795172400) Received SIGTERM scheduling shutdown..."
+    expect:
+      "class_uid": 6002
+      "activity_id": 4
+      "time": 1795172400000
+  # server_security_attack
+  - raw: "1:M 20 Nov 2026 10:20:00.000 # Possible SECURITY ATTACK detected. It looks like somebody is sending POST or Host: commands to Redis. This is likely due to an attacker attempting to use Cross Protocol Scripting to compromise your Redis instance. Connection from 198.51.100.23:51234 aborted."
+    expect:
+      "class_uid": 4001
+      "activity_id": 5
+      "src_endpoint.ip": "198.51.100.23"
+  # server_bgsave_error
+  - raw: "1:M 20 Nov 2026 10:16:00.001 # Background saving error"
+    expect:
+      "class_uid": 6008
+      "severity_id": 3
+  # server_bgsave_child
+  - raw: "20:C 20 Nov 2026 10:15:00.420 * DB saved on disk"
+    expect:
+      "class_uid": 0
+  # acl_log_auth_failure
+  - raw: "{\"count\": 1, \"reason\": \"auth\", \"context\": \"toplevel\", \"object\": \"AUTH\", \"username\": \"someuser\", \"age-seconds\": \"8.038\", \"client-info\": \"id=3 addr=192.0.2.15:57275 laddr=192.0.2.5:6379 fd=8 name= age=16 idle=0 flags=N db=0 sub=0 psub=0 ssub=0 multi=-1 qbuf=48 qbuf-free=16842 argv-mem=25 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem=0 tot-mem=18737 events=r cmd=auth user=default redir=-1 resp=2\", \"entry-id\": 0, \"timestamp-created\": 1795170242408, \"timestamp-last-updated\": 1795170242408}"
+    expect:
+      "class_uid": 3002
+      "status_id": 2
+      "user.name": "someuser"
+      "src_endpoint.ip": "192.0.2.15"
+  # acl_log_command_denied
+  - raw: "{\"count\": 3, \"reason\": \"command\", \"context\": \"toplevel\", \"object\": \"flushall\", \"username\": \"reporting\", \"age-seconds\": \"2.5\", \"client-info\": \"id=3 addr=192.0.2.15:57275 laddr=192.0.2.5:6379 fd=8 name= age=16 idle=0 flags=N db=0 sub=0 psub=0 ssub=0 multi=-1 qbuf=48 qbuf-free=16842 argv-mem=25 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem=0 tot-mem=18737 events=r cmd=flushall user=reporting redir=-1 resp=2\", \"entry-id\": 1, \"timestamp-created\": 1795170300000, \"timestamp-last-updated\": 1795170302000}"
+    expect:
+      "class_uid": 6005
+      "status_id": 2
+      "activity_id": 7
+  # monitor_set
+  - raw: "1339518090.420270 [0 192.0.2.15:60866] \"set\" \"x\" \"6\""
+    expect:
+      "class_uid": 6005
+      "activity_id": 5
+      "database.uid": "0"
+  # junk
+  - raw: "this is not a redis log line"
+    expect:
+      "class_uid": 0
+      "unmapped.parse_fallback": "unparsable input"

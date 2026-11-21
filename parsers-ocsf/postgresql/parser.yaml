@@ -1,0 +1,766 @@
+name: postgresql_ocsf
+display_name: PostgreSQL (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses PostgreSQL server logs into complete OCSF 1.9.0 records. Accepts the
+  stderr destination with any common log_line_prefix (default '%m [%p] ',
+  Debian '%m [%p] %q%u@%d ', Amazon RDS '%t:%r:%u@%d:[%p]:', optionally behind
+  a syslog prefix, multi-line DETAIL/HINT/STATEMENT continuations included),
+  csvlog, and jsonlog (PostgreSQL 15+). Routing per event:
+    connection received                      -> Network Activity 4001 (Open)
+    connection authenticated / authorized    -> Authentication 3002 (Logon, Success)
+    password / ident / peer / LDAP / cert failures, no pg_hba.conf entry,
+    pg_hba.conf rejects, unknown role        -> Authentication 3002 (Logon, Failure)
+    disconnection                            -> Authentication 3002 (Logoff)
+    statement / duration / execute lines and errors that carry a STATEMENT
+                                             -> Datastore Activity 6005
+    ready to accept connections / shut down  -> Application Lifecycle 6002
+    other ERROR / FATAL / PANIC              -> Application Error 6008
+    checkpoints and other server lines       -> Base Event 0
+  The PostgreSQL severity is kept (WARNING Medium, ERROR High, FATAL Critical,
+  PANIC Fatal) and the SQLSTATE lands in status_code. Input that matches none of
+  the formats is kept whole as a Base Event marked unmapped.parse_fallback.
+match_values:
+  - postgresql
+category: application
+vendor: "PostgreSQL Global Development Group"
+product: "PostgreSQL"
+parser_vrl: |
+  # PostgreSQL stderr / csvlog / jsonlog -> OCSF 1.9.0. Emits the COMPLETE record
+  # on root and never aborts on bad input.
+
+  raw_log = string(.message) ?? ""
+  if raw_log == "" && exists(.message) { raw_log = encode_json(.message) }
+  __raw_body = raw_log
+  __source_kv = {}
+
+  parsed_ok = false
+  ts = ""
+  pid = ""
+  user = ""
+  db = ""
+  rhost = ""
+  rport = ""
+  sev = ""
+  sqlstate = ""
+  msg = ""
+  detail = ""
+  statement = ""
+  app = ""
+  session_id = ""
+  query_id = ""
+  hostname = ""
+  log_format = ""
+
+  j, jerr = parse_json(raw_log)
+  if jerr == null && is_object(j) && (exists(j.error_severity) || (exists(j.message) && exists(j.timestamp))) {
+      # ---------------- jsonlog ----------------
+      parsed_ok = true
+      log_format = "jsonlog"
+      __source_kv = object!(j)
+      ts = string(j.timestamp) ?? ""
+      pid = to_string(j.pid) ?? ""
+      user = string(j.user) ?? ""
+      db = string(j.dbname) ?? ""
+      rhost = string(j.remote_host) ?? ""
+      rport = to_string(j.remote_port) ?? ""
+      sev = string(j.error_severity) ?? ""
+      sqlstate = string(j.state_code) ?? ""
+      msg = string(j.message) ?? ""
+      detail = string(j.detail) ?? ""
+      statement = string(j.statement) ?? ""
+      app = string(j.application_name) ?? ""
+      session_id = string(j.session_id) ?? ""
+      query_id = to_string(j.query_id) ?? ""
+  } else if match(raw_log, r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?(?: [A-Za-z0-9+:-]+)?,') {
+      # ---------------- csvlog ----------------
+      c, cerr = parse_csv(raw_log)
+      if cerr == null && length(c) >= 23 {
+          parsed_ok = true
+          log_format = "csvlog"
+          names = ["timestamp", "user", "dbname", "pid", "connection_from", "session_id", "line_num", "ps", "session_start", "vxid", "txid", "error_severity", "state_code", "message", "detail", "hint", "internal_query", "internal_position", "context", "statement", "cursor_position", "location", "application_name", "backend_type", "leader_pid", "query_id"]
+          for_each(c) -> |i, v| {
+              if v != "" && i < length(names) { __source_kv = set!(__source_kv, [string!(get!(names, [i]))], v) }
+          }
+          ts = string(__source_kv.timestamp) ?? ""
+          pid = string(__source_kv.pid) ?? ""
+          user = string(__source_kv.user) ?? ""
+          db = string(__source_kv.dbname) ?? ""
+          cf = string(__source_kv.connection_from) ?? ""
+          cfm, cfmerr = parse_regex(cf, r'^(?P<h>.+):(?P<p>\d+)$')
+          if cfmerr == null { rhost = string(cfm.h) ?? ""; rport = string(cfm.p) ?? "" } else { rhost = cf }
+          sev = string(__source_kv.error_severity) ?? ""
+          sqlstate = string(__source_kv.state_code) ?? ""
+          msg = string(__source_kv.message) ?? ""
+          detail = string(__source_kv.detail) ?? ""
+          statement = string(__source_kv.statement) ?? ""
+          app = string(__source_kv.application_name) ?? ""
+          session_id = string(__source_kv.session_id) ?? ""
+          query_id = string(__source_kv.query_id) ?? ""
+      }
+  } else {
+      # ---------------- stderr (log_line_prefix) ----------------
+      line = raw_log
+      sl, slerr = parse_regex(raw_log, r'^(?P<syslog_time>[A-Z][a-z]{2} +\d{1,2} \d{2}:\d{2}:\d{2}) (?P<syslog_host>\S+) (?P<syslog_app>postgres(?:ql)?|postmaster)\[(?P<syslog_pid>\d+)\]: (?:\[\d+(?:-\d+)?\] )?(?P<rest>(?s).*)$')
+      if slerr == null {
+          line = string(sl.rest) ?? ""
+          hostname = string(sl.syslog_host) ?? ""
+          pid = string(sl.syslog_pid) ?? ""
+          __source_kv = {"syslog_time": sl.syslog_time, "syslog_host": sl.syslog_host, "syslog_app": sl.syslog_app, "pid": sl.syslog_pid}
+      }
+      m, merr = parse_regex(line, r'(?s)^(?P<prefix>.*?)\b(?P<sev>DEBUG[1-5]?|LOG|INFO|NOTICE|WARNING|ERROR|FATAL|PANIC|DETAIL|HINT|STATEMENT|CONTEXT|QUERY|LOCATION):  (?P<body>.*)\z')
+      if merr == null {
+          parsed_ok = true
+          log_format = "stderr"
+          prefix = string(m.prefix) ?? ""
+          sev = string(m.sev) ?? ""
+          body = string(m.body) ?? ""
+          __source_kv.error_severity = sev
+          tm, tmerr = parse_regex(prefix, r'(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?: ?(?:[A-Z]{2,5}|[+-]\d{2}(?::?\d{2})?))?)')
+          if tmerr == null { ts = string(tm.ts) ?? ""; __source_kv.timestamp = ts }
+          if pid == "" {
+              pm, pmerr = parse_regex(prefix, r'\[(?P<pid>\d+)(?:-\d+)?\]')
+              if pmerr == null { pid = string(pm.pid) ?? ""; __source_kv.pid = pid }
+          }
+          um, umerr = parse_regex(prefix, r'(?P<user>\[unknown\]|[^\s@:\x5B\x5D]+)@(?P<db>\[unknown\]|[^\s@:\x5B\x5D]+)')
+          if umerr == null {
+              u = string(um.user) ?? ""
+              d = string(um.db) ?? ""
+              if u != "[unknown]" { user = u; __source_kv.user = u }
+              if d != "[unknown]" { db = d; __source_kv.dbname = d }
+          }
+          rm, rmerr = parse_regex(prefix, r'(?:^|:)(?P<h>[0-9A-Fa-f.:]+|\[local\])\((?P<p>\d+)\)')
+          if rmerr == null { rhost = string(rm.h) ?? ""; rport = string(rm.p) ?? ""; __source_kv.remote_host = rhost; __source_kv.remote_port = rport }
+          # First line (plus tab-indented continuation of a multi-line statement).
+          mm, mmerr = parse_regex(body, r'(?s)^(?P<main>.*?)(?:\n[^\t].*)?\z')
+          msg = if mmerr == null { string(mm.main) ?? body } else { body }
+          __source_kv.message = msg
+          dm, dmerr = parse_regex(body, r'(?m)\bDETAIL:  (?P<v>.*)$')
+          if dmerr == null { detail = string(dm.v) ?? ""; __source_kv.detail = detail }
+          hm, hmerr = parse_regex(body, r'(?m)\bHINT:  (?P<v>.*)$')
+          if hmerr == null { __source_kv.hint = hm.v }
+          stm, stmerr = parse_regex(body, r'(?s)\bSTATEMENT:  (?P<v>.*)\z')
+          if stmerr == null { statement = string(stm.v) ?? ""; __source_kv.statement = statement }
+          # A standalone continuation line carries the statement as its body.
+          if sev == "STATEMENT" { statement = msg }
+      }
+  }
+
+  # ---- time ----
+  time_ms = 0
+  if ts != "" {
+      tp, tperr = parse_regex(ts, r'^(?P<d>\d{4}-\d{2}-\d{2})[ T](?P<t>\d{2}:\d{2}:\d{2}(?:\.\d+)?) ?(?P<tz>.*)$')
+      if tperr == null {
+          tz = string(tp.tz) ?? ""
+          off = "+0000"
+          if match(tz, r'^[+-]\d{2}$') { off = tz + "00" }
+          if match(tz, r'^[+-]\d{2}:?\d{2}$') { off = replace(tz, ":", "") }
+          t, terr = parse_timestamp((string(tp.d) ?? "") + " " + (string(tp.t) ?? "") + " " + off, "%Y-%m-%d %H:%M:%S%.f %z")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+  }
+  if time_ms == 0 { time_ms = to_unix_timestamp(now(), unit: "milliseconds") }
+
+  # ---- severity ----
+  severity_id = 1
+  severity = "Informational"
+  if sev == "WARNING" { severity_id = 3; severity = "Medium" }
+  if sev == "ERROR" { severity_id = 4; severity = "High" }
+  if sev == "FATAL" { severity_id = 5; severity = "Critical" }
+  if sev == "PANIC" { severity_id = 6; severity = "Fatal" }
+
+  # ---- classify ----
+  kind = "base"
+  auth_user = user
+  auth_method = ""
+  dur_ms = -1
+  query = ""
+  if parsed_ok {
+      if starts_with(msg, "connection received:") {
+          kind = "net_open"
+          cr, crerr = parse_regex(msg, r'host=(?P<h>\S+)(?: port=(?P<p>\d+))?')
+          if crerr == null { rhost = string(cr.h) ?? rhost; rport = string(cr.p) ?? rport }
+      } else if match(msg, r'^(?:replication )?connection (?:authorized|authenticated):') {
+          kind = "auth_ok"
+          ca, caerr = parse_regex(msg, r'(?:user=(?P<u>\S+))?(?:.*?database=(?P<d>\S+))?(?:.*?identity="(?P<id>[^"]*)")?(?:.*?method=(?P<meth>\S+))?')
+          if caerr == null {
+              auth_user = string(ca.u) ?? string(ca.id) ?? user
+              if db == "" { db = string(ca.d) ?? "" }
+              auth_method = string(ca.meth) ?? ""
+          }
+      } else if starts_with(msg, "disconnection:") {
+          kind = "logoff"
+          dc, dcerr = parse_regex(msg, r'user=(?P<u>\S+) database=(?P<d>\S+) host=(?P<h>\S+)(?: port=(?P<p>\d+))?')
+          if dcerr == null {
+              auth_user = string(dc.u) ?? user
+              if db == "" { db = string(dc.d) ?? "" }
+              rhost = string(dc.h) ?? rhost
+              rport = string(dc.p) ?? rport
+          }
+      } else if sev == "FATAL" && match(msg, r'authentication failed for user|^no pg_hba\.conf entry|^pg_hba\.conf rejects|^role ".*" does not exist|^password authentication failed') {
+          kind = "auth_fail"
+          af, aferr = parse_regex(msg, r'^(?P<meth>\S+) authentication failed for user "(?P<u>[^"]*)"|user "(?P<u2>[^"]*)"|^role "(?P<u3>[^"]*)"')
+          if aferr == null {
+              auth_user = string(af.u) ?? string(af.u2) ?? string(af.u3) ?? user
+              auth_method = downcase(string(af.meth) ?? "")
+          }
+          ah, aherr = parse_regex(msg, r'host "(?P<h>[^"]+)"')
+          if aherr == null && rhost == "" { rhost = string(ah.h) ?? "" }
+          ad, aderr = parse_regex(msg, r'database "(?P<d>[^"]+)"')
+          if aderr == null && db == "" { db = string(ad.d) ?? "" }
+      } else if match(msg, r'^database system is ready to accept') {
+          kind = "start"
+      } else if match(msg, r'^database system is shut down|^received (?:smart|fast|immediate) shutdown request') {
+          kind = "stop"
+      } else {
+          sm, smerr = parse_regex(msg, r'(?s)^(?:duration: (?P<dur>[0-9.]+) ms  )?(?P<verb>statement|execute|parse|bind)(?: (?P<pname>[^:]+))?: (?P<q>.*)\z')
+          if smerr == null {
+              kind = "query"
+              query = string(sm.q) ?? ""
+              dd = to_float(string(sm.dur) ?? "") ?? -1.0
+              if dd >= 0.0 { dur_ms = to_int(dd) }
+          } else if statement != "" {
+              kind = "query"
+              query = statement
+          } else if severity_id >= 4 {
+              kind = "error"
+          }
+      }
+  }
+
+  verb = ""
+  vm, vmerr = parse_regex(query, r'^\s*(?P<v>[A-Za-z]+)')
+  if vmerr == null { verb = upcase(string(vm.v) ?? "") }
+
+  # ---- endpoints / actors shared by the classes ----
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]*:[0-9A-Fa-f:.]+$'
+  src = {}
+  if match(rhost, ip_re) { src.ip = rhost } else if rhost == "[local]" { src.name = "local" } else if rhost != "" { src.hostname = rhost }
+  if rport != "" && rport != "0" { src.port = to_int(rport) ?? 0 }
+  if app != "" { src.svc_name = app }
+  dst = { "svc_name": "postgresql" }
+  if hostname != "" { dst.hostname = hostname }
+
+  class_uid = 0
+  class_name = "Base Event"
+  category_uid = 0
+  category_name = "Uncategorized"
+  activity_id = 99
+  activity_name = "Other"
+  status_id = 0
+  status = "Unknown"
+  if kind == "net_open" {
+      class_uid = 4001; class_name = "Network Activity"; category_uid = 4; category_name = "Network Activity"
+      activity_id = 1; activity_name = "Open"; status_id = 1; status = "Success"
+  } else if kind == "auth_ok" || kind == "auth_fail" || kind == "logoff" {
+      class_uid = 3002; class_name = "Authentication"; category_uid = 3; category_name = "Identity & Access Management"
+      activity_id = 1; activity_name = "Logon"; status_id = 1; status = "Success"
+      if kind == "auth_fail" { status_id = 2; status = "Failure" }
+      if kind == "logoff" { activity_id = 2; activity_name = "Logoff" }
+  } else if kind == "query" {
+      class_uid = 6005; class_name = "Datastore Activity"; category_uid = 6; category_name = "Application Activity"
+      activity_id = 99; activity_name = "Other"
+      if includes(["SELECT", "WITH", "SHOW", "EXPLAIN", "TABLE", "VALUES", "FETCH"], verb) { activity_id = 4; activity_name = "Query" }
+      if includes(["INSERT", "COPY"], verb) { activity_id = 5; activity_name = "Write" }
+      if includes(["UPDATE", "MERGE", "ALTER", "GRANT", "REVOKE", "SET"], verb) { activity_id = 2; activity_name = "Update" }
+      if includes(["DELETE", "DROP", "TRUNCATE"], verb) { activity_id = 7; activity_name = "Delete" }
+      if verb == "CREATE" { activity_id = 6; activity_name = "Create" }
+      status_id = 1; status = "Success"
+      if severity_id >= 4 { status_id = 2; status = "Failure" }
+      if sev == "STATEMENT" { status_id = 0; status = "Unknown" }
+  } else if kind == "start" || kind == "stop" {
+      class_uid = 6002; class_name = "Application Lifecycle"; category_uid = 6; category_name = "Application Activity"
+      activity_id = 3; activity_name = "Start"; status_id = 1; status = "Success"
+      if kind == "stop" { activity_id = 4; activity_name = "Stop" }
+  } else if kind == "error" {
+      class_uid = 6008; class_name = "Application Error"; category_uid = 6; category_name = "Application Activity"
+      activity_id = 1; activity_name = "General Error"; status_id = 2; status = "Failure"
+  }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": sha2("postgresql|raw|" + raw_log, variant: "SHA-256"),
+      "log_name": "postgresql",
+      "log_provider": "postgresql",
+      "product": { "name": "PostgreSQL", "vendor_name": "PostgreSQL Global Development Group" }
+  }
+  if log_format != "" { metadata.log_format = log_format }
+  if ts != "" { metadata.original_time = ts }
+  if sev != "" { metadata.log_level = sev }
+  if session_id != "" { metadata.correlation_uid = session_id }
+
+  . = {
+      "class_uid": class_uid,
+      "class_name": class_name,
+      "category_uid": category_uid,
+      "category_name": category_name,
+      "activity_id": activity_id,
+      "activity_name": activity_name,
+      "type_uid": class_uid * 100 + activity_id,
+      "severity_id": severity_id,
+      "severity": severity,
+      "status_id": status_id,
+      "status": status,
+      "time": time_ms,
+      "raw_data": raw_log,
+      "metadata": metadata
+  }
+  if msg != "" { .message = msg }
+  if sqlstate != "" && sqlstate != "00000" { .status_code = sqlstate }
+  if detail != "" { .status_detail = detail }
+
+  process = {}
+  if pid != "" { process = { "pid": to_int(pid) ?? 0, "name": "postgres" } }
+
+  if class_uid == 4001 {
+      if length(src) > 0 { .src_endpoint = src }
+      .dst_endpoint = dst
+  } else if class_uid == 3002 {
+      u = auth_user
+      if u == "" || u == "[unknown]" { u = "unknown" }
+      .user = { "name": u }
+      .service = { "name": "postgresql" }
+      .dst_endpoint = dst
+      if length(src) > 0 { .src_endpoint = src }
+      if session_id != "" { .session = { "uid": session_id } }
+      if db != "" { .unmapped = { "database": db } }
+      if auth_method != "" {
+          .auth_protocol = auth_method
+          .auth_protocol_id = 99
+          if auth_method == "ldap" { .auth_protocol_id = 12 }
+          if auth_method == "radius" { .auth_protocol_id = 10 }
+          if auth_method == "gss" || auth_method == "gssapi" { .auth_protocol_id = 2 }
+      }
+      .logon_type_id = 3
+      .logon_type = "Network"
+      if rhost == "[local]" { .logon_type_id = 2; .logon_type = "Interactive" }
+  } else if class_uid == 6005 {
+      actor = {}
+      if user != "" { actor.user = { "name": user } }
+      if length(process) > 0 { actor.process = process }
+      if session_id != "" { actor.session = { "uid": session_id } }
+      if length(actor) == 0 { actor.app_name = "postgres" }
+      .actor = actor
+      if length(src) == 0 { src.name = "unknown" }
+      .src_endpoint = src
+      .dst_endpoint = dst
+      database = { "type_id": 1, "type": "Relational" }
+      if db != "" { database.name = db } else { database.uid = "unknown" }
+      .database = database
+      .type_id = 1
+      .type = "Database"
+      qi = { "query_string": query, "name": verb }
+      if verb == "" { qi.name = "statement" }
+      if query_id != "" && query_id != "0" { qi.uid = query_id }
+      .query_info = qi
+      if dur_ms >= 0 { .duration = dur_ms }
+  } else if class_uid == 6002 {
+      .app = { "name": "PostgreSQL", "vendor_name": "PostgreSQL Global Development Group" }
+  }
+
+  if hostname != "" {
+      .device = { "hostname": hostname, "type_id": 1, "type": "Server" }
+      .metadata.profiles = ["host"]
+  }
+
+  if !parsed_ok {
+      .metadata.log_level = "error"
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+  }
+  .
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    application_name
+  | connection_from
+  | dbname
+  | detail
+  | error_severity
+  | message
+  | pid
+  | query_id
+  | remote_host
+  | remote_port
+  | session_id
+  | state_code
+  | statement
+  | syslog_app
+  | syslog_host
+  | timestamp
+  | user
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+# Runtime samples (NAN-2327): one per event shape this parser routes. The
+# sidecar corpus in samples/ (sources in samples/README.md) is the full set.
+samples:
+  # stderr_connection_received
+  - raw: "2026-11-20 10:23:45.101 UTC [24117] [unknown]@[unknown] LOG:  connection received: host=192.0.2.10 port=54321"
+    expect:
+      "class_uid": 4001
+      "activity_id": 1
+      "src_endpoint.ip": "192.0.2.10"
+  # stderr_connection_authorized
+  - raw: "2026-11-20 10:23:45.120 UTC [24117] alice@appdb LOG:  connection authorized: user=alice database=appdb application_name=psql SSL enabled (protocol=TLSv1.3, cipher=TLS_AES_256_GCM_SHA384, bits=256)"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "status_id": 1
+      "user.name": "alice"
+  # stderr_password_auth_failed_multiline
+  - raw: "2026-11-20 10:24:02.511 UTC [24130] bob@appdb FATAL:  password authentication failed for user \"bob\"\n2026-11-20 10:24:02.511 UTC [24130] bob@appdb DETAIL:  Connection matched file \"/etc/postgresql/16/main/pg_hba.conf\" line 118: \"host    all             all             0.0.0.0/0               scram-sha-256\""
+    expect:
+      "class_uid": 3002
+      "status_id": 2
+      "user.name": "bob"
+      "severity_id": 5
+  # stderr_no_pg_hba_entry
+  - raw: "2026-11-20 10:24:10.002 UTC [24133] mallory@postgres FATAL:  no pg_hba.conf entry for host \"198.51.100.23\", user \"mallory\", database \"postgres\", no encryption"
+    expect:
+      "class_uid": 3002
+      "status_id": 2
+      "src_endpoint.ip": "198.51.100.23"
+      "user.name": "mallory"
+  # stderr_disconnection
+  - raw: "2026-11-20 10:30:01.900 UTC [24117] alice@appdb LOG:  disconnection: session time: 0:06:16.782 user=alice database=appdb host=192.0.2.10 port=54321"
+    expect:
+      "class_uid": 3002
+      "activity_id": 2
+  # stderr_duration_statement
+  - raw: "2026-11-20 10:25:03.456 UTC [24117] alice@appdb LOG:  duration: 1834.512 ms  statement: UPDATE orders SET status = 'shipped' WHERE id = 4211;"
+    expect:
+      "class_uid": 6005
+      "activity_id": 2
+      "duration": 1834
+      "database.name": "appdb"
+      "actor.user.name": "alice"
+  # stderr_error_with_statement
+  - raw: "2026-11-20 10:26:00.010 UTC [24117] alice@appdb ERROR:  relation \"custmers\" does not exist at character 15\n2026-11-20 10:26:00.010 UTC [24117] alice@appdb STATEMENT:  SELECT * FROM custmers;"
+    expect:
+      "class_uid": 6005
+      "status_id": 2
+      "query_info.query_string": "SELECT * FROM custmers;"
+  # stderr_checkpoint_complete
+  - raw: "2026-11-20 10:28:41.775 UTC [61] LOG:  checkpoint complete: wrote 1532 buffers (9.4%); 0 WAL file(s) added, 0 removed, 1 recycled; write=153.192 s, sync=0.011 s, total=153.233 s; sync files=41, longest=0.003 s, average=0.001 s; distance=13428 kB, estimate=13428 kB; lsn=0/1A2B3C4D, redo lsn=0/19F00028"
+    expect:
+      "class_uid": 0
+  # stderr_ready_to_accept
+  - raw: "2026-11-20 10:00:00.312 UTC [1] LOG:  database system is ready to accept connections"
+    expect:
+      "class_uid": 6002
+      "activity_id": 3
+  # stderr_panic_error
+  - raw: "2026-11-20 10:40:00.000 UTC [61] PANIC:  could not write to file \"pg_wal/xlogtemp.61\": No space left on device"
+    expect:
+      "class_uid": 6008
+      "severity_id": 6
+  # csvlog_auth_failed
+  - raw: "2026-11-20 10:24:02.511 UTC,\"bob\",\"appdb\",24130,\"192.0.2.10:54400\",673db8a2.5e42,1,\"authentication\",2026-11-20 10:24:02 UTC,3/41,0,FATAL,28P01,\"password authentication failed for user \"\"bob\"\"\",\"Connection matched file \"\"/etc/postgresql/16/main/pg_hba.conf\"\" line 118: \"\"host all all 0.0.0.0/0 scram-sha-256\"\"\",,,,,,,,\"\",\"client backend\",,0"
+    expect:
+      "class_uid": 3002
+      "status_id": 2
+      "status_code": "28P01"
+  # jsonlog_duration_statement
+  - raw: "{\"timestamp\": \"2026-11-20 10:25:03.456 UTC\", \"user\": \"alice\", \"dbname\": \"appdb\", \"pid\": 24117, \"remote_host\": \"192.0.2.10\", \"remote_port\": 54321, \"session_id\": \"673db7f1.5e35\", \"line_num\": 7, \"ps\": \"UPDATE\", \"session_start\": \"2026-11-20 10:23:45 UTC\", \"vxid\": \"3/14\", \"txid\": 0, \"error_severity\": \"LOG\", \"message\": \"duration: 1834.512 ms  statement: UPDATE orders SET status = 'shipped' WHERE id = 4211;\", \"application_name\": \"psql\", \"backend_type\": \"client backend\", \"query_id\": -6235128741109874356}"
+    expect:
+      "class_uid": 6005
+      "src_endpoint.ip": "192.0.2.10"
+      "duration": 1834
+  # junk
+  - raw: "this is not a postgres log line"
+    expect:
+      "class_uid": 0
+      "unmapped.parse_fallback": "unparsable input"

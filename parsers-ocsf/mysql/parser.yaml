@@ -1,0 +1,787 @@
+name: mysql_ocsf
+display_name: MySQL / MariaDB (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses MySQL and MariaDB server logs into complete OCSF 1.9.0 records:
+  the error log (MySQL 8.x `time thread [label] [MY-code] [subsystem] msg`,
+  MySQL 5.7 and MariaDB `[label] msg`, and the log_sink_json JSON format), the
+  general query log, the slow query log (one entry per event: aggregate lines
+  from `# Time:` / `# User@Host:` with multiline), MySQL Enterprise Audit JSON
+  and Percona Audit Log JSON. Routing per event:
+    Access denied (error log, general log Connect, audit connect status != 0)
+                                         -> Authentication 3002 (Logon, Failure)
+    general log Connect, audit connect   -> Authentication 3002 (Logon, Success)
+    audit disconnect / Quit              -> Authentication 3002 (Logoff)
+    general log Query / Execute / Init DB, slow log entries, audit query /
+    general events                       -> Datastore Activity 6005
+    ready for connections / Shutdown complete -> Application Lifecycle 6002
+    other [ERROR] lines                  -> Application Error 6008
+    everything else                      -> Base Event 0
+  Severity follows the log label (Warning Medium, ERROR High). Input that matches
+  none of the formats is kept whole as a Base Event marked unmapped.parse_fallback.
+match_values:
+  - mysql
+category: application
+vendor: "Oracle"
+product: "MySQL"
+parser_vrl: |
+  # MySQL / MariaDB error, general, slow and audit logs -> OCSF 1.9.0. Emits the
+  # COMPLETE record on root and never aborts on bad input.
+
+  raw_log = string(.message) ?? ""
+  if raw_log == "" && exists(.message) { raw_log = encode_json(.message) }
+  __raw_body = raw_log
+  __source_kv = {}
+
+  parsed_ok = false
+  log_name = "mysql"
+  kind = "base"
+  ts = ""
+  time_ms = 0
+  thread = ""
+  label = ""
+  msg = ""
+  user = ""
+  host = ""
+  db = ""
+  query = ""
+  verb = ""
+  status_code = ""
+  failed = false
+  dur_ms = -1
+  version = ""
+
+  j, jerr = parse_json(raw_log)
+  if jerr == null && is_object(j) {
+      jo = object!(j)
+      __source_kv = jo
+      ar = object(jo.audit_record) ?? {}
+      if length(ar) > 0 {
+          # ---------------- Percona Audit Log (JSON) ----------------
+          parsed_ok = true
+          log_name = "audit"
+          name = string(ar.name) ?? ""
+          ts = string(ar.timestamp) ?? ""
+          thread = to_string(ar.connection_id) ?? ""
+          db = string(ar.db) ?? ""
+          sc = to_string(ar.status) ?? ""
+          if sc != "" && sc != "0" { failed = true; status_code = sc }
+          pu, puerr = parse_regex(string(ar.user) ?? "", r'^(?P<u>[^\x5B\s]*)')
+          if puerr == null { user = string(pu.u) ?? "" }
+          if user == "" { user = string(ar.priv_user) ?? "" }
+          host = string(ar.ip) ?? ""
+          if host == "" { host = string(ar.host) ?? "" }
+          query = string(ar.sqltext) ?? ""
+          verb = string(ar.command_class) ?? ""
+          if name == "Connect" || name == "Change user" { kind = if failed { "auth_fail" } else { "auth_ok" } }
+          if name == "Quit" { kind = "logoff" }
+          if query != "" { kind = "query" }
+      } else if exists(jo.class) && exists(jo.event) {
+          # ---------------- MySQL Enterprise Audit (JSON) ----------------
+          parsed_ok = true
+          log_name = "audit"
+          ts = string(jo.timestamp) ?? ""
+          thread = to_string(jo.connection_id) ?? ""
+          user = string(jo.login.user) ?? ""
+          if user == "" { user = string(jo.account.user) ?? "" }
+          host = string(jo.login.ip) ?? ""
+          if host == "" { host = string(jo.account.host) ?? "" }
+          cls = string(jo.class) ?? ""
+          ev = string(jo.event) ?? ""
+          if cls == "connection" {
+              db = string(jo.connection_data.db) ?? ""
+              sc = to_string(jo.connection_data.status) ?? ""
+              if sc != "" && sc != "0" { failed = true; status_code = sc }
+              if ev == "connect" || ev == "change_user" { kind = if failed { "auth_fail" } else { "auth_ok" } }
+              if ev == "disconnect" { kind = "logoff" }
+          } else {
+              gd = object(jo.general_data) ?? object(jo.query_data) ?? {}
+              query = string(gd.query) ?? ""
+              verb = string(gd.sql_command) ?? ""
+              sc = to_string(gd.status) ?? ""
+              if sc != "" && sc != "0" { failed = true; status_code = sc }
+              if query != "" { kind = "query" }
+          }
+      } else if exists(jo.err_code) || exists(jo.label) {
+          # ---------------- error log, log_sink_json ----------------
+          parsed_ok = true
+          log_name = "error"
+          ts = string(jo.time) ?? ""
+          thread = to_string(jo.thread) ?? ""
+          label = string(jo.label) ?? ""
+          msg = string(jo.msg) ?? ""
+          status_code = to_string(jo.err_code) ?? ""
+      }
+  } else {
+      e, eerr = parse_regex(raw_log, r'(?s)^(?P<time>\d{4}-\d{2}-\d{2}[T ] ?\d{1,2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?|\d{6} +\d{1,2}:\d{2}:\d{2}) +(?P<thread>\d+) \[(?P<label>System|Note|Warning|ERROR|Error|Info)\] (?:\[(?P<err_code>MY-\d+)\] \[(?P<subsystem>[^\x5D]+)\] )?(?P<msg>.*)\z')
+      g, gerr = parse_regex(raw_log, r'(?s)^(?:(?P<time>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?|\d{6} +\d{1,2}:\d{2}:\d{2})|)\s+(?P<thread>\d+) (?P<command>Connect|Query|Quit|Init DB|Execute|Prepare|Close stmt|Field List|Statistics|Shutdown|Change user|Binlog Dump|Ping|Refresh|Reset stmt|Fetch|Set option|Processlist|Kill)(?:[ \t]+(?P<argument>.*))?\z')
+      if eerr == null {
+          # ---------------- error log (text) ----------------
+          parsed_ok = true
+          log_name = "error"
+          __source_kv = compact(e)
+          ts = string(e.time) ?? ""
+          thread = string(e.thread) ?? ""
+          label = string(e.label) ?? ""
+          msg = string(e.msg) ?? ""
+          status_code = string(e.err_code) ?? ""
+      } else if gerr == null {
+          # ---------------- general query log ----------------
+          parsed_ok = true
+          log_name = "general"
+          __source_kv = compact(g)
+          ts = string(g.time) ?? ""
+          thread = string(g.thread) ?? ""
+          cmd = string(g.command) ?? ""
+          arg = strip_whitespace(string(g.argument) ?? "")
+          if cmd == "Connect" || cmd == "Change user" {
+              ad, aderr = parse_regex(arg, r'^Access denied for user \x27(?P<u>[^\x27]*)\x27@\x27(?P<h>[^\x27]*)\x27')
+              if aderr == null {
+                  kind = "auth_fail"; failed = true; status_code = "1045"
+                  user = string(ad.u) ?? ""; host = string(ad.h) ?? ""
+                  msg = arg
+              } else {
+                  cm, cmerr = parse_regex(arg, r'^(?P<u>[^@\s]*)@(?P<h>\S+) on ?(?P<db>\S*)')
+                  if cmerr == null {
+                      kind = "auth_ok"
+                      user = string(cm.u) ?? ""; host = string(cm.h) ?? ""; db = string(cm.db) ?? ""
+                  }
+              }
+          } else if cmd == "Quit" {
+              kind = "logoff"
+          } else if cmd == "Query" || cmd == "Execute" || cmd == "Prepare" {
+              kind = "query"
+              query = arg
+          } else if cmd == "Init DB" {
+              kind = "init_db"
+              db = arg
+          }
+      } else if match(raw_log, r'^# (?:Time|User@Host): ') {
+          # ---------------- slow query log entry ----------------
+          parsed_ok = true
+          log_name = "slow"
+          kind = "query"
+          st, sterr = parse_regex(raw_log, r'(?m)^# Time: (?P<time>\S+(?: +\d{1,2}:\d{2}:\d{2})?)\s*$')
+          if sterr == null { ts = string(st.time) ?? ""; __source_kv.time = ts }
+          su, suerr = parse_regex(raw_log, r'(?m)^# User@Host: (?P<user>[^\x5B\s]*)\[(?P<priv_user>[^\x5D]*)\] @ (?P<host>[^\x5B\s]*) ?\[(?P<ip>[^\x5D]*)\](?:\s+Id:\s+(?P<id>\d+))?')
+          if suerr == null {
+              __source_kv = merge(__source_kv, compact(su))
+              user = string(su.user) ?? ""
+              if user == "" { user = string(su.priv_user) ?? "" }
+              host = string(su.ip) ?? ""
+              if host == "" { host = string(su.host) ?? "" }
+              thread = string(su.id) ?? ""
+          }
+          sq, sqerr = parse_regex(raw_log, r'(?m)^# Query_time: (?P<query_time>[0-9.]+)\s+Lock_time: (?P<lock_time>[0-9.]+)\s+Rows_sent: (?P<rows_sent>\d+)\s+Rows_examined: (?P<rows_examined>\d+)')
+          if sqerr == null {
+              __source_kv = merge(__source_kv, compact(sq))
+              qt = to_float(string(sq.query_time) ?? "") ?? -1.0
+              if qt >= 0.0 { dur_ms = to_int(qt * 1000.0) }
+          }
+          sd, sderr = parse_regex(raw_log, r'(?m)^use (?P<db>[^;\s]+);\s*$')
+          if sderr == null { db = string(sd.db) ?? ""; __source_kv.db = db }
+          ss, sserr = parse_regex(raw_log, r'(?m)^SET timestamp=(?P<timestamp>\d+);\s*$')
+          if sserr == null {
+              __source_kv.timestamp = ss.timestamp
+              tsec = to_int(string(ss.timestamp) ?? "") ?? 0
+              if tsec > 0 { time_ms = tsec * 1000 }
+          }
+          # The statement: every line that is not a header, `use db;` or `SET timestamp=`.
+          lines = split(raw_log, "\n")
+          for_each(lines) -> |_i, l| {
+              if !match(l, r'^#|^use [^;\s]+;\s*$|^SET timestamp=\d+;\s*$') && strip_whitespace(l) != "" {
+                  query = if query == "" { l } else { query + "\n" + l }
+              }
+          }
+          if query != "" { __source_kv.statement = query }
+          if starts_with(query, "# administrator command:") { kind = "base" }
+          if query == "" { kind = "base" }
+      }
+  }
+
+  # ---- error-log message classification ----
+  if log_name == "error" && msg != "" {
+      am, amerr = parse_regex(msg, r'Access denied for user \x27(?P<u>[^\x27]*)\x27@\x27(?P<h>[^\x27]*)\x27')
+      if amerr == null {
+          kind = "auth_fail"; failed = true
+          user = string(am.u) ?? ""; host = string(am.h) ?? ""
+      } else if match(msg, r'ready for connections') {
+          kind = "start"
+          vm, vmerr = parse_regex(msg, r'Version: \x27(?P<v>[^\x27]+)\x27')
+          if vmerr == null { version = string(vm.v) ?? "" }
+      } else if match(msg, r'Shutdown complete|Received SHUTDOWN from user|Normal shutdown') {
+          kind = "stop"
+      } else if downcase(label) == "error" {
+          kind = "error"
+      }
+  }
+
+  # ---- time ----
+  if time_ms == 0 && ts != "" {
+      t, terr = parse_timestamp(ts, "%+")
+      if terr != null {
+          n = replace(replace(ts, "T", " "), r' +', " ")
+          t, terr = parse_timestamp(n, "%Y-%m-%d %H:%M:%S%.f", timezone: "UTC")
+          if terr != null { t, terr = parse_timestamp(n, "%y%m%d %H:%M:%S", timezone: "UTC") }
+      }
+      if terr == null { time_ms = to_unix_timestamp!(t, unit: "milliseconds") }
+  }
+  if time_ms == 0 { time_ms = to_unix_timestamp(now(), unit: "milliseconds") }
+
+  # ---- severity ----
+  lv = downcase(label)
+  severity_id = 1
+  severity = "Informational"
+  if lv == "warning" { severity_id = 3; severity = "Medium" }
+  if lv == "error" { severity_id = 4; severity = "High" }
+  if failed && severity_id < 3 { severity_id = 3; severity = "Medium" }
+
+  if verb == "" {
+      vq, vqerr = parse_regex(query, r'^\s*(?P<v>[A-Za-z]+)')
+      if vqerr == null { verb = string(vq.v) ?? "" }
+  }
+  sql_verb = upcase(replace(verb, r'_.*$', ""))
+
+  class_uid = 0
+  class_name = "Base Event"
+  category_uid = 0
+  category_name = "Uncategorized"
+  activity_id = 99
+  activity_name = "Other"
+  status_id = 0
+  status = "Unknown"
+  if kind == "auth_ok" || kind == "auth_fail" || kind == "logoff" {
+      class_uid = 3002; class_name = "Authentication"; category_uid = 3; category_name = "Identity & Access Management"
+      activity_id = 1; activity_name = "Logon"; status_id = 1; status = "Success"
+      if kind == "logoff" { activity_id = 2; activity_name = "Logoff" }
+      if failed { status_id = 2; status = "Failure" }
+  } else if kind == "query" || kind == "init_db" {
+      class_uid = 6005; class_name = "Datastore Activity"; category_uid = 6; category_name = "Application Activity"
+      if kind == "init_db" { activity_id = 3; activity_name = "Connect" }
+      if includes(["SELECT", "SHOW", "WITH", "EXPLAIN", "DESCRIBE", "DESC", "TABLE"], sql_verb) { activity_id = 4; activity_name = "Query" }
+      if includes(["INSERT", "REPLACE", "LOAD"], sql_verb) { activity_id = 5; activity_name = "Write" }
+      if includes(["UPDATE", "ALTER", "GRANT", "REVOKE", "SET", "RENAME"], sql_verb) { activity_id = 2; activity_name = "Update" }
+      if includes(["DELETE", "DROP", "TRUNCATE"], sql_verb) { activity_id = 7; activity_name = "Delete" }
+      if sql_verb == "CREATE" { activity_id = 6; activity_name = "Create" }
+      status_id = 1; status = "Success"
+      if failed { status_id = 2; status = "Failure" }
+  } else if kind == "start" || kind == "stop" {
+      class_uid = 6002; class_name = "Application Lifecycle"; category_uid = 6; category_name = "Application Activity"
+      activity_id = 3; activity_name = "Start"; status_id = 1; status = "Success"
+      if kind == "stop" { activity_id = 4; activity_name = "Stop" }
+  } else if kind == "error" {
+      class_uid = 6008; class_name = "Application Error"; category_uid = 6; category_name = "Application Activity"
+      activity_id = 1; activity_name = "General Error"; status_id = 2; status = "Failure"
+  }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": sha2("mysql|raw|" + raw_log, variant: "SHA-256"),
+      "log_name": log_name,
+      "log_provider": "mysqld",
+      "product": { "name": "MySQL", "vendor_name": "Oracle" }
+  }
+  if ts != "" { metadata.original_time = ts }
+  if label != "" { metadata.log_level = label }
+
+  . = {
+      "class_uid": class_uid,
+      "class_name": class_name,
+      "category_uid": category_uid,
+      "category_name": category_name,
+      "activity_id": activity_id,
+      "activity_name": activity_name,
+      "type_uid": class_uid * 100 + activity_id,
+      "severity_id": severity_id,
+      "severity": severity,
+      "status_id": status_id,
+      "status": status,
+      "time": time_ms,
+      "raw_data": raw_log,
+      "metadata": metadata
+  }
+  if msg != "" { .message = msg }
+  if status_code != "" { .status_code = status_code }
+
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]*:[0-9A-Fa-f:.]+$'
+  src = {}
+  if match(host, ip_re) { src.ip = host } else if host != "" { src.hostname = host }
+  dst = { "svc_name": "mysql" }
+
+  if class_uid == 3002 {
+      u = user
+      if u == "" { u = "unknown" }
+      .user = { "name": u }
+      .service = { "name": "mysql" }
+      .dst_endpoint = dst
+      if length(src) > 0 { .src_endpoint = src }
+      if thread != "" { .session = { "uid": thread } }
+      if db != "" { .unmapped = { "database": db } }
+      .logon_type_id = 3
+      .logon_type = "Network"
+      if host == "localhost" { .logon_type_id = 2; .logon_type = "Interactive" }
+  } else if class_uid == 6005 {
+      actor = {}
+      if user != "" { actor.user = { "name": user } }
+      if thread != "" { actor.session = { "uid": thread } }
+      if length(actor) == 0 { actor.app_name = "mysqld" }
+      .actor = actor
+      if length(src) == 0 { src.name = "unknown" }
+      .src_endpoint = src
+      .dst_endpoint = dst
+      database = { "type_id": 1, "type": "Relational" }
+      if db != "" { database.name = db } else { database.uid = "unknown" }
+      .database = database
+      .type_id = 1
+      .type = "Database"
+      if query != "" {
+          qn = sql_verb
+          if qn == "" { qn = "statement" }
+          .query_info = { "query_string": query, "name": qn }
+      }
+      if dur_ms >= 0 { .duration = dur_ms }
+  } else if class_uid == 6002 {
+      .app = { "name": "MySQL", "vendor_name": "Oracle" }
+      if version != "" { .app.version = version }
+  }
+
+  if !parsed_ok {
+      .metadata.log_level = "error"
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+  }
+  .
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # query_time: Slow log Query_time in seconds converted to the OCSF millisecond duration.
+  # timestamp: Slow log SET timestamp Unix seconds converted to event milliseconds.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        query_time
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if ."duration" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        timestamp
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    account\.host
+  | account\.user
+  | argument
+  | audit_record\.command_class
+  | audit_record\.connection_id
+  | audit_record\.db
+  | audit_record\.ip
+  | audit_record\.sqltext
+  | audit_record\.status
+  | audit_record\.timestamp
+  | audit_record\.user
+  | class
+  | connection_data\.db
+  | connection_data\.status
+  | connection_id
+  | db
+  | err_code
+  | general_data\.query
+  | general_data\.sql_command
+  | general_data\.status
+  | host
+  | id
+  | ip
+  | label
+  | login\.ip
+  | login\.user
+  | msg
+  | priv_user
+  | statement
+  | thread
+  | time
+  | timestamp
+  | user
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+# Runtime samples (NAN-2327): one per event shape this parser routes. The
+# sidecar corpus in samples/ (sources in samples/README.md) is the full set.
+samples:
+  # errlog_access_denied
+  - raw: "2026-11-20T10:24:02.511234Z 27 [Note] [MY-010926] [Server] Access denied for user 'dbadmin'@'192.0.2.77' (using password: YES)"
+    expect:
+      "class_uid": 3002
+      "status_id": 2
+      "user.name": "dbadmin"
+      "src_endpoint.ip": "192.0.2.77"
+  # errlog_ready_for_connections
+  - raw: "2026-11-20T10:00:00.412345Z 0 [System] [MY-010931] [Server] /usr/sbin/mysqld: ready for connections. Version: '8.0.40'  socket: '/var/run/mysqld/mysqld.sock'  port: 3306  MySQL Community Server - GPL."
+    expect:
+      "class_uid": 6002
+      "activity_id": 3
+      "app.version": "8.0.40"
+  # errlog_error_innodb
+  - raw: "2026-11-20T10:40:00.000001Z 0 [ERROR] [MY-012592] [InnoDB] Operating system error number 28 in a file operation."
+    expect:
+      "class_uid": 6008
+      "severity_id": 4
+      "status_code": "MY-012592"
+  # errlog_warning_self_signed_ca
+  - raw: "2020-08-06T14:25:02.936146Z 0 [Warning] [MY-010068] [Server] CA certificate /var/mysql/sslinfo/cacert.pem is self signed."
+    expect:
+      "class_uid": 0
+      "severity_id": 3
+  # errlog_mariadb_access_denied
+  - raw: "2026-11-20 10:24:05 31 [Warning] Access denied for user 'admin'@'198.51.100.23' (using password: YES)"
+    expect:
+      "class_uid": 3002
+      "status_id": 2
+      "user.name": "admin"
+  # genlog_connect
+  - raw: "2026-11-20T10:23:45.120001Z\t   12 Connect\tapp@192.0.2.10 on appdb using TCP/IP"
+    expect:
+      "class_uid": 3002
+      "status_id": 1
+      "user.name": "app"
+      "src_endpoint.ip": "192.0.2.10"
+  # genlog_query
+  - raw: "2026-11-20T10:25:00.000100Z\t   12 Query\tSELECT id, email FROM customers WHERE created_at > NOW() - INTERVAL 1 DAY"
+    expect:
+      "class_uid": 6005
+      "activity_id": 4
+      "actor.session.uid": "12"
+  # slowlog_entry
+  - raw: "# Time: 2026-11-20T10:25:03.456789Z\n# User@Host: app[app] @  [192.0.2.10]  Id:    12\n# Query_time: 1.834512  Lock_time: 0.000123 Rows_sent: 0  Rows_examined: 1048576\nuse appdb;\nSET timestamp=1795170303;\nUPDATE orders SET status = 'shipped' WHERE customer_id = 4211;"
+    expect:
+      "class_uid": 6005
+      "activity_id": 2
+      "duration": 1834
+      "database.name": "appdb"
+      "time": 1795170303000
+  # audit_enterprise_connect_failed
+  - raw: "{\"timestamp\": \"2026-11-20 10:24:02\", \"id\": 7, \"class\": \"connection\", \"event\": \"connect\", \"connection_id\": 27, \"account\": {\"user\": \"\", \"host\": \"\"}, \"login\": {\"user\": \"root\", \"os\": \"\", \"ip\": \"192.0.2.77\", \"proxy\": \"\"}, \"connection_data\": {\"connection_type\": \"tcp/ip\", \"status\": 1045, \"db\": \"\"}}"
+    expect:
+      "class_uid": 3002
+      "status_id": 2
+      "status_code": "1045"
+  # audit_enterprise_disconnect
+  - raw: "{\"timestamp\": \"2019-10-03 14:24:45\", \"id\": 3, \"class\": \"connection\", \"event\": \"disconnect\", \"connection_id\": 5, \"account\": {\"user\": \"root\", \"host\": \"localhost\"}, \"login\": {\"user\": \"root\", \"os\": \"\", \"ip\": \"::1\", \"proxy\": \"\"}, \"connection_data\": {\"connection_type\": \"ssl\"}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 2
+      "status_id": 1
+  # audit_percona_query
+  - raw: "{\"audit_record\": {\"name\": \"Query\", \"record\": \"743_2026-11-20T10:00:00\", \"timestamp\": \"2026-11-20T10:25:00Z\", \"command_class\": \"select\", \"connection_id\": \"12\", \"status\": 0, \"sqltext\": \"SELECT * FROM customers LIMIT 10\", \"user\": \"app[app] @  [192.0.2.10]\", \"host\": \"\", \"os_user\": \"\", \"ip\": \"192.0.2.10\", \"db\": \"appdb\"}}"
+    expect:
+      "class_uid": 6005
+      "activity_id": 4
+      "database.name": "appdb"
+  # junk
+  - raw: "this is not a mysql log line"
+    expect:
+      "class_uid": 0
+      "unmapped.parse_fallback": "unparsable input"

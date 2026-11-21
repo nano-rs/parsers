@@ -79,6 +79,7 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Azure Firewall](parsers-ocsf/azure_firewall) | `azure_firewall` | Microsoft | JSON | Network rules, application rules, threat intel, DNS proxy |
 | [GCP Audit Log](parsers-ocsf/gcp_audit) | `gcp_audit` | Google | JSON | IAM changes, API calls, resource operations, authorization |
 | [Kubernetes Audit](parsers-ocsf/kubernetes_audit) | `kubernetes_audit` | CNCF | JSON | API server audit: resource operations, RBAC, user identity |
+| [Kubernetes Container Logs](parsers-ocsf/kubernetes_container) | `kubernetes_container` | CNCF | CRI text / json-file / collector JSON | Container stdout/stderr from /var/log/pods (CRI `P`/`F` lines), Fluent Bit and Vector kubernetes_logs envelopes: namespace, pod, pod UID, container and node, JSON bodies passed through. OCSF only |
 | [Microsoft 365](parsers-ocsf/microsoft_365) | `microsoft_365` | Microsoft | JSON | Exchange, SharePoint, Azure AD, DLP, Teams audit events |
 | [Google Workspace Audit](parsers-ocsf/google_workspace) | `gws_login` | Google | JSON | Admin SDK Reports: login, admin console, OAuth token, Drive activity |
 
@@ -123,6 +124,10 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Apache HTTP Server](parsers-ocsf/apache) | `apache_access` | Apache | Combined/common log | Client IP, method, status, bytes, user agent, referrer |
 | [Nginx](parsers-ocsf/nginx) | `nginx` | Nginx | Combined / JSON / error | Access and error logs with upstream and proxy support |
 | [Squid Proxy](parsers-ocsf/squid_proxy) | `squid_proxy` | Squid Project | Access log | Cache hit/miss, URL extraction, HTTP metadata |
+| [Docker](parsers-ocsf/docker) | `docker` | Docker | json-file JSON / logrus text / JSON | Container stdout/stderr (json-file driver, Vector docker_logs) and dockerd/containerd daemon logs: lifecycle, errors, JSON bodies passed through. OCSF only |
+| [PostgreSQL](parsers-ocsf/postgresql) | `postgresql` | PostgreSQL Global Development Group | stderr / csvlog / jsonlog | Connections, logons and auth failures (pg_hba, password, unknown role), disconnections, statements with duration, errors with SQLSTATE, checkpoints, start/stop. OCSF only |
+| [MySQL / MariaDB](parsers-ocsf/mysql) | `mysql` | Oracle | Error / general / slow log text, error log JSON, audit JSON | Access denied, connects and quits, queries, slow queries with timing, Enterprise and Percona audit records, errors, start/stop. OCSF only |
+| [Redis](parsers-ocsf/redis) | `redis` | Redis | Server log / ACL LOG JSON / MONITOR | Server events, ACL auth failures and command/key denials, cross-protocol attack warnings, MONITOR commands, start/stop. OCSF only |
 | [nano Platform API](parsers-ocsf/nano-platform-api) | `nano-platform-api` | nano | JSON (pino) | nano platform API logs: level mapping, request/response context |
 | [nano Operational Logs](parsers-ocsf/nano_operational) | `nano_operational` | nano | JSON (tracing) | nano service operational + tracing logs (api, jobs, search) |
 
