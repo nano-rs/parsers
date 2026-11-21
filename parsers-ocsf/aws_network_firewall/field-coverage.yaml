@@ -1,0 +1,66 @@
+source: json
+transforms:
+- source: event.timestamp
+  kind: epoch_ms
+  target: time
+  reason: Suricata ISO timestamp converted to the emitted millisecond clock.
+- source: event.netflow.start
+  kind: epoch_ms
+  target: start_time
+  reason: Flow start converted to the emitted millisecond clock.
+- source: event.netflow.end
+  kind: epoch_ms
+  target: end_time
+  reason: Flow end converted to the emitted millisecond clock.
+- source: event.proto
+  kind: lowercase
+  reason: Transport protocol lowercased onto connection_info.protocol_name.
+- source: event.alert.severity
+  kind: enum
+  target: severity_id
+  values:
+    '1': 4
+    '2': 3
+    '3': 2
+  reason: Suricata severity (1 most severe) normalized to the OCSF severity; consume only when the expected ID is emitted.
+- source: event.alert.action
+  kind: enum
+  target: action_id
+  values:
+    allowed: 1
+    blocked: 2
+    rejected: 2
+  reason: Alert verdict normalized to the OCSF action; consume only when the expected ID is emitted.
+consumed_candidates:
+- availability_zone
+- event.alert.category
+- event.alert.rev
+- event.alert.signature
+- event.alert.signature_id
+- event.app_proto
+- event.aws_metadata.resource_arn
+- event.dest_ip
+- event.dest_port
+- event.event_type
+- event.flow_id
+- event.http.hostname
+- event.http.http_method
+- event.http.http_user_agent
+- event.http.protocol
+- event.http.url
+- event.netflow.bytes
+- event.netflow.pkts
+- event.sni
+- event.src_ip
+- event.src_port
+- event.tls.fingerprint
+- event.tls.issuerdn
+- event.tls.serial
+- event.tls.sni
+- event.tls.subject
+- event.tls.version
+- event.tls_error.error_message
+- firewall_name
+consumed_reason: Only source keys read by this parser are eligible for exact-value
+  consumption; the selected branch must emit the value. Unknown keys always spill,
+  even when their value equals an OCSF default.

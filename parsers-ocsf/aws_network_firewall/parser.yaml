@@ -1,0 +1,848 @@
+name: aws_network_firewall_ocsf
+display_name: AWS Network Firewall (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses AWS Network Firewall logs (one JSON record per line, as delivered to S3,
+  CloudWatch Logs or Firehose: firewall_name, availability_zone, event_timestamp
+  and the Suricata EVE-style `event`) into complete OCSF 1.9.0 records:
+    event_type alert               -> Detection Finding 2004 (security_control:
+                                      alert.action allowed -> Allowed, blocked /
+                                      rejected -> Denied + Blocked; Suricata
+                                      severity 1/2/3 -> High/Medium/Low; the rule
+                                      on finding_info.analytic and firewall_rule;
+                                      the 5-tuple, HTTP and TLS on evidences[])
+    event_type netflow             -> Network Activity 4001 Traffic (uni-directional
+                                      packets/bytes on traffic.*_out, flow start/end)
+    TLS engine (tls_error,
+    revocation_check)              -> Network Activity 4001 Fail / Refuse
+  The firewall is metadata.reporter, the zone and its region land on cloud.
+  Anything that is not a Network Firewall record is kept whole as a Base Event
+  with unmapped.parse_fallback. Samples come from the AWS "Contents of an AWS
+  Network Firewall log" examples and the Elastic aws.firewall_logs pipeline
+  fixtures, with documentation addresses.
+match_values:
+  - aws_network_firewall
+category: network
+vendor: "Amazon"
+product: "Network Firewall"
+parser_vrl: |
+  # AWS Network Firewall log (JSON, Suricata EVE-style `event`) -> OCSF 1.9.0
+  #   event_type alert              -> Detection Finding 2004 (security_control)
+  #   event_type netflow / flow     -> Network Activity 4001 (Traffic)
+  #   TLS engine event (event_type tls, or tls_error / revocation_check)
+  #                                 -> Network Activity 4001 (Fail / Refuse / Traffic)
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+
+  parsed, err = parse_json(raw_log)
+  p = {}
+  ev = {}
+  ok = false
+  if err == null && is_object(parsed) {
+      p = object!(parsed)
+      ev = object(p.event) ?? {}
+      ok = length(ev) > 0
+  }
+  __source_kv = p
+
+  if !ok {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": to_unix_timestamp(now(), unit: "milliseconds"),
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud"],
+              "uid": sha2("aws_network_firewall|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "AWS Network Firewall",
+              "log_provider": "AWS Network Firewall",
+              "product": { "name": "AWS Network Firewall", "vendor_name": "Amazon" }
+          },
+          "cloud": { "provider": "AWS" }
+      }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "not a Network Firewall log record")
+  } else {
+      event_type = downcase(to_string(ev.event_type) ?? "")
+      fw_name = to_string(p.firewall_name) ?? ""
+      zone = to_string(p.availability_zone) ?? ""
+
+      # ---- time: event.timestamp (microseconds) else event_timestamp (epoch s) ----
+      time_ms = 0
+      ts = to_string(ev.timestamp) ?? ""
+      if ts != "" {
+          tp, terr = parse_timestamp(ts, "%+")
+          if terr == null { time_ms = to_unix_timestamp(tp, unit: "milliseconds") }
+      }
+      if time_ms == 0 {
+          epoch = to_int(p.event_timestamp) ?? 0
+          if epoch > 0 { time_ms = epoch * 1000 }
+      }
+      if time_ms == 0 { time_ms = to_unix_timestamp(now(), unit: "milliseconds") }
+
+      # ---- cloud: region is the zone without its trailing letter ----
+      cloud = { "provider": "AWS" }
+      if zone != "" {
+          cloud.zone = zone
+          rm, rerr = parse_regex(zone, r'^(?P<region>[a-z]{2}(?:-[a-z]+)+-\d+)[a-z]$')
+          if rerr == null { cloud.region = string!(rm.region) }
+      }
+
+      # ---- endpoints and connection ----
+      src_endpoint = {}
+      sip = to_string(ev.src_ip) ?? ""
+      if sip != "" { src_endpoint.ip = downcase(sip) }
+      sport = to_int(ev.src_port) ?? 0
+      if sport > 0 { src_endpoint.port = sport }
+      dst_endpoint = {}
+      dip = to_string(ev.dest_ip) ?? ""
+      if dip != "" { dst_endpoint.ip = downcase(dip) }
+      dport = to_int(ev.dest_port) ?? 0
+      if dport > 0 { dst_endpoint.port = dport }
+
+      # Suricata's direction (to_server / to_client) is flow orientation, not
+      # an inbound / outbound boundary, so the OCSF direction stays Unknown.
+      conn = { "direction_id": 0, "direction": "Unknown" }
+      proto = downcase(to_string(ev.proto) ?? "")
+      if proto != "" {
+          conn.protocol_name = proto
+          if proto == "tcp" { conn.protocol_num = 6 }
+          if proto == "udp" { conn.protocol_num = 17 }
+          if proto == "icmp" { conn.protocol_num = 1 }
+          if proto == "ipv6-icmp" { conn.protocol_num = 58 }
+      }
+      flow_id = to_string(ev.flow_id) ?? ""
+      if flow_id != "" { conn.uid = flow_id }
+
+      # ---- application layer ----
+      http_request = {}
+      hreq = object(ev.http) ?? {}
+      if length(hreq) > 0 {
+          url_obj = {}
+          hhost = to_string(hreq.hostname) ?? ""
+          hurl = to_string(hreq.url) ?? ""
+          if hhost != "" { url_obj.hostname = hhost }
+          if hurl != "" { url_obj.path = hurl }
+          if length(url_obj) == 0 { url_obj.path = "/" }
+          http_request.url = url_obj
+          hm = to_string(hreq.http_method) ?? ""
+          if hm != "" { http_request.http_method = hm }
+          hua = to_string(hreq.http_user_agent) ?? ""
+          if hua != "" { http_request.user_agent = hua }
+          hver = to_string(hreq.protocol) ?? ""
+          if hver != "" { http_request.version = hver }
+      }
+      tls = {}
+      tobj = object(ev.tls) ?? {}
+      sni = string(tobj.sni) ?? string(ev.sni) ?? ""
+      if sni != "" { tls.sni = sni }
+      tver = to_string(tobj.version) ?? ""
+      if tver != "" { tls.version = tver }
+      ja3 = to_string(get(tobj, ["ja3", "hash"]) ?? null) ?? ""
+      if ja3 != "" { tls.ja3_hash = { "algorithm_id": 1, "algorithm": "MD5", "value": ja3 } }
+      cert = {}
+      subj = to_string(tobj.subject) ?? ""
+      if subj != "" { cert.subject = subj }
+      iss = to_string(tobj.issuerdn) ?? ""
+      if iss != "" { cert.issuer = iss }
+      serial = to_string(tobj.serial) ?? ""
+      if serial != "" { cert.serial_number = serial }
+      fpr = to_string(tobj.fingerprint) ?? ""
+      if fpr != "" { cert.fingerprints = [{ "algorithm_id": 2, "algorithm": "SHA-1", "value": fpr }] }
+      if length(cert) > 0 {
+          if !exists(cert.issuer) { cert.issuer = "" }
+          if !exists(cert.serial_number) { cert.serial_number = "" }
+          tls.certificate = cert
+      }
+
+      # OCSF requires tls.version. The TLS engine's error / revocation records
+      # carry only the SNI, which then names the server on dst_endpoint.
+      if length(tls) > 0 && !exists(tls.version) {
+          if sni != "" { dst_endpoint.hostname = sni }
+          tls = {}
+      }
+
+      metadata = {
+          "version": "1.9.0",
+          "profiles": ["cloud"],
+          "log_name": "AWS Network Firewall",
+          "log_provider": "AWS Network Firewall",
+          "product": { "name": "AWS Network Firewall", "vendor_name": "Amazon" }
+      }
+      if fw_name != "" { metadata.reporter = { "name": fw_name } }
+      metadata.uid = sha2("aws_network_firewall|" + fw_name + "|" + flow_id + "|" + event_type + "|" + ts + "|" + raw_log, variant: "SHA-256")
+
+      if event_type == "alert" {
+          al = object(ev.alert) ?? {}
+          al_action = downcase(to_string(al.action) ?? "")
+          sid = to_string(al.signature_id) ?? ""
+          sig = to_string(al.signature) ?? ""
+          cat = to_string(al.category) ?? ""
+          rev = to_string(al.rev) ?? ""
+          sev = to_int(al.severity) ?? 0
+
+          # Suricata severity: 1 is the most severe.
+          severity_id = 1
+          severity = "Informational"
+          if sev == 1 { severity_id = 4; severity = "High" }
+          if sev == 2 { severity_id = 3; severity = "Medium" }
+          if sev == 3 { severity_id = 2; severity = "Low" }
+
+          action_id = 0
+          action = "Unknown"
+          disposition_id = 0
+          disposition = "Unknown"
+          if al_action == "allowed" { action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed" }
+          if al_action == "blocked" || al_action == "rejected" { action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked" }
+
+          title = sig
+          if title == "" { title = "Network Firewall alert (sid " + sid + ")" }
+          analytic = { "type_id": 1, "type": "Rule" }
+          if sid != "" { analytic.uid = sid }
+          if sig != "" { analytic.name = sig }
+          if rev != "" { analytic.version = rev }
+          if cat != "" { analytic.category = cat }
+          finding_info = {
+              "uid": sha2("aws_network_firewall|alert|" + fw_name + "|" + flow_id + "|" + sid + "|" + ts, variant: "SHA-256"),
+              "title": title,
+              "analytic": analytic
+          }
+          if cat != "" { finding_info.types = [cat] }
+          arn = to_string(get(ev, ["aws_metadata", "resource_arn"]) ?? null) ?? ""
+          if arn != "" { finding_info.product_uid = arn }
+
+          fw_rule = {}
+          if sid != "" { fw_rule.uid = sid }
+          if sig != "" { fw_rule.name = sig }
+          if rev != "" { fw_rule.version = rev }
+          if cat != "" { fw_rule.category = cat }
+
+          evidence = {}
+          if length(src_endpoint) > 0 { evidence.src_endpoint = src_endpoint }
+          if length(dst_endpoint) > 0 { evidence.dst_endpoint = dst_endpoint }
+          if length(conn) > 0 { evidence.connection_info = conn }
+          if length(http_request) > 0 { evidence.http_request = http_request }
+          if length(tls) > 0 { evidence.tls = tls }
+
+          metadata.profiles = ["cloud", "security_control"]
+          ocsf = {
+              "class_uid": 2004,
+              "class_name": "Detection Finding",
+              "category_uid": 2,
+              "category_name": "Findings",
+              "activity_id": 1,
+              "activity_name": "Create",
+              "type_uid": 200401,
+              "severity_id": severity_id,
+              "severity": severity,
+              "status_id": 1,
+              "status": "New",
+              "is_alert": true,
+              "action_id": action_id,
+              "action": action,
+              "disposition_id": disposition_id,
+              "disposition": disposition,
+              "time": time_ms,
+              "message": title,
+              "raw_data": raw_log,
+              "metadata": metadata,
+              "cloud": cloud,
+              "finding_info": finding_info
+          }
+          if length(fw_rule) > 0 { ocsf.firewall_rule = fw_rule }
+          if length(evidence) > 0 { ocsf.evidences = [evidence] }
+          . = ocsf
+      } else {
+          activity_id = 6
+          activity_name = "Traffic"
+          status_id = 1
+          status = "Success"
+          severity_id = 1
+          severity = "Informational"
+          action_id = 0
+          action = ""
+          status_detail = ""
+          log_name = "AWS Network Firewall"
+          traffic = {}
+          start_ms = 0
+          end_ms = 0
+
+          nf = object(ev.netflow) ?? object(ev.flow) ?? {}
+          if length(nf) > 0 {
+              log_name = "AWS Network Firewall flow"
+              # netflow is uni-directional: every packet went source -> destination.
+              # Suricata's bidirectional flow form splits the counters by side.
+              if exists(nf.pkts) { traffic.packets_out = to_int(nf.pkts) ?? 0 }
+              if exists(nf.bytes) { traffic.bytes_out = to_int(nf.bytes) ?? 0 }
+              if exists(nf.pkts_toserver) { traffic.packets_out = to_int(nf.pkts_toserver) ?? 0 }
+              if exists(nf.pkts_toclient) { traffic.packets_in = to_int(nf.pkts_toclient) ?? 0 }
+              if exists(nf.bytes_toserver) { traffic.bytes_out = to_int(nf.bytes_toserver) ?? 0 }
+              if exists(nf.bytes_toclient) { traffic.bytes_in = to_int(nf.bytes_toclient) ?? 0 }
+              st = to_string(nf.start) ?? ""
+              if st != "" {
+                  s1, s1err = parse_timestamp(st, "%+")
+                  if s1err == null { start_ms = to_unix_timestamp(s1, unit: "milliseconds") }
+              }
+              en = to_string(nf.end) ?? ""
+              if en != "" {
+                  e1, e1err = parse_timestamp(en, "%+")
+                  if e1err == null { end_ms = to_unix_timestamp(e1, unit: "milliseconds") }
+              }
+          }
+
+          rc = object(ev.revocation_check) ?? {}
+          tls_err = ev.tls_error
+          if event_type == "tls" || length(rc) > 0 || tls_err != null { log_name = "AWS Network Firewall TLS" }
+          if length(rc) > 0 {
+              rc_action = upcase(to_string(rc.action) ?? "")
+              rc_status = to_string(rc.status) ?? ""
+              status_detail = "revocation check: " + rc_status
+              if rc_action == "DROP" || rc_action == "REJECT" {
+                  activity_id = 5; activity_name = "Refuse"
+                  status_id = 2; status = "Failure"
+                  action_id = 2; action = "Denied"
+                  severity_id = 3; severity = "Medium"
+              } else {
+                  action_id = 1; action = "Allowed"
+              }
+          }
+          if tls_err != null {
+              activity_id = 4; activity_name = "Fail"
+              status_id = 2; status = "Failure"
+              severity_id = 2; severity = "Low"
+              terr_msg = to_string(get(tls_err, ["error_message"]) ?? null) ?? to_string(tls_err) ?? ""
+              if terr_msg != "" { status_detail = terr_msg }
+          }
+
+          tcp = object(ev.tcp) ?? {}
+          tflags = to_string(tcp.tcp_flags) ?? ""
+          if tflags != "" {
+              fl, flerr = parse_int(tflags, base: 16)
+              if flerr == null { conn.tcp_flags = fl }
+          }
+
+          if action_id != 0 { metadata.profiles = ["cloud", "security_control"] }
+          metadata.log_name = log_name
+          if length(src_endpoint) == 0 { src_endpoint.ip = "0.0.0.0" }
+          ocsf = {
+              "class_uid": 4001,
+              "class_name": "Network Activity",
+              "category_uid": 4,
+              "category_name": "Network Activity",
+              "activity_id": activity_id,
+              "activity_name": activity_name,
+              "type_uid": 400100 + activity_id,
+              "severity_id": severity_id,
+              "severity": severity,
+              "status_id": status_id,
+              "status": status,
+              "time": time_ms,
+              "raw_data": raw_log,
+              "metadata": metadata,
+              "cloud": cloud,
+              "src_endpoint": src_endpoint
+          }
+          if length(dst_endpoint) > 0 { ocsf.dst_endpoint = dst_endpoint }
+          if length(conn) > 0 { ocsf.connection_info = conn }
+          if length(traffic) > 0 { ocsf.traffic = traffic }
+          if length(tls) > 0 { ocsf.tls = tls }
+          if start_ms > 0 { ocsf.start_time = start_ms }
+          if end_ms > 0 { ocsf.end_time = end_ms }
+          if start_ms > 0 && end_ms >= start_ms { ocsf.duration = end_ms - start_ms }
+          if status_detail != "" { ocsf.status_detail = status_detail }
+          if action_id != 0 { ocsf.action_id = action_id; ocsf.action = action }
+          app = to_string(ev.app_proto) ?? ""
+          if app != "" && app != "failed" { ocsf.app_protocol_name = app }
+          . = ocsf
+      }
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # event.timestamp: Suricata ISO timestamp converted to the emitted millisecond clock.
+  # event.netflow.start: Flow start converted to the emitted millisecond clock.
+  # event.netflow.end: Flow end converted to the emitted millisecond clock.
+  # event.proto: Transport protocol lowercased onto connection_info.protocol_name.
+  # event.alert.severity: Suricata severity (1 most severe) normalized to the OCSF severity; consume only when the expected ID is emitted.
+  # event.alert.action: Alert verdict normalized to the OCSF action; consume only when the expected ID is emitted.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        event\.timestamp
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        event\.netflow\.start
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."start_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        event\.netflow\.end
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."end_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        event\.proto
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        event\.alert\.severity
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"1": 4, "2": 3, "3": 2}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."severity_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        event\.alert\.action
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"allowed": 1, "blocked": 2, "rejected": 2}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."action_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    availability_zone
+  | event\.alert\.category
+  | event\.alert\.rev
+  | event\.alert\.signature
+  | event\.alert\.signature_id
+  | event\.app_proto
+  | event\.aws_metadata\.resource_arn
+  | event\.dest_ip
+  | event\.dest_port
+  | event\.event_type
+  | event\.flow_id
+  | event\.http\.hostname
+  | event\.http\.http_method
+  | event\.http\.http_user_agent
+  | event\.http\.protocol
+  | event\.http\.url
+  | event\.netflow\.bytes
+  | event\.netflow\.pkts
+  | event\.sni
+  | event\.src_ip
+  | event\.src_port
+  | event\.tls\.fingerprint
+  | event\.tls\.issuerdn
+  | event\.tls\.serial
+  | event\.tls\.sni
+  | event\.tls\.subject
+  | event\.tls\.version
+  | event\.tls_error\.error_message
+  | firewall_name
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # source: https://github.com/elastic/integrations/blob/main/packages/aws/data_stream/firewall_logs/_dev/test/pipeline/test-firewall.log
+  - raw: "{\"firewall_name\":\"AWSNetworkFirewall\",\"availability_zone\":\"us-east-2a\",\"event_timestamp\":\"1636381332\",\"event\":{\"timestamp\":\"2021-11-08T14:22:12.637611+0000\",\"flow_id\":706471429191862,\"event_type\":\"alert\",\"src_ip\":\"198.51.100.43\",\"src_port\":51254,\"dest_ip\":\"203.0.113.57\",\"dest_port\":80,\"proto\":\"TCP\",\"alert\":{\"action\":\"blocked\",\"signature_id\":1000003,\"rev\":1,\"signature\":\"Deny all other TCP traffic\",\"category\":\"\",\"severity\":3},\"http\":{\"hostname\":\"203.0.113.57\",\"url\":\"/\",\"http_user_agent\":\"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/95.0.4638.69 Safari/537.36\",\"http_method\":\"GET\",\"protocol\":\"HTTP/1.1\",\"length\":0},\"app_proto\":\"http\"}}"
+    expect:
+      "class_uid": "2004"
+      "activity_id": "1"
+      "severity_id": "2"
+      "action_id": "2"
+      "disposition_id": "2"
+      "finding_info.title": "Deny all other TCP traffic"
+      "finding_info.analytic.uid": "1000003"
+      "evidences.0.src_endpoint.ip": "198.51.100.43"
+      "evidences.0.dst_endpoint.port": "80"
+      "evidences.0.http_request.http_method": "GET"
+      "cloud.region": "us-east-2"
+      "metadata.reporter.name": "AWSNetworkFirewall"
+      "time": "1636381332637"
+  # source: https://github.com/elastic/integrations/blob/main/packages/aws/data_stream/firewall_logs/_dev/test/pipeline/test-firewall.log
+  - raw: "{\"firewall_name\":\"AWSNetworkFirewall\",\"availability_zone\":\"us-east-2a\",\"event_timestamp\":\"1636395643\",\"event\":{\"timestamp\":\"2021-11-08T18:20:43.324542+0000\",\"flow_id\":625409144331688,\"event_type\":\"netflow\",\"src_ip\":\"198.51.100.61\",\"src_port\":61953,\"dest_ip\":\"203.0.113.156\",\"dest_port\":5060,\"proto\":\"TCP\",\"netflow\":{\"pkts\":1,\"bytes\":40,\"start\":\"2021-11-08T18:18:11.990632+0000\",\"end\":\"2021-11-08T18:18:11.990632+0000\",\"age\":0,\"min_ttl\":221,\"max_ttl\":221},\"tcp\":{\"tcp_flags\":\"02\",\"syn\":true}}}"
+    expect:
+      "class_uid": "4001"
+      "activity_id": "6"
+      "traffic.packets_out": "1"
+      "traffic.bytes_out": "40"
+      "connection_info.protocol_name": "tcp"
+      "connection_info.tcp_flags": "2"
+      "start_time": "1636395491990"
+  # source: https://github.com/elastic/integrations/blob/main/packages/aws/data_stream/firewall_logs/_dev/test/pipeline/test-firewall.log
+  - raw: "{\"firewall_name\":\"outbound\",\"availability_zone\":\"eu-central-1a\",\"event_timestamp\":\"1674225318\",\"event\":{\"app_proto\":\"tls\",\"src_ip\":\"198.51.100.61\",\"src_port\":5302,\"event_type\":\"alert\",\"alert\":{\"severity\":3,\"signature_id\":4,\"rev\":0,\"signature\":\"aws:alert_established action\",\"action\":\"allowed\",\"category\":\"\"},\"flow_id\":1829676028160453,\"dest_ip\":\"203.0.113.156\",\"proto\":\"TCP\",\"tls\":{\"subject\":\"CN=sqs.eu-central-1.amazonaws.com\",\"issuerdn\":\"C=US, O=Amazon, OU=Server CA 1B, CN=Amazon\",\"serial\":\"08:C9:76:68:CB:30:31:1C:B2:24:A4:B3:22:F0:16:29\",\"fingerprint\":\"34:36:32:fb:05:65:83:55:a0:8e:24:7b:41:52:bf:98:88:3b:bf:9b\",\"sni\":\"sqs.eu-central-1.amazonaws.com\",\"version\":\"TLS 1.2\",\"notbefore\":\"2022-11-03T00:00:00\",\"notafter\":\"2023-10-16T23:59:59\",\"ja3\":{},\"ja3s\":{}},\"dest_port\":443,\"timestamp\":\"2023-01-20T14:35:18.307095+0000\"}}"
+    expect:
+      "class_uid": "2004"
+      "action_id": "1"
+      "evidences.0.tls.sni": "sqs.eu-central-1.amazonaws.com"
+      "evidences.0.tls.certificate.issuer": "C=US, O=Amazon, OU=Server CA 1B, CN=Amazon"
+  # source: https://docs.aws.amazon.com/network-firewall/latest/developerguide/firewall-logging-contents.html
+  - raw: "{\"firewall_name\":\"test-firewall\",\"availability_zone\":\"us-east-1b\",\"event_timestamp\":\"1602627001\",\"event\":{\"timestamp\":\"2020-10-13T22:10:01.006481+0000\",\"flow_id\":1582438383425873,\"event_type\":\"alert\",\"src_ip\":\"203.0.113.4\",\"src_port\":55555,\"dest_ip\":\"192.0.2.16\",\"dest_port\":111,\"proto\":\"TCP\",\"alert\":{\"action\":\"allowed\",\"signature_id\":5,\"rev\":0,\"signature\":\"test_tcp\",\"category\":\"\",\"severity\":1},\"aws_metadata\":{\"resource_arn\":\"arn:aws:network-firewall:us-east-1:123456789012:stateful-rulegroup/example-rule-group\"}}}"
+    expect:
+      "severity_id": "4"
+      "action_id": "1"
+      "finding_info.product_uid": "arn:aws:network-firewall:us-east-1:123456789012:stateful-rulegroup/example-rule-group"
+  # source: https://docs.aws.amazon.com/network-firewall/latest/developerguide/firewall-logging-contents.html
+  - raw: "{\"firewall_name\":\"test-firewall\",\"availability_zone\":\"us-east-1b\",\"event_timestamp\":\"1763508615\",\"event\":{\"aws_category\":\"[\\\"Technology and Internet\\\"]\",\"tx_id\":0,\"app_proto\":\"tls\",\"src_ip\":\"10.0.100.55\",\"src_port\":44474,\"event_type\":\"alert\",\"alert\":{\"severity\":3,\"signature_id\":6,\"rev\":0,\"signature\":\"\",\"action\":\"blocked\",\"category\":\"\"},\"flow_id\":1972143099170468,\"dest_ip\":\"198.51.100.113\",\"proto\":\"TCP\",\"verdict\":{\"action\":\"drop\"},\"tls\":{\"sni\":\"developers.example.com\",\"version\":\"UNDETERMINED\"},\"dest_port\":443,\"pkt_src\":\"geneve encapsulation\",\"timestamp\":\"2025-11-18T23:30:15.006867+0000\",\"direction\":\"to_server\"}}"
+    expect:
+      "class_uid": "2004"
+      "disposition_id": "2"
+      "evidences.0.tls.sni": "developers.example.com"
+      "finding_info.title": "Network Firewall alert (sid 6)"
+  # source: https://docs.aws.amazon.com/network-firewall/latest/developerguide/firewall-logging-contents.html
+  - raw: "{\"firewall_name\":\"egress-fw\",\"availability_zone\":\"us-east-1d\",\"event_timestamp\":1708361189,\"event\":{\"src_ip\":\"10.0.2.53\",\"src_port\":\"55930\",\"revocation_check\":{\"leaf_cert_fpr\":\"1234567890EXAMPLE0987654321\",\"status\":\"REVOKED\",\"action\":\"DROP\"},\"dest_ip\":\"203.0.113.72\",\"dest_port\":\"443\",\"timestamp\":\"2024-02-19T16:46:29.441824Z\",\"sni\":\"revoked.example.net\"}}"
+    expect:
+      "class_uid": "4001"
+      "activity_id": "5"
+      "status_id": "2"
+      "action_id": "2"
+      "dst_endpoint.hostname": "revoked.example.net"
+      "dst_endpoint.port": "443"
+      "status_detail": "revocation check: REVOKED"
+  # source: https://docs.aws.amazon.com/network-firewall/latest/developerguide/firewall-logging-contents.html (tls_error)
+  - raw: "{\"firewall_name\":\"egress-fw\",\"availability_zone\":\"us-east-1d\",\"event_timestamp\":1708361300,\"event\":{\"src_ip\":\"10.0.2.53\",\"src_port\":\"55931\",\"tls_error\":{\"error_message\":\"SNI: www.example.com and Server Certificate: www.example.net mismatch\"},\"dest_ip\":\"203.0.113.80\",\"dest_port\":\"443\",\"timestamp\":\"2024-02-19T16:48:20.112233Z\",\"sni\":\"www.example.com\"}}"
+    expect:
+      "class_uid": "4001"
+      "activity_id": "4"
+      "status_detail": "SNI: www.example.com and Server Certificate: www.example.net mismatch"
+  # source: https://docs.aws.amazon.com/network-firewall/latest/developerguide/logging-policy-v2.html (Next Generation policy alert fields)
+  - raw: "{\"firewall_name\":\"ngfw-policy-v2\",\"availability_zone\":\"us-west-2a\",\"event_timestamp\":\"1762074000\",\"event\":{\"timestamp\":\"2026-11-02T09:00:00.331122+0000\",\"flow_id\":771122334455667,\"event_type\":\"alert\",\"src_ip\":\"10.1.4.20\",\"src_port\":49822,\"dest_ip\":\"198.51.100.200\",\"dest_port\":3389,\"proto\":\"TCP\",\"direction\":\"to_server\",\"alert\":{\"action\":\"rejected\",\"signature_id\":202,\"rev\":3,\"signature\":\"Reject outbound RDP\",\"category\":\"Policy Violation\",\"severity\":2,\"engine\":\"fw\"},\"firewall\":{\"hook\":\"packet:filter\",\"policy\":\"drop:flow,alert\"},\"verdict\":{\"action\":\"reject\"},\"aws_metadata\":{\"resource_arn\":\"arn:aws:network-firewall:us-west-2:123456789012:firewall-rulegroup/block-rdp\"}}}"
+    expect:
+      "class_uid": "2004"
+      "severity_id": "3"
+      "action_id": "2"
+      "finding_info.analytic.category": "Policy Violation"
+  # NAN-3702: an unparseable record gets the deterministic sha256("aws_network_firewall|raw|" + raw) uid.
+  - raw: "NAN-3702 determinism probe: not a aws_network_firewall record"
+    expect:
+      "class_uid": "0"
+      "metadata.uid": "50ff5f7e7dc4577789fdf1d90cd99e90d95169e540c97cbad9bb242d73784f5f"
+      "unmapped.parse_fallback": "not a Network Firewall log record"

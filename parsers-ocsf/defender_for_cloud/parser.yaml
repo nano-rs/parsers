@@ -1,0 +1,982 @@
+name: defender_for_cloud_ocsf
+display_name: Microsoft Defender for Cloud (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Microsoft Defender for Cloud (formerly Azure Security Center) security
+  alerts and recommendations, one JSON record per event, as delivered by
+  continuous export to Event Hubs or a Log Analytics workspace, the alerts REST
+  API and the Logic App / workflow automation trigger, into complete OCSF 1.9.0
+  records:
+    security alert (AlertDisplayName / properties.alertDisplayName /
+    SecurityAlert row)                    -> Detection Finding 2004
+    assessment, sub-assessment
+    (recommendation), regulatory
+    compliance assessment                 -> Compliance Finding 2003
+    secure score / secure score control   -> Base Event 0 (a posture metric)
+  Field names differ in case between delivery paths, so the mapping reads a
+  lower-cased copy and the original record is what the residual spill keeps.
+  Alerts carry SystemAlertId as finding_info.uid, AlertType as the analytic,
+  intent / techniques as ATT&CK attacks, the affected Azure resource on
+  resources[], and the ip / host / account / process / file entities on
+  evidences[]. Alert severity High / Medium / Low / Informational maps to the
+  OCSF severity; status Active / New -> New, InProgress -> In Progress,
+  Dismissed -> Suppressed, Resolved -> Resolved. Assessments map status
+  Healthy / Passed -> Pass, Unhealthy / Failed -> Fail, NotApplicable / Skipped
+  -> Other on compliance, with the recommendation severity applied only to a
+  failing resource; the regulatory standard and control come from the record
+  id. The continuous-export Insert / Write / Delete action is the activity
+  (Create / Update / Close). An Event Hubs `{"records": [...]}` envelope is
+  exploded upstream (one record per event); one that reaches the lane anyway is
+  kept whole as a Base Event with unmapped.parse_fallback. Distinct from the
+  defender_xdr and defender_edr parsers, and from Defender for Cloud alerts that
+  arrive inside the Azure Activity Log (azure_monitor). Samples come from the
+  Elastic microsoft_defender_cloud pipeline fixtures and the Microsoft Defender
+  for Cloud alert schema docs, with documentation identifiers.
+match_values:
+  - defender_for_cloud
+category: cloud
+vendor: "Microsoft"
+product: "Defender for Cloud"
+parser_vrl: |
+  # Microsoft Defender for Cloud (formerly Azure Security Center) -> OCSF 1.9.0
+  #   security alert (continuous export / Event Hubs, alerts REST API and Logic
+  #   App trigger `properties` shape, Log Analytics SecurityAlert row)
+  #                                      -> Detection Finding 2004
+  #   assessment / sub-assessment (recommendation), regulatory compliance
+  #   assessment                         -> Compliance Finding 2003
+  #   secure score / secure score control -> Base Event 0 (a posture metric)
+  # Field names differ in case between delivery paths (AlertDisplayName vs
+  # alertDisplayName, Status.Code vs status.code), so lookups read a
+  # lower-cased copy; the original record is what the residual spill sees.
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+
+  parsed, err = parse_json(raw_log)
+  p = {}
+  ok = false
+  if err == null && is_object(parsed) {
+      p = object!(parsed)
+      ok = true
+  }
+  __source_kv = p
+
+  t = {}
+  if ok { t = map_keys(p, recursive: true) -> |k| { downcase(k) } }
+  props = object(t.properties) ?? {}
+  r = merge(t, props)
+  rtype = downcase(string(t.type) ?? "")
+
+  kind = ""
+  if ok {
+      if exists(t.records) {
+          kind = "envelope"
+      } else if contains(rtype, "securescore") {
+          kind = "score"
+      } else if contains(rtype, "regulatorycompliance") {
+          kind = "regulatory"
+      } else if contains(rtype, "microsoft.security/assessments") {
+          kind = "assessment"
+      } else if contains(rtype, "/alerts") || rtype == "securityalert" || exists(r.systemalertid) || exists(r.alertdisplayname) || exists(r.alertname) {
+          kind = "alert"
+      }
+  }
+
+  # ---- shared: severity, resource, cloud, time helpers ----
+  sev_txt = downcase(string(r.severity) ?? string(r.alertseverity) ?? string(get(r, ["metadata", "severity"]) ?? null) ?? string(get(r, ["status", "severity"]) ?? null) ?? "")
+  severity_id = 1
+  severity = "Informational"
+  if sev_txt == "low" { severity_id = 2; severity = "Low" }
+  if sev_txt == "medium" { severity_id = 3; severity = "Medium" }
+  if sev_txt == "high" { severity_id = 4; severity = "High" }
+  if sev_txt == "critical" { severity_id = 5; severity = "Critical" }
+
+  rid_obj = object(r.resourcedetails) ?? {}
+  res_id = string(r.azureresourceid) ?? string(rid_obj.id) ?? string(r.resourceid) ?? ""
+  rec_id = string(t.id) ?? ""
+  sub_src = res_id
+  if sub_src == "" { sub_src = rec_id }
+  sub = ""
+  sm, smerr = parse_regex(sub_src, r'(?i)/subscriptions/(?P<sub>[0-9a-f-]{36})')
+  if smerr == null { sub = downcase(string!(sm.sub)) }
+  cloud = { "provider": "Azure" }
+  if sub != "" { cloud.account = { "uid": sub, "type_id": 99, "type": "Azure Subscription" } }
+  tenant = string(r.tenantid) ?? ""
+  if tenant != "" { cloud.org = { "uid": tenant } }
+
+  resource = {}
+  if res_id != "" { resource.uid = res_id }
+  rname = string(rid_obj.resourcename) ?? string(r.compromisedentity) ?? ""
+  if rname == "" && res_id != "" {
+      nm, nmerr = parse_regex(res_id, r'/(?P<n>[^/]+)$')
+      if nmerr == null { rname = string!(nm.n) }
+  }
+  if rname != "" { resource.name = rname }
+  rtype_res = string(rid_obj.resourcetype) ?? ""
+  if rtype_res == "" && res_id != "" {
+      pm, pmerr = parse_regex(res_id, r'(?i)/providers/(?P<p>[^/]+/[^/]+)/[^/]+$')
+      if pmerr == null { rtype_res = string!(pm.p) }
+  }
+  if rtype_res != "" { resource.type = rtype_res }
+
+  enrich = object(r.securityeventdataenrichment) ?? object(r.assessmenteventdataenrichment) ?? object(r.subassessmenteventdataenrichment) ?? {}
+  enrich_action = downcase(string(enrich.action) ?? "")
+
+  # ISO 8601 to epoch milliseconds, 0 when absent or unparseable.
+  clock_ms = {}
+  for_each(["timegenerated", "timegeneratedutc", "processingendtime", "processingendtimeutc", "starttimeutc", "starttime", "endtimeutc", "endtime"]) -> |_i, k| {
+      v = string(get(r, [k]) ?? null) ?? ""
+      if v != "" {
+          tp, terr = parse_timestamp(v, "%+")
+          if terr == null { clock_ms = set!(clock_ms, [k], to_unix_timestamp(tp, unit: "milliseconds")) }
+      }
+  }
+  status_obj = object(r.status) ?? {}
+  for_each(["statuschangedate", "firstevaluationdate"]) -> |_i, k| {
+      v = string(get(status_obj, [k]) ?? null) ?? ""
+      if v != "" {
+          tp, terr = parse_timestamp(v, "%+")
+          if terr == null { clock_ms = set!(clock_ms, [k], to_unix_timestamp(tp, unit: "milliseconds")) }
+      }
+  }
+  now_ms = to_unix_timestamp(now(), unit: "milliseconds")
+
+  metadata = {
+      "version": "1.9.0",
+      "profiles": ["cloud"],
+      "log_name": "Defender for Cloud",
+      "log_provider": "Microsoft Defender for Cloud",
+      "product": { "name": "Microsoft Defender for Cloud", "vendor_name": "Microsoft" }
+  }
+
+  if kind == "alert" {
+      title = string(r.alertdisplayname) ?? string(r.alertname) ?? string(r.displayname) ?? "Defender for Cloud alert"
+      alert_uid = string(r.systemalertid) ?? string(t.name) ?? ""
+      if alert_uid == "" { alert_uid = sha2("defender_for_cloud|alert|" + raw_log, variant: "SHA-256") }
+      alert_type = string(r.alerttype) ?? ""
+
+      time_ms = int(clock_ms.timegenerated) ?? int(clock_ms.timegeneratedutc) ?? int(clock_ms.processingendtime) ?? int(clock_ms.processingendtimeutc) ?? int(clock_ms.starttimeutc) ?? int(clock_ms.starttime) ?? now_ms
+
+      finding_info = { "uid": alert_uid, "title": title }
+      desc = string(r.description) ?? ""
+      if desc != "" { finding_info.desc = desc }
+      if alert_type != "" {
+          finding_info.types = [alert_type]
+          finding_info.analytic = { "uid": alert_type, "name": title, "type_id": 1, "type": "Rule" }
+      }
+      first = int(clock_ms.starttimeutc) ?? int(clock_ms.starttime) ?? 0
+      if first > 0 { finding_info.first_seen_time = first }
+      last = int(clock_ms.endtimeutc) ?? int(clock_ms.endtime) ?? 0
+      if last > 0 { finding_info.last_seen_time = last }
+      created = int(clock_ms.timegenerated) ?? int(clock_ms.timegeneratedutc) ?? 0
+      if created > 0 { finding_info.created_time = created }
+      uri = string(r.alerturi) ?? string(r.alertlink) ?? ""
+      if uri != "" { finding_info.src_url = uri }
+      pcomp = string(r.productcomponentname) ?? ""
+      if pcomp != "" { finding_info.product = { "name": pcomp } }
+
+      # ---- MITRE ATT&CK: techniques + intent (kill-chain tactics) ----
+      tactics = []
+      intent = string(r.intent) ?? string(r.tactics) ?? ""
+      for_each(split(intent, ",")) -> |_i, it| {
+          name = strip_whitespace(string!(it))
+          if name != "" && downcase(name) != "unknown" && downcase(name) != "preattack" {
+              tactics = push(tactics, { "name": name })
+          }
+      }
+      techs = array(r.techniques) ?? []
+      if length(techs) == 0 {
+          ts_txt = string(r.techniques) ?? ""
+          if ts_txt != "" { techs = split(ts_txt, ",") }
+      }
+      attacks = []
+      for_each(techs) -> |_i, tq| {
+          tid = strip_whitespace(to_string(tq) ?? "")
+          if tid != "" {
+              a = { "technique": { "uid": tid } }
+              if length(tactics) > 0 { a.tactics = tactics }
+              attacks = push(attacks, a)
+          }
+      }
+      if length(attacks) == 0 && length(tactics) > 0 { attacks = [{ "tactics": tactics }] }
+      if length(attacks) > 0 { finding_info.attacks = attacks }
+
+      # ---- status: New / Active / InProgress / Resolved / Dismissed ----
+      st = downcase(string(r.status) ?? "")
+      status_id = 1
+      status = "New"
+      activity_id = 1
+      activity_name = "Create"
+      if st == "inprogress" { status_id = 2; status = "In Progress"; activity_id = 2; activity_name = "Update" }
+      if st == "dismissed" { status_id = 3; status = "Suppressed"; activity_id = 2; activity_name = "Update" }
+      if st == "resolved" { status_id = 4; status = "Resolved"; activity_id = 3; activity_name = "Close" }
+
+      # ---- entities -> evidence (first of each kind) ----
+      evidence = {}
+      device = {}
+      for_each(array(r.entities) ?? []) -> |_i, e| {
+          eo = object(e) ?? {}
+          et = downcase(string(eo.type) ?? "")
+          if et == "ip" && !exists(evidence.src_endpoint) {
+              addr = string(eo.address) ?? ""
+              if addr != "" { evidence.src_endpoint = { "ip": downcase(addr) } }
+          }
+          if et == "host" && length(device) == 0 {
+              hn = string(eo.hostname) ?? ""
+              if hn != "" { device = { "hostname": hn, "type_id": 0 } }
+              osf = string(eo.osfamily) ?? ""
+              if osf != "" && length(device) > 0 {
+                  os_type = 0
+                  if downcase(osf) == "windows" { os_type = 100 }
+                  if downcase(osf) == "linux" { os_type = 200 }
+                  device.os = { "name": osf, "type_id": os_type }
+              }
+          }
+          if et == "account" && !exists(evidence.user) {
+              un = string(eo.name) ?? ""
+              if un != "" {
+                  evidence.user = { "name": un }
+                  sid = string(eo.sid) ?? ""
+                  if sid != "" { evidence.user.uid = sid }
+                  ntd = string(eo.ntdomain) ?? ""
+                  if ntd != "" { evidence.user.domain = ntd }
+              }
+          }
+          if et == "process" && !exists(evidence.process) {
+              # OCSF needs a pid on a process; Defender writes it in hex.
+              pid_txt = downcase(string(eo.processid) ?? "")
+              pid, pid_err = parse_int(replace(pid_txt, "0x", ""), base: 16)
+              if pid_err == null && starts_with(pid_txt, "0x") {
+                  proc = { "pid": pid }
+                  cl = string(eo.commandline) ?? ""
+                  if cl != "" { proc.cmd_line = cl }
+                  evidence.process = proc
+              }
+          }
+          if et == "file" && !exists(evidence.file) {
+              fnm = string(eo.name) ?? ""
+              if fnm != "" {
+                  evidence.file = { "name": fnm, "type_id": 1 }
+                  dirp = string(eo.directory) ?? ""
+                  if dirp != "" { evidence.file.parent_folder = dirp }
+              }
+          }
+      }
+      if length(device) > 0 { evidence.device = device }
+
+      remediation = {}
+      steps = array(r.remediationsteps) ?? []
+      if length(steps) == 0 {
+          rs_txt = string(r.remediationsteps) ?? ""
+          if rs_txt != "" {
+              rs_arr, rs_err = parse_json(rs_txt)
+              if rs_err == null && is_array(rs_arr) { steps = array!(rs_arr) } else { steps = [rs_txt] }
+          }
+      }
+      if length(steps) > 0 { remediation.desc = join(map_values(steps) -> |s| { to_string(s) ?? "" }, "\n") ?? "" }
+
+      vendor = string(r.vendorname) ?? "Microsoft"
+      pname = string(r.productname) ?? "Microsoft Defender for Cloud"
+      metadata.product = { "name": pname, "vendor_name": vendor }
+      metadata.uid = alert_uid
+      if alert_uid != "" { metadata.original_event_uid = alert_uid }
+
+      ocsf = {
+          "class_uid": 2004,
+          "class_name": "Detection Finding",
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": 200400 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status,
+          "is_alert": true,
+          "time": time_ms,
+          "message": title,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "cloud": cloud,
+          "finding_info": finding_info
+      }
+      if length(resource) > 0 { ocsf.resources = [resource] }
+      if length(evidence) > 0 { ocsf.evidences = [evidence] }
+      if length(remediation) > 0 { ocsf.remediation = remediation }
+      conf = downcase(string(r.confidencelevel) ?? "")
+      if conf == "low" { ocsf.confidence_id = 1; ocsf.confidence = "Low" }
+      if conf == "medium" { ocsf.confidence_id = 2; ocsf.confidence = "Medium" }
+      if conf == "high" { ocsf.confidence_id = 3; ocsf.confidence = "High" }
+      if is_boolean(r.isincident) && r.isincident == true { ocsf.is_suspected_breach = true }
+      . = ocsf
+  } else if kind == "assessment" || kind == "regulatory" {
+      title = ""
+      code = ""
+      standard = ""
+      control = ""
+      if kind == "regulatory" {
+          title = string(r.description) ?? string(t.name) ?? ""
+          code = downcase(string(r.state) ?? "")
+          cm, cmerr = parse_regex(rec_id, r'(?i)regulatoryComplianceStandards/(?P<std>[^/]+)/regulatoryComplianceControls/(?P<ctl>[^/]+)')
+          if cmerr == null { standard = string!(cm.std); control = string!(cm.ctl) }
+      } else {
+          title = string(r.displayname) ?? string(get(r, ["metadata", "displayname"]) ?? null) ?? string(t.name) ?? ""
+          code = downcase(string(status_obj.code) ?? "")
+          control = string(t.name) ?? ""
+      }
+      if title == "" { title = "Defender for Cloud assessment" }
+
+      # Healthy / Passed -> Pass, Unhealthy / Failed -> Fail, else Other.
+      c_status_id = 0
+      c_status = "Unknown"
+      if code == "healthy" || code == "passed" { c_status_id = 1; c_status = "Pass" }
+      if code == "unhealthy" || code == "failed" { c_status_id = 3; c_status = "Fail" }
+      if code == "notapplicable" || code == "skipped" { c_status_id = 99; c_status = "Other" }
+      compliance = { "status_id": c_status_id, "status": c_status }
+      if code != "" { compliance.status_code = string(status_obj.code) ?? string(r.state) ?? code }
+      cdesc = string(status_obj.description) ?? ""
+      if cdesc != "" { compliance.status_detail = cdesc }
+      if control != "" { compliance.control = control }
+      if standard != "" { compliance.standards = [standard] }
+      cats = array(get(r, ["metadata", "categories"]) ?? null) ?? []
+      if length(cats) > 0 { compliance.category = to_string(cats[0]) ?? "" }
+      if kind == "assessment" && exists(r.category) {
+          acat = string(r.category) ?? ""
+          if acat != "" && acat != "N/A" { compliance.category = acat }
+      }
+
+      # The finding is open while the resource fails; a pass resolves it.
+      status_id = 1
+      status = "New"
+      if c_status_id == 1 { status_id = 4; status = "Resolved" }
+      if c_status_id == 99 { status_id = 99; status = "Other" }
+      if c_status_id != 3 { severity_id = 1; severity = "Informational" }
+
+      activity_id = 1
+      activity_name = "Create"
+      if enrich_action == "write" || enrich_action == "update" { activity_id = 2; activity_name = "Update" }
+      if enrich_action == "delete" { activity_id = 3; activity_name = "Close" }
+
+      uid = rec_id
+      if uid == "" { uid = sha2("defender_for_cloud|assessment|" + raw_log, variant: "SHA-256") }
+      finding_info = { "uid": uid, "title": title, "types": ["Recommendation"] }
+      if kind == "regulatory" { finding_info.types = ["Regulatory Compliance"] }
+      if contains(rtype, "subassessments") { finding_info.types = ["Sub-assessment"] }
+      fdesc = string(get(r, ["metadata", "description"]) ?? null) ?? string(r.description) ?? ""
+      if fdesc != "" && kind != "regulatory" { finding_info.desc = fdesc }
+      first_eval = int(clock_ms.firstevaluationdate) ?? 0
+      if first_eval > 0 { finding_info.created_time = first_eval }
+      changed = int(clock_ms.statuschangedate) ?? 0
+      if changed > 0 { finding_info.modified_time = changed }
+      portal = string(get(r, ["links", "azureportal"]) ?? null) ?? string(r.assessmentdetailslink) ?? ""
+      if portal != "" { finding_info.src_url = portal }
+      pol = string(get(r, ["metadata", "policydefinitionid"]) ?? null) ?? ""
+      if pol != "" { finding_info.analytic = { "uid": pol, "name": title, "type_id": 1, "type": "Rule" } }
+
+      remediation = {}
+      rdesc = string(get(r, ["metadata", "remediationdescription"]) ?? null) ?? string(r.remediation) ?? ""
+      if rdesc != "" { remediation.desc = rdesc }
+
+      time_ms = int(clock_ms.statuschangedate) ?? int(clock_ms.timegenerated) ?? now_ms
+      metadata.uid = sha2("defender_for_cloud|" + uid + "|" + enrich_action + "|" + to_string(time_ms), variant: "SHA-256")
+      metadata.log_name = "Defender for Cloud recommendations"
+      if kind == "regulatory" { metadata.log_name = "Defender for Cloud regulatory compliance" }
+
+      ocsf = {
+          "class_uid": 2003,
+          "class_name": "Compliance Finding",
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": 200300 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status,
+          "time": time_ms,
+          "message": title,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "cloud": cloud,
+          "compliance": compliance,
+          "finding_info": finding_info
+      }
+      if length(resource) > 0 { ocsf.resources = [resource] }
+      if length(remediation) > 0 { ocsf.remediation = remediation }
+      . = ocsf
+  } else {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": now_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "cloud": cloud
+      }
+      .metadata.uid = sha2("defender_for_cloud|raw|" + raw_log, variant: "SHA-256")
+      if kind == "score" {
+          # A secure score is a posture metric, not a finding: keep it whole.
+          .metadata.log_name = "Defender for Cloud secure score"
+          .metadata.log_level = "info"
+          dn = string(r.displayname) ?? ""
+          if dn != "" { .message = dn }
+      } else {
+          .metadata.log_level = "error"
+          reason = "not a Defender for Cloud alert or assessment"
+          if !ok { reason = "unparsable input" }
+          # One record per event: an Event Hubs envelope is exploded upstream.
+          if kind == "envelope" { reason = "Event Hubs records envelope (explode upstream)" }
+          # NAN-5264: explicit fallback marker; nano parser health counts it.
+          . = set!(., ["unmapped", "parse_fallback"], reason)
+      }
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # TimeGenerated: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # StartTimeUtc: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # EndTimeUtc: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # StartTime: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # EndTime: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # ProcessingEndTime: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # Properties.TimeGenerated: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # properties.timeGeneratedUtc: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # properties.startTimeUtc: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # properties.endTimeUtc: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # properties.processingEndTimeUtc: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # properties.status.statusChangeDate: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # properties.status.firstEvaluationDate: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # Severity: Defender severity normalized to the OCSF severity_id; consume only when that ID is emitted.
+  # AlertSeverity: Defender severity normalized to the OCSF severity_id; consume only when that ID is emitted.
+  # properties.severity: Defender severity normalized to the OCSF severity_id; consume only when that ID is emitted.
+  # properties.metadata.severity: Defender severity normalized to the OCSF severity_id; consume only when that ID is emitted.
+  # Properties.Status.Severity: Defender severity normalized to the OCSF severity_id; consume only when that ID is emitted.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        TimeGenerated
+      | StartTimeUtc
+      | EndTimeUtc
+      | StartTime
+      | EndTime
+      | ProcessingEndTime
+      | Properties\.TimeGenerated
+      | properties\.timeGeneratedUtc
+      | properties\.startTimeUtc
+      | properties\.endTimeUtc
+      | properties\.processingEndTimeUtc
+      | properties\.status\.statusChangeDate
+      | properties\.status\.firstEvaluationDate
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        Severity
+      | AlertSeverity
+      | properties\.severity
+      | properties\.metadata\.severity
+      | Properties\.Status\.Severity
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"informational": 1, "low": 2, "medium": 3, "high": 4, "critical": 5}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    AlertDisplayName
+  | AlertLink
+  | AlertName
+  | AlertSeverity
+  | AlertType
+  | AlertUri
+  | AzureResourceId
+  | CompromisedEntity
+  | ConfidenceLevel
+  | Description
+  | DisplayName
+  | EndTime
+  | EndTimeUtc
+  | Id
+  | Intent
+  | IsIncident
+  | Name
+  | ProcessingEndTime
+  | ProductComponentName
+  | ProductName
+  | Properties\.Category
+  | Properties\.Description
+  | Properties\.DisplayName
+  | Properties\.Impact
+  | Properties\.Remediation
+  | Properties\.ResourceDetails\.Id
+  | Properties\.Status\.Code
+  | Properties\.Status\.Severity
+  | Properties\.TimeGenerated
+  | RemediationSteps
+  | ResourceId
+  | Severity
+  | StartTime
+  | StartTimeUtc
+  | Status
+  | SystemAlertId
+  | Tactics
+  | Techniques
+  | TenantId
+  | TimeGenerated
+  | Type
+  | VendorName
+  | id
+  | name
+  | properties\.alertDisplayName
+  | properties\.alertType
+  | properties\.alertUri
+  | properties\.assessmentDetailsLink
+  | properties\.compromisedEntity
+  | properties\.description
+  | properties\.displayName
+  | properties\.endTimeUtc
+  | properties\.intent
+  | properties\.isIncident
+  | properties\.links\.azurePortal
+  | properties\.metadata\.categories
+  | properties\.metadata\.description
+  | properties\.metadata\.displayName
+  | properties\.metadata\.policyDefinitionId
+  | properties\.metadata\.remediationDescription
+  | properties\.metadata\.severity
+  | properties\.processingEndTimeUtc
+  | properties\.productComponentName
+  | properties\.productName
+  | properties\.remediationSteps
+  | properties\.resourceDetails\.Id
+  | properties\.resourceDetails\.ResourceName
+  | properties\.resourceDetails\.ResourceType
+  | properties\.resourceDetails\.id
+  | properties\.severity
+  | properties\.startTimeUtc
+  | properties\.state
+  | properties\.status
+  | properties\.status\.code
+  | properties\.status\.description
+  | properties\.status\.firstEvaluationDate
+  | properties\.status\.statusChangeDate
+  | properties\.systemAlertId
+  | properties\.techniques
+  | properties\.timeGeneratedUtc
+  | properties\.vendorName
+  | tenantId
+  | type
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # source: https://github.com/elastic/integrations/blob/main/packages/microsoft_defender_cloud/data_stream/event/_dev/test/pipeline/test-alert.log
+  - raw: "{\"VendorName\":\"Microsoft\",\"AlertType\":\"ARM_AnomalousServiceOperation.CredentialAccess\",\"ProductName\":\"Microsoft Defender for Cloud\",\"StartTimeUtc\":\"2023-05-11T13:15:45.0170422Z\",\"EndTimeUtc\":\"2023-05-11T13:15:45.0170422Z\",\"TimeGenerated\":\"2023-05-11T13:17:09.0170422Z\",\"ProcessingEndTime\":\"2023-05-11T13:17:09.0170422Z\",\"Severity\":\"Medium\",\"Status\":\"New\",\"ProviderAlertStatus\":null,\"ConfidenceLevel\":null,\"ConfidenceScore\":null,\"ConfidenceReasons\":null,\"IsIncident\":false,\"SystemAlertId\":\"2517184898549829577_cdcf9f94-ec53-47a6-ab87-76130f87218d\",\"CorrelationKey\":null,\"Intent\":\"PreAttack\",\"AzureResourceId\":\"/SUBSCRIPTIONS/00000000-0000-0000-0000-000000000000/RESOURCEGROUPS/Sample-RG/providers/Microsoft.Compute/virtualMachines/Sample-VM\",\"WorkspaceId\":\"00000000-0000-0000-0000-000000000001\",\"WorkspaceSubscriptionId\":\"00000000-0000-0000-0000-000000000001\",\"WorkspaceResourceGroup\":\"Sample-RG\",\"AgentId\":null,\"CompromisedEntity\":\"Sample-VM\",\"AlertDisplayName\":\"[SAMPLE ALERT] Login from a suspicious IP\",\"Description\":\"THIS IS A SAMPLE ALERT: Your resource has been accessed successfully from an IP address that Microsoft Threat Intelligence has associated with suspicious activity.\",\"Entities\":[{\"$id\":\"5\",\"Address\":\"203.0.113.142\",\"Location\":{\"CountryCode\":\"US\",\"CountryName\":\"United States\",\"State\":\"Virginia\",\"City\":\"Washington\",\"Longitude\":-78.17197,\"Latitude\":38.73078,\"Asn\":8075},\"ThreatIntelligence\":[{\"ProviderName\":\"AlertSimulator\",\"ThreatType\":\"Sample-Type\",\"ThreatName\":\"Sample-Threat\",\"Confidence\":1,\"ThreatDescription\":\"\"}],\"Asset\":false,\"Type\":\"ip\"},{\"$id\":\"5\",\"DnsDomain\":\"\",\"NTDomain\":\"\",\"HostName\":\"Sample-VM\",\"NetBiosName\":\"Sample-VM\",\"AzureID\":\"/SUBSCRIPTIONS/00000000-0000-0000-0000-000000000000/RESOURCEGROUPS/Sample-RG/providers/Microsoft.Compute/virtualMachines/Sample-VM\",\"OMSAgentID\":\"00000000-0000-0000-0000-000000000001\",\"OSFamily\":\"Linux\",\"OSVersion\":\"Linux\",\"Asset\":false,\"Type\":\"host\"},{\"$id\":\"9\",\"ProcessId\":\"0x1e99b\",\"CommandLine\":\"php\",\"CreationTimeUtc\":\"2023-05-11T13:17:49.1333596Z\",\"ImageFile\":{\"$ref\":\"8\"},\"Account\":{\"$ref\":\"7\"},\"ParentProcess\":{\"$ref\":\"6\"},\"Host\":{\"$ref\":\"5\"},\"Asset\":false,\"Type\":\"process\"},{\"$id\":\"7\",\"Name\":\"Sample-account\",\"Host\":{\"$ref\":\"5\"},\"Sid\":\"\",\"Asset\":false,\"Type\":\"account\",\"LogonId\":\"0xbd6e\"}],\"ExtendedLinks\":[{\"Href\":\"https://learn.microsoft.com/en-us/azure/defender-for-cloud/alerts-reference\",\"Category\":null,\"Label\":\"Alerts reference\",\"Type\":\"webLink\"}],\"ResourceIdentifiers\":[{\"$id\":\"2\",\"AzureResourceId\":\"/subscriptions/00000000-0000-0000-0000-000000000000\",\"Type\":\"AzureResource\",\"AzureResourceTenantId\":\"00000000-0000-0000-0000-000000000000\"},{\"$id\":\"3\",\"AadTenantId\":\"00000000-0000-0000-0000-000000000000\",\"Type\":\"AAD\"}],\"RemediationSteps\":[\"Go to the firewall settings in order to lock down the firewall as tightly as possible.\"],\"ExtendedProperties\":{\"resourceType\":\"Virtual Machine\",\"Investigation steps\":\"{\\\"displayValue\\\":\\\"How to investigate this alert using logs at your Log Analytics workspace.\\\",\\\"kind\\\":\\\"Link\\\",\\\"value\\\":\\\"https:\\\\/\\\\/go.microsoft.com\\\\/fwlink\\\\/?linkid=2091064\\\"}\",\"Potential causes\":\"An attacker has accessed your database from a potentially suspicious IP; a legitimate user has accessed your database from a potentially suspicious IP.\"},\"AlertUri\":\"https://portal.azure.com/#blade/Microsoft_Azure_Security_AzureDefenderForData/AlertBlade/alertId/2517184898549829577_cdcf9f94-ec53-47a6-ab87-76130f87218d/subscriptionId/00000000-0000-0000-0000-000000000000/resourceGroup/Sample-RG/referencedFrom/alertDeepLink/location/centralus\"}"
+    expect:
+      "class_uid": "2004"
+      "activity_id": "1"
+      "severity_id": "3"
+      "status_id": "1"
+      "finding_info.uid": "2517184898549829577_cdcf9f94-ec53-47a6-ab87-76130f87218d"
+      "finding_info.analytic.uid": "ARM_AnomalousServiceOperation.CredentialAccess"
+      "evidences.0.src_endpoint.ip": "203.0.113.142"
+      "evidences.0.device.hostname": "Sample-VM"
+      "resources.0.name": "Sample-VM"
+      "cloud.account.uid": "00000000-0000-0000-0000-000000000000"
+      "time": "1683811029017"
+  # source: https://learn.microsoft.com/en-us/rest/api/defenderforcloud-composite/alerts (properties shape, also the Logic App trigger)
+  - raw: "{\"id\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-example/providers/Microsoft.Security/locations/westeurope/alerts/2518298467986649999_d5b4e6a1-2222-4444-8888-000000000001\",\"name\":\"2518298467986649999_d5b4e6a1-2222-4444-8888-000000000001\",\"type\":\"Microsoft.Security/Locations/alerts\",\"properties\":{\"status\":\"Active\",\"timeGeneratedUtc\":\"2026-11-02T10:20:31.4413124Z\",\"processingEndTimeUtc\":\"2026-11-02T10:21:02.1234567Z\",\"vendorName\":\"Microsoft\",\"alertDisplayName\":\"Suspicious process executed\",\"alertType\":\"VM_SuspectProcess\",\"compromisedEntity\":\"vm-web-01\",\"description\":\"Machine logs indicate that the suspicious process 'c:\\\\users\\\\public\\\\svch0st.exe' was running on the machine.\",\"remediationSteps\":[\"Review the process command line and the user account that ran it.\",\"If the activity is unexpected, isolate the machine and run a full antimalware scan.\"],\"intent\":\"Execution,DefenseEvasion\",\"startTimeUtc\":\"2026-11-02T10:12:00.0000000Z\",\"endTimeUtc\":\"2026-11-02T10:12:00.0000000Z\",\"resourceIdentifiers\":[{\"type\":\"AzureResource\",\"azureResourceId\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-example/providers/Microsoft.Compute/virtualMachines/vm-web-01\"},{\"type\":\"LogAnalytics\",\"workspaceId\":\"00000000-0000-0000-0000-000000000000\",\"workspaceSubscriptionId\":\"00000000-0000-0000-0000-000000000000\",\"workspaceResourceGroup\":\"rg-example\",\"agentId\":\"11111111-2222-3333-4444-555555555555\"}],\"systemAlertId\":\"2518298467986649999_d5b4e6a1-2222-4444-8888-000000000001\",\"productName\":\"Microsoft Defender for Cloud\",\"productComponentName\":\"Servers\",\"alertUri\":\"https://portal.azure.com/#blade/Microsoft_Azure_Security/AlertBlade/alertId/2518298467986649999_d5b4e6a1-2222-4444-8888-000000000001/subscriptionId/00000000-0000-0000-0000-000000000000/resourceGroup/rg-example/referencedFrom/alertDeepLink/location/westeurope\",\"isIncident\":false,\"severity\":\"High\",\"techniques\":[\"T1059\",\"T1036\"],\"subTechniques\":[\"T1059.001\"],\"entities\":[{\"$id\":\"1\",\"hostName\":\"vm-web-01\",\"azureID\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-example/providers/Microsoft.Compute/virtualMachines/vm-web-01\",\"osFamily\":\"Windows\",\"type\":\"host\"},{\"$id\":\"2\",\"name\":\"svc_web\",\"ntDomain\":\"EXAMPLE\",\"sid\":\"S-1-5-21-1004336348-1177238915-682003330-1001\",\"host\":{\"$ref\":\"1\"},\"type\":\"account\"},{\"$id\":\"3\",\"processId\":\"0x1f2c\",\"commandLine\":\"c:\\\\users\\\\public\\\\svch0st.exe -k netsvcs\",\"host\":{\"$ref\":\"1\"},\"type\":\"process\"}],\"extendedProperties\":{\"resourceType\":\"Virtual Machine\",\"suspicious process\":\"c:\\\\users\\\\public\\\\svch0st.exe\",\"account logon id\":\"0x3e7\"}}}"
+    expect:
+      "class_uid": "2004"
+      "severity_id": "4"
+      "finding_info.title": "Suspicious process executed"
+      "finding_info.attacks.0.technique.uid": "T1059"
+      "finding_info.attacks.1.tactics.1.name": "DefenseEvasion"
+      "evidences.0.process.pid": "7980"
+      "evidences.0.user.name": "svc_web"
+      "remediation.desc": "Review the process command line and the user account that ran it.\nIf the activity is unexpected, isolate the machine and run a full antimalware scan."
+      "finding_info.product.name": "Servers"
+  # source: https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/securityalert
+  - raw: "{\"TenantId\":\"00000000-0000-0000-0000-000000000000\",\"TimeGenerated\":\"2026-11-02T11:05:44.2290000Z\",\"DisplayName\":\"Access from a suspicious IP to a storage account\",\"AlertName\":\"Access from a suspicious IP to a storage account\",\"AlertSeverity\":\"Low\",\"Description\":\"Someone has accessed your Azure Storage account from an IP address that is associated with suspicious activity.\",\"ProviderName\":\"ASI Scheduled Alerts\",\"VendorName\":\"Microsoft\",\"VendorOriginalId\":\"2518298401234567890_aaaa1111-bbbb-2222-cccc-333333333333\",\"SystemAlertId\":\"aaaa1111-bbbb-2222-cccc-333333333333\",\"ResourceId\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-data/providers/Microsoft.Storage/storageAccounts/stexampledata\",\"SourceComputerId\":\"\",\"AlertType\":\"Storage.Blob_SuspiciousIp\",\"ConfidenceLevel\":\"Low\",\"ConfidenceScore\":null,\"IsIncident\":false,\"StartTime\":\"2026-11-02T10:58:00.0000000Z\",\"EndTime\":\"2026-11-02T10:59:00.0000000Z\",\"ProcessingEndTime\":\"2026-11-02T11:05:40.0000000Z\",\"RemediationSteps\":\"[\\\"Limit access to your storage account, following the principle of least privilege.\\\"]\",\"ExtendedProperties\":\"{\\\"Client IP address\\\":\\\"198.51.100.250\\\",\\\"Operations types\\\":\\\"GetBlob\\\"}\",\"Entities\":\"[{\\\"$id\\\":\\\"4\\\",\\\"Address\\\":\\\"198.51.100.250\\\",\\\"Type\\\":\\\"ip\\\"}]\",\"SourceSystem\":\"Detection\",\"WorkspaceSubscriptionId\":\"00000000-0000-0000-0000-000000000000\",\"WorkspaceResourceGroup\":\"rg-sentinel\",\"ExtendedLinks\":\"\",\"ProductName\":\"Azure Security Center\",\"ProductComponentName\":\"Storage\",\"AlertLink\":\"\",\"Status\":\"Resolved\",\"CompromisedEntity\":\"stexampledata\",\"Tactics\":\"InitialAccess\",\"Techniques\":\"T1190\",\"Type\":\"SecurityAlert\"}"
+    expect:
+      "class_uid": "2004"
+      "activity_id": "3"
+      "status_id": "4"
+      "severity_id": "2"
+      "confidence_id": "1"
+      "finding_info.attacks.0.technique.uid": "T1190"
+      "resources.0.type": "Microsoft.Storage/storageAccounts"
+  # source: https://github.com/elastic/integrations/blob/main/packages/microsoft_defender_cloud/data_stream/assessment/_dev/test/pipeline/test-assessment.log (continuous export shape with metadata)
+  - raw: "{\"tenantId\":\"00000000-0000-0000-0000-000000000000\",\"type\":\"Microsoft.Security/assessments\",\"id\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-example/providers/Microsoft.Storage/storageAccounts/stexample/providers/Microsoft.Security/assessments/1c5de8e1-f68d-6a17-e0d2-ec259c42768c\",\"name\":\"1c5de8e1-f68d-6a17-e0d2-ec259c42768c\",\"securityEventDataEnrichment\":{\"action\":\"Insert\",\"apiVersion\":\"2019-01-01\",\"isSnapshot\":false,\"interval\":\"00:00:00\"},\"properties\":{\"resourceDetails\":{\"source\":\"Azure\",\"id\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-example/providers/Microsoft.Storage/storageAccounts/stexample\"},\"displayName\":\"Storage account public access should be disallowed\",\"status\":{\"code\":\"Unhealthy\",\"statusChangeDate\":\"2026-11-02T06:31:10.1122334Z\",\"firstEvaluationDate\":\"2026-10-28T06:30:55.0000000Z\"},\"metadata\":{\"displayName\":\"Storage account public access should be disallowed\",\"assessmentType\":\"BuiltIn\",\"policyDefinitionId\":\"/providers/Microsoft.Authorization/policyDefinitions/4fa4b6c0-31ca-4c0d-b10d-24b96f62a751\",\"description\":\"Anonymous public read access to containers and blobs in Azure Storage is a convenient way to share data but might present security risks.\",\"remediationDescription\":\"Set allowBlobPublicAccess to false on the storage account.\",\"categories\":[\"Data\"],\"severity\":\"High\",\"userImpact\":\"Low\",\"implementationEffort\":\"Low\",\"threats\":[\"DataExfiltration\"]},\"links\":{\"azurePortal\":\"portal.azure.com/#blade/Microsoft_Azure_Security/RecommendationsBlade/assessmentKey/1c5de8e1-f68d-6a17-e0d2-ec259c42768c\"}}}"
+    expect:
+      "class_uid": "2003"
+      "activity_id": "1"
+      "severity_id": "4"
+      "status_id": "1"
+      "compliance.status_id": "3"
+      "compliance.category": "Data"
+      "finding_info.analytic.uid": "/providers/Microsoft.Authorization/policyDefinitions/4fa4b6c0-31ca-4c0d-b10d-24b96f62a751"
+      "remediation.desc": "Set allowBlobPublicAccess to false on the storage account."
+      "time": "1793601070112"
+  # source: https://github.com/elastic/integrations/blob/main/packages/microsoft_defender_cloud/data_stream/assessment/_dev/test/pipeline/test-assessment.log
+  - raw: "{\"type\":\"Microsoft.Security/assessments\",\"id\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/RG-EXAMPLE/providers/Microsoft.Compute/virtualMachines/vm-for-defender-cloud-test/providers/Microsoft.Security/assessments/fabcdef2-5678-1234-8382-21234567890d\",\"name\":\"fabcdef2-5678-1234-8382-21234567890d\",\"properties\":{\"resourceDetails\":{\"Source\":\"Azure\",\"Id\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/RG-EXAMPLE/providers/Microsoft.Compute/virtualMachines/vm-for-defender-cloud-test\",\"ResourceName\":\"vm-for-defender-cloud-test\",\"ResourceType\":\"virtualMachines\",\"ResourceProvider\":\"Microsoft.Compute\",\"NativeResourceId\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/RG-EXAMPLE/providers/Microsoft.Compute/virtualMachines/vm-for-defender-cloud-test\"},\"displayName\":\"Machines should have a vulnerability assessment solution\",\"status\":{\"code\":\"Healthy\",\"cause\":\"mdeTvm\",\"description\":\"The machine is onboarded to Microsoft defender vulnerability management\"},\"additionalData\":{\"Can onboard to BYOL\":\"true\"}}}"
+    expect:
+      "class_uid": "2003"
+      "compliance.status_id": "1"
+      "status_id": "4"
+      "severity_id": "1"
+      "resources.0.name": "vm-for-defender-cloud-test"
+  # source: https://github.com/elastic/integrations/blob/main/packages/microsoft_defender_cloud/data_stream/assessment/_dev/test/pipeline/test-assessment.log
+  - raw: "{\"type\":\"Microsoft.Security/assessments\",\"id\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/example-test_group/providers/Microsoft.ContainerService/managedClusters/example-test/providers/Microsoft.Security/assessments/c6852852-abab-1234-5678-9abcdabcdef5\",\"name\":\"c6852852-abab-1234-5678-9abcdabcdef5\",\"properties\":{\"resourceDetails\":{\"Source\":\"Azure\",\"Id\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/example-test_group/providers/Microsoft.ContainerService/managedClusters/example-test\",\"ResourceName\":\"example-test\",\"ResourceType\":\"managedClusters\",\"ResourceProvider\":\"Microsoft.ContainerService\",\"NativeResourceId\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/example-test_group/providers/Microsoft.ContainerService/managedClusters/example-test\"},\"displayName\":\"Azure running container images should have vulnerabilities resolved\",\"status\":{\"code\":\"NotApplicable\",\"cause\":\"Unscanned\",\"description\":\"Image is not located in any of the supported container registries\"},\"additionalData\":{\"subAssessmentsLink\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/example-test_group/providers/Microsoft.ContainerService/managedClusters/example-test/providers/Microsoft.Security/assessments/c6852852-abab-1234-5678-9abcdabcdef5/subAssessments\",\"subAssessment\":{\"type\":\"Microsoft.Security/assessments/subAssessments\",\"id\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/example-test_group/providers/Microsoft.ContainerService/managedClusters/example-test/providers/Microsoft.Security/assessments/c6852852-abab-1234-5678-9abcdabcdef5/subassessments/9a3fbe5a-5c26-74d1-bed0-c4ab58f490d0\",\"name\":\"9a3fbe5a-5c26-74d1-bed0-c4ab58f490d0\",\"properties\":{\"status\":{\"code\":\"NotApplicable\",\"severity\":\"Unknown\",\"cause\":\"Unscanned\",\"description\":\"Image is not located in any of the supported container registries\"},\"timeGenerated\":\"2025-08-24T17:33:55.7367255Z\",\"resourceDetails\":{\"NativeResourceId\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/example-test_group/providers/Microsoft.ContainerService/managedClusters/example-test\",\"ResourceName\":\"example-test\",\"ResourceType\":\"managedClusters\",\"ResourceProvider\":\"Microsoft.ContainerService\",\"source\":\"Azure\",\"id\":\"mcr.microsoft.com/azuremonitor/containerinsights/ciprod/prometheus-collector/images@sha256:0200d22ccf78ce4d7f922092d9e03d1db7fb9d8923f2b5004cc8e8719b8c18c8\"},\"additionalData\":{\"assessedResourceType\":\"AzureRuntimeImageVulnerability\",\"clusterDetails\":{\"clusterResourceId\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/example-test_group/providers/Microsoft.ContainerService/managedClusters/example-test\",\"clusterName\":\"example-test\"},\"kubernetesContext\":{\"workloads\":[{\"kind\":\"ReplicaSet\",\"name\":\"ama-metrics-operator-targets-5abcd12345\",\"namespace\":\"kube-system\",\"ownedResources\":[{\"containers\":[{\"name\":\"targetallocator\"}],\"kind\":\"Pod\",\"name\":\"ama-metrics-operator-targets-5abcd12345-smfn6\"}]}]},\"artifactDetails\":{\"repositoryName\":\"\",\"registryHost\":\"mcr.microsoft.com\",\"digest\":\"sha256:0200d22ccf78ce4d7f922092d9e03d1db7fb9d8923f2b5004cc8e8719b8c18c8\",\"artifactType\":\"ContainerImage\"},\"metadata\":{\"inventorySource\":\"Agentless\",\"scanner\":\"MicrosoftDefenderVulnerabilityManagement\"}}}}}}}"
+    expect:
+      "compliance.status_id": "99"
+      "compliance.status_detail": "Image is not located in any of the supported container registries"
+  # source: https://github.com/elastic/integrations/blob/main/packages/microsoft_defender_cloud/data_stream/event/_dev/test/pipeline/test-alert.log
+  - raw: "{\"assessmentEventDataEnrichment\":{\"action\":\"Delete\",\"apiVersion\":\"2019-01-01\",\"isSnapshot\":false},\"securityEventDataEnrichment\":{\"action\":\"Delete\",\"apiVersion\":\"2019-01-01\",\"isSnapshot\":false},\"tenantId\":\"00000000-0000-0000-0000-000000000000\",\"type\":\"Microsoft.Security/assessments\",\"kind\":null,\"location\":null,\"id\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-example-web/providers/microsoft.web/sites/rg-example-web/providers/Microsoft.Security/assessments/7b3d4796-9400-2904-692b-4a5ede7f0a1e\",\"name\":\"7b3d4796-9400-2904-692b-4a5ede7f0a1e\",\"tags\":null,\"properties\":{\"resourceDetails\":{\"source\":\"Azure\",\"id\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-example-web/providers/microsoft.web/sites/rg-example-web\"},\"displayName\":\"CORS should not allow every resource to access Function Apps\",\"status\":{\"code\":\"Healthy\",\"statusChangeDate\":\"2023-05-09T13:19:49.3381028Z\",\"firstEvaluationDate\":\"2023-05-09T13:19:49.3381028Z\"},\"additionalData\":{\"kind\":\"Functionapp\"},\"metadata\":{\"displayName\":\"CORS should not allow every resource to access Function Apps\",\"assessmentType\":\"BuiltIn\",\"policyDefinitionId\":\"/providers/microsoft.authorization/policydefinitions/0820b7b9-23aa-4725-a1ce-ae4558f718e5\",\"description\":\"Cross-Origin Resource Sharing (CORS) should not allow all domains to access your Function app. Allow only required domains to interact with your Function app.\",\"remediationDescription\":\"To allow only required domains to interact with your web app, we recommend the following steps:<br>1. Go to the app service CORS page<br>2. Remove the \\\"*\\\" defined and instead specify explicit origins that should be allowed to make cross-origin calls<br>3. Click Save\",\"categories\":[\"AppServices\"],\"severity\":\"Low\",\"userImpact\":\"Low\",\"implementationEffort\":\"Low\",\"threats\":[\"MaliciousInsider\",\"AccountBreach\"]},\"links\":{\"azurePortal\":\"portal.azure.com/#blade/Microsoft_Azure_Security/RecommendationsBlade/assessmentKey/7b3d4796-9400-2904-692b-4a5ede7f0a1e/resourceId/%2fsubscriptions%2f00000000-0000-0000-0000-000000000000%2fresourcegroups%2frg-example-web%2fproviders%2fmicrosoft.web%2fsites%2frg-example-web\"}}}"
+    expect:
+      "class_uid": "2003"
+      "activity_id": "3"
+      "compliance.status_id": "1"
+  # source: https://github.com/elastic/integrations/blob/main/packages/microsoft_defender_cloud/data_stream/event/_dev/test/pipeline/test-alert.log
+  - raw: "{\"$type\":\"subAssessmentEvent\",\"SubAssessmentEventDataEnrichment\":{\"$type\":\"subAssessmentEventDataEnrichment\",\"Action\":\"Delete\",\"ApiVersion\":\"2020-01-01\",\"IsSnapshot\":false},\"SecurityEventDataEnrichment\":{\"$type\":\"subAssessmentEventDataEnrichment\",\"Action\":\"Delete\",\"ApiVersion\":\"2020-01-01\",\"IsSnapshot\":false},\"TenantId\":\"00000000-0000-0000-0000-000000000000\",\"Type\":\"Microsoft.Security/assessments/subAssessments\",\"Id\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-example-linux/providers/microsoft.compute/virtualmachines/vm-example-01/providers/Microsoft.Security/assessments/c476dc48-8110-4139-91af-c8d940896b98/subassessments/93d2736e-7329-8806-3ef6-e71bb2203d11\",\"Name\":\"93d2736e-7329-8806-3ef6-e71bb2203d11\",\"Properties\":{\"$type\":\"response/subAssessmentProperties\",\"Id\":\"93d2736e-7329-8806-3ef6-e71bb2203d11\",\"DisplayName\":\"Ensure DCCP is disabled\",\"Status\":{\"$type\":\"status\",\"Code\":\"Unhealthy\",\"Severity\":\"Low\"},\"Remediation\":\"Edit or create a file in the `/etc/modprobe.d/` directory ending in .conf and add `install dccp /bin/true` then unload the dccp module or run '/opt/microsoft/omsagent/plugin/omsremediate -r disable-unnecessary-kernel-mods'\",\"Impact\":\"If the protocol is not required, it is recommended that the drivers not be installed to reduce the potential attack surface.\",\"Category\":\"N/A\",\"Description\":\"Ensure DCCP is disabled\",\"TimeGenerated\":\"2023-05-12T09:58:32.2607101Z\",\"ResourceDetails\":{\"$type\":\"resourceDetails/azure\",\"Source\":\"Azure\",\"Id\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourcegroups/rg-example-linux/providers/microsoft.compute/virtualmachines/vm-example-01\"},\"AdditionalData\":{\"$type\":\"additionalData/general\",\"AssessedResourceType\":\"GeneralVulnerability\",\"Data\":{\"OsName\":\"Linux\",\"RuleType\":\"Command\",\"Vulnerability\":\"\",\"AZID\":\"MSID 54\",\"DataSourceType\":\"Not Applicable\",\"DataSourceKey\":\"Not Applicable\"}}}}"
+    expect:
+      "class_uid": "2003"
+      "severity_id": "2"
+      "finding_info.types.0": "Sub-assessment"
+      "remediation.desc": "Edit or create a file in the `/etc/modprobe.d/` directory ending in .conf and add `install dccp /bin/true` then unload the dccp module or run '/opt/microsoft/omsagent/plugin/omsremediate -r disable-unnecessary-kernel-mods'"
+  # source: https://github.com/elastic/integrations/blob/main/packages/microsoft_defender_cloud/data_stream/event/_dev/test/pipeline/test-alert.log (regulatory compliance assessment shape)
+  - raw: "{\"securityEventDataEnrichment\":{\"action\":\"Insert\",\"apiVersion\":\"2019-01-01-preview\",\"isSnapshot\":false,\"interval\":\"00:00:00\"},\"id\":\"/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Security/regulatoryComplianceStandards/PCI-DSS-4/regulatoryComplianceControls/1.2.1/regulatoryComplianceAssessments/22730e10-96f6-4aac-ad84-9383d35b5917\",\"name\":\"22730e10-96f6-4aac-ad84-9383d35b5917\",\"type\":\"Microsoft.Security/regulatoryComplianceStandards/regulatoryComplianceControls/regulatoryComplianceAssessments\",\"properties\":{\"description\":\"Management ports should be closed on your virtual machines\",\"state\":\"Failed\",\"passedResources\":3,\"failedResources\":2,\"skippedResources\":0,\"assessmentType\":\"Assessment\",\"assessmentDetailsLink\":\"https://portal.azure.com/#blade/Microsoft_Azure_Security/RecommendationsBlade/assessmentKey/22730e10-96f6-4aac-ad84-9383d35b5917\"}}"
+    expect:
+      "class_uid": "2003"
+      "compliance.status_id": "3"
+      "compliance.standards.0": "PCI-DSS-4"
+      "compliance.control": "1.2.1"
+  # source: https://github.com/elastic/integrations/blob/main/packages/microsoft_defender_cloud/data_stream/event/_dev/test/pipeline/test-alert.log
+  - raw: "{\"securityEventDataEnrichment\":{\"action\":\"Insert\",\"apiVersion\":\"2020-01-01\",\"isSnapshot\":false},\"id\":\"/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Security/secureScores/ascScore/secureScoreControls/61702b76-1fab-41f2-bcbc-50b7870dcf38\",\"name\":\"61702b76-1fab-41f2-bcbc-50b7870dcf38\",\"type\":\"Microsoft.Security/secureScores/secureScoreControls\",\"properties\":{\"displayName\":\"Apply system updates\",\"healthyResourceCount\":0,\"unhealthyResourceCount\":3,\"notApplicableResourceCount\":1,\"score\":{\"max\":6,\"current\":0,\"percentage\":0},\"definition\":{\"id\":\"/providers/Microsoft.Security/secureScoreControlDefinitions/61702b76-1fab-41f2-bcbc-50b7870dcf38\",\"name\":\"61702b76-1fab-41f2-bcbc-50b7870dcf38\",\"type\":\"Microsoft.Security/secureScoreControlDefinitions\",\"properties\":{\"source\":{\"sourceType\":\"BuiltIn\"},\"displayName\":\"Apply system updates\",\"maxScore\":6,\"assessmentDefinitions\":[{\"id\":\"/providers/Microsoft.Security/assessmentMetadata/d1db3318-01ff-16de-29eb-28b344515626\"},{\"id\":\"/providers/Microsoft.Security/assessmentMetadata/27ac71b1-75c5-41c2-adc2-858f5db45b08\"},{\"id\":\"/providers/Microsoft.Security/assessmentMetadata/720a3e77-0b9a-4fa9-98b6-ddf0fd7e32c1\"},{\"id\":\"/providers/Microsoft.Security/assessmentMetadata/4ab6e3c5-74dd-8b35-9ab9-f61b30875b27\"},{\"id\":\"/providers/Microsoft.Security/assessmentMetadata/e1145ab1-eb4f-43d8-911b-36ddf771d13f\"},{\"id\":\"/providers/Microsoft.Security/assessmentMetadata/90386950-71ca-4357-a12e-486d1679427c\"},{\"id\":\"/providers/Microsoft.Security/assessmentMetadata/45cfe080-ceb1-a91e-9743-71551ed24e94\"},{\"id\":\"/providers/Microsoft.Security/assessmentMetadata/bd20bd91-aaf1-7f14-b6e4-866de2f43146\"},{\"id\":\"/providers/Microsoft.Security/assessmentMetadata/bc85a7ee-7f43-47ab-8736-4faaec9346b5\"},{\"id\":\"/providers/Microsoft.Security/assessmentMetadata/11c3f3c8-3c13-48be-9ee5-67b6865e7462\"},{\"id\":\"/providers/Microsoft.Security/assessmentMetadata/643a00cb-3da3-43ef-b523-15a0f3198e45\"},{\"id\":\"/providers/Microsoft.Security/assessmentMetadata/d352afac-cebc-4e02-b474-7ef402fb1d65\"}]}},\"weight\":3}}"
+    expect:
+      "class_uid": "0"
+      "metadata.log_level": "info"
+      "message": "Apply system updates"
+  # source: https://learn.microsoft.com/en-us/azure/defender-for-cloud/alerts-schemas (continuous export to Event Hubs)
+  - raw: "{\"records\":[{\"VendorName\":\"Microsoft\",\"AlertType\":\"VM_SuspectProcess\",\"SystemAlertId\":\"2518298467986649999_d5b4e6a1-2222-4444-8888-000000000002\",\"Severity\":\"High\",\"AlertDisplayName\":\"Suspicious process executed\"}]}"
+    expect:
+      "class_uid": "0"
+      "unmapped.parse_fallback": "Event Hubs records envelope (explode upstream)"
+  # NAN-3702: an unparseable record gets the deterministic sha256("defender_for_cloud|raw|" + raw) uid.
+  - raw: "NAN-3702 determinism probe: not a defender_for_cloud record"
+    expect:
+      "class_uid": "0"
+      "metadata.uid": "68433770a5100dff17539285eb102d829f00f80257486fcc4892882e14237579"
+      "unmapped.parse_fallback": "unparsable input"
