@@ -1,0 +1,100 @@
+source: text
+transforms:
+- source: header.ts
+  kind: epoch_ms
+  target: time
+  format: '%+'
+  reason: RFC 3339 syslog timestamp converted to event milliseconds; "Mon DD YYYY" clocks remain residual.
+- source: fields.Protocol
+  kind: lowercase
+  reason: Protocol name lowercased into connection_info.protocol_name.
+- source: event.protocol
+  kind: lowercase
+  reason: Protocol name lowercased into connection_info.protocol_name.
+- source: event.protocol
+  kind: enum
+  target: connection_info.protocol_num
+  values:
+    tcp: 6
+    udp: 17
+    icmp: 1
+  reason: Protocol name normalized to the IANA protocol number.
+- source: fields.Protocol
+  kind: enum
+  target: connection_info.protocol_num
+  values:
+    tcp: 6
+    udp: 17
+    icmp: 1
+  reason: Protocol name normalized to the IANA protocol number.
+- source: fields.ConnectionDuration
+  kind: scale
+  factor: 1000
+  target: duration
+  reason: Connection duration in seconds converted to OCSF milliseconds.
+- source: fields.AccessControlRuleAction
+  kind: enum
+  target: action_id
+  values:
+    allow: 1
+    trust: 1
+    block: 2
+    block with reset: 2
+  reason: Access control verdict normalized to the OCSF action; consume only when the expected ID is emitted.
+consumed_candidates:
+- header.host
+- header.msg_id
+- fields.SrcIP
+- fields.DstIP
+- fields.SrcPort
+- fields.DstPort
+- fields.IngressInterface
+- fields.EgressInterface
+- fields.IngressZone
+- fields.EgressZone
+- fields.Protocol
+- fields.ConnectionID
+- fields.User
+- fields.ApplicationProtocol
+- fields.URL
+- fields.URI
+- fields.AccessControlRuleName
+- fields.AccessControlRuleReason
+- fields.IPReputationSICategory
+- fields.URLSICategory
+- fields.DNSSICategory
+- fields.ACPolicy
+- fields.InitiatorBytes
+- fields.ResponderBytes
+- fields.InitiatorPackets
+- fields.ResponderPackets
+- fields.Revision
+- fields.Message
+- fields.Classification
+- fields.IntrusionPolicy
+- fields.FileName
+- fields.FileSize
+- fields.FileSHA256
+- fields.FileType
+- fields.ThreatName
+- fields.FilePolicy
+- fields.FileAction
+- fields.DeviceUUID
+- event.src_ip
+- event.dst_ip
+- event.src_port
+- event.dst_port
+- event.src_iface
+- event.dst_iface
+- event.protocol
+- event.conn_id
+- event.acl
+- event.bytes
+- event.reason
+- event.server
+- event.service
+- event.user
+- message
+consumed_reason: Only source keys read by this parser are eligible for exact-value
+  consumption; the selected branch must emit the value. Unknown keys always spill,
+  even when their value equals an OCSF default.

@@ -1,0 +1,51 @@
+source: text
+transforms:
+- source: header.ts
+  kind: epoch_ms
+  target: time
+  format: '%+'
+  reason: RFC 5424 timestamp converted to event milliseconds; RFC 3164 clocks carry no year and remain residual.
+- source: filter.protocol
+  kind: lowercase
+  reason: filterlog protocol names (UDP on IPv6) are lowercased into connection_info.protocol_name.
+- source: filter.action
+  kind: enum
+  target: action_id
+  values:
+    pass: 1
+    block: 2
+    reject: 2
+  reason: filterlog verdict normalized to the OCSF action; consume only when the expected ID is emitted.
+- source: dhcp.mac
+  kind: lowercase
+  reason: Client MAC lowercased into src_endpoint.mac.
+consumed_candidates:
+- header.host
+- header.prog
+- filter.tracker
+- filter.rule_number
+- filter.interface
+- filter.protocol
+- filter.protocol_id
+- filter.src_ip
+- filter.dst_ip
+- filter.src_port
+- filter.dst_port
+- filter.length
+- dns.client
+- dns.qtype
+- dns.qclass
+- dns.rcode
+- dhcp.type
+- dhcp.ip
+- dhcp.server
+- dhcp.mac
+- dhcp.hostname
+- dhcp.via
+- openvpn.user
+- openvpn.client
+- openvpn.client_port
+- message
+consumed_reason: Only source keys read by this parser are eligible for exact-value
+  consumption; the selected branch must emit the value. Unknown keys always spill,
+  even when their value equals an OCSF default.

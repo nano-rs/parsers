@@ -1,0 +1,1004 @@
+name: cisco_ftd_ocsf
+display_name: Cisco Secure Firewall Threat Defense / Firepower (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Cisco Secure Firewall Threat Defense (FTD, Firepower) syslog into
+  OCSF 1.9.0. The Snort / FMC security events, sent as %FTD-<sev>-43000x
+  with "Key: Value, ..." bodies (also accepted under the %NGIPS and %ASA
+  facility names), are mapped as follows. 430001 intrusion events become
+  Detection Finding (2004): the rule (GID:SID, revision, message,
+  classification) is finding_info.analytic, Priority sets severity and
+  InlineResult sets the action. 430002 / 430003 connection start / end
+  become Network Activity (4001) Open / Close (Refuse when the access
+  control action is a block) with initiator / responder bytes and packets,
+  zones, interfaces, the access control rule and policy, application,
+  URL and security intelligence category. 430004 file events and 430005
+  malware events become Detection Finding with the file (name, size,
+  SHA-256) and URI as evidence and the threat name as malware; a Malware
+  SHA disposition is High severity. FTD also emits the classic ASA-style
+  data-plane codes under %FTD: connection build / teardown (3020xx), ACL
+  permit / deny (106023, 106100, 106001 / 106006 / 106007 / 106015) become
+  Network Activity, and AAA / management / VPN logins (113004 / 113005 /
+  113015, 605004 / 605005, 611101 / 611102, 113019) become Authentication
+  (3002). Any other message id becomes Base Event (0) with the header and
+  body kept; a line with no %FTD / %ASA / %NGIPS header is a Base Event
+  marked with unmapped.parse_fallback. Match split versus `cisco_asa`: both
+  parsers understand the ASA message ids, but `cisco_asa` only recognizes
+  the %ASA facility and knows no 43000x events, so route Threat Defense
+  devices and FMC syslog to `cisco_ftd` and classic ASA appliances to
+  `cisco_asa`; deploy one per device, never both for the same stream.
+match_values:
+  - cisco_ftd
+category: network
+vendor: "Cisco"
+product: "Secure Firewall Threat Defense"
+parser_vrl: |
+  # Cisco FTD / Firepower -> OCSF 1.9.0 Detection Finding (2004) / Network
+  # Activity (4001) / Authentication (3002) / Base Event (0)
+  raw_log = if is_string(.message) { string!(.message) } else { encode_json(.) }
+  __raw_body = raw_log
+  __source_kv = {}
+
+  time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
+  parsed = false
+  host = ""
+  msg_id = ""
+  sev_num = 6
+  body = ""
+
+  hm, he = parse_regex(raw_log, r'^(?:<(?P<pri>\d{1,3})>)?(?P<prefix>.*?)\s*%(?P<facility>FTD|ASA|NGIPS)-(?P<sev>\d)-(?P<msgid>\d{6}):\s*(?P<body>.*)$')
+  if he == null {
+      parsed = true
+      hdr = { "facility": hm.facility, "severity": hm.sev, "msg_id": hm.msgid }
+      if hm.pri != null { hdr.pri = hm.pri }
+      msg_id = string!(hm.msgid)
+      sev_num = to_int(hm.sev) ?? 6
+      body = string!(hm.body)
+      prefix = string!(hm.prefix)
+      ts_str = ""
+      pm, pe = parse_regex(prefix, r'^(?P<ts>\d{4}-\d{2}-\d{2}T\S+|[A-Z][a-z]{2}\s+\d{1,2}\s+(?:\d{4}\s+)?\d{2}:\d{2}:\d{2})?\s*:?\s*(?P<host>[^\s:]+)?(?:\s+(?P<tag>[^\s:]+))?\s*:?\s*$')
+      if pe == null {
+          if pm.ts != null { hdr.ts = pm.ts; ts_str = string!(pm.ts) }
+          if pm.host != null { hdr.host = pm.host; host = string!(pm.host) }
+          if pm.tag != null { hdr.tag = pm.tag }
+      }
+      __source_kv.header = hdr
+      if ts_str != "" {
+          t1, t1e = parse_timestamp(ts_str, "%+")
+          if t1e == null {
+              time_ms = to_unix_timestamp(t1, unit: "milliseconds")
+          } else {
+              ts_norm = replace(ts_str, r'\s+', " ")
+              t2, t2e = parse_timestamp(ts_norm, "%b %d %Y %H:%M:%S", timezone: "UTC")
+              if t2e == null {
+                  time_ms = to_unix_timestamp(t2, unit: "milliseconds")
+              } else {
+                  t3, t3e = parse_timestamp(ts_norm + " " + format_timestamp!(now(), "%Y"), "%b %d %H:%M:%S %Y", timezone: "UTC")
+                  if t3e == null { time_ms = to_unix_timestamp(t3, unit: "milliseconds") }
+              }
+          }
+      }
+  }
+
+  severity_id = 1
+  severity = "Informational"
+  if sev_num <= 2 { severity_id = 5; severity = "Critical" }
+  if sev_num == 3 { severity_id = 4; severity = "High" }
+  if sev_num == 4 { severity_id = 3; severity = "Medium" }
+  if sev_num == 5 { severity_id = 2; severity = "Low" }
+
+  route = "base"
+  activity_id = 99
+  activity_name = "Other"
+  action_id = 0
+  action = "Unknown"
+  disposition_id = 0
+  disposition = "Unknown"
+  status_id = 0
+  status_str = "Unknown"
+  src = {}
+  dst = {}
+  proto = ""
+  conn_uid = ""
+  traffic = {}
+  duration_ms = 0
+  rule = {}
+  policy = {}
+  user_name = ""
+  app = ""
+  url_str = ""
+  finding = {}
+  file_obj = {}
+  malware = []
+  status_detail = ""
+  ev = {}
+  f = {}
+
+  # ================= Firepower security events: Key: Value, ... =================
+  if parsed && starts_with(msg_id, "4300") {
+      last = ""
+      for_each(split(body, ", ")) -> |_i, piece| {
+          km, ke = parse_regex(piece, r'^(?P<k>[A-Za-z][A-Za-z0-9_ ]{0,48}):\s(?P<v>.*)$')
+          if ke == null {
+              f = set!(f, [string!(km.k)], km.v)
+              last = string!(km.k)
+          } else if last != "" {
+              f = set!(f, [last], (string(get(f, [last]) ?? "") ?? "") + ", " + piece)
+          }
+      }
+      __source_kv.fields = f
+      ff = f
+      sip = string(ff.SrcIP) ?? ""
+      dip = string(ff.DstIP) ?? ""
+      if is_ipv4(sip) || is_ipv6(sip) { src.ip = sip }
+      if is_ipv4(dip) || is_ipv6(dip) { dst.ip = dip }
+      sp = to_int(string(ff.SrcPort) ?? "") ?? 0
+      dp = to_int(string(ff.DstPort) ?? "") ?? 0
+      if sp > 0 { src.port = sp }
+      if dp > 0 { dst.port = dp }
+      ii = string(ff.IngressInterface) ?? ""
+      if ii != "" { src.interface_name = ii }
+      ei = string(ff.EgressInterface) ?? ""
+      if ei != "" { dst.interface_name = ei }
+      iz = string(ff.IngressZone) ?? ""
+      if iz != "" { src.zone = iz }
+      ez = string(ff.EgressZone) ?? ""
+      if ez != "" { dst.zone = ez }
+      proto = downcase(string(ff.Protocol) ?? "")
+      conn_uid = string(ff.ConnectionID) ?? ""
+      u = string(ff.User) ?? ""
+      if u != "" && !includes(["No Authentication Required", "Not Found", "Unknown", "Pending"], u) { user_name = u }
+      app = string(ff.ApplicationProtocol) ?? ""
+      url_str = string(ff.URL) ?? string(ff.URI) ?? ""
+      rn = string(ff.AccessControlRuleName) ?? ""
+      if rn != "" { rule.name = rn }
+      sic = string(ff.IPReputationSICategory) ?? string(ff.URLSICategory) ?? string(ff.DNSSICategory) ?? ""
+      if sic != "" { rule.category = sic }
+      acp = string(ff.ACPolicy) ?? ""
+      if acp != "" { policy.name = acp }
+
+      if msg_id == "430002" || msg_id == "430003" {
+          route = "network"
+          if msg_id == "430002" { activity_id = 1; activity_name = "Open" } else { activity_id = 2; activity_name = "Close" }
+          severity_id = 1; severity = "Informational"
+          aca = downcase(string(ff.AccessControlRuleAction) ?? "")
+          if contains(aca, "block") {
+              activity_id = 5; activity_name = "Refuse"
+              action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
+              status_id = 2; status_str = "Failure"
+              severity_id = 2; severity = "Low"
+          } else if aca != "" {
+              action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed"
+              status_id = 1; status_str = "Success"
+          }
+          if sic != "" && severity_id < 3 { severity_id = 3; severity = "Medium" }
+          ib = to_int(string(ff.InitiatorBytes) ?? "") ?? -1
+          rb = to_int(string(ff.ResponderBytes) ?? "") ?? -1
+          ip = to_int(string(ff.InitiatorPackets) ?? "") ?? -1
+          rp = to_int(string(ff.ResponderPackets) ?? "") ?? -1
+          if ib >= 0 { traffic.bytes_out = ib }
+          if rb >= 0 { traffic.bytes_in = rb }
+          if ip >= 0 { traffic.packets_out = ip }
+          if rp >= 0 { traffic.packets_in = rp }
+          cd = to_int(string(ff.ConnectionDuration) ?? "") ?? -1
+          if cd >= 0 { duration_ms = cd * 1000 }
+          if exists(ff.AccessControlRuleReason) { rule.desc = ff.AccessControlRuleReason }
+      } else if msg_id == "430001" {
+          route = "finding"
+          gid = string(ff.GID) ?? "1"
+          sid = string(ff.SID) ?? ""
+          title = string(ff.Message) ?? "Intrusion event"
+          analytic = { "name": title, "type_id": 1, "type": "Rule" }
+          if sid != "" { analytic.uid = gid + ":" + sid }
+          if exists(ff.Revision) { analytic.version = ff.Revision }
+          finding = { "title": title, "analytic": analytic, "types": ["Intrusion"] }
+          cls = string(ff.Classification) ?? ""
+          if cls != "" { finding.types = ["Intrusion", cls] }
+          prio = to_int(string(ff.Priority) ?? "") ?? 0
+          ep = downcase(string(ff.EventPriority) ?? "")
+          severity_id = 3; severity = "Medium"
+          if prio == 1 || ep == "high" { severity_id = 4; severity = "High" }
+          if prio == 3 || ep == "low" { severity_id = 2; severity = "Low" }
+          if prio >= 4 { severity_id = 1; severity = "Informational" }
+          ir = downcase(string(ff.InlineResult) ?? "")
+          if ir == "blocked" || ir == "dropped" || ir == "drop" {
+              action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
+          } else {
+              action_id = 3; action = "Observed"; disposition_id = 15; disposition = "Detected"
+          }
+          ips = string(ff.IntrusionPolicy) ?? ""
+          if ips != "" { policy.name = ips }
+      } else if msg_id == "430004" || msg_id == "430005" {
+          route = "finding"
+          fname = string(ff.FileName) ?? ""
+          if fname == "" { fname = "unknown" }
+          file_obj = { "name": fname, "type_id": 1, "type": "Regular File" }
+          fsz = to_int(string(ff.FileSize) ?? "") ?? 0
+          if fsz > 0 { file_obj.size = fsz }
+          fh = downcase(string(ff.FileSHA256) ?? "")
+          if match(fh, r'^[0-9a-f]{64}$') { file_obj.hashes = [{ "algorithm_id": 3, "algorithm": "SHA-256", "value": fh }] }
+          ft = string(ff.FileType) ?? ""
+          if ft != "" { file_obj.desc = ft }
+          threat = string(ff.ThreatName) ?? ""
+          shad = downcase(string(ff.SHA_Disposition) ?? "")
+          faction = downcase(string(ff.FileAction) ?? "")
+          if threat != "" && !includes(["Unknown", "Invalid ID"], threat) {
+              malware = [{ "name": threat, "classification_ids": [0], "classifications": ["Unknown"] }]
+          }
+          if msg_id == "430005" {
+              mname = if threat != "" { threat } else { fname }
+              finding = { "title": "Malware event: " + mname, "types": ["Malware"] }
+              severity_id = 3; severity = "Medium"
+              if shad == "malware" || length(malware) > 0 { severity_id = 4; severity = "High" }
+          } else {
+              finding = { "title": "File event: " + fname, "types": ["File"] }
+              severity_id = 2; severity = "Low"
+          }
+          fpol = string(ff.FilePolicy) ?? ""
+          if fpol != "" { policy.name = fpol }
+          if contains(faction, "block") {
+              action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
+              if severity_id < 3 { severity_id = 3; severity = "Medium" }
+          } else {
+              action_id = 3; action = "Observed"; disposition_id = 15; disposition = "Detected"
+          }
+          if faction != "" { status_detail = string!(ff.FileAction) }
+      }
+
+  # ================= ASA-style data-plane codes under %FTD =================
+  } else if parsed {
+      # connection build
+      if msg_id == "302013" || msg_id == "302015" || msg_id == "302020" || msg_id == "302017" {
+          ev, er = parse_regex(body, r'^Built\s+(?P<direction>inbound|outbound)\s+(?P<protocol>\w+)\s+connection\s+(?P<conn_id>\d+)\s+for\s+(?P<src_iface>[^:\s]+):(?P<src_ip>[^/\s]+)/(?P<src_port>\d+)\s*(?:\x28(?P<src_nat_ip>[^/]+)/(?P<src_nat_port>\d+)\x29)?(?:\x28(?P<src_user>[^\x29]*)\x29)?\s+to\s+(?P<dst_iface>[^:\s]+):(?P<dst_ip>[^/\s]+)/(?P<dst_port>\d+)\s*(?:\x28(?P<dst_nat_ip>[^/]+)/(?P<dst_nat_port>\d+)\x29)?')
+          if er == null { route = "network"; activity_id = 1; activity_name = "Open"; action_id = 1 } else { ev = {} }
+      } else if msg_id == "302014" || msg_id == "302016" || msg_id == "302021" || msg_id == "302018" {
+          ev, er = parse_regex(body, r'^Teardown\s+(?P<protocol>\w+)\s+connection\s+(?P<conn_id>\d+)\s+for\s+(?P<src_iface>[^:\s]+):(?P<src_ip>[^/\s]+)/(?P<src_port>\d+)(?:\s+\x28[^\x29]*\x29)?\s+to\s+(?P<dst_iface>[^:\s]+):(?P<dst_ip>[^/\s]+)/(?P<dst_port>\d+)(?:\s+\x28[^\x29]*\x29)?(?:\s+duration\s+(?P<h>\d+):(?P<m>\d{2}):(?P<s>\d{2}))?(?:\s+bytes\s+(?P<bytes>\d+))?(?:\s+(?P<reason>.+))?$')
+          if er == null { route = "network"; activity_id = 2; activity_name = "Close"; action_id = 1 } else { ev = {} }
+      } else if msg_id == "106023" {
+          ev, er = parse_regex(body, r'^Deny\s+(?P<protocol>\w+)\s+src\s+(?P<src_iface>[^:\s]+):(?P<src_ip>[^/\s]+)(?:/(?P<src_port>\d+))?\s+dst\s+(?P<dst_iface>[^:\s]+):(?P<dst_ip>[^/\s]+)(?:/(?P<dst_port>\d+))?.*?by\s+access-group\s+"(?P<acl>[^"]+)"')
+          if er == null { route = "network"; activity_id = 5; activity_name = "Refuse"; action_id = 2 } else { ev = {} }
+      } else if msg_id == "106100" {
+          ev, er = parse_regex(body, r'^access-list\s+(?P<acl>\S+)\s+(?P<verdict>permitted|denied|est-allowed)\s+(?P<protocol>\w+)\s+(?P<src_iface>[^/\s]+)/(?P<src_ip>[^\x28\s]+)\x28(?P<src_port>\d+)\x29(?:\x28[^\x29]*\x29)?\s*->\s*(?P<dst_iface>[^/\s]+)/(?P<dst_ip>[^\x28\s]+)\x28(?P<dst_port>\d+)\x29(?:\x28[^\x29]*\x29)?\s+hit-cnt\s+(?P<hits>\d+)')
+          if er == null {
+              route = "network"
+              if ev.verdict == "denied" { activity_id = 5; activity_name = "Refuse"; action_id = 2 } else { activity_id = 6; activity_name = "Traffic"; action_id = 1 }
+          } else { ev = {} }
+      } else if msg_id == "106001" || msg_id == "106006" || msg_id == "106007" || msg_id == "106015" {
+          ev, er = parse_regex(body, r'^(?:Inbound\s+(?P<protocol>TCP)\s+connection\s+denied|Deny\s+(?:inbound\s+)?(?P<protocol2>\w+)(?:\s+\x28no connection\x29)?)\s+from\s+(?P<src_ip>[^/\s]+)/(?P<src_port>\d+)\s+to\s+(?P<dst_ip>[^/\s]+)/(?P<dst_port>\d+)(?:\s+flags\s+(?P<tcp_flags>.*?))?(?:\s+due to\s+(?P<reason>.*?))?(?:\s+on\s+interface\s+(?P<src_iface>\S+))?\s*$')
+          if er == null {
+              route = "network"; activity_id = 5; activity_name = "Refuse"; action_id = 2
+              if ev.protocol == null { ev.protocol = ev.protocol2 }
+              __d = del(ev.protocol2)
+              ev = compact(ev)
+          } else { ev = {} }
+      } else if msg_id == "113004" || msg_id == "113005" || msg_id == "113015" || msg_id == "113012" {
+          ev, er = parse_regex(body, r'^AAA user (?P<kind>authentication|authorization) (?P<result>Successful|Rejected)\s*:\s*(?:reason = (?P<reason>[^:]+?)\s*:\s*)?(?:server = (?P<server>[^\s:]+)\s*:\s*|local database\s*:\s*)?user = (?P<user>[^:]+?)(?:\s*:\s*user IP = (?P<src_ip>\S+))?\s*$')
+          if er == null {
+              route = "auth"; activity_id = 1; activity_name = "Logon"
+              if ev.result == "Successful" { action_id = 1 } else { action_id = 2 }
+              user_name = string!(ev.user)
+          } else { ev = {} }
+      } else if msg_id == "605004" || msg_id == "605005" {
+          ev, er = parse_regex(body, r'^Login\s+(?P<verdict>permitted|denied)\s+from\s+(?P<src_ip>[^/\s]+)/(?P<src_port>\d+)\s+to\s+(?P<dst_iface>[^:\s]+):(?P<dst_ip>[^/\s]+)/(?P<service>\S+)\s+for\s+user\s+"(?P<user>[^"]*)"')
+          if er == null {
+              route = "auth"; activity_id = 1; activity_name = "Logon"
+              if ev.verdict == "permitted" { action_id = 1 } else { action_id = 2 }
+              user_name = string!(ev.user)
+          } else { ev = {} }
+      } else if msg_id == "611101" || msg_id == "611102" {
+          ev, er = parse_regex(body, r'^User authentication (?P<result>succeeded|failed):\s*(?:IP address:\s*(?P<src_ip>[^,\s]+),\s*)?Uname:\s*(?P<user>\S+)')
+          if er == null {
+              route = "auth"; activity_id = 1; activity_name = "Logon"
+              if ev.result == "succeeded" { action_id = 1 } else { action_id = 2 }
+              user_name = string!(ev.user)
+          } else { ev = {} }
+      } else if msg_id == "113019" {
+          ev, er = parse_regex(body, r'^Group = (?P<group>[^,]+), Username = (?P<user>[^,]+), IP = (?P<src_ip>[^,]+), Session disconnected\. Session Type: (?P<session_type>[^,]+), Duration: (?P<duration>[^,]+), Bytes xmt: (?P<bytes_xmt>\d+), Bytes rcv: (?P<bytes_rcv>\d+), Reason: (?P<reason>.*)$')
+          if er == null {
+              route = "auth"; activity_id = 2; activity_name = "Logoff"; action_id = 1
+              user_name = string!(ev.user)
+          } else { ev = {} }
+      }
+      if length(ev) > 0 { __source_kv.event = ev }
+
+      if route == "network" || route == "auth" {
+          if action_id == 1 {
+              action = "Allowed"; disposition_id = 1; disposition = "Allowed"; status_id = 1; status_str = "Success"
+          } else {
+              action = "Denied"; disposition_id = 2; disposition = "Blocked"; status_id = 2; status_str = "Failure"
+              if severity_id < 2 { severity_id = 2; severity = "Low" }
+          }
+          sip = string(ev.src_ip) ?? ""
+          dip = string(ev.dst_ip) ?? ""
+          if is_ipv4(sip) || is_ipv6(sip) { src.ip = sip }
+          if is_ipv4(dip) || is_ipv6(dip) { dst.ip = dip }
+          sp = to_int(string(ev.src_port) ?? "") ?? 0
+          dp = to_int(string(ev.dst_port) ?? "") ?? 0
+          if sp > 0 { src.port = sp }
+          if dp > 0 { dst.port = dp }
+          si = string(ev.src_iface) ?? ""
+          if si != "" { src.interface_name = si }
+          di = string(ev.dst_iface) ?? ""
+          if di != "" { dst.interface_name = di }
+          proto = downcase(string(ev.protocol) ?? "")
+          conn_uid = string(ev.conn_id) ?? ""
+          acl = string(ev.acl) ?? ""
+          if acl != "" { rule.name = acl; rule.uid = acl }
+          b = to_int(string(ev.bytes) ?? "") ?? -1
+          if b >= 0 { traffic.bytes = b }
+          if exists(ev.h) {
+              duration_ms = ((to_int(string(ev.h) ?? "") ?? 0) * 3600 + (to_int(string(ev.m) ?? "") ?? 0) * 60 + (to_int(string(ev.s) ?? "") ?? 0)) * 1000
+          }
+          status_detail = string(ev.reason) ?? ""
+          if exists(ev.server) { dst.ip = ev.server }
+          if exists(ev.service) { dst.svc_name = ev.service }
+      } else {
+          __source_kv.message = body
+      }
+  }
+
+  # ---- protocol ----
+  proto_num = -1
+  pnum = to_int(proto) ?? -1
+  if pnum >= 0 {
+      proto_num = pnum
+      if pnum == 6 { proto = "tcp" } else if pnum == 17 { proto = "udp" } else if pnum == 1 { proto = "icmp" } else { proto = "" }
+  } else if proto == "tcp" { proto_num = 6 } else if proto == "udp" { proto_num = 17 } else if proto == "icmp" { proto_num = 1 } else if proto == "icmp6" || proto == "ipv6-icmp" { proto_num = 58 } else if proto == "gre" { proto_num = 47 } else if proto == "esp" { proto_num = 50 }
+  conn = { "direction_id": 0 }
+  if proto_num >= 0 { conn.protocol_num = proto_num }
+  if proto != "" && proto != "ip" { conn.protocol_name = proto }
+  if conn_uid != "" { conn.uid = conn_uid }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": sha2("cisco_ftd|raw|" + raw_log, variant: "SHA-256"),
+      "profiles": ["host", "security_control"],
+      "log_name": "cisco_ftd",
+      "product": { "name": "Secure Firewall Threat Defense", "vendor_name": "Cisco" }
+  }
+  if msg_id != "" { metadata.event_code = msg_id }
+  device = {}
+  if host != "" { device.hostname = host }
+  duid = string(f.DeviceUUID) ?? ""
+  if duid != "" { device.uid = duid }
+  if length(device) > 0 { device.type_id = 9; device.type = "Firewall" }
+
+  if route == "network" {
+      . = {
+          "class_uid": 4001, "class_name": "Network Activity",
+          "category_uid": 4, "category_name": "Network Activity",
+          "activity_id": activity_id, "activity_name": activity_name,
+          "type_uid": 400100 + activity_id,
+          "severity_id": severity_id, "severity": severity,
+          "status_id": status_id, "status": status_str,
+          "action_id": action_id, "action": action,
+          "disposition_id": disposition_id, "disposition": disposition,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "connection_info": conn
+      }
+      if exists(src.ip) { .src_endpoint = src }
+      if exists(dst.ip) { .dst_endpoint = dst }
+      if length(traffic) > 0 { .traffic = traffic }
+      if duration_ms > 0 { .duration = duration_ms }
+      if length(rule) > 0 && (exists(rule.name) || exists(rule.uid)) { .firewall_rule = rule }
+      if length(policy) > 0 { .policy = policy }
+      if app != "" { .app_name = app }
+      if url_str != "" { .url = { "url_string": url_str } }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
+      if status_detail != "" { .status_detail = status_detail }
+  } else if route == "finding" {
+      evd = {}
+      if exists(src.ip) { evd.src_endpoint = src }
+      if exists(dst.ip) { evd.dst_endpoint = dst }
+      if proto_num >= 0 || conn_uid != "" { evd.connection_info = conn }
+      if length(file_obj) > 0 { evd.file = file_obj }
+      if url_str != "" { evd.url = { "url_string": url_str } }
+      if user_name != "" { evd.user = { "name": user_name } }
+      finding.uid = metadata.uid
+      . = {
+          "class_uid": 2004, "class_name": "Detection Finding",
+          "category_uid": 2, "category_name": "Findings",
+          "activity_id": 1, "activity_name": "Create",
+          "type_uid": 200401,
+          "severity_id": severity_id, "severity": severity,
+          "status_id": 1, "status": "New",
+          "action_id": action_id, "action": action,
+          "disposition_id": disposition_id, "disposition": disposition,
+          "is_alert": true,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "finding_info": finding
+      }
+      if length(evd) > 0 { .evidences = [evd] }
+      if length(malware) > 0 { .malware = malware }
+      if length(policy) > 0 { .policy = policy }
+      if length(rule) > 0 && exists(rule.name) { .firewall_rule = rule }
+      if status_detail != "" { .status_detail = status_detail }
+      if length(device) > 0 { .device = device }
+  } else if route == "auth" {
+      . = {
+          "class_uid": 3002, "class_name": "Authentication",
+          "category_uid": 3, "category_name": "Identity & Access Management",
+          "activity_id": activity_id, "activity_name": activity_name,
+          "type_uid": 300200 + activity_id,
+          "severity_id": severity_id, "severity": severity,
+          "status_id": status_id, "status": status_str,
+          "action_id": action_id, "action": action,
+          "disposition_id": disposition_id, "disposition": disposition,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "user": { "name": user_name },
+          "is_remote": true
+      }
+      if exists(src.ip) { .src_endpoint = src }
+      if exists(dst.ip) { .dst_endpoint = dst } else if host != "" { .dst_endpoint = { "hostname": host } }
+      if !exists(.dst_endpoint) { .service = { "name": "Secure Firewall Threat Defense" } }
+      if status_detail != "" { .status_detail = status_detail }
+      if msg_id == "113019" || msg_id == "113004" || msg_id == "113005" { .logon_type = "VPN" }
+  } else {
+      . = {
+          "class_uid": 0, "class_name": "Base Event",
+          "category_uid": 0, "category_name": "Uncategorized",
+          "activity_id": 99, "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": severity_id, "severity": severity,
+          "status_id": 0, "status": "Unknown",
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata
+      }
+      if parsed {
+          .message = body
+      } else {
+          . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+      }
+  }
+  if route != "finding" && length(device) > 0 { .device = device }
+
+  .
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # header.ts: RFC 3339 syslog timestamp converted to event milliseconds; "Mon DD YYYY" clocks remain residual.
+  # fields.Protocol: Protocol name lowercased into connection_info.protocol_name.
+  # event.protocol: Protocol name lowercased into connection_info.protocol_name.
+  # event.protocol: Protocol name normalized to the IANA protocol number.
+  # fields.Protocol: Protocol name normalized to the IANA protocol number.
+  # fields.ConnectionDuration: Connection duration in seconds converted to OCSF milliseconds.
+  # fields.AccessControlRuleAction: Access control verdict normalized to the OCSF action; consume only when the expected ID is emitted.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        header\.ts
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        fields\.Protocol
+      | event\.protocol
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        event\.protocol
+      | fields\.Protocol
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"tcp": 6, "udp": 17, "icmp": 1}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."connection_info"."protocol_num" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        fields\.ConnectionDuration
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if ."duration" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        fields\.AccessControlRuleAction
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"allow": 1, "trust": 1, "block": 2, "block with reset": 2}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."action_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    header\.host
+  | header\.msg_id
+  | fields\.SrcIP
+  | fields\.DstIP
+  | fields\.SrcPort
+  | fields\.DstPort
+  | fields\.IngressInterface
+  | fields\.EgressInterface
+  | fields\.IngressZone
+  | fields\.EgressZone
+  | fields\.Protocol
+  | fields\.ConnectionID
+  | fields\.User
+  | fields\.ApplicationProtocol
+  | fields\.URL
+  | fields\.URI
+  | fields\.AccessControlRuleName
+  | fields\.AccessControlRuleReason
+  | fields\.IPReputationSICategory
+  | fields\.URLSICategory
+  | fields\.DNSSICategory
+  | fields\.ACPolicy
+  | fields\.InitiatorBytes
+  | fields\.ResponderBytes
+  | fields\.InitiatorPackets
+  | fields\.ResponderPackets
+  | fields\.Revision
+  | fields\.Message
+  | fields\.Classification
+  | fields\.IntrusionPolicy
+  | fields\.FileName
+  | fields\.FileSize
+  | fields\.FileSHA256
+  | fields\.FileType
+  | fields\.ThreatName
+  | fields\.FilePolicy
+  | fields\.FileAction
+  | fields\.DeviceUUID
+  | event\.src_ip
+  | event\.dst_ip
+  | event\.src_port
+  | event\.dst_port
+  | event\.src_iface
+  | event\.dst_iface
+  | event\.protocol
+  | event\.conn_id
+  | event\.acl
+  | event\.bytes
+  | event\.reason
+  | event\.server
+  | event\.service
+  | event\.user
+  | message
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # Sources: Elastic cisco_ftd integration test fixtures (real FTD syslog)
+  #   https://github.com/elastic/integrations/tree/main/packages/cisco_ftd/data_stream/log/_dev/test/pipeline
+  # and Cisco Secure Firewall Threat Defense Syslog Messages (430001-430005):
+  #   https://www.cisco.com/c/en/us/td/docs/security/firepower/Syslogs/fptd_syslog_guide/security-event-syslog-messages.html
+  # Public IPs, hosts, users and device UUIDs replaced with documentation values.
+  # 430001 intrusion event, priority 1 (test-intrusion.log)
+  - raw: '2019-08-16T09:54:00Z firepower  %FTD-0-430001: SrcIP: 10.0.1.20, DstIP: 10.0.100.30, SrcPort: 55644, DstPort: 80, Protocol: tcp, IngressInterface: inside, EgressInterface: outside, IngressZone: input-zone, EgressZone: output-zone, Priority: 1, GID: 1, SID: 17279, Revision: 12, Message: SERVER-WEBAPP Ipswitch WhatsUp Small Business directory traversal attempt, Classification: Attempted User Privilege Gain, User: No Authentication Required, Client: Firefox, ApplicationProtocol: HTTP, IntrusionPolicy: intrusion-policy, ACPolicy: default, NAPPolicy: Balanced Security and Connectivity'
+    expect:
+      class_uid: 2004
+      severity_id: 4
+      finding_info.analytic.uid: "1:17279"
+      finding_info.title: SERVER-WEBAPP Ipswitch WhatsUp Small Business directory traversal attempt
+      evidences.0.src_endpoint.ip: 10.0.1.20
+      evidences.0.dst_endpoint.port: 80
+      action_id: 3
+      policy.name: intrusion-policy
+      time: 1565949240000
+  # 430001 priority 3 with a numeric protocol (test-intrusion.log)
+  - raw: '2019-08-16T10:09:47Z firepower  %FTD-0-430001: SrcIP: 10.0.100.30, DstIP: 10.0.1.20, SrcPort: 21, DstPort: 40740, Protocol: 6, IngressInterface: outside, EgressInterface: inside, IngressZone: output-zone, EgressZone: input-zone, Priority: 3, GID: 1, SID: 13360, Revision: 6, Message: APP-DETECT failed FTP login attempt, Classification: Misc Activity, User: No Authentication Required, InlineResult: Blocked, IntrusionPolicy: intrusion-policy, ACPolicy: default, NAPPolicy: Balanced Security and Connectivity'
+    expect:
+      class_uid: 2004
+      severity_id: 2
+      action_id: 2
+      evidences.0.connection_info.protocol_name: tcp
+  # 430002 connection start, DNS (test-security-connection.log)
+  - raw: '2019-08-15T16:05:37Z firepower  %FTD-1-430002: AccessControlRuleAction: Allow, SrcIP: 10.0.1.20, DstIP: 198.51.100.144, SrcPort: 50074, DstPort: 53, Protocol: udp, IngressInterface: inside, EgressInterface: outside, IngressZone: input-zone, EgressZone: output-zone, ACPolicy: default, AccessControlRuleName: Rule-1, Prefilter Policy: Default Prefilter Policy, User: No Authentication Required, Client: DNS client, ApplicationProtocol: DNS, InitiatorPackets: 1, ResponderPackets: 0, InitiatorBytes: 106, ResponderBytes: 0, NAPPolicy: Balanced Security and Connectivity, DNSQuery: archive.example.com, DNSRecordType: a host address'
+    expect:
+      class_uid: 4001
+      activity_id: 1
+      action_id: 1
+      firewall_rule.name: Rule-1
+      src_endpoint.zone: input-zone
+      traffic.bytes_out: 106
+      app_name: DNS
+  # 430003 connection end, ICMP (test-security-connection.log)
+  - raw: '2019-08-15T16:05:33Z firepower  %FTD-1-430003: AccessControlRuleAction: Allow, SrcIP: 10.0.100.30, DstIP: 10.0.1.20, ICMPType: Echo Request, ICMPCode: No Code, Protocol: icmp, IngressInterface: output, EgressInterface: input, IngressZone: output-zone, EgressZone: input-zone, ACPolicy: default, AccessControlRuleName: Rule-1, Prefilter Policy: Default Prefilter Policy, User: No Authentication Required, Client: ICMP client, ApplicationProtocol: ICMP, ConnectionDuration: 0, InitiatorPackets: 1, ResponderPackets: 1, InitiatorBytes: 98, ResponderBytes: 98, NAPPolicy: Balanced Security and Connectivity'
+    expect:
+      class_uid: 4001
+      activity_id: 2
+      connection_info.protocol_num: 1
+      traffic.bytes_in: 98
+  # 430003 connection end with security intelligence (test-security-malware-site.log, NGIPS facility)
+  - raw: '2020-03-01T01:02:36Z SENSOR-3D Alerts %NGIPS-0-430003: DeviceUUID: 00000000-0000-0000-0000-000000000001, AccessControlRuleAction: Allow, AccessControlRuleReason: IP Monitor, SrcIP: 192.0.2.144, DstIP: 203.0.113.144, SrcPort: 65090, DstPort: 80, Protocol: tcp, IngressInterface: s1p1, EgressInterface: s1p2, IngressZone: Inside-DMZ-Interface-Inline, EgressZone: Inside-DMZ-Interface-Inline, ACPolicy: COOL-POLICY-3D, AccessControlRuleName: Inside DMZ-Rule-Inline, Prefilter Policy: Unknown, User: No Authentication Required, UserAgent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.87 Safari/537.36, Client: Chrome, ClientVersion: 80.0.3987.87, ApplicationProtocol: HTTP, ConnectionDuration: 20, InitiatorPackets: 4, ResponderPackets: 4, InitiatorBytes: 729, ResponderBytes: 246, NAPPolicy: State-Backbone, SecIntMatchingIP: Destination, IPReputationSICategory: Malware, HTTPReferer: http://color-pick.example.net/mk?c=1581483445764, ReferencedHost: color-pick.example.net, URL: http://bad-site.example.net/favicon.ico'
+    expect:
+      class_uid: 4001
+      severity_id: 3
+      firewall_rule.category: Malware
+      duration: 20000
+      url.url_string: http://bad-site.example.net/favicon.ico
+      device.uid: 00000000-0000-0000-0000-000000000001
+  # 430002 connection blocked by access control (Cisco syslog guide field set)
+  - raw: '<113>2021-08-25T14:55:00Z ftd01 : %FTD-1-430002: DeviceUUID: 00000000-0000-0000-0000-000000000002, InstanceID: 3, FirstPacketSecond: 2021-08-25T14:54:59Z, ConnectionID: 44561, AccessControlRuleAction: Block, AccessControlRuleReason: Default Action, SrcIP: 172.16.0.2, DstIP: 203.0.113.156, SrcPort: 65001, DstPort: 23, Protocol: tcp, IngressInterface: inside, EgressInterface: outside, IngressZone: inside-zone, EgressZone: outside-zone, ACPolicy: corp-acp, AccessControlRuleName: block-telnet, User: CORP\jdoe, InitiatorPackets: 1, ResponderPackets: 0, InitiatorBytes: 66, ResponderBytes: 0'
+    expect:
+      class_uid: 4001
+      activity_id: 5
+      action_id: 2
+      connection_info.uid: "44561"
+      actor.user.name: CORP\jdoe
+  # 430004 file event (test-security-file-malware.log)
+  - raw: 'Aug 14 2019 15:03:28 siem-ftd  %FTD-1-430004: SrcIP: 10.0.1.20, DstIP: 10.0.100.30, SrcPort: 41540, DstPort: 8000, Protocol: tcp, FileDirection: Download, FileAction: Detect, FileSHA256: 2546dcffc5ad854d4ddc64fbf056871cd5a00f2471cb7a5bfd4ac23b6e9eedad, ThreatName: Unknown, FileName: eicar_com.zip, FileType: ZIP, FileSize: 184, ApplicationProtocol: HTTP, Client: cURL, User: No Authentication Required, FirstPacketSecond: 2019-08-14T15:03:27Z, FilePolicy: malware-and-file-policy, FileSandboxStatus: File Size Is Too Small, URI: http://10.0.100.30:8000/eicar_com.zip'
+    expect:
+      class_uid: 2004
+      severity_id: 2
+      evidences.0.file.name: eicar_com.zip
+      evidences.0.file.hashes.0.value: 2546dcffc5ad854d4ddc64fbf056871cd5a00f2471cb7a5bfd4ac23b6e9eedad
+      time: 1565795008000
+  # 430005 malware event, blocked (test-security-file-malware.log)
+  - raw: 'Aug 14 2019 15:09:43 siem-ftd  %FTD-1-430005: SrcIP: 10.0.1.20, DstIP: 10.0.100.30, SrcPort: 41544, DstPort: 8000, Protocol: tcp, FileDirection: Download, FileAction: Malware Block, FileSHA256: 2546dcffc5ad854d4ddc64fbf056871cd5a00f2471cb7a5bfd4ac23b6e9eedad, SHA_Disposition: Malware, SperoDisposition: Spero detection not performed on file, ThreatName: Win.Ransomware.Eicar::95.sbx.tg, ThreatScore: 76, FileName: eicar_com.zip, FileType: ZIP, FileSize: 184, ApplicationProtocol: HTTP, Client: cURL, User: No Authentication Required, FirstPacketSecond: 2019-08-14T15:09:40Z, FilePolicy: malware-and-file-policy, FileSandboxStatus: File Size Is Too Small, URI: http://10.0.100.30:8000/eicar_com.zip'
+    expect:
+      class_uid: 2004
+      severity_id: 4
+      action_id: 2
+      malware.0.name: Win.Ransomware.Eicar::95.sbx.tg
+  # ASA-style codes under %FTD (test-sample.log, test-ftd-fix.log)
+  - raw: 'Apr 29 2013 12:59:50: %FTD-6-302013: Built outbound TCP connection 89743274 for outside:192.0.2.43/443 (192.0.2.43/443) to inside:10.123.3.42/4952 (198.51.100.42/12834)'
+    expect:
+      class_uid: 4001
+      activity_id: 1
+      connection_info.uid: "89743274"
+      src_endpoint.interface_name: outside
+  - raw: 'Dec 11 2018 08:01:31 ftd02: %FTD-6-302014: Teardown TCP connection 447236 for outside:192.0.2.222/1234 to dmz:192.168.1.34/5678 duration 0:00:00 bytes 14804 TCP FINs'
+    expect:
+      class_uid: 4001
+      activity_id: 2
+      traffic.bytes: 14804
+      status_detail: TCP FINs
+  - raw: 'Apr 15 2013 09:36:50: %FTD-4-106023: Deny tcp src dmz:10.1.2.30/63016 dst outside:192.0.2.8/53 by access-group "acl_dmz" [0xe3aab522, 0x0]'
+    expect:
+      class_uid: 4001
+      activity_id: 5
+      firewall_rule.name: acl_dmz
+      severity_id: 3
+  - raw: 'Apr 24 2013 16:00:28 INT-FW01 : %FTD-6-106100: access-list inside denied udp inside/172.29.2.101(1039) -> outside/192.0.2.10(53) hit-cnt 1 first hit [0xd820e56a, 0x0]'
+    expect:
+      class_uid: 4001
+      action_id: 2
+      dst_endpoint.port: 53
+  - raw: 'Dec 11 2018 08:01:38 ftd02: %FTD-6-106015: Deny TCP (no connection) from 192.0.2.222/1234 to 192.168.1.34/5679 flags RST  on interface outside'
+    expect:
+      class_uid: 4001
+      action_id: 2
+      src_endpoint.interface_name: outside
+  - raw: '<166>ftd03 %FTD-6-113005: AAA user authentication Rejected : reason = AAA failure : server = 192.0.2.38 : user = scan : user IP = 192.0.2.139'
+    expect:
+      class_uid: 3002
+      status_id: 2
+      user.name: scan
+      src_endpoint.ip: 192.0.2.139
+      status_detail: AAA failure
+  - raw: '<164>Feb 19 2024 16:29:38: %FTD-4-113019: Group = VPN, Username = abcd, IP = 192.0.2.30, Session disconnected. Session Type: SSL, Duration: 1h:24m:30s, Bytes xmt: 25292048, Bytes rcv: 12546398, Reason: User Requested'
+    expect:
+      class_uid: 3002
+      activity_id: 2
+      user.name: abcd
+  # Unmapped message id -> Base Event; malformed line -> fallback
+  - raw: 'Sep 12 2014 06:50:53 FW01 : %FTD-2-106016: Deny IP spoof from (0.0.0.0) to 192.168.99.47 on interface Mobile_Traffic'
+    expect:
+      class_uid: 0
+      metadata.event_code: "106016"
+  - raw: 'garbage without any ftd header'
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: unparsable input

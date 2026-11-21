@@ -1,0 +1,745 @@
+name: cisco_ise_ocsf
+display_name: Cisco ISE (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Cisco Identity Services Engine remote-logging syslog
+  (CISE_<category> <msg id> <segments> <segment> <timestamp> <seq> <code>
+  <severity> <class>: <text>, key=value, ...) into OCSF 1.9.0. Passed
+  Authentications (52xx) and Failed Attempts (54xx) with a user become
+  Authentication (3002) Logon, Success or Failure, with FailureReason as
+  status_code / status_detail; RADIUS and TACACS+ are told apart by
+  Protocol. The endpoint (Calling-Station-ID MAC, Framed-IP or
+  Remote-Address) is src_endpoint and the network access device rides on
+  src_endpoint.intermediate_ips; the ISE node is dst_endpoint. RADIUS
+  Accounting Start / Stop / Interim become Authentication Logon / Logoff /
+  Other with the accounting session id, and TACACS+ session accounting does
+  the same. TACACS+ command accounting (CmdSet) becomes API Activity (6003)
+  with the device command as api.operation, so admin commands on network
+  gear are huntable. Posture reports with a PostureStatus become Compliance
+  Finding (2003). Every other ISE message (diagnostics, system statistics,
+  administrative audit, continuation segments of a split message) becomes
+  Base Event (0) with the header and key=value body parsed; a line with no
+  ISE header is a Base Event marked with unmapped.parse_fallback. ISE splits
+  long messages into numbered segments; segments are parsed one at a time
+  (nano does not reassemble them), so raise the ISE "maximum length" to
+  8192 to keep a message in one segment.
+match_values:
+  - cisco_ise
+category: security
+vendor: "Cisco"
+product: "Identity Services Engine"
+parser_vrl: |
+  # Cisco ISE -> OCSF 1.9.0 Authentication (3002) / API Activity (6003) /
+  # Compliance Finding (2003) / Base Event (0)
+  raw_log = if is_string(.message) { string!(.message) } else { encode_json(.) }
+  __raw_body = raw_log
+  __source_kv = {}
+
+  time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
+  parsed = false
+  host = ""
+  cat = ""
+  code = 0
+  sev_word = ""
+  text = ""
+  kv = ""
+  segment = 0
+
+  hm, he = parse_regex(raw_log, r'^(?:<(?P<pri>\d{1,3})>)?(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(?P<host>\S+)\s+(?P<category>CISE_\S+)\s+(?P<msg_id>\d+)\s+(?P<total>\d+)\s+(?P<segment>\d+)\s+(?P<rest>.*)$')
+  if he == null {
+      parsed = true
+      hdr = { "ts": hm.ts, "host": hm.host, "category": hm.category, "msg_id": hm.msg_id, "total_segments": hm.total, "segment": hm.segment }
+      if hm.pri != null { hdr.pri = hm.pri }
+      host = string!(hm.host)
+      cat = string!(hm.category)
+      segment = to_int(hm.segment) ?? 0
+      rest = string!(hm.rest)
+      bm, be = parse_regex(rest, r'^(?P<date>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+(?P<tz>[+-]\d{2}:?\d{2})\s+(?P<seq>\d+)\s+(?P<code>\d+)\s+(?P<severity>[A-Z]+)\s+(?P<class>[^:,]+):\s*(?P<text>[^,]*),?\s*(?P<kv>.*)$')
+      if be == null {
+          hdr.date = bm.date
+          hdr.tz = bm.tz
+          hdr.sequence = bm.seq
+          hdr.code = bm.code
+          hdr.severity = bm.severity
+          hdr.class = bm.class
+          hdr.text = bm.text
+          code = to_int(bm.code) ?? 0
+          sev_word = string!(bm.severity)
+          text = string!(bm.text)
+          kv = string!(bm.kv)
+          t, te = parse_timestamp(string!(bm.date) + " " + string!(bm.tz), "%Y-%m-%d %H:%M:%S%.f %:z")
+          if te == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      } else {
+          # a continuation segment carries only key=value pairs
+          kv = rest
+      }
+      __source_kv.header = hdr
+  }
+
+  # ---- key=value body: split on ", " only where a new key starts ----
+  cmd = ""
+  cm, ce = parse_regex(kv, r'CmdSet=\x5B\s*CmdAV=(?P<cmd>.*?)\s*(?:<cr>)?\s*\x5D')
+  if ce == null {
+      cmd = string!(cm.cmd)
+      __source_kv.cmd = cmd
+      kv = replace(kv, r'CmdSet=\x5B[^\x5D]*\x5D,?\s*', "")
+  }
+  f = {}
+  last = ""
+  for_each(split(kv, ", ")) -> |_i, piece| {
+      pm, pe = parse_regex(piece, r'^\s*(?P<k>[A-Za-z][A-Za-z0-9 _.:-]{0,63})=(?P<v>.*)$')
+      if pe == null {
+          k = string!(pm.k)
+          v = replace(string!(pm.v), r',\s*$', "")
+          prev = get(f, [k]) ?? null
+          if prev == null {
+              f = set!(f, [k], v)
+          } else if is_array(prev) {
+              f = set!(f, [k], push(array!(prev), v))
+          } else {
+              f = set!(f, [k], [prev, v])
+          }
+          last = k
+      } else if last != "" {
+          prev = get(f, [last]) ?? ""
+          if is_string(prev) { f = set!(f, [last], string!(prev) + ", " + replace(piece, r',\s*$', "")) }
+      }
+  }
+  if length(f) > 0 { __source_kv.fields = f }
+
+  # ---- severity ----
+  severity_id = 1
+  severity = "Informational"
+  if sev_word == "WARN" || sev_word == "WARNING" { severity_id = 3; severity = "Medium" }
+  if sev_word == "ERROR" { severity_id = 4; severity = "High" }
+  if sev_word == "FATAL" { severity_id = 6; severity = "Fatal" }
+
+  # ---- common entities ----
+  fv = f
+  user_name = string(fv.UserName) ?? string(fv."User-Name") ?? string(fv.User) ?? ""
+  mac_re = r'^(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$'
+  csid = string(fv."Calling-Station-ID") ?? ""
+  src = {}
+  if match(csid, mac_re) { src.mac = downcase(replace(csid, "-", ":")) }
+  cip = string(fv."Framed-IP-Address") ?? string(fv."Remote-Address") ?? ""
+  if cip == "" && (is_ipv4(csid) || is_ipv6(csid)) { cip = csid }
+  if is_ipv4(cip) || is_ipv6(cip) { src.ip = cip }
+  nad_ip = string(fv."Device IP Address") ?? string(fv."NAS-IP-Address") ?? ""
+  if !is_ipv4(nad_ip) && !is_ipv6(nad_ip) { nad_ip = "" }
+  if nad_ip != "" && nad_ip != cip { src.intermediate_ips = [nad_ip] }
+  if !exists(src.ip) && exists(src.mac) { src.uid = src.mac }
+  if !exists(src.ip) && !exists(src.uid) && nad_ip != "" { src.ip = nad_ip; __d = del(src.intermediate_ips) }
+  dst = {}
+  dip = string(fv.DestinationIPAddress) ?? ""
+  if is_ipv4(dip) || is_ipv6(dip) { dst.ip = dip }
+  dport = to_int(string(fv.DestinationPort) ?? "0") ?? 0
+  if dport > 0 { dst.port = dport }
+  if host != "" { dst.hostname = host }
+  protocol = downcase(string(fv.Protocol) ?? "")
+  if cat == "CISE_TACACS_Accounting" { protocol = "tacacs" }
+  if cat == "CISE_RADIUS_Accounting" { protocol = "radius" }
+  session = {}
+  sid = string(fv."Acct-Session-Id") ?? string(fv.CPMSessionID) ?? string(fv.SessionId) ?? ""
+  if sid != "" { session.uid = sid }
+  acs = string(fv.AcsSessionID) ?? ""
+  if acs != "" { session.uid_alt = acs }
+
+  # ---- route ----
+  route = "base"
+  activity_id = 99
+  activity_name = "Other"
+  status_id = 0
+  status_str = "Unknown"
+  if parsed && segment == 0 {
+      if (cat == "CISE_Passed_Authentications" || cat == "CISE_Failed_Attempts") && user_name != "" {
+          route = "auth"
+          activity_id = 1; activity_name = "Logon"
+          if cat == "CISE_Failed_Attempts" || (code >= 5400 && code < 5500) {
+              status_id = 2; status_str = "Failure"
+              if severity_id < 2 { severity_id = 2; severity = "Low" }
+          } else {
+              status_id = 1; status_str = "Success"
+          }
+      } else if cat == "CISE_RADIUS_Accounting" && user_name != "" {
+          route = "auth"
+          ast = downcase(string(fv."Acct-Status-Type") ?? "")
+          status_id = 1; status_str = "Success"
+          if ast == "start" { activity_id = 1; activity_name = "Logon" }
+          if ast == "stop" { activity_id = 2; activity_name = "Logoff" }
+      } else if cat == "CISE_TACACS_Accounting" && cmd != "" {
+          route = "api"
+          status_id = 1; status_str = "Success"
+          if match(cmd, r'^(?:show|sh|ping|traceroute|dir|more)\b') { activity_id = 2; activity_name = "Read" }
+      } else if cat == "CISE_TACACS_Accounting" && user_name != "" {
+          route = "auth"
+          flags = downcase(string(fv."AcctRequest-Flags") ?? "")
+          status_id = 1; status_str = "Success"
+          if flags == "start" || code == 3301 { activity_id = 1; activity_name = "Logon" }
+          if flags == "stop" || code == 3302 { activity_id = 2; activity_name = "Logoff" }
+      } else if exists(fv.PostureStatus) {
+          route = "posture"
+      }
+  }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": sha2("cisco_ise|raw|" + raw_log, variant: "SHA-256"),
+      "profiles": ["host", "security_control"],
+      "log_name": "cisco_ise",
+      "product": { "name": "Identity Services Engine", "vendor_name": "Cisco" }
+  }
+  if cat != "" { metadata.log_provider = cat }
+  if code > 0 { metadata.event_code = to_string(code) }
+  if sev_word != "" { metadata.log_level = sev_word }
+
+  if route == "auth" {
+      . = {
+          "class_uid": 3002, "class_name": "Authentication",
+          "category_uid": 3, "category_name": "Identity & Access Management",
+          "activity_id": activity_id, "activity_name": activity_name,
+          "type_uid": 300200 + activity_id,
+          "severity_id": severity_id, "severity": severity,
+          "status_id": status_id, "status": status_str,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "user": { "name": user_name },
+          "is_remote": true
+      }
+      if text != "" { .message = text }
+      if status_id == 1 {
+          .action_id = 1; .action = "Allowed"; .disposition_id = 1; .disposition = "Allowed"
+      } else if status_id == 2 {
+          .action_id = 2; .action = "Denied"; .disposition_id = 2; .disposition = "Blocked"
+      }
+      if protocol == "radius" {
+          .auth_protocol_id = 10; .auth_protocol = "RADIUS"
+          .logon_type_id = 3; .logon_type = "Network"
+      } else if protocol == "tacacs" {
+          .auth_protocol_id = 99; .auth_protocol = "TACACS+"
+          .logon_type_id = 10; .logon_type = "Remote Interactive"
+      }
+      fr = string(fv.FailureReason) ?? ""
+      if fr != "" {
+          .status_detail = fr
+          frm, fre = parse_regex(fr, r'^(?P<c>\d+)\s')
+          if fre == null { .status_code = frm.c }
+      }
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if length(session) > 0 { .session = session }
+      svc = string(fv.SelectedAccessService) ?? ""
+      if svc != "" { .service = { "name": svc } }
+      pol = string(fv.AuthorizationPolicyMatchedRule) ?? ""
+      if pol != "" { .policy = { "name": pol } }
+  } else if route == "api" {
+      actor_name = if user_name != "" { user_name } else { "unknown" }
+      . = {
+          "class_uid": 6003, "class_name": "API Activity",
+          "category_uid": 6, "category_name": "Application Activity",
+          "activity_id": activity_id, "activity_name": activity_name,
+          "type_uid": 600300 + activity_id,
+          "severity_id": severity_id, "severity": severity,
+          "status_id": status_id, "status": status_str,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "actor": { "user": { "name": actor_name } },
+          "api": { "operation": cmd, "service": { "name": "TACACS+ command accounting" } }
+      }
+      if text != "" { .message = text }
+      asrc = {}
+      ra = string(fv."Remote-Address") ?? ""
+      if is_ipv4(ra) || is_ipv6(ra) { asrc.ip = ra } else { asrc.name = "unknown" }
+      .src_endpoint = asrc
+      adst = {}
+      if nad_ip != "" { adst.ip = nad_ip }
+      ndn = string(fv.NetworkDeviceName) ?? ""
+      if ndn != "" { adst.name = ndn }
+      if length(adst) > 0 { .dst_endpoint = adst }
+      if length(session) > 0 { .actor.session = session }
+  } else if route == "posture" {
+      ps = string(fv.PostureStatus) ?? ""
+      cstat = 0
+      if downcase(ps) == "compliant" { cstat = 1 }
+      if downcase(ps) == "noncompliant" { cstat = 3; if severity_id < 3 { severity_id = 3; severity = "Medium" } }
+      comp = { "status": ps, "status_id": cstat }
+      ppm = string(fv.PosturePolicyMatched) ?? ""
+      if ppm != "" { comp.control = ppm }
+      dev = { "type_id": 0, "type": "Unknown" }
+      pmac = string(fv.MacAddress) ?? ""
+      if match(pmac, mac_re) { dev.mac = downcase(replace(pmac, "-", ":")) }
+      pip = string(fv.IpAddress) ?? ""
+      if is_ipv4(pip) || is_ipv6(pip) { dev.ip = pip }
+      sname = string(fv.SystemName) ?? ""
+      if sname != "" { dev.hostname = sname }
+      if !exists(dev.ip) && !exists(dev.hostname) && exists(dev.mac) { dev.uid = dev.mac }
+      . = {
+          "class_uid": 2003, "class_name": "Compliance Finding",
+          "category_uid": 2, "category_name": "Findings",
+          "activity_id": 1, "activity_name": "Create",
+          "type_uid": 200301,
+          "severity_id": severity_id, "severity": severity,
+          "status_id": 1, "status": "New",
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "compliance": comp,
+          "finding_info": { "uid": metadata.uid, "title": "Endpoint posture " + ps }
+      }
+      if text != "" { .message = text }
+      if exists(dev.ip) || exists(dev.hostname) || exists(dev.uid) { .device = dev }
+  } else {
+      . = {
+          "class_uid": 0, "class_name": "Base Event",
+          "category_uid": 0, "category_name": "Uncategorized",
+          "activity_id": 99, "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": severity_id, "severity": severity,
+          "status_id": 0, "status": "Unknown",
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata
+      }
+      if text != "" { .message = text }
+      if !parsed { . = set!(., ["unmapped", "parse_fallback"], "unparsable input") }
+  }
+  if parsed && route != "base" && host != "" && route != "posture" {
+      .device = { "hostname": host, "type_id": 1, "type": "Server" }
+  }
+
+  .
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # fields.Calling-Station-ID: Endpoint MAC lowercased (dashes become colons) into src_endpoint.mac; a dashed MAC remains residual.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        fields\.Calling\-Station\-ID
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    header\.host
+  | header\.category
+  | header\.code
+  | header\.severity
+  | header\.text
+  | cmd
+  | fields\.UserName
+  | fields\.User\-Name
+  | fields\.User
+  | fields\.Calling\-Station\-ID
+  | fields\.Framed\-IP\-Address
+  | fields\.Remote\-Address
+  | fields\.Device\ IP\ Address
+  | fields\.NAS\-IP\-Address
+  | fields\.DestinationIPAddress
+  | fields\.DestinationPort
+  | fields\.Protocol
+  | fields\.Acct\-Session\-Id
+  | fields\.CPMSessionID
+  | fields\.SessionId
+  | fields\.AcsSessionID
+  | fields\.FailureReason
+  | fields\.SelectedAccessService
+  | fields\.AuthorizationPolicyMatchedRule
+  | fields\.NetworkDeviceName
+  | fields\.PostureStatus
+  | fields\.PosturePolicyMatched
+  | fields\.MacAddress
+  | fields\.IpAddress
+  | fields\.SystemName
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # Sources: Elastic cisco_ise integration test fixtures (real ISE syslog)
+  #   https://github.com/elastic/integrations/tree/main/packages/cisco_ise/data_stream/log/_dev/test/pipeline
+  # Cisco ISE syslog message catalog / remote logging format:
+  #   https://www.cisco.com/c/en/us/td/docs/security/ise/syslog/Cisco_ISE_Syslogs.html
+  # Posture field names: https://docs.logrhythm.com/devices/docs/cise-posture-and-client-provisioning-audit
+  # IPs, hosts and users replaced with documentation values; long key lists trimmed.
+  # Passed RADIUS MAB authentication (test-pipeline-passed-authentications.log)
+  - raw: '<181>Mar 3 11:37:34 ise01 CISE_Passed_Authentications 0000083423 1 0 2022-03-03 11:37:34.978 +00:00 0000083490 5200 NOTICE Passed-Authentication: Authentication succeeded, ConfigVersionId=1696, Device IP Address=192.0.2.143, DestinationIPAddress=192.0.2.193, DestinationPort=1812, UserName=92-09-00-00-00-01, Protocol=Radius, NetworkDeviceName=Simulator, User-Name=92-09-00-00-00-01, NAS-IP-Address=192.0.2.143, NAS-Port=86, Service-Type=Call Check, Calling-Station-ID=92:09:00:00:00:01, NAS-Port-Type=Wireless - IEEE 802.11, NAS-Port-Id=gigabitEthernet1/0/1, AcsSessionID=ise01/435083133/126, AuthenticationMethod=Lookup, SelectedAccessService=Default Network Access, SelectedAuthorizationProfiles=hotspot, Step=11001, Step=11017, Step=5239, AuthenticationStatus=UnknownUser, NetworkDeviceGroups=IPSEC#Is IPSEC Device#No, NetworkDeviceGroups=Location#All Locations, AuthorizationPolicyMatchedRule=Hotspot, CPMSessionID=0a0009ccdD2BsLZMkW8ZRUAE/sDVf78pplxJC0wv2VwZR6N070M, EndPointMACAddress=92-09-00-00-00-01, Response={Class=CACS:0a0009ccdD2BsLZMkW8ZRUAE:ise01/435083133/126; cisco-av-pair=url-redirect-acl=REDIRECT; LicenseTypes=1; },'
+    expect:
+      class_uid: 3002
+      activity_id: 1
+      status_id: 1
+      user.name: 92-09-00-00-00-01
+      src_endpoint.mac: 92:09:00:00:00:01
+      src_endpoint.intermediate_ips.0: 192.0.2.143
+      dst_endpoint.ip: 192.0.2.193
+      auth_protocol_id: 10
+      policy.name: Hotspot
+      time: 1646307454978
+  # Passed TACACS+ device-admin authorization (test-pipeline-passed-authentications.log)
+  - raw: '<181>Mar 31 11:24:45 host002 CISE_Passed_Authentications 2233445566 1 0 2026-03-31 11:24:45.159 +01:00 9988776655 5203 NOTICE Device-Administration: Session Authorization succeeded, ConfigVersionId=79, Device IP Address=192.0.2.30, DestinationIPAddress=198.51.100.30, DestinationPort=49, UserName=user02, Protocol=Tacacs, RequestLatency=13, NetworkDeviceName=device002, Type=Authorization, Privilege-Level=1, Authen-Type=ASCII, Service=Login, User=user02, Port=tty644, Remote-Address=203.0.113.40, Authen-Method=TacacsPlus, Service-Argument=shell, AcsSessionID=host002/222222222/444444, AuthenticationIdentityStore=EE-SSA, SelectedAccessService=Default Device Admin, SelectedShellProfile=Privilege Level 15 Shell Profile, Step=13005, Step=15049,'
+    expect:
+      class_uid: 3002
+      status_id: 1
+      auth_protocol: TACACS+
+      src_endpoint.ip: 203.0.113.40
+      time: 1774952685159
+  # Failed PEAP authentication (test-pipeline-failed-attempts.log)
+  - raw: '<181>Mar 2 10:36:16 ise01 CISE_Failed_Attempts 0000075876 1 0 2022-03-02 10:36:16.136 +00:00 0000075943 5411 NOTICE Failed-Attempt: Supplicant stopped responding to ISE, ConfigVersionId=1381, RadiusPacketType=Drop, Device IP Address=192.0.2.193, DestinationIPAddress=192.0.2.145, UserName=testnac1, AcsSessionID=ise01/435083133/80, SelectedAccessService=Default Network Access, RequestLatency=13, FailureReason=12309 PEAP handshake failed, Step=11001, Step=11017, Step=12309, Step=5411, NetworkDeviceName=testDevice, EapTunnel=PEAP, OpenSSLErrorMessage=SSL alert: code=0x246=582 ; source=local ; type=fatal ; message="protocol version, unsupported", User-Name=testnac1, Calling-Station-ID=00-23-DF-00-00-01, Protocol=Radius,'
+    expect:
+      class_uid: 3002
+      status_id: 2
+      status_code: "12309"
+      status_detail: 12309 PEAP handshake failed
+      action_id: 2
+      user.name: testnac1
+      src_endpoint.mac: 00:23:df:00:00:01
+  # Failed attempt with no user (RADIUS request dropped) -> Base Event
+  - raw: '<181>Mar 2 09:09:13 ise01 CISE_Failed_Attempts 0000075134 1 0 2022-03-02 09:09:13.790 +00:00 0000075201 5405 NOTICE Failed-Attempt: RADIUS Request dropped, ConfigVersionId=1364, Device IP Address=192.0.2.193, Device Port=42946, DestinationIPAddress=192.0.2.145, DestinationPort=1812, Protocol=Radius, NetworkDeviceName=testDevice, FailureReason=11036 The Message-Authenticator RADIUS attribute is invalid, Step=11001, Step=11036, Step=5405,'
+    expect:
+      class_uid: 0
+      metadata.event_code: "5405"
+  # RADIUS accounting start and stop (test-pipeline-radius-accounting.log)
+  - raw: '<182>Apr 27 11:11:47 ise02.example.com CISE_RADIUS_Accounting 0000070618 1 0 2020-04-27 11:11:47.028075 -08:00 0091827141 3000 NOTICE Radius-Accounting: RADIUS Accounting start request, ConfigVersionId=33, Device IP Address=192.0.2.145, RequestLatency=6, NetworkDeviceName=WNBU-WLC1, User-Name=alice, NAS-IP-Address=192.0.2.145, NAS-Port=13, Framed-IP-Address=10.20.0.112, Called-Station-ID=00-24-97-69-7a-c0, Calling-Station-ID=d4-ca-6d-14-87-3b, Acct-Status-Type=Start, Acct-Session-Id=00000000/d4:ca:6d:14:87:3b/20879, Acct-Authentic=RADIUS, NAS-Port-Type=Wireless - IEEE 802.11, AcsSessionID=ise02.example.com/176956368/1092777, SelectedAccessService=Default Network Access, Step=11004, Step=11005,'
+    expect:
+      class_uid: 3002
+      activity_id: 1
+      src_endpoint.ip: 10.20.0.112
+      session.uid: 00000000/d4:ca:6d:14:87:3b/20879
+  - raw: '<182>Apr 27 11:18:08 ise02.example.com CISE_RADIUS_Accounting 0000142722 1 0 2020-04-27 11:18:08.144167 -08:00 0096217580 3001 NOTICE Radius-Accounting: RADIUS Accounting stop request, ConfigVersionId=33, Device IP Address=192.0.2.145, RequestLatency=4, NetworkDeviceName=WNBU-WLC1, User-Name=bob, NAS-IP-Address=192.0.2.145, Framed-IP-Address=10.20.0.113, Calling-Station-ID=5c-0a-5b-43-3f-79, Acct-Status-Type=Stop, Acct-Input-Octets=43000, Acct-Output-Octets=140998, Acct-Session-Id=0000AAAA/5c:0a:5b:43:3f:79/24927, Acct-Session-Time=209, Acct-Terminate-Cause=User Request,'
+    expect:
+      class_uid: 3002
+      activity_id: 2
+  # TACACS+ command accounting (test-pipeline-tacacs-accounting.log)
+  - raw: '<182>Feb 21 19:13:08 ise01 CISE_TACACS_Accounting 0000000001 1 0 2020-02-21 19:13:08.328 +00:00 0018415781 3300 NOTICE Tacacs-Accounting: TACACS+ Accounting with Command, ConfigVersionId=1829, Device IP Address=192.0.2.144, CmdSet=[ CmdAV=show mac-address-table <cr> ], RequestLatency=1, NetworkDeviceName=wlnwan1, Type=Accounting, Privilege-Level=15, Service=Login, User=netadmin, Port=tty10, Remote-Address=198.51.100.44, Authen-Method=TacacsPlus, AcctRequest-Flags=Stop, Service-Argument=shell, AcsSessionID=ise01/359344348/952729, SelectedAccessService=Device Admin - TACACS, Response={AcctReply-Status=Success; },'
+    expect:
+      class_uid: 6003
+      activity_id: 2
+      api.operation: show mac-address-table
+      actor.user.name: netadmin
+      src_endpoint.ip: 198.51.100.44
+      dst_endpoint.name: wlnwan1
+  - raw: '<181>Jul 12 08:49:05 ise01 CISE_TACACS_Accounting 0006616665 1 0 2024-07-12 08:49:05.018 +02:00 17627964199 3300 NOTICE Tacacs-Accounting: TACACS+ Accounting with Command, ConfigVersionId=280, Device IP Address=192.0.2.144, CmdSet=[ CmdAV=no ip access-list extended MGMT-IN <cr> ], RequestLatency=5, NetworkDeviceName=core-sw1, Privilege-Level=15, User=netadmin, Remote-Address=198.51.100.44, AcctRequest-Flags=Stop,'
+    expect:
+      class_uid: 6003
+      activity_id: 99
+      api.operation: no ip access-list extended MGMT-IN
+  # TACACS+ session accounting stop (test-pipeline-tacacs-accounting.log)
+  - raw: '<182>Feb 21 19:13:08 ise01 CISE_TACACS_Accounting 0000000001 1 0 2020-02-21 19:13:08.328 +00:00 0018415932 3302 NOTICE Tacacs-Accounting: TACACS+ Accounting STOP, ConfigVersionId=1829, Device IP Address=192.0.2.144, RequestLatency=1, NetworkDeviceName=LDNBuildSW1, Type=Accounting, Privilege-Level=1, Service=Login, User=netops, Port=tty2, Remote-Address=198.51.100.45, Authen-Method=TacacsPlus, AcctRequest-Flags=Stop, Service-Argument=shell,'
+    expect:
+      class_uid: 3002
+      activity_id: 2
+  # Posture report, non-compliant endpoint (fields per the ISE posture audit category)
+  - raw: '<181>Feb 26 22:15:22 ise01 CISE_Posture_and_Client_Provisioning_Audit 0000000960 1 0 2021-02-26 22:15:22.379 +00:00 0000004349 87000 NOTICE Posture: Endpoint Posture Report Received, ConfigVersionId=88, MacAddress=00-50-56-AB-CD-EF, OperatingSystem=Windows 10 Enterprise 64-bit, PostureAgentVersion=4.9.04043, PostureStatus=NonCompliant, PosturePolicyMatched=USB-Block-Policy, UserName=alice, SessionId=0a0009cc0000a1b2c3d4e5f6, IpAddress=10.20.0.50, SystemName=WKS-0042,'
+    expect:
+      class_uid: 2003
+      compliance.status_id: 3
+      severity_id: 3
+      device.hostname: WKS-0042
+  # EPS operation audit (test-pipeline-posture-client-provisioning-audit.log) -> Base Event
+  - raw: '<181>Feb 26 22:15:22 ise01 CISE_Posture_and_Client_Provisioning_Audit 0000000959 1 0 2021-02-26 22:15:22.379 +00:00 0000004348 87751 NOTICE EPS: Endpoint Protection Service has obtained the result of an operation, ConfigVersionId=88, OperationID=ise01.example.com:1, OperationType=CLEAR_POLICY_BY_IP:192.0.2.145, OperationStatus=RUNNING, AdminName=admin@example.com,'
+    expect:
+      class_uid: 0
+  # Continuation segment of a split message -> Base Event
+  - raw: '<182>Feb 21 19:13:08 ise01 CISE_TACACS_Accounting 0000000001 4 1 ConfigVersionId=1856, Device IP Address=192.0.2.144, RequestLatency=6, NetworkDeviceName=LDNBuildSW1, Type=Accounting, User=netops,'
+    expect:
+      class_uid: 0
+  # Malformed line -> Base Event with the fallback marker
+  - raw: 'not an ise line'
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: unparsable input
