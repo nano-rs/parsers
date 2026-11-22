@@ -1,0 +1,969 @@
+name: pingfederate_ocsf
+display_name: PingFederate Audit Log (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses the PingFederate security audit log into complete OCSF 1.9.0
+  "Authentication" (class_uid 3002) records. Two wire forms: the pipe-delimited
+  audit.log written by PingFederate's documented default log4j2 pattern (`%d|
+  trackingid| transactionid| event| subject| ip | app| connectionid| protocol|
+  host| role| status| adapterid| description| responsetime`). Values are not
+  escaped, so subject, app and description may hold `|`; the line is parsed
+  only when exactly one placement of those pipes fits the documented formats of
+  the other columns, otherwise it is kept whole with status Unknown)
+  and the CEF form of the syslog / SIEM appender (`CEF:0|Ping Identity|
+  PingFederate|...` with duid, src, msg, cs1 to cs6, dvchost, externalId), with
+  or without a syslog header; CEF from another vendor is kept whole as a Base
+  Event. SSO, OAuth, AUTHN_ATTEMPT, AUTHN_REQUEST and
+  AUTHN_SESSION_CREATED / _USED are Logon, SLO and AUTHN_SESSION_DELETED are
+  Logoff, other event types (SRI_REVOKED, ...) are Other. Status success /
+  failure / inprogress maps to Success / Failure / Other ("In Progress"); a
+  failure is Low severity with the failure description on status_detail. The
+  subject is user (also user.email_addr when it is an address; "unknown" when
+  an attempt has not named one yet), the client IP src_endpoint, the PingFederate node
+  dst_endpoint, the partner connection id service, SAML / OAuth / OIDC the auth
+  protocol, the tracking id metadata.correlation_uid, the transaction id
+  metadata.uid, and responsetime the duration. Timestamps without a zone are read as
+  UTC; ISO 8601 with a zone and epoch seconds or milliseconds are honored. Anything else (for example a PingFederate server.log line) is
+  kept whole as a Base Event with unmapped.parse_fallback. Distinct from the
+  PingOne cloud parser. Samples follow the PingFederate "Security audit
+  logging" field reference and the Elastic ping_federate audit pipeline
+  fixtures, with documentation addresses.
+match_values:
+  - pingfederate
+category: security
+vendor: "Ping Identity"
+product: "PingFederate"
+parser_vrl: |
+  # PingFederate security audit log (audit.log) -> OCSF 1.9.0 Authentication 3002
+  # Two wire forms, read onto one field set:
+  #   pipe-delimited audit.log (the documented default log4j2 pattern, 15 fields):
+  #     %d| trackingid| transactionid| event| subject| ip | app| connectionid|
+  #     protocol| host| role| status| adapterid| description| responsetime
+  #   CEF (syslog / SIEM appender):
+  #     CEF:0|Ping Identity|PingFederate|<ver>|<event>|<event>|0|rt= duid= src= msg=
+  #     cs1=app cs2=connection id cs3=protocol dvchost= cs4=role externalId=tid:...
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+
+  f = {}
+  form = ""
+
+  fallback = "not a PingFederate audit record"
+
+  # CEF only when a real CEF header starts the body (a syslog header may precede
+  # it); "CEF:" elsewhere, say inside a pipe line's description or subject, is
+  # just text. A syslog header never holds '|', so nothing before CEF: may.
+  cm, cm_err = parse_regex(raw_log, r'^(?:[^|\r\n]*\s)?(?P<cef>CEF:\d+\|.*)$')
+  if cm_err == null {
+      c, cerr = parse_cef(string!(cm.cef))
+      if cerr == null {
+          co = object!(c)
+          vendor = downcase(string(co.deviceVendor) ?? "")
+          product = downcase(string(co.deviceProduct) ?? "")
+          if contains(vendor, "ping") || contains(product, "pingfederate") {
+              form = "cef"
+              __source_kv = object(parse_json!(encode_json(co))) ?? {}
+              f.event = string(co.name) ?? string(co.deviceEventClassId) ?? ""
+              f.subject = string(co.duid) ?? string(co.suser) ?? ""
+              f.ip = string(co.src) ?? ""
+              f.status = string(co.msg) ?? ""
+              f.app = string(co.cs1) ?? ""
+              f.connectionid = string(co.cs2) ?? ""
+              f.protocol = string(co.cs3) ?? ""
+              f.role = string(co.cs4) ?? ""
+              f.host = string(co.dvchost) ?? ""
+              f.trackingid = string(co.externalId) ?? ""
+              f.timestamp = string(co.rt) ?? ""
+              f.version = string(co.deviceVersion) ?? ""
+          } else {
+              # Another product's CEF routed here: keep it whole, never guess.
+              fallback = "CEF from another product"
+          }
+      }
+  }
+
+  if form == "" && fallback == "not a PingFederate audit record" {
+      m, merr = parse_regex(raw_log, r'(?P<timestamp>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[,.]\d{1,9})?(?:Z|[+-]\d{2}:?\d{2})?)\s*\|(?P<rest>.*)$')
+      if merr == null {
+          parts = map_values(split(string!(m.rest), "|")) -> |v| { strip_whitespace(string!(v)) }
+          n = length(parts)
+          # PingFederate's documented default audit.log pattern (Security audit
+          # logging reference, 12.2 to 13.1) records 15 fields in this order:
+          #   %d | trackingid | transactionid | event | subject | ip | app |
+          #   connectionid | protocol | host | role | status | adapterid |
+          #   description | responsetime
+          # Fields are separated by '|' and values are NOT escaped. Three columns
+          # carry text a requester controls and may hold a raw '|': subject (the
+          # submitted username), app (the target resource of the request) and
+          # description (failure text that can echo input). Every other column
+          # is checked only for the format its documentation states, so a
+          # genuine value always passes:
+          #   transactionid  an identifier (may be empty outside SSO / SLO)
+          #   event          a transaction type identifier (the documented list
+          #                  is explicitly not exhaustive, so no vocabulary)
+          #   ip             the incoming IP address
+          #   protocol       an identity protocol identifier (SAML20, OAuth20)
+          #   host           a host name or IP address
+          #   role, status   undocumented value sets: a single word
+          #   adapterid      an adapter instance id, or a bracketed list
+          #   responsetime   milliseconds
+          # Every split of the extra pipes over subject, app and description is
+          # tried. Exactly one fitting split is parsed. None, or more than one (a
+          # forged tail in a free-text column), is never guessed: the record is
+          # kept whole with status Unknown and parse_fallback. A line with fewer
+          # columns than the documented pattern (a customized log4j2 pattern) is
+          # kept the same way.
+          extra = n - 14
+          tid_ok = match(string(get(parts, [1]) ?? "") ?? "", r'^\S*$')
+          ev_ok = match(string(get(parts, [2]) ?? "") ?? "", r'^[A-Za-z][A-Za-z0-9_]*$')
+          rt_ok = match(string(get(parts, [n - 1]) ?? "") ?? "", r'^\d*$')
+          cands = []
+          if extra >= 0 && tid_ok && ev_ok && rt_ok {
+              for_each(parts) -> |ds, _p1| {
+                  for_each(parts) -> |da, _p2| {
+                      if ds + da <= extra {
+                          sh = ds + da
+                          ipv = string(get(parts, [4 + ds]) ?? "") ?? ""
+                          protov = string(get(parts, [7 + sh]) ?? "") ?? ""
+                          hostv = string(get(parts, [8 + sh]) ?? "") ?? ""
+                          rolev = string(get(parts, [9 + sh]) ?? "") ?? ""
+                          stv = string(get(parts, [10 + sh]) ?? "") ?? ""
+                          adv = string(get(parts, [11 + sh]) ?? "") ?? ""
+                          ok = ipv == "" || is_ipv4(ipv) || is_ipv6(ipv)
+                          ok = ok && match(protov, r'^(?:[A-Za-z][A-Za-z0-9._-]*)?$')
+                          ok = ok && match(hostv, r'^[A-Za-z0-9._:\x5B\x5D-]*$')
+                          ok = ok && match(rolev, r'^(?:[A-Za-z][A-Za-z0-9_-]*)?$')
+                          ok = ok && match(stv, r'^(?:[A-Za-z][A-Za-z_ ]*)?$')
+                          ok = ok && match(adv, r'^(?:\x5B[^\x5D]*\x5D|[^\s\x5B\x5D]*)$')
+                          if ok { cands = push(cands, { "ds": ds, "da": da }) }
+                      }
+                  }
+              }
+          }
+          if length(cands) == 1 {
+              ds = int(cands[0].ds) ?? 0
+              da = int(cands[0].da) ?? 0
+              sh = ds + da
+              form = "pipe"
+              f.timestamp = string!(m.timestamp)
+              subj_cols = slice(parts, 3, 4 + ds) ?? []
+              app_cols = slice(parts, 5 + ds, 6 + sh) ?? []
+              desc_cols = slice(parts, 12 + sh, n - 1) ?? []
+              f.trackingid = string(get(parts, [0]) ?? "") ?? ""
+              f.transactionid = string(get(parts, [1]) ?? "") ?? ""
+              f.event = string(get(parts, [2]) ?? "") ?? ""
+              f.subject = join!(subj_cols, "|")
+              f.ip = string(get(parts, [4 + ds]) ?? "") ?? ""
+              f.app = join!(app_cols, "|")
+              f.connectionid = string(get(parts, [6 + sh]) ?? "") ?? ""
+              f.protocol = string(get(parts, [7 + sh]) ?? "") ?? ""
+              f.host = string(get(parts, [8 + sh]) ?? "") ?? ""
+              f.role = string(get(parts, [9 + sh]) ?? "") ?? ""
+              f.status = string(get(parts, [10 + sh]) ?? "") ?? ""
+              f.adapterid = string(get(parts, [11 + sh]) ?? "") ?? ""
+              f.description = join!(desc_cols, "|")
+              f.responsetime = string(get(parts, [n - 1]) ?? "") ?? ""
+              f = filter(f) -> |_k, v| { v != "" }
+              __source_kv = f
+          } else if length(cands) > 1 {
+              fallback = "ambiguous PingFederate audit columns (subject, app or description holds '|')"
+          } else {
+              fallback = "PingFederate audit columns do not fit the documented 15-field layout"
+          }
+      }
+  }
+
+  if form == "" {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": to_unix_timestamp(now(), unit: "milliseconds"),
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("pingfederate|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "PingFederate audit",
+              "log_provider": "PingFederate",
+              "product": { "name": "PingFederate", "vendor_name": "Ping Identity" }
+          }
+      }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], fallback)
+  } else {
+      event = upcase(string(f.event) ?? "")
+      st = downcase(replace(string(f.status) ?? "", " ", ""))
+
+      # ---- time: ISO 8601 with a zone, else log4j %d / CEF rt read as UTC
+      # (neither carries a zone), else epoch seconds or milliseconds ----
+      time_ms = 0
+      ts = string(get(f, ["timestamp"]) ?? "") ?? ""
+      if ts != "" {
+          tsn = replace(ts, ",", ".")
+          if match(ts, r'^\d{9,13}$') {
+              ep = to_int(ts) ?? 0
+              if ep < 100000000000 { time_ms = ep * 1000 } else { time_ms = ep }
+          } else if match(tsn, r'(?:Z|[+-]\d{2}:?\d{2})$') {
+              t0, t0err = parse_timestamp(tsn, "%+")
+              if t0err != null { t0, t0err = parse_timestamp(tsn, "%Y-%m-%dT%H:%M:%S%.f%z") }
+              if t0err == null { time_ms = to_unix_timestamp(t0, unit: "milliseconds") }
+          } else {
+              t1, t1err = parse_timestamp(replace(tsn, "T", " "), "%Y-%m-%d %H:%M:%S%.f", timezone: "UTC")
+              if t1err == null {
+                  time_ms = to_unix_timestamp(t1, unit: "milliseconds")
+              } else {
+                  t2, t2err = parse_timestamp(ts, "%b %d %Y %H:%M:%S%.f", timezone: "UTC")
+                  if t2err != null { t2, t2err = parse_timestamp(ts, "%b %d %Y %H:%M:%S", timezone: "UTC") }
+                  if t2err == null { time_ms = to_unix_timestamp(t2, unit: "milliseconds") }
+              }
+          }
+      }
+      if time_ms == 0 { time_ms = to_unix_timestamp(now(), unit: "milliseconds") }
+
+      # ---- event -> activity ----
+      activity_id = 99
+      activity_name = "Other"
+      if includes(["SSO", "OAUTH", "AUTHN_ATTEMPT", "AUTHN_REQUEST", "AUTHN_SESSION_CREATED", "AUTHN_SESSION_USED", "LOGIN"], event) {
+          activity_id = 1; activity_name = "Logon"
+      }
+      if includes(["SLO", "AUTHN_SESSION_DELETED", "LOGOUT"], event) {
+          activity_id = 2; activity_name = "Logoff"
+      }
+
+      # ---- status: success / failure / inprogress ----
+      status_id = 0
+      status = "Unknown"
+      severity_id = 1
+      severity = "Informational"
+      if st == "success" { status_id = 1; status = "Success" }
+      if st == "failure" || st == "failed" { status_id = 2; status = "Failure"; severity_id = 2; severity = "Low" }
+      if st == "inprogress" { status_id = 99; status = "In Progress" }
+
+      # ---- protocol ----
+      proto = string(f.protocol) ?? ""
+      pl = downcase(proto)
+      auth_protocol_id = 0
+      auth_protocol = "Unknown"
+      if proto != "" { auth_protocol_id = 99; auth_protocol = proto }
+      if starts_with(pl, "saml") { auth_protocol_id = 5; auth_protocol = "SAML" }
+      if starts_with(pl, "oauth") { auth_protocol_id = 6; auth_protocol = "OAUTH 2.0" }
+      if pl == "oidc" || starts_with(pl, "openid") { auth_protocol_id = 4; auth_protocol = "OpenID" }
+
+      # ---- who / where ----
+      subject = string(f.subject) ?? ""
+      user = {}
+      # OCSF requires user; an attempt that has not named a subject yet is "unknown".
+      if subject != "" { user.name = subject } else { user.name = "unknown" }
+      if match(subject, r'^[^@\s|]+@[^@\s|]+\.[^@\s|]+$') { user.email_addr = subject }
+      src_endpoint = {}
+      ip = string(f.ip) ?? ""
+      if ip != "" { src_endpoint.ip = downcase(ip) }
+      dst_endpoint = {}
+      host = string(f.host) ?? ""
+      if host != "" { dst_endpoint.hostname = host }
+
+      service = {}
+      conn = string(f.connectionid) ?? ""
+      if conn != "" { service.name = conn; service.uid = conn }
+      # OCSF needs a service or a dst_endpoint: the authenticating service is
+      # PingFederate itself when the record names neither partner nor node.
+      if length(service) == 0 && (string(f.host) ?? "") == "" { service.name = "PingFederate" }
+
+      tid = string(f.trackingid) ?? ""
+      txid = string(f.transactionid) ?? ""
+      uid = txid
+      if uid == "" { uid = sha2("pingfederate|" + ts + "|" + tid + "|" + event + "|" + st + "|" + raw_log, variant: "SHA-256") }
+
+      metadata = {
+          "version": "1.9.0",
+          "uid": uid,
+          "log_name": "PingFederate audit",
+          "log_provider": "PingFederate",
+          "event_code": event,
+          "product": { "name": "PingFederate", "vendor_name": "Ping Identity" }
+      }
+      if tid != "" { metadata.correlation_uid = tid }
+      pver = string(f.version) ?? ""
+      if pver != "" { metadata.product.version = pver }
+
+      ocsf = {
+          "class_uid": 3002,
+          "class_name": "Authentication",
+          "category_uid": 3,
+          "category_name": "Identity & Access Management",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": 300200 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status,
+          "auth_protocol_id": auth_protocol_id,
+          "auth_protocol": auth_protocol,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "user": user
+      }
+      if event != "" { ocsf.message = strip_whitespace(event + " " + (string(f.status) ?? "")) }
+      if length(src_endpoint) > 0 { ocsf.src_endpoint = src_endpoint }
+      if length(dst_endpoint) > 0 { ocsf.dst_endpoint = dst_endpoint }
+      if length(service) > 0 { ocsf.service = service }
+      desc = string(f.description) ?? ""
+      if desc != "" { ocsf.status_detail = desc }
+      rt_ms = to_int(string(f.responsetime) ?? "") ?? -1
+      if exists(f.responsetime) && rt_ms >= 0 { ocsf.duration = rt_ms }
+      if (string(f.app) ?? "") != "" { ocsf.http_request = { "url": { "url_string": string!(f.app) } } }
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # status: Audit status normalized to the OCSF status; consume only when the expected ID is emitted.
+  # msg: CEF msg carries the audit status; consume only when the expected ID is emitted.
+  # protocol: Identity protocol normalized to the OCSF auth protocol; consume only when the expected ID is emitted.
+  # cs3: CEF cs3 (Protocol) normalized to the OCSF auth protocol; consume only when the expected ID is emitted.
+  # event: Event type upper-cased onto metadata.event_code; consume only when the emitted code matches.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        status
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"success": 1, "failure": 2, "failed": 2, "inprogress": 99}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."status_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        msg
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"success": 1, "failure": 2, "failed": 2, "inprogress": 99, "in progress": 99}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."status_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        protocol
+      | cs3
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"saml20": 5, "saml11": 5, "oauth20": 6, "oidc": 4}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."auth_protocol_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        event
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"oauth": "OAUTH"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."metadata"."event_code" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    app
+  | connectionid
+  | cs1
+  | cs2
+  | cs4
+  | description
+  | deviceEventClassId
+  | deviceProduct
+  | deviceVendor
+  | deviceVersion
+  | duid
+  | dvchost
+  | event
+  | externalId
+  | host
+  | ip
+  | name
+  | responsetime
+  | src
+  | subject
+  | suser
+  | trackingid
+  | transactionid
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default audit.log fields)
+  - raw: "2026-11-02 14:03:15,877| tid:6Gx3QhVbN0kC2pZ8xYzEx01| a1b2c3d4-0000-4000-8000-000000000010| SSO| alice@example.com| 192.0.2.10 | https://app.example.com/sso| sp:cloud:saml2| SAML20| pf01.example.com| IdP| success| HTMLFormAdapter| | 163"
+    expect:
+      "class_uid": "3002"
+      "activity_id": "1"
+      "status_id": "1"
+      "user.name": "alice@example.com"
+      "src_endpoint.ip": "192.0.2.10"
+      "dst_endpoint.hostname": "pf01.example.com"
+      "auth_protocol_id": "5"
+      "service.name": "sp:cloud:saml2"
+      "metadata.correlation_uid": "tid:6Gx3QhVbN0kC2pZ8xYzEx01"
+      "duration": "163"
+      "time": "1793628195877"
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html
+  - raw: "2026-11-02 14:03:11,204| tid:6Gx3QhVbN0kC2pZ8xYzEx01| | AUTHN_ATTEMPT| | 192.0.2.10 | https://app.example.com/sso| sp:cloud:saml2| SAML20| pf01.example.com| IdP| inprogress| HTMLFormAdapter| | 0"
+    expect:
+      "class_uid": "3002"
+      "activity_id": "1"
+      "status_id": "99"
+      "status": "In Progress"
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (pattern with transactionid)
+  - raw: "2026-11-02 14:05:40,031| tid:Qm2Lr8TzA1bYv9WcExample02| a1b2c3d4-0000-4000-8000-000000000001| AUTHN_ATTEMPT| bob| 198.51.100.77 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| Invalid username or password| 41"
+    expect:
+      "status_id": "2"
+      "severity_id": "2"
+      "status_detail": "Invalid username or password"
+      "metadata.uid": "a1b2c3d4-0000-4000-8000-000000000001"
+      "user.name": "bob"
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html
+  - raw: "2026-11-02 14:07:02,512| tid:Zt5Kp0QwE3nMx7RbExample03| a1b2c3d4-0000-4000-8000-000000000002| OAuth| svc-reporting| 203.0.113.25 | | reporting-client| OAuth20| pf02.example.com| AS| success| | | 27"
+    expect:
+      "auth_protocol_id": "6"
+      "service.uid": "reporting-client"
+      "metadata.event_code": "OAUTH"
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (description example)
+  - raw: "2026-11-02 14:09:55,640| tid:Hy7Nc2VaR4sLp1QdExample04| | AUTHN_ATTEMPT| mallory| 203.0.113.66 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| [source:AccountLockingService] Account Locked| 3"
+    expect:
+      "status_id": "2"
+      "status_detail": "[source:AccountLockingService] Account Locked"
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html
+  - raw: "2026-11-02 18:40:09,118| tid:6Gx3QhVbN0kC2pZ8xYzEx01| a1b2c3d4-0000-4000-8000-000000000011| SLO| alice@example.com| 192.0.2.10 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| success| | | 12"
+    expect:
+      "activity_id": "2"
+      "status_id": "1"
+  # source: https://github.com/elastic/integrations/blob/main/packages/ping_federate/data_stream/audit/_dev/test/pipeline/test-audit.json
+  - raw: "CEF:0|Ping Identity|PingFederate|6.4|AUTHN_SESSION_DELETED|AUTHN_SESSION_DELETED|0|rt=May 18 2012 11:41:48.452 duid=joe src=203.0.113.142 msg=success cs1Label=Target Application URL cs1=http://www.example.com&landingpage\\=pageA cs2Label=Connection ID cs2=sp:cloud:saml2 cs3Label=Protocol cs3=SAML20 dvchost=hello cs4Label=Role cs4=IdP externalId=tid:ae14b5ce8 cs5Label=SP Local User ID cs5=idlocal cs6Label=Attributes cs6={SAML_SUBJECT\\=joe, ognl\\=tom}"
+    expect:
+      "class_uid": "3002"
+      "activity_id": "2"
+      "status_id": "1"
+      "user.name": "joe"
+      "src_endpoint.ip": "203.0.113.142"
+      "time": "1337341308452"
+      "metadata.product.version": "6.4"
+  # source: https://github.com/elastic/integrations/blob/main/packages/ping_federate/data_stream/audit/_dev/test/pipeline/test-audit.json
+  - raw: "CEF:0|Ping Identity|PingFederate|6.4|AUTHN_SESSION_USED|AUTHN_SESSION_USED|0|rt=May 18 2012 11:41:48.453 duid=moe src=203.0.113.142 msg=in progress cs1Label=Target Application URL cs1= cs2Label=Connection ID cs2= cs3Label=Protocol cs3= cs4Label=Role cs4= externalId=tid:ae14b5cea cs5Label=SP Local User ID cs5= cs6Label=Attributes cs6="
+    expect:
+      "activity_id": "1"
+      "status_id": "99"
+      "service.name": "PingFederate"
+  # source: https://github.com/elastic/integrations/blob/main/packages/ping_federate/data_stream/audit/_dev/test/pipeline/test-audit.json
+  - raw: "CEF:0|Ping Identity|PingFederate|6.4|UNKNOWN_TYPE|UNKNOWN_TYPE|0|"
+    expect:
+      "class_uid": "3002"
+      "activity_id": "99"
+      "metadata.event_code": "UNKNOWN_TYPE"
+  # source: https://www.ibm.com/docs/en/SS42VS_DSM/com.ibm.dsm.doc/c_dsm_guide_PingFederate_sample_event_msg.html
+  - raw: "<110>Feb 02 15:49:15 pf01.example.com CEF:0|Ping Identity|PingFederate|12.0|SSO|SSO|0|rt=Feb 02 2024 15:49:15.178 duid=carol@example.com src=192.0.2.31 msg=success cs1Label=Target Application URL cs1=https://portal.example.com/ cs2Label=Connection ID cs2=sp:cloud:saml2 cs3Label=Protocol cs3=SAML20 dvchost=pf01.example.com cs4Label=Role cs4=IdP externalId=tid:Rk3Vb8NqT0zWm5LxExample05 cs5Label=SP Local User ID cs5=carol cs6Label=Attributes cs6={SAML_SUBJECT\\=carol@example.com}"
+    expect:
+      "class_uid": "3002"
+      "status_id": "1"
+      "user.name": "carol@example.com"
+      "http_request.url.url_string": "https://portal.example.com/"
+      "time": "1706888955178"
+  # source: https://docs.sekoia.com/integration/categories/iam/pingfederate/ (server.log line, not audit)
+  - raw: "2026-11-02 14:10:00,000 tid:Q08PzbPCjfSJL8sbIj88OLO5YWg DEBUG [com.pingidentity.locale.LocaleUtil] Locale Override: none"
+    expect:
+      "class_uid": "0"
+      "unmapped.parse_fallback": "not a PingFederate audit record"
+  # neon review #78: a line whose description holds '|' keeps its columns.
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html
+  - raw: "2026-11-02 14:12:20,315| tid:Pp4Df6GhJ8kLz0XcExample06| a1b2c3d4-0000-4000-8000-000000000012| SSO| alice@example.com| 192.0.2.1 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| reason A|reason B| 42"
+    expect:
+      "activity_id": "1"
+      "status_id": "2"
+      "severity_id": "2"
+      "user.name": "alice@example.com"
+      "user.email_addr": "alice@example.com"
+      "src_endpoint.ip": "192.0.2.1"
+      "status_detail": "reason A|reason B"
+      "duration": "42"
+  # neon review #78: 15-field (transactionid) line whose description holds '|'.
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html
+  - raw: "2026-11-02 14:13:05,902| tid:Ww3Ee5Rr7Tt9YyUuExample07| a1b2c3d4-0000-4000-8000-000000000003| AUTHN_ATTEMPT| dave| 198.51.100.12 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| step 1 ok|step 2 denied| 18"
+    expect:
+      "status_id": "2"
+      "user.name": "dave"
+      "metadata.uid": "a1b2c3d4-0000-4000-8000-000000000003"
+      "status_detail": "step 1 ok|step 2 denied"
+      "duration": "18"
+  # neon review #78: 'CEF:' inside a pipe description is text, not a CEF header.
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html
+  - raw: "2026-11-02 14:14:41,077| tid:Aa1Ss2Dd3Ff4Gg5HhExample08| | AUTHN_ATTEMPT| erin| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| Blocked by CEF:rule 7| 5"
+    expect:
+      "class_uid": "3002"
+      "status_id": "2"
+      "status_detail": "Blocked by CEF:rule 7"
+  # neon review #78: ISO 8601 %d with a zone.
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html
+  - raw: "2026-11-02T14:15:02.640Z| tid:Zz9Xx8Cc7Vv6Bb5NnExample09| a1b2c3d4-0000-4000-8000-000000000013| SSO| frank@example.com| 192.0.2.55 | | sp:cloud:saml2| SAML20| pf02.example.com| IdP| success| HTMLFormAdapter| | 77"
+    expect:
+      "class_uid": "3002"
+      "time": "1793628902640"
+      "user.email_addr": "frank@example.com"
+  # neon review #78: epoch-second rt is scaled to milliseconds.
+  # source: https://www.ibm.com/docs/en/SS42VS_DSM/com.ibm.dsm.doc/c_dsm_guide_PingFederate_sample_event_msg.html
+  - raw: "CEF:0|Ping Identity|PingFederate|12.1|SSO|SSO|0|rt=1793628195 duid=grace@example.com src=192.0.2.60 msg=success cs2Label=Connection ID cs2=sp:cloud:saml2 cs3Label=Protocol cs3=SAML20 dvchost=pf01.example.com cs4Label=Role cs4=IdP externalId=tid:Qq1Ww2Ee3Rr4Tt5YyExample10"
+    expect:
+      "class_uid": "3002"
+      "time": "1793628195000"
+      "status_id": "1"
+  # neon review #78: ISO 8601 rt.
+  # source: https://www.ibm.com/docs/en/SS42VS_DSM/com.ibm.dsm.doc/c_dsm_guide_PingFederate_sample_event_msg.html
+  - raw: "CEF:0|Ping Identity|PingFederate|12.1|AUTHN_ATTEMPT|AUTHN_ATTEMPT|0|rt=2026-11-02T14:16:30Z duid=heidi src=198.51.100.61 msg=failure cs2Label=Connection ID cs2=sp:cloud:saml2 cs3Label=Protocol cs3=SAML20 dvchost=pf01.example.com cs4Label=Role cs4=IdP externalId=tid:Uu1Ii2Oo3Pp4Aa5SsExample11"
+    expect:
+      "time": "1793628990000"
+      "status_id": "2"
+      "severity_id": "2"
+  # neon review #78: another product's CEF is kept whole, not mapped to Authentication.
+  # source: https://docs.paloaltonetworks.com/pan-os/11-1/pan-os-admin/monitoring/use-syslog-for-monitoring/syslog-field-descriptions (CEF shape)
+  - raw: "<14>Nov  2 14:17:00 fw01 CEF:0|Palo Alto Networks|PAN-OS|11.1|end|TRAFFIC|1|rt=Nov 02 2026 14:17:00 src=192.0.2.9 dst=198.51.100.9 suser=alice"
+    expect:
+      "class_uid": "0"
+      "unmapped.parse_fallback": "CEF from another product"
+  # NAN-3702: an unparseable record gets the deterministic sha256("pingfederate|raw|" + raw) uid.
+  - raw: "NAN-3702 determinism probe: not a pingfederate record"
+    expect:
+      "class_uid": "0"
+      "metadata.uid": "b85d6bc8a56b271a11ae0c688b4c3d1683769c236f466fdd4dadd2181668524f"
+      "unmapped.parse_fallback": "not a PingFederate audit record"
+  # genuine: bracketed adapter list (neon #78 r4)
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:03:15,877| tid:6Gx| | SSO| alice@example.com| 192.0.2.10 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| success| [HTMLFormAdapter, PingIDAdapter]| | 163"
+    expect:
+      "class_uid": "3002"
+      "status_id": "1"
+      "metadata.event_code": "SSO"
+      "user.name": "alice@example.com"
+      "src_endpoint.ip": "192.0.2.10"
+  # genuine: space in the app target resource (neon #78 r4)
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:03:15,877| tid:6Gx| | SSO| alice@example.com| 192.0.2.10 | https://app.example.com/my app| sp:cloud:saml2| SAML20| pf01.example.com| IdP| success| HTMLFormAdapter| | 163"
+    expect:
+      "class_uid": "3002"
+      "status_id": "1"
+      "metadata.event_code": "SSO"
+      "user.name": "alice@example.com"
+      "src_endpoint.ip": "192.0.2.10"
+  # genuine: empty transactionid, RS role, space in the OAuth client id (neon #78 r4)
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:07:02,512| tid:Zt5| | OAuth| svc-reporting| 203.0.113.25 | | reporting client| OAuth20| pf02.example.com| RS| success| | | 27"
+    expect:
+      "class_uid": "3002"
+      "status_id": "1"
+      "metadata.event_code": "OAUTH"
+      "user.name": "svc-reporting"
+      "src_endpoint.ip": "203.0.113.25"
+      "service.name": "reporting client"
+  # genuine: all-uppercase transactionid (neon #78 r3)
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:07:02,512| tid:Zt5| TX9876543210| AUTHN_ATTEMPT| alice@example.com| 192.0.2.50 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| bad password| 5"
+    expect:
+      "class_uid": "3002"
+      "status_id": "2"
+      "metadata.event_code": "AUTHN_ATTEMPT"
+      "user.name": "alice@example.com"
+      "src_endpoint.ip": "192.0.2.50"
+      "metadata.uid": "TX9876543210"
+  # genuine: an event outside the documented examples is read, not guessed (neon #78 r4)
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:07:02,512| tid:Zt5| | PROVISIONING| scim-client| 192.0.2.51 | | sp:scim| SCIM| pf01.example.com| SP| success| | | 5"
+    expect:
+      "class_uid": "3002"
+      "status_id": "1"
+      "metadata.event_code": "PROVISIONING"
+      "user.name": "scim-client"
+      "src_endpoint.ip": "192.0.2.51"
+  # genuine: a '|' in the subject alone parses (the only fitting split)
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:14:41,077| tid:abc| | AUTHN_ATTEMPT| dave|x| 198.51.100.12 | https://app.example.com/| sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| | 18"
+    expect:
+      "class_uid": "3002"
+      "status_id": "2"
+      "metadata.event_code": "AUTHN_ATTEMPT"
+      "user.name": "dave|x"
+      "src_endpoint.ip": "198.51.100.12"
+  # attack: forged success tail in the subject plus a space in app (neon #78 r4): not guessed
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:14:41,077| tid:abc| | AUTHN_ATTEMPT| admin@example.com|10.0.0.1|||||IdP|success|HTMLFormAdapter|| 203.0.113.90 | https://app.example.com/my app| sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| invalid user| 5"
+    expect:
+      "class_uid": "0"
+      "status_id": "0"
+      "unmapped.parse_fallback": "ambiguous PingFederate audit columns (subject, app or description holds '|')"
+  # attack: forged success tail in the subject plus a bracketed adapter list (neon #78 r4): not guessed
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:14:41,077| tid:abc| | AUTHN_ATTEMPT| admin@example.com|10.0.0.1|||||IdP|success|HTMLFormAdapter|| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| [HTMLFormAdapter, PingIDAdapter]| invalid user| 5"
+    expect:
+      "class_uid": "0"
+      "status_id": "0"
+      "unmapped.parse_fallback": "ambiguous PingFederate audit columns (subject, app or description holds '|')"
+  # attack: a known event in the subject cannot replace the real event (neon #78 r4)
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:14:41,077| tid:abc| | AUTHN_SESSION_DELETED| SSO|admin@example.com| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| success| HTMLFormAdapter| | 5"
+    expect:
+      "class_uid": "3002"
+      "status_id": "1"
+      "metadata.event_code": "AUTHN_SESSION_DELETED"
+      "user.name": "SSO|admin@example.com"
+      "src_endpoint.ip": "203.0.113.90"
+      "activity_id": "2"
+  # attack: forged failure tail in the subject of a real success (neon #78 r3): not guessed
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:14:41,077| tid:abc| | SSO| admin@example.com|10.0.0.1|||||IdP|failure| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| success| HTMLFormAdapter| | 5"
+    expect:
+      "class_uid": "0"
+      "status_id": "0"
+      "unmapped.parse_fallback": "ambiguous PingFederate audit columns (subject, app or description holds '|')"
+  # attack: forged success tail, real failure with empty ip and role (neon #78 r3): not guessed
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:14:41,077| tid:abc| | AUTHN_ATTEMPT| admin@example.com|10.0.0.1|||||IdP|success| | | sp:cloud:saml2| SAML20| pf01.example.com| | failure| HTMLFormAdapter| bad| 5"
+    expect:
+      "class_uid": "0"
+      "status_id": "0"
+      "unmapped.parse_fallback": "ambiguous PingFederate audit columns (subject, app or description holds '|')"
+  # attack: forged success tail in the description (neon #78 r3): not guessed
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:14:41,077| tid:abc| | AUTHN_ATTEMPT| attacker@evil.example| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| bad |10.0.0.1|||||IdP|success|HTMLFormAdapter|| 5"
+    expect:
+      "class_uid": "0"
+      "status_id": "0"
+      "unmapped.parse_fallback": "ambiguous PingFederate audit columns (subject, app or description holds '|')"
+  # attack: forged success tail in the app target resource: not guessed
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:14:41,077| tid:abc| | AUTHN_ATTEMPT| eve| 203.0.113.90 | https://app.example.com/?x=1|10.0.0.1|||||IdP|success|HTMLFormAdapter|| | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| | 5"
+    expect:
+      "class_uid": "0"
+      "status_id": "0"
+      "unmapped.parse_fallback": "ambiguous PingFederate audit columns (subject, app or description holds '|')"
+  # attack: a CEF record inside the description is never parsed as CEF (neon #78 r2)
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:14:41,077| tid:abc| | AUTHN_ATTEMPT| attacker@evil.example| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| invalid user CEF:0|Ping Identity|PingFederate|12.1|SSO|SSO|0|duid=admin@example.com src=10.0.0.1 msg=success cs1=x| 5"
+    expect:
+      "class_uid": "0"
+      "status_id": "0"
+      "unmapped.parse_fallback": "ambiguous PingFederate audit columns (subject, app or description holds '|')"
+  # a line with fewer columns than the documented pattern is kept whole
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:03:15,877| tid:6Gx| SSO| alice@example.com| 192.0.2.10 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| success| HTMLFormAdapter| | 163"
+    expect:
+      "class_uid": "0"
+      "status_id": "0"
+      "unmapped.parse_fallback": "PingFederate audit columns do not fit the documented 15-field layout"
