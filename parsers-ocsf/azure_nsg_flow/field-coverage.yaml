@@ -1,0 +1,55 @@
+source: mixed
+transforms:
+- source: time
+  kind: scale
+  factor: 1000
+  target: time
+  reason: Bare NSG tuple clock in epoch seconds converted to the emitted millisecond value.
+- source: src_ip
+  kind: lowercase
+  reason: Bare tuple IPv6 source address is lowercased in the emitted endpoint.
+- source: dst_ip
+  kind: lowercase
+  reason: Bare tuple IPv6 destination address is lowercased in the emitted endpoint.
+- source: protocol
+  kind: enum
+  target: connection_info.protocol_num
+  values:
+    t: 6
+    u: 17
+  reason: NSG protocol letter normalized to the IANA protocol number; consume only when the expected number is emitted.
+- source: direction
+  kind: enum
+  target: connection_info.direction_id
+  values:
+    i: 1
+    o: 2
+  reason: Flow direction letter normalized to the OCSF direction id; consume only when the expected id is emitted.
+- source: decision
+  kind: enum
+  target: action_id
+  values:
+    a: 1
+    d: 2
+  reason: NSG traffic decision letter normalized to the OCSF action id; consume only when the expected id is emitted.
+consumed_candidates:
+- aclID
+- bytes_in
+- bytes_out
+- category
+- direction
+- dst_ip
+- dst_port
+- flowLogVersion
+- operationName
+- packets_in
+- packets_out
+- properties.Version
+- protocol
+- rule
+- src_ip
+- src_port
+- time
+consumed_reason: Only source keys read by this parser are eligible for exact-value
+  consumption; the selected branch must emit the value. Unknown keys always spill,
+  even when their value equals an OCSF default.

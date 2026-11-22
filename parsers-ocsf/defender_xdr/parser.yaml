@@ -1,0 +1,1242 @@
+name: defender_xdr_ocsf
+display_name: Microsoft Defender XDR alerts and incidents (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Microsoft Defender XDR alert and incident records into OCSF 1.9.0:
+    * Graph security alerts_v2 (GET /security/alerts_v2)      -> Detection Finding 2004
+      with evidence[] mapped to evidences[] (device, file, process, user, ip,
+      url, registry, mailbox, email message) and mitreTechniques to
+      finding_info.attacks[]
+    * Graph security incidents (GET /security/incidents)      -> Incident Finding 2005
+      (an `alerts` array from $expand=alerts becomes finding_info_list[])
+    * Streaming API / advanced hunting AlertInfo rows         -> Detection Finding 2004
+    * Streaming API / advanced hunting AlertEvidence rows     -> Detection Finding 2004
+      (activity Update, one evidence entity per row)
+  Streaming API rows are accepted both inside the Event Hubs record
+  (`category` "AdvancedHunting-AlertInfo" / "AdvancedHunting-AlertEvidence"
+  with the row in `properties`) and as bare rows. One record per event: the
+  Event Hubs `{"records": [...]}` envelope and the Graph `{"value": [...]}`
+  page are exploded upstream; one that reaches the lane anyway is kept whole
+  as a Base Event, never dropped. Anything unparseable is a Base Event with
+  the body in raw_data and unmapped.parse_fallback set. Severity maps
+  informational/low/medium/high to 1/2/3/4; alert status new/inProgress/resolved
+  maps to finding status New/In Progress/Resolved and activity
+  Create/Update/Close; classification/determination map to verdict.
+  metadata.uid is deterministic (sha256 of the natural id plus last update
+  time) so a replay dedupes in the lake. Distinct from defender_edr, which
+  parses Defender for Endpoint device telemetry.
+  The primary process and user evidence (Graph evidence[] or an AlertEvidence
+  row, including ProcessCommandLine) is also promoted to actor.process /
+  actor.user (host profile), and Azure resource evidence to top-level
+  resources, where nano's unified hunt columns read them. A missing clock
+  falls back to ingest time, never 1970. An AlertEvidence process id is read
+  from the AdditionalFields JSON when present; otherwise, because OCSF needs
+  pid, uid or cpid, process.uid is a synthetic value prefixed
+  "synthetic:defender_xdr:" (16 hex chars of sha256 over alert id, device id
+  and command line). It is scoped to one alert and is NOT an OS process GUID,
+  so do not join it against EDR or Sysmon process_guid.
+  Sample sources:
+    https://learn.microsoft.com/en-us/graph/api/security-alert-get?view=graph-rest-1.0
+    https://learn.microsoft.com/en-us/graph/api/resources/security-alert?view=graph-rest-1.0
+    https://learn.microsoft.com/en-us/graph/api/security-incident-get?view=graph-rest-1.0
+    https://learn.microsoft.com/en-us/graph/api/resources/security-incident?view=graph-rest-1.0
+    https://learn.microsoft.com/en-us/defender-xdr/streaming-api-event-hub
+    https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-alertinfo-table
+    https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-alertevidence-table
+match_values:
+  - defender_xdr
+category: security
+vendor: "Microsoft"
+product: "Defender XDR"
+parser_vrl: |
+  # Microsoft Defender XDR alert / incident -> OCSF 1.9.0 (2004 / 2005 / 0)
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+
+  parsed, err = parse_json(raw_log)
+  p = {}
+  is_obj = false
+  if err == null && is_object(parsed) {
+      p = object!(parsed)
+      is_obj = true
+  }
+  __source_kv = p
+
+  # ---- shape detection ----
+  rec_cat = to_string(p.category) ?? ""
+  props = object(p.properties) ?? {}
+  row = p
+  shape = "unknown"
+  if rec_cat == "AdvancedHunting-AlertInfo" && length(keys(props)) > 0 {
+      shape = "alertinfo"
+      row = props
+  } else if rec_cat == "AdvancedHunting-AlertEvidence" && length(keys(props)) > 0 {
+      shape = "alertevidence"
+      row = props
+  } else {
+      odata = downcase(to_string(get(p, ["@odata.type"]) ?? null) ?? "")
+      has_alert_id = (to_string(p.AlertId) ?? "") != ""
+      if has_alert_id && exists(p.EntityType) {
+          shape = "alertevidence"
+      } else if has_alert_id {
+          shape = "alertinfo"
+      } else if odata == "#microsoft.graph.security.alert" || exists(p.providerAlertId) || (exists(p.serviceSource) && exists(p.evidence)) {
+          shape = "alert"
+      } else if odata == "#microsoft.graph.security.incident" || (exists(p.incidentWebUrl) && exists(p.displayName)) {
+          shape = "incident"
+      }
+  }
+
+  base_meta = {
+      "version": "1.9.0",
+      "profiles": ["cloud"],
+      "log_provider": "Microsoft Defender XDR",
+      "product": { "name": "Microsoft Defender XDR", "vendor_name": "Microsoft" }
+  }
+
+  if !is_obj || shape == "unknown" {
+      # Unparseable body or an unknown shape: still a valid OCSF Base Event.
+      reason = "unparsable input"
+      if is_obj { reason = "unrecognized Defender XDR record shape" }
+      meta = base_meta
+      meta.uid = sha2("defender_xdr|raw|" + raw_log, variant: "SHA-256")
+      meta.log_level = "error"
+      meta.log_name = "DefenderXDR"
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": to_unix_timestamp(now(), unit: "milliseconds"),
+          "raw_data": raw_log,
+          "metadata": meta,
+          "cloud": { "provider": "Azure" }
+      }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], reason)
+  } else {
+      # ---- common: severity ----
+      # to_string(null) is "" (it does not fail), so each fallback is an explicit empty check.
+      sev_l = downcase(to_string(row.severity) ?? "")
+      if sev_l == "" { sev_l = downcase(to_string(row.Severity) ?? "") }
+      severity_id = 0
+      severity = "Unknown"
+      if sev_l == "informational" { severity_id = 1; severity = "Informational" }
+      if sev_l == "low" { severity_id = 2; severity = "Low" }
+      if sev_l == "medium" { severity_id = 3; severity = "Medium" }
+      if sev_l == "high" { severity_id = 4; severity = "High" }
+
+      tenant_id = to_string(p.tenantId) ?? ""
+      if tenant_id == "" { tenant_id = to_string(row.tenantId) ?? "" }
+      meta = base_meta
+      if tenant_id != "" { meta.tenant_uid = tenant_id }
+
+      # ---- common: verdict from classification / determination ----
+      cls_l = downcase(to_string(row.classification) ?? "")
+      det_l = downcase(to_string(row.determination) ?? "")
+      verdict_id = 0
+      verdict = ""
+      if cls_l == "truepositive" { verdict_id = 2; verdict = "True Positive" }
+      if cls_l == "falsepositive" { verdict_id = 1; verdict = "False Positive" }
+      if cls_l == "informationalexpectedactivity" { verdict_id = 5; verdict = "Benign" }
+      if det_l == "securitytesting" { verdict_id = 6; verdict = "Test" }
+
+      # ---- common: clocks ----
+      created_ms = 0
+      ct, cterr = parse_timestamp(to_string(row.createdDateTime) ?? "", "%+")
+      if cterr == null { created_ms = to_unix_timestamp(ct, unit: "milliseconds") }
+      updated_ms = 0
+      ut, uterr = parse_timestamp(to_string(row.lastUpdateDateTime) ?? "", "%+")
+      if uterr == null { updated_ms = to_unix_timestamp(ut, unit: "milliseconds") }
+      row_ms = 0
+      rt, rterr = parse_timestamp(to_string(row.Timestamp) ?? "", "%+")
+      if rterr == null { row_ms = to_unix_timestamp(rt, unit: "milliseconds") }
+      rec_ms = 0
+      rct, rcterr = parse_timestamp(to_string(p.time) ?? "", "%+")
+      if rcterr == null { rec_ms = to_unix_timestamp(rct, unit: "milliseconds") }
+
+      # ---- common: MITRE techniques ----
+      # Graph: ["T1564.001"]; AlertInfo/AlertEvidence: a JSON-array string,
+      # e.g. "[\"Masquerading (T1036)\"]".
+      tech_list = array(row.mitreTechniques) ?? []
+      at_raw = row.AttackTechniques
+      if is_array(at_raw) {
+          tech_list = array!(at_raw)
+      } else if is_string(at_raw) {
+          at_parsed = parse_json(string!(at_raw)) ?? null
+          if is_array(at_parsed) { tech_list = array!(at_parsed) }
+      }
+      attacks = []
+      for_each(tech_list) -> |_i, tv| {
+          ts = to_string(tv) ?? ""
+          tm, tmerr = parse_regex(ts, r'^(?:(?P<name>.*?)\s*\x28)?(?P<tech>T\d{4})(?:\.(?P<sub>\d{3}))?\x29?\s*$')
+          if tmerr == null {
+              tech = { "uid": string!(tm.tech) }
+              tname = string(tm.name) ?? ""
+              sub = string(tm.sub) ?? ""
+              atk = {}
+              if sub != "" {
+                  atk.sub_technique = { "uid": string!(tm.tech) + "." + sub }
+                  if tname != "" { atk.sub_technique.name = tname }
+              } else if tname != "" {
+                  tech.name = tname
+              }
+              atk.technique = tech
+              attacks = push(attacks, atk)
+          }
+      }
+
+      ocsf = {}
+
+      if shape == "incident" {
+          # =================== Graph incident -> Incident Finding 2005 ===================
+          inc_id = to_string(row.id) ?? ""
+          title = to_string(row.displayName) ?? ""
+          st_l = downcase(to_string(row.status) ?? "")
+          status_id = 0
+          status_str = "Unknown"
+          activity_id = 2
+          activity_name = "Update"
+          if st_l == "active" { status_id = 1; status_str = "New"; activity_id = 1; activity_name = "Create" }
+          if st_l == "inprogress" { status_id = 2; status_str = "In Progress" }
+          if st_l == "awaitingaction" { status_id = 3; status_str = "On Hold" }
+          if st_l == "resolved" { status_id = 4; status_str = "Resolved"; activity_id = 3; activity_name = "Close" }
+          if st_l == "redirected" { status_id = 5; status_str = "Closed"; activity_id = 3; activity_name = "Close" }
+          if status_id == 0 && st_l != "" { status_id = 99; status_str = to_string(row.status) ?? "Other" }
+
+          infos = []
+          for_each(array(row.alerts) ?? []) -> |_i, al| {
+              a = object(al) ?? {}
+              aid = to_string(a.id) ?? ""
+              if aid != "" {
+                  fi = { "uid": aid }
+                  at = to_string(a.title) ?? ""
+                  if at != "" { fi.title = at }
+                  infos = push(infos, fi)
+              }
+          }
+          if length(infos) == 0 {
+              fi_uid = if inc_id != "" { inc_id } else { "unknown" }
+              fi = { "uid": fi_uid }
+              if title != "" { fi.title = title }
+              if created_ms > 0 { fi.created_time = created_ms }
+              if updated_ms > 0 { fi.modified_time = updated_ms }
+              infos = [fi]
+          }
+
+          meta.log_name = "incidents"
+          meta.uid = sha2("defender_xdr|incident|" + inc_id + "|" + (to_string(row.lastUpdateDateTime) ?? ""), variant: "SHA-256")
+          if inc_id != "" { meta.correlation_uid = inc_id }
+          meta.profiles = ["cloud", "incident"]
+          inc_ms = if updated_ms > 0 { updated_ms } else { created_ms }
+          if inc_ms <= 0 { inc_ms = to_unix_timestamp(now(), unit: "milliseconds") }
+          ocsf = {
+              "class_uid": 2005,
+              "class_name": "Incident Finding",
+              "category_uid": 2,
+              "category_name": "Findings",
+              "activity_id": activity_id,
+              "activity_name": activity_name,
+              "type_uid": 200500 + activity_id,
+              "severity_id": severity_id,
+              "severity": severity,
+              "status_id": status_id,
+              "status": status_str,
+              "time": inc_ms,
+              "finding_info_list": infos,
+              "metadata": meta,
+              "cloud": { "provider": "Azure" }
+          }
+          if title != "" { ocsf.message = title }
+          desc = to_string(row.description) ?? ""
+          if desc != "" { ocsf.desc = desc }
+          if created_ms > 0 { ocsf.start_time = created_ms }
+          url = to_string(row.incidentWebUrl) ?? ""
+          if url != "" { ocsf.src_url = url }
+          if verdict_id > 0 { ocsf.verdict_id = verdict_id; ocsf.verdict = verdict }
+          assigned = to_string(row.assignedTo) ?? ""
+          if assigned != "" {
+              ocsf.assignee = { "name": assigned }
+              if contains(assigned, "@") { ocsf.assignee.email_addr = assigned }
+          }
+          rc = to_string(row.resolvingComment) ?? ""
+          if rc != "" { ocsf.comment = rc }
+      } else {
+          # =================== alert shapes -> Detection Finding 2004 ===================
+          evidences = []
+          device = {}
+          alert_uid = ""
+          title = ""
+          activity_id = 1
+          activity_name = "Create"
+          status_id = 1
+          status_str = "New"
+          finding_info = {}
+          time_ms = 0
+          first_ms = 0
+          # Primary entities promoted to the top level (actor / resources), where
+          # nano's unified hunt columns read them; evidences[] keeps every entity.
+          actor_process = {}
+          actor_user = {}
+          top_resources = []
+          last_ms = 0
+
+          if shape == "alert" {
+              alert_uid = to_string(row.id) ?? ""
+              title = to_string(row.title) ?? ""
+              st_l = downcase(to_string(row.status) ?? "")
+              status_id = 0
+              status_str = "Unknown"
+              activity_id = 2
+              activity_name = "Update"
+              if st_l == "new" { status_id = 1; status_str = "New"; activity_id = 1; activity_name = "Create" }
+              if st_l == "inprogress" { status_id = 2; status_str = "In Progress" }
+              if st_l == "resolved" { status_id = 4; status_str = "Resolved"; activity_id = 3; activity_name = "Close" }
+              if status_id == 0 && st_l != "" { status_id = 99; status_str = to_string(row.status) ?? "Other" }
+              time_ms = if updated_ms > 0 { updated_ms } else { created_ms }
+
+              fi_uid = if alert_uid != "" { alert_uid } else { "unknown" }
+              finding_info = { "uid": fi_uid }
+              if title != "" { finding_info.title = title }
+              d = to_string(row.description) ?? ""
+              if d != "" { finding_info.desc = d }
+              if created_ms > 0 { finding_info.created_time = created_ms }
+              if updated_ms > 0 { finding_info.modified_time = updated_ms }
+              fa, faerr = parse_timestamp(to_string(row.firstActivityDateTime) ?? "", "%+")
+              if faerr == null { first_ms = to_unix_timestamp(fa, unit: "milliseconds"); finding_info.first_seen_time = first_ms }
+              la, laerr = parse_timestamp(to_string(row.lastActivityDateTime) ?? "", "%+")
+              if laerr == null { last_ms = to_unix_timestamp(la, unit: "milliseconds"); finding_info.last_seen_time = last_ms }
+              aurl = to_string(row.alertWebUrl) ?? ""
+              if aurl != "" { finding_info.src_url = aurl }
+              cat = to_string(row.category) ?? ""
+              if cat != "" { finding_info.types = [cat] }
+              svc = to_string(row.serviceSource) ?? ""
+              if svc != "" { finding_info.data_sources = [svc] }
+              det_src = to_string(row.detectionSource) ?? ""
+              det_id = to_string(row.detectorId) ?? ""
+              if det_src != "" || det_id != "" {
+                  an = { "type_id": 99, "type": "Other" }
+                  if contains(downcase(det_src), "custom") { an.type_id = 1; an.type = "Rule" }
+                  if det_src != "" { an.name = det_src }
+                  if det_id != "" { an.uid = det_id }
+                  finding_info.analytic = an
+              }
+              pa = to_string(row.providerAlertId) ?? ""
+              if pa != "" && pa != alert_uid { finding_info.uid_alt = pa }
+              pn = to_string(row.productName) ?? ""
+              if pn != "" { meta.product.name = pn }
+              inc = to_string(row.incidentId) ?? ""
+              if inc != "" { meta.correlation_uid = inc }
+              meta.log_name = "alerts_v2"
+              meta.uid = sha2("defender_xdr|alert|" + alert_uid + "|" + (to_string(row.lastUpdateDateTime) ?? ""), variant: "SHA-256")
+
+              # ---- evidence[] -> evidences[] ----
+              for_each(array(row.evidence) ?? []) -> |_i, evv| {
+                  e = object(evv) ?? {}
+                  etype = to_string(get(e, ["@odata.type"]) ?? null) ?? ""
+                  etype = replace(etype, "#microsoft.graph.security.", "")
+                  ev = {}
+                  if etype != "" { ev.name = etype }
+                  vd = downcase(to_string(e.verdict) ?? "")
+                  if vd == "suspicious" { ev.verdict_id = 4; ev.verdict = "Suspicious" }
+                  if vd == "malicious" { ev.verdict_id = 8; ev.verdict = "Security Risk" }
+                  if vd == "nothreatsfound" { ev.verdict_id = 5; ev.verdict = "Benign" }
+                  fd = object(e.fileDetails) ?? object(e.imageFile) ?? {}
+                  fname = to_string(fd.fileName) ?? ""
+                  fobj = {}
+                  if fname != "" {
+                      fobj = { "name": fname, "type_id": 1, "type": "Regular File" }
+                      fdir = to_string(fd.filePath) ?? ""
+                      if fdir != "" { fobj.parent_folder = fdir; fobj.path = fdir + "\\" + fname }
+                      fsz = to_int(fd.fileSize) ?? 0
+                      if fsz > 0 { fobj.size = fsz }
+                      hashes = []
+                      h1 = to_string(fd.sha1) ?? ""
+                      if h1 != "" { hashes = push(hashes, { "algorithm_id": 2, "algorithm": "SHA-1", "value": h1 }) }
+                      h2 = to_string(fd.sha256) ?? ""
+                      if h2 != "" { hashes = push(hashes, { "algorithm_id": 3, "algorithm": "SHA-256", "value": h2 }) }
+                      if length(hashes) > 0 { fobj.hashes = hashes }
+                      fpub = to_string(fd.filePublisher) ?? ""
+                      if fpub != "" { fobj.company_name = fpub }
+                  }
+                  if etype == "deviceEvidence" {
+                      dv = { "type_id": 0, "type": "Unknown" }
+                      hn = to_string(e.hostName) ?? ""
+                      dns = to_string(e.deviceDnsName) ?? ""
+                      if hn == "" { hn = dns }
+                      if hn != "" { dv.hostname = hn }
+                      if dns != "" { dv.name = dns }
+                      did = to_string(e.mdeDeviceId) ?? ""
+                      if did != "" { dv.uid = did }
+                      aad = to_string(e.azureAdDeviceId) ?? ""
+                      if aad != "" { dv.uid_alt = aad }
+                      dd = to_string(e.dnsDomain) ?? ""
+                      if dd != "" { dv.domain = dd }
+                      ips = array(e.ipInterfaces) ?? []
+                      if length(ips) > 0 { dv.ip = downcase(to_string(ips[0]) ?? "") }
+                      if length(keys(dv)) > 2 {
+                          ev.device = dv
+                          if length(keys(device)) == 0 { device = dv }
+                      }
+                  } else if etype == "fileEvidence" {
+                      if fname != "" { ev.file = fobj }
+                  } else if etype == "processEvidence" {
+                      # to_int(null) is 0, not an error: guard null so a missing id
+                      # never fabricates pid 0 (Windows System Idle Process).
+                      pid = if e.processId != null { to_int(e.processId) ?? -1 } else { -1 }
+                      if pid >= 0 {
+                          pr = { "pid": pid }
+                          cl = to_string(e.processCommandLine) ?? ""
+                          if cl != "" { pr.cmd_line = cl }
+                          if fname != "" { pr.name = fname; pr.file = fobj }
+                          pct, pcterr = parse_timestamp(to_string(e.processCreationDateTime) ?? "", "%+")
+                          if pcterr == null { pr.created_time = to_unix_timestamp(pct, unit: "milliseconds") }
+                          ppid = if e.parentProcessId != null { to_int(e.parentProcessId) ?? -1 } else { -1 }
+                          if ppid >= 0 {
+                              pp = { "pid": ppid }
+                              ppf = object(e.parentProcessImageFile) ?? {}
+                              ppn = to_string(ppf.fileName) ?? ""
+                              if ppn != "" { pp.name = ppn }
+                              pr.parent_process = pp
+                          }
+                          ua = object(e.userAccount) ?? {}
+                          uan = to_string(ua.accountName) ?? ""
+                          if uan != "" {
+                              pu = { "name": uan }
+                              uad = to_string(ua.domainName) ?? ""
+                              if uad != "" { pu.domain = uad }
+                              usid = to_string(ua.userSid) ?? ""
+                              if usid != "" { pu.uid = usid }
+                              pr.user = pu
+                          }
+                          ev.process = pr
+                          if length(keys(actor_process)) == 0 { actor_process = pr }
+                      } else if fname != "" {
+                          ev.file = fobj
+                      }
+                  } else if etype == "userEvidence" {
+                      ua = object(e.userAccount) ?? {}
+                      un = to_string(ua.accountName) ?? ""
+                      if un == "" { un = to_string(ua.userPrincipalName) ?? "" }
+                      if un != "" {
+                          us = { "name": un }
+                          upn = to_string(ua.userPrincipalName) ?? ""
+                          if contains(upn, "@") { us.email_addr = upn }
+                          dn = to_string(ua.domainName) ?? ""
+                          if dn != "" { us.domain = dn }
+                          usid = to_string(ua.userSid) ?? ""
+                          if usid != "" { us.uid = usid }
+                          aid = to_string(ua.azureAdUserId) ?? ""
+                          if aid != "" { us.uid_alt = aid }
+                          disp = to_string(ua.displayName) ?? ""
+                          if disp != "" { us.display_name = disp }
+                          ev.user = us
+                          if length(keys(actor_user)) == 0 { actor_user = us }
+                      }
+                  } else if etype == "azureResourceEvidence" {
+                      arid = to_string(e.resourceId) ?? ""
+                      arn = to_string(e.resourceName) ?? ""
+                      if arid != "" || arn != "" {
+                          res = {}
+                          if arn != "" { res.name = arn }
+                          if arid != "" { res.uid = arid }
+                          arty = to_string(e.resourceType) ?? ""
+                          if arty != "" { res.type = arty }
+                          ev.resources = [res]
+                          # OCSF evidences need one of actor/data/device/...; resources
+                          # is not in that list, so data carries the compact resource
+                          # identity only, never the whole raw Graph entity.
+                          ev.data = res
+                          top_resources = push(top_resources, res)
+                      }
+                  } else if etype == "ipEvidence" {
+                      ip = to_string(e.ipAddress) ?? ""
+                      if ip != "" { ev.dst_endpoint = { "ip": downcase(ip) } }
+                  } else if etype == "urlEvidence" {
+                      u = to_string(e.url) ?? ""
+                      if u != "" { ev.url = { "url_string": u } }
+                  } else if etype == "registryKeyEvidence" || etype == "registryValueEvidence" {
+                      rk = to_string(e.registryKey) ?? ""
+                      rh = to_string(e.registryHive) ?? ""
+                      if rk != "" {
+                          rpath = if rh != "" { rh + "\\" + rk } else { rk }
+                          ev.reg_key = { "path": rpath }
+                          rvn = to_string(e.registryValueName) ?? ""
+                          if rvn != "" { ev.reg_value = { "name": rvn, "path": rpath } }
+                      }
+                  } else if etype == "mailboxEvidence" {
+                      mb = to_string(e.primaryAddress) ?? ""
+                      if mb != "" {
+                          ev.user = { "name": mb, "email_addr": mb }
+                          mdn = to_string(e.displayName) ?? ""
+                          if mdn != "" { ev.user.display_name = mdn }
+                      }
+                  } else if etype == "analyzedMessageEvidence" {
+                      sfrom = to_string(e.senderFromAddress) ?? ""
+                      rto = to_string(e.recipientEmailAddress) ?? ""
+                      if sfrom != "" || rto != "" {
+                          em = {}
+                          if sfrom != "" { em.from = sfrom }
+                          if rto != "" { em.to = [rto] }
+                          subj = to_string(e.subject) ?? ""
+                          if subj != "" { em.subject = subj }
+                          nmi = to_string(e.networkMessageId) ?? ""
+                          if nmi != "" { em.uid = nmi }
+                          imid = to_string(e.internetMessageId) ?? ""
+                          if imid != "" { em.message_uid = imid }
+                          ev.email = em
+                      }
+                  }
+                  # An entity this parser does not model keeps its type name and
+                  # its whole body (also preserved in unmapped.evidence).
+                  if length(keys(ev)) <= 3 && !exists(ev.device) && !exists(ev.file) && !exists(ev.process) && !exists(ev.user) && !exists(ev.dst_endpoint) && !exists(ev.url) && !exists(ev.reg_key) && !exists(ev.email) && !exists(ev.resources) {
+                      ev.data = e
+                  }
+                  evidences = push(evidences, ev)
+              }
+              ra = to_string(row.recommendedActions) ?? ""
+              if ra != "" { ocsf.remediation = { "desc": ra } }
+              assigned = to_string(row.assignedTo) ?? ""
+              if assigned != "" {
+                  ocsf.assignee = { "name": assigned }
+                  if contains(assigned, "@") { ocsf.assignee.email_addr = assigned }
+              }
+              if verdict_id > 0 { ocsf.verdict_id = verdict_id; ocsf.verdict = verdict }
+          } else {
+              # ---- streaming API / advanced hunting rows ----
+              alert_uid = to_string(row.AlertId) ?? ""
+              title = to_string(row.Title) ?? ""
+              time_ms = if row_ms > 0 { row_ms } else { rec_ms }
+              fi_uid = if alert_uid != "" { alert_uid } else { "unknown" }
+              finding_info = { "uid": fi_uid }
+              if title != "" { finding_info.title = title }
+              if time_ms > 0 { finding_info.created_time = time_ms }
+              svc = to_string(row.ServiceSource) ?? ""
+              if svc != "" { finding_info.data_sources = [svc] }
+              det_src = to_string(row.DetectionSource) ?? ""
+              if det_src != "" {
+                  an = { "name": det_src, "type_id": 99, "type": "Other" }
+                  if contains(downcase(det_src), "custom") { an.type_id = 1; an.type = "Rule" }
+                  finding_info.analytic = an
+              }
+              cat = to_string(row.Category) ?? ""
+              if cat != "" { finding_info.types = [cat] }
+              cats = row.Categories
+              if is_string(cats) { cats = parse_json(string!(cats)) ?? null }
+              if is_array(cats) && length(array!(cats)) > 0 { finding_info.types = cats }
+
+              if shape == "alertinfo" {
+                  meta.log_name = "AlertInfo"
+                  ts_key = to_string(row.Timestamp) ?? ""
+                  if ts_key == "" { ts_key = raw_log }
+                  meta.uid = sha2("defender_xdr|alertinfo|" + alert_uid + "|" + ts_key, variant: "SHA-256")
+              } else {
+                  # One AlertEvidence row adds one entity to an existing alert.
+                  activity_id = 2
+                  activity_name = "Update"
+                  status_id = 0
+                  status_str = "Unknown"
+                  meta.log_name = "AlertEvidence"
+                  meta.uid = sha2("defender_xdr|alertevidence|" + raw_log, variant: "SHA-256")
+                  et = to_string(row.EntityType) ?? ""
+                  ev = {}
+                  if et != "" { ev.name = et }
+                  fname = to_string(row.FileName) ?? ""
+                  fobj = {}
+                  if fname != "" {
+                      fobj = { "name": fname, "type_id": 1, "type": "Regular File" }
+                      fp = to_string(row.FolderPath) ?? ""
+                      if fp != "" { fobj.path = fp }
+                      fsz = to_int(row.FileSize) ?? 0
+                      if fsz > 0 { fobj.size = fsz }
+                      hashes = []
+                      h1 = to_string(row.SHA1) ?? ""
+                      if h1 != "" { hashes = push(hashes, { "algorithm_id": 2, "algorithm": "SHA-1", "value": h1 }) }
+                      h2 = to_string(row.SHA256) ?? ""
+                      if h2 != "" { hashes = push(hashes, { "algorithm_id": 3, "algorithm": "SHA-256", "value": h2 }) }
+                      if length(hashes) > 0 { fobj.hashes = hashes }
+                      ev.file = fobj
+                  }
+                  pcl = to_string(row.ProcessCommandLine) ?? ""
+                  # AlertEvidence carries the process id inside the AdditionalFields
+                  # JSON string, not as a column. to_int(null) is 0, so null is
+                  # guarded explicitly: a missing id never becomes pid 0.
+                  ppid_ = -1
+                  if row.ProcessId != null { ppid_ = to_int(row.ProcessId) ?? -1 }
+                  if ppid_ < 0 && is_string(row.AdditionalFields) {
+                      xaf = object(parse_json(string!(row.AdditionalFields)) ?? {}) ?? {}
+                      if xaf.ProcessId != null { ppid_ = to_int(xaf.ProcessId) ?? -1 }
+                  }
+                  has_proc = pcl != "" || (ppid_ >= 0 && downcase(et) == "process")
+                  pr = {}
+                  if has_proc {
+                      if pcl != "" { pr.cmd_line = pcl }
+                      if fname != "" { pr.name = fname; pr.file = fobj }
+                      # OCSF requires pid, uid or cpid on a process. Without a real
+                      # id the uid is explicitly synthetic ("synthetic:defender_xdr:"
+                      # prefix) and scoped to one alert, so it is never mistaken for
+                      # an OS process GUID in a correlation join.
+                      if ppid_ >= 0 {
+                          pr.pid = ppid_
+                      } else {
+                          pr.uid = "synthetic:defender_xdr:" + slice!(sha2("defender_xdr|process|" + alert_uid + "|" + (to_string(row.DeviceId) ?? "") + "|" + pcl, variant: "SHA-256"), 0, 16)
+                      }
+                  }
+                  dname = to_string(row.DeviceName) ?? ""
+                  did = to_string(row.DeviceId) ?? ""
+                  if dname != "" || did != "" {
+                      dv = { "type_id": 0, "type": "Unknown" }
+                      if dname != "" { dv.hostname = dname }
+                      if did != "" { dv.uid = did }
+                      lip = to_string(row.LocalIP) ?? ""
+                      if lip != "" { dv.ip = downcase(lip) }
+                      ev.device = dv
+                      device = dv
+                  }
+                  an_ = to_string(row.AccountName) ?? ""
+                  aupn = to_string(row.AccountUpn) ?? ""
+                  asid = to_string(row.AccountSid) ?? ""
+                  aoid = to_string(row.AccountObjectId) ?? ""
+                  if an_ != "" || aupn != "" || asid != "" || aoid != "" {
+                      us = {}
+                      us.name = if an_ != "" { an_ } else if aupn != "" { aupn } else if asid != "" { asid } else { aoid }
+                      if contains(aupn, "@") { us.email_addr = aupn }
+                      ad = to_string(row.AccountDomain) ?? ""
+                      if ad != "" { us.domain = ad }
+                      if asid != "" { us.uid = asid }
+                      if aoid != "" { us.uid_alt = aoid }
+                      ev.user = us
+                      actor_user = us
+                  }
+                  if has_proc {
+                      if length(keys(actor_user)) > 0 { pr.user = actor_user }
+                      ev.process = pr
+                      actor_process = pr
+                  }
+                  rip = to_string(row.RemoteIP) ?? ""
+                  if rip != "" {
+                      if downcase(to_string(row.EvidenceDirection) ?? "") == "source" {
+                          ev.src_endpoint = { "ip": downcase(rip) }
+                      } else {
+                          ev.dst_endpoint = { "ip": downcase(rip) }
+                      }
+                  }
+                  rurl = to_string(row.RemoteUrl) ?? ""
+                  if rurl != "" { ev.url = { "url_string": rurl } }
+                  rk = to_string(row.RegistryKey) ?? ""
+                  if rk != "" {
+                      ev.reg_key = { "path": rk }
+                      rvn = to_string(row.RegistryValueName) ?? ""
+                      if rvn != "" { ev.reg_value = { "name": rvn, "path": rk } }
+                  }
+                  cres = to_string(row.CloudResource) ?? ""
+                  cresid = to_string(row.ResourceID) ?? ""
+                  if cres != "" || cresid != "" {
+                      res = {}
+                      if cres != "" { res.name = cres }
+                      if cresid != "" { res.uid = cresid }
+                      rty = to_string(row.ResourceType) ?? ""
+                      if rty != "" { res.type = rty }
+                      ev.resources = [res]
+                      # resources does not satisfy the OCSF evidences at_least_one
+                      # constraint; data carries the compact resource identity.
+                      if length(keys(ev)) <= 2 { ev.data = res }
+                      top_resources = push(top_resources, res)
+                  }
+                  if length(keys(ev)) <= 1 { ev.data = { "EntityType": et } }
+                  evidences = [ev]
+              }
+          }
+
+          if length(attacks) > 0 { finding_info.attacks = attacks }
+          meta.profiles = ["cloud", "incident"]
+          actor = {}
+          if length(keys(actor_process)) > 0 {
+              actor.process = actor_process
+              if length(keys(actor_user)) == 0 && exists(actor_process.user) { actor_user = object(actor_process.user) ?? {} }
+          }
+          if length(keys(actor_user)) > 0 { actor.user = actor_user }
+          if length(keys(actor)) > 0 {
+              ocsf.actor = actor
+              meta.profiles = ["cloud", "incident", "host"]
+          }
+          if length(top_resources) > 0 { ocsf.resources = top_resources }
+          if time_ms <= 0 { time_ms = to_unix_timestamp(now(), unit: "milliseconds") }
+          ocsf.class_uid = 2004
+          ocsf.class_name = "Detection Finding"
+          ocsf.category_uid = 2
+          ocsf.category_name = "Findings"
+          ocsf.activity_id = activity_id
+          ocsf.activity_name = activity_name
+          ocsf.type_uid = 200400 + activity_id
+          ocsf.severity_id = severity_id
+          ocsf.severity = severity
+          ocsf.status_id = status_id
+          ocsf.status = status_str
+          ocsf.is_alert = true
+          ocsf.time = time_ms
+          ocsf.finding_info = finding_info
+          ocsf.metadata = meta
+          ocsf.cloud = { "provider": "Azure" }
+          if title != "" { ocsf.message = title }
+          if length(evidences) > 0 { ocsf.evidences = evidences }
+          if length(keys(device)) > 0 { ocsf.device = device }
+          if first_ms > 0 { ocsf.start_time = first_ms }
+          if last_ms > 0 { ocsf.end_time = last_ms }
+      }
+      ocsf.raw_data = raw_log
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # severity: Defender severity word normalized to OCSF severity; consume only when the expected ID is emitted.
+  # Severity: Defender severity word normalized to OCSF severity; consume only when the expected ID is emitted.
+  # properties.Severity: Defender severity word normalized to OCSF severity; consume only when the expected ID is emitted.
+  # createdDateTime: ISO clock converted to an emitted OCSF millisecond timestamp; verified against the output.
+  # lastUpdateDateTime: ISO clock converted to an emitted OCSF millisecond timestamp; verified against the output.
+  # firstActivityDateTime: ISO clock converted to an emitted OCSF millisecond timestamp; verified against the output.
+  # lastActivityDateTime: ISO clock converted to an emitted OCSF millisecond timestamp; verified against the output.
+  # Timestamp: ISO clock converted to an emitted OCSF millisecond timestamp; verified against the output.
+  # properties.Timestamp: ISO clock converted to an emitted OCSF millisecond timestamp; verified against the output.
+  # time: ISO clock converted to an emitted OCSF millisecond timestamp; verified against the output.
+  # status: Graph alert/incident status normalized to the OCSF finding status; consume only when the expected ID is emitted.
+  # classification: Graph classification normalized to OCSF verdict; consume only when the expected ID is emitted.
+  # RemoteIP: IP address is lowercased in the emitted endpoint.
+  # properties.RemoteIP: IP address is lowercased in the emitted endpoint.
+  # LocalIP: IP address is lowercased in the emitted endpoint.
+  # properties.LocalIP: IP address is lowercased in the emitted endpoint.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        severity
+      | Severity
+      | properties\.Severity
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"informational": 1, "low": 2, "medium": 3, "high": 4}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."severity_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        createdDateTime
+      | lastUpdateDateTime
+      | firstActivityDateTime
+      | lastActivityDateTime
+      | Timestamp
+      | properties\.Timestamp
+      | time
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        status
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"new": 1, "active": 1, "inprogress": 2, "awaitingaction": 3, "resolved": 4}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."status_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        classification
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"truepositive": 2, "falsepositive": 1, "informationalexpectedactivity": 5}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."verdict_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        RemoteIP
+      | properties\.RemoteIP
+      | LocalIP
+      | properties\.LocalIP
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    @odata\.type
+  | AccountDomain
+  | AccountName
+  | AccountObjectId
+  | AccountSid
+  | AccountUpn
+  | AlertId
+  | Category
+  | CloudResource
+  | DetectionSource
+  | DeviceId
+  | DeviceName
+  | EntityType
+  | EvidenceDirection
+  | FileName
+  | ProcessCommandLine
+  | ProcessId
+  | FileSize
+  | FolderPath
+  | LocalIP
+  | RegistryKey
+  | RegistryValueName
+  | RemoteIP
+  | RemoteUrl
+  | ResourceID
+  | ResourceType
+  | SHA1
+  | SHA256
+  | ServiceSource
+  | Severity
+  | Timestamp
+  | Title
+  | alertWebUrl
+  | assignedTo
+  | category
+  | classification
+  | createdDateTime
+  | description
+  | detectionSource
+  | detectorId
+  | determination
+  | displayName
+  | firstActivityDateTime
+  | id
+  | incidentId
+  | incidentWebUrl
+  | lastActivityDateTime
+  | lastUpdateDateTime
+  | mitreTechniques
+  | productName
+  | properties
+  | properties\.AccountDomain
+  | properties\.AccountName
+  | properties\.AccountObjectId
+  | properties\.AccountSid
+  | properties\.AccountUpn
+  | properties\.AlertId
+  | properties\.Category
+  | properties\.CloudResource
+  | properties\.DetectionSource
+  | properties\.DeviceId
+  | properties\.DeviceName
+  | properties\.EntityType
+  | properties\.EvidenceDirection
+  | properties\.FileName
+  | properties\.ProcessCommandLine
+  | properties\.ProcessId
+  | properties\.FileSize
+  | properties\.FolderPath
+  | properties\.LocalIP
+  | properties\.RegistryKey
+  | properties\.RegistryValueName
+  | properties\.RemoteIP
+  | properties\.RemoteUrl
+  | properties\.ResourceID
+  | properties\.ResourceType
+  | properties\.SHA1
+  | properties\.SHA256
+  | properties\.ServiceSource
+  | properties\.Severity
+  | properties\.Timestamp
+  | properties\.Title
+  | providerAlertId
+  | recommendedActions
+  | resolvingComment
+  | serviceSource
+  | severity
+  | status
+  | tenantId
+  | time
+  | title
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # Graph alerts_v2, documentation example shape (security-alert-get), status new.
+  - raw: "{\"@odata.type\":\"#microsoft.graph.security.alert\",\"id\":\"da637578995287051192_756343937\",\"providerAlertId\":\"da637578995287051192_756343937\",\"incidentId\":\"28282\",\"status\":\"new\",\"severity\":\"low\",\"classification\":\"unknown\",\"determination\":\"unknown\",\"serviceSource\":\"microsoftDefenderForEndpoint\",\"detectionSource\":\"antivirus\",\"productName\":\"Microsoft Defender for Endpoint\",\"detectorId\":\"e0da400f-affd-43ef-b1d5-afc2eb6f2756\",\"tenantId\":\"00000000-0000-0000-0000-000000000000\",\"title\":\"Suspicious execution of hidden file\",\"category\":\"DefenseEvasion\",\"mitreTechniques\":[\"T1564.001\"],\"createdDateTime\":\"2021-04-27T12:19:27.7211305Z\",\"lastUpdateDateTime\":\"2021-05-02T14:19:01.3266667Z\",\"evidence\":[]}"
+    expect:
+      "class_uid": 2004
+      "activity_id": 1
+      "severity_id": 2
+      "status_id": 1
+      "finding_info.attacks.0.sub_technique.uid": "T1564.001"
+      "finding_info.attacks.0.technique.uid": "T1564"
+  # Graph incident (security-incident-get), resolved true positive.
+  - raw: "{\"@odata.type\":\"#microsoft.graph.security.incident\",\"id\":\"29\",\"tenantId\":\"00000000-0000-0000-0000-000000000000\",\"status\":\"resolved\",\"incidentWebUrl\":\"https://security.microsoft.com/incident2/29/overview?tid=00000000-0000-0000-0000-000000000000\",\"displayName\":\"Multi-stage incident involving Execution & Command and control on one endpoint\",\"createdDateTime\":\"2026-01-22T12:09:23.1433333Z\",\"lastUpdateDateTime\":\"2026-02-25T16:29:33.1Z\",\"assignedTo\":\"admin@example.com\",\"classification\":\"truePositive\",\"determination\":\"multiStagedAttack\",\"severity\":\"high\"}"
+    expect:
+      "class_uid": 2005
+      "activity_id": 3
+      "status_id": 4
+      "verdict_id": 2
+      "severity_id": 4
+  # Review fix: AlertInfo carries PascalCase Severity (to_string(null) never fell back).
+  - raw: "{\"Timestamp\": \"2026-10-05T12:00:00Z\", \"AlertId\": \"ed638638000000000001_1\", \"Title\": \"Possible attempt to access Primary Refresh Token (PRT)\", \"Category\": \"CredentialAccess\", \"Severity\": \"High\", \"ServiceSource\": \"Microsoft Defender for Endpoint\", \"DetectionSource\": \"EDR\", \"AttackTechniques\": \"[\\\"Steal Application Access Token (T1528)\\\"]\"}"
+    expect:
+      "class_uid": 2004
+      "severity_id": 4
+      "severity": "High"
+  # Review fix: AlertEvidence ProcessCommandLine promoted to actor.process (host profile).
+  - raw: "{\"time\": \"2026-10-05T11:20:07.1234567Z\", \"tenantId\": \"00000000-0000-0000-0000-000000000000\", \"operationName\": \"Publish\", \"category\": \"AdvancedHunting-AlertEvidence\", \"_TimeReceivedBySvc\": \"2026-10-05T11:19:59.0000000Z\", \"properties\": {\"Timestamp\": \"2026-10-05T11:19:40.0000000Z\", \"AlertId\": \"da638638123456789012_-1234567890\", \"Title\": \"Suspicious process injection observed\", \"Categories\": \"[\\\"DefenseEvasion\\\"]\", \"AttackTechniques\": \"[\\\"Process Injection (T1055)\\\"]\", \"ServiceSource\": \"Microsoft Defender for Endpoint\", \"DetectionSource\": \"EDR\", \"EntityType\": \"File\", \"EvidenceRole\": \"Impacted\", \"EvidenceDirection\": \"\", \"FileName\": \"rundll32.exe\", \"FolderPath\": \"C:\\\\Windows\\\\System32\\\\rundll32.exe\", \"SHA1\": \"a0aa8e3b6e1d7f8a8f6a0f0e5c5b1d0c7e0a1b2c\", \"SHA256\": \"\", \"FileSize\": 71680, \"ThreatFamily\": \"\", \"RemoteIP\": \"\", \"RemoteUrl\": \"\", \"AccountName\": \"\", \"AccountDomain\": \"\", \"AccountSid\": \"\", \"AccountObjectId\": \"\", \"AccountUpn\": \"\", \"DeviceId\": \"2222222222222222222222222222222222222222\", \"DeviceName\": \"wks-02.corp.example.com\", \"LocalIP\": \"\", \"NetworkMessageId\": \"\", \"EmailSubject\": \"\", \"ApplicationId\": null, \"Application\": \"\", \"ProcessCommandLine\": \"rundll32.exe C:\\\\Users\\\\Public\\\\x.dll,Start\", \"AdditionalFields\": \"{\\\"Host\\\":\\\"wks-02\\\"}\", \"RegistryKey\": \"\", \"RegistryValueName\": \"\", \"RegistryValueData\": \"\", \"Severity\": \"Medium\"}}"
+    expect:
+      "severity_id": 3
+      "actor.process.cmd_line": "rundll32.exe C:\\Users\\Public\\x.dll,Start"
+      "evidences.0.process.cmd_line": "rundll32.exe C:\\Users\\Public\\x.dll,Start"
+      "metadata.profiles.2": "host"
+      "device.hostname": "wks-02.corp.example.com"
+      "actor.process.uid": "synthetic:defender_xdr:bf7ce1dfa3c8aeab"
+      "actor.process.pid": "<missing>"
+  # Review fix: cloud-only userEvidence (accountName null), deviceDnsName-only device,
+  # azureResourceEvidence promoted to top-level resources.
+  - raw: "{\"@odata.type\": \"#microsoft.graph.security.alert\", \"id\": \"da00000000-0000-4000-8000-000000000042\", \"providerAlertId\": \"aa00000000-0000-4000-8000-000000000042\", \"incidentId\": \"4242\", \"status\": \"new\", \"severity\": \"medium\", \"classification\": null, \"determination\": null, \"serviceSource\": \"microsoftDefenderForCloud\", \"detectionSource\": \"microsoftDefenderForCloud\", \"productName\": \"Microsoft Defender for Cloud\", \"detectorId\": \"K8S_ExposedDashboard\", \"tenantId\": \"00000000-0000-0000-0000-000000000000\", \"title\": \"Suspicious sign-in followed by storage key listing\", \"description\": \"A cloud-only account listed storage account keys from an unusual location.\", \"category\": \"CredentialAccess\", \"assignedTo\": null, \"alertWebUrl\": \"https://security.microsoft.com/alerts/da00000000-0000-4000-8000-000000000042\", \"mitreTechniques\": [\"T1552.001\"], \"createdDateTime\": \"2026-11-02T08:00:00.000Z\", \"lastUpdateDateTime\": \"2026-11-02T08:05:00.000Z\", \"firstActivityDateTime\": \"2026-11-02T07:55:00.000Z\", \"lastActivityDateTime\": \"2026-11-02T07:58:00.000Z\", \"comments\": [], \"evidence\": [{\"@odata.type\": \"#microsoft.graph.security.userEvidence\", \"createdDateTime\": \"2026-11-02T08:00:00.000Z\", \"verdict\": \"suspicious\", \"remediationStatus\": \"none\", \"roles\": [\"compromised\"], \"userAccount\": {\"accountName\": null, \"domainName\": null, \"userSid\": null, \"azureAdUserId\": \"00000000-0000-0000-0000-000000000001\", \"userPrincipalName\": \"cloudonly@example.com\", \"displayName\": \"Cloud Only\"}}, {\"@odata.type\": \"#microsoft.graph.security.deviceEvidence\", \"createdDateTime\": \"2026-11-02T08:00:00.000Z\", \"verdict\": \"unknown\", \"remediationStatus\": \"none\", \"hostName\": null, \"deviceDnsName\": \"vm-web-01.example.com\", \"mdeDeviceId\": \"3333333333333333333333333333333333333333\", \"azureAdDeviceId\": null, \"dnsDomain\": \"example.com\", \"ipInterfaces\": [\"192.0.2.30\"]}, {\"@odata.type\": \"#microsoft.graph.security.azureResourceEvidence\", \"createdDateTime\": \"2026-11-02T08:00:00.000Z\", \"verdict\": \"unknown\", \"remediationStatus\": \"none\", \"resourceId\": \"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-prod/providers/Microsoft.Storage/storageAccounts/stprod01\", \"resourceName\": \"stprod01\", \"resourceType\": \"Storage Accounts\"}]}"
+    expect:
+      "evidences.0.user.name": "cloudonly@example.com"
+      "actor.user.name": "cloudonly@example.com"
+      "device.hostname": "vm-web-01.example.com"
+      "resources.0.name": "stprod01"
+      "metadata.tenant_uid": "00000000-0000-0000-0000-000000000000"
+  # Review fix: AlertEvidence user row lands on actor.user and its Severity maps.
+  - raw: "{\"Timestamp\": \"2026-10-05T12:00:00Z\", \"AlertId\": \"ca638638000000000002_7\", \"Title\": \"Atypical travel\", \"Categories\": \"[\\\"InitialAccess\\\"]\", \"ServiceSource\": \"Microsoft Entra ID Protection\", \"DetectionSource\": \"Microsoft Entra ID Protection\", \"EntityType\": \"User\", \"EvidenceRole\": \"Impacted\", \"AccountName\": \"user3\", \"AccountDomain\": \"example.com\", \"AccountObjectId\": \"00000000-0000-0000-0000-000000000000\", \"AccountUpn\": \"user3@example.com\", \"Severity\": \"Medium\"}"
+    expect:
+      "actor.user.name": "user3"
+      "severity_id": 3
+  # Review fix: to_int(null) is 0; a missing parentProcessId / null processId never
+  # fabricates pid 0.
+  - raw: "{\"@odata.type\":\"#microsoft.graph.security.alert\",\"id\":\"da00000000-0000-4000-8000-000000000077\",\"status\":\"new\",\"severity\":\"low\",\"lastUpdateDateTime\":\"2026-10-05T11:00:00Z\",\"evidence\":[{\"@odata.type\":\"#microsoft.graph.security.processEvidence\",\"processId\":4000,\"imageFile\":{\"fileName\":\"a.exe\"}},{\"@odata.type\":\"#microsoft.graph.security.processEvidence\",\"processId\":null,\"imageFile\":{\"fileName\":\"b.exe\"}}]}"
+    expect:
+      "evidences.0.process.pid": 4000
+      "evidences.0.process.parent_process": "<missing>"
+      "evidences.1.process": "<missing>"
+      "evidences.1.file.name": "b.exe"
+  # Review fix: AlertEvidence process id read from the AdditionalFields JSON.
+  - raw: "{\"Timestamp\": \"2026-10-05T12:00:00Z\", \"AlertId\": \"da638638000000000003_9\", \"Title\": \"Suspicious process\", \"EntityType\": \"Process\", \"FileName\": \"powershell.exe\", \"ProcessCommandLine\": \"\", \"DeviceId\": \"3333333333333333333333333333333333333333\", \"DeviceName\": \"wks-03.corp.example.com\", \"AdditionalFields\": \"{\\\"ProcessId\\\": 4242}\", \"Severity\": \"Medium\"}"
+    expect:
+      "actor.process.pid": 4242
+      "actor.process.uid": "<missing>"
+      "evidences.0.process.name": "powershell.exe"
+  # Review fix: an AlertEvidence cloud-resource row satisfies the OCSF evidences
+  # at_least_one constraint through data (resources is not in that list).
+  - raw: "{\"time\": \"2026-10-05T11:20:07.1234567Z\", \"tenantId\": \"00000000-0000-0000-0000-000000000000\", \"operationName\": \"Publish\", \"category\": \"AdvancedHunting-AlertEvidence\", \"properties\": {\"Timestamp\": \"2026-10-05T11:19:40.0000000Z\", \"AlertId\": \"fd638638000000000004_3\", \"Title\": \"Suspicious secret access on key vault\", \"Categories\": \"[\\\"CredentialAccess\\\"]\", \"ServiceSource\": \"Microsoft Defender for Cloud\", \"DetectionSource\": \"Microsoft Defender for Key Vault\", \"EntityType\": \"CloudResource\", \"EvidenceRole\": \"Impacted\", \"CloudResource\": \"prod-kv-01\", \"ResourceID\": \"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg1/providers/Microsoft.KeyVault/vaults/prod-kv-01\", \"ResourceType\": \"Microsoft.KeyVault/vaults\", \"Severity\": \"High\"}}"
+    expect:
+      "evidences.0.data.name": "prod-kv-01"
+      "evidences.0.resources.0.type": "Microsoft.KeyVault/vaults"
+      "resources.0.name": "prod-kv-01"
+      "severity_id": 4

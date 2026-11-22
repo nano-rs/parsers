@@ -1,0 +1,1037 @@
+name: windows_dns_ocsf
+display_name: Windows DNS Server (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Microsoft Windows Server DNS logs into OCSF 1.9.0 "DNS Activity"
+  (class_uid 4003). Three input forms are accepted, one record per event:
+    * the DNS debug log text file (dns.log), PACKET lines: date and time
+      (12 h en-US or 24 h day-first / ISO / dotted locales), thread, packet id,
+      UDP/TCP, Snd/Rcv, remote IP, XID, query/response, opcode, the
+      [flags-hex flag-chars rcode] block, question type and the
+      (n)label(n) question name, which is converted to dotted form;
+    * the NXLog xm_msdns parsed record (QuestionName, ResponseCode, ...);
+    * the Microsoft-Windows-DNSServer/Analytical ETW events as JSON from
+      Winlogbeat / Elastic Agent (winlog.event_data) or NXLog (flat keys):
+      256 QUERY_RECEIVED, 257 RESPONSE_SUCCESS, 258 RESPONSE_FAILURE,
+      259 IGNORED_QUERY, 260 RECURSE_QUERY_OUT, 261 RECURSE_RESPONSE_IN,
+      262 RECURSE_QUERY_TIMEOUT.
+  Activity is Query (1) or Response (2); src_endpoint is always the client
+  that asked the question (for recursion the DNS server itself is the
+  client), and the debug log Snd/Rcv lands on connection_info.direction.
+  Flags map to flag_ids, the opcode to query.opcode_id, the response code to
+  rcode_id. Microsoft-Windows-DNSServer/Audit events (zone, record and policy
+  changes) and non-PACKET debug log lines are kept as Base Event (class 0,
+  activity Other) with their message; debug log header and legend lines are
+  kept as Base Event (activity Unknown) with unmapped.log_line_type = header.
+  Anything else is a Base Event with the body in raw_data and
+  unmapped.parse_fallback set. The debug log and NXLog EventTime carry no
+  time zone and are read as UTC. Windows Event XML for these channels is not
+  parsed here.
+match_values:
+  - windows_dns
+category: network
+vendor: "Microsoft"
+product: "Windows DNS Server"
+parser_vrl: |
+  # Windows DNS Server (debug log / xm_msdns / Analytical ETW) -> OCSF 1.9.0 DNS Activity (4003)
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+
+  fmt = "unknown"
+  p = {}
+  parsed, jerr = parse_json(raw_log)
+  if jerr == null && is_object(parsed) {
+      p = object!(parsed)
+      __source_kv = p
+      fmt = "json"
+  }
+
+  # ---- normalized fields, filled by whichever branch matches ----
+  time_ms = 0
+  dt_str = ""
+  eid = ""
+  host = ""
+  log_name = "DNS Server debug log"
+  is_dns = false
+  is_resp = false
+  activity_id = 1
+  activity_name = "Query"
+  opcode_id = -1
+  qname = ""
+  qtype = ""
+  rcode_txt = ""
+  rcode_num = -1
+  xid = -1
+  proto = ""
+  sr = ""
+  remote_ip = ""
+  flag_chars = ""
+  flags_word = -1
+  client_ip = ""
+  client_port = 0
+  server_ip = ""
+  server_port = 0
+  status_id = 0
+  status_detail = ""
+  elapsed_ms = -1
+  message = ""
+  line_kind = ""
+
+  if fmt == "unknown" {
+      # ---- DNS debug log PACKET line ----
+      m, merr = parse_regex(raw_log, r'^(?P<datetime>\d{1,4}[/.-]\d{1,2}[/.-]\d{1,4} \d{1,2}:\d{2}:\d{2}(?: [AP]M)?)\s+(?P<thread_id>[0-9A-Fa-f]+)\s+(?P<context>PACKET)\s+(?P<packet_id>[0-9A-Fa-f]+)\s+(?P<protocol>UDP|TCP)\s+(?P<direction>Snd|Rcv)\s+(?P<remote_ip>[0-9A-Fa-f.:]+)\s+(?P<xid>[0-9A-Fa-f]{1,4})\s+(?P<qr>R)?\s*(?P<opcode>[QNU?])\s+\x5B(?P<flags_hex>[0-9A-Fa-f]{4})\s+(?:(?P<flags_char>[ATDR](?:[ATDR ]*[ATDR])?)\s+)?(?P<rcode>[A-Z]+)\x5D\s+(?P<qtype>\S+)\s+(?P<qname>\S+)\s*$')
+      if merr == null {
+          __source_kv = compact(m)
+          fmt = "packet"
+          dt_str = to_string(m.datetime)
+          proto = downcase(to_string(m.protocol))
+          sr = to_string(m.direction)
+          remote_ip = to_string(m.remote_ip)
+          xid = parse_int(to_string(m.xid), base: 16) ?? -1
+          is_resp = (to_string(m.qr)) == "R"
+          op = to_string(m.opcode)
+          if op == "Q" { opcode_id = 0 } else if op == "N" { opcode_id = 4 } else if op == "U" { opcode_id = 5 } else if op == "?" { opcode_id = 99 }
+          flag_chars = to_string(m.flags_char)
+          rcode_txt = to_string(m.rcode)
+          qtype = to_string(m.qtype)
+          qname = replace(to_string(m.qname), r'\(\d+\)', ".")
+          is_dns = true
+      } else {
+          # ---- other timestamped debug log lines (EVENT, Note, ...) ----
+          e, eerr = parse_regex(raw_log, r'^(?P<datetime>\d{1,4}[/.-]\d{1,2}[/.-]\d{1,4} \d{1,2}:\d{2}:\d{2}(?: [AP]M)?)\s+(?P<thread_id>[0-9A-Fa-f]+)\s+(?P<context>[A-Za-z]+)\s+(?P<detail>\S.*?)\s*$')
+          if eerr == null {
+              __source_kv = compact(e)
+              fmt = "debug_event"
+              # A PACKET line the packet regex could not read is a degraded parse,
+              # not an ordinary EVENT line: flag it so source health sees the loss.
+              if to_string(e.context) == "PACKET" { fmt = "packet_unparsed" }
+              dt_str = to_string(e.datetime)
+              message = to_string(e.detail)
+          } else if match(raw_log, r'(?i)\A(?:\s|-{2,}|\z|dns server log|log file wrap|message logging key|field\s*#)') {
+              fmt = "header"
+              line_kind = "header"
+          }
+      }
+  } else {
+      w = object(p.winlog) ?? {}
+      evt = object(p.event) ?? {}
+      ed = object(w.event_data) ?? object(p.event_data) ?? p
+      eid = to_string(w.event_id) ?? ""
+      if eid == "" { eid = to_string(evt.code) ?? "" }
+      if eid == "" { eid = to_string(p.EventID) ?? "" }
+      if eid == "" { eid = to_string(p.event_id) ?? "" }
+      host = to_string(get(p, ["host", "name"]) ?? null) ?? ""
+      if host == "" { host = to_string(w.computer_name) ?? "" }
+      if host == "" { host = to_string(p.Hostname) ?? "" }
+      chan = to_string(w.channel) ?? ""
+      if chan == "" { chan = to_string(p.Channel) ?? "" }
+      provider = to_string(w.provider_name) ?? ""
+      if provider == "" { provider = to_string(evt.provider) ?? "" }
+      if provider == "" { provider = to_string(p.ProviderName) ?? "" }
+      if provider == "" { provider = to_string(p.SourceName) ?? "" }
+      ts = to_string(get(p, ["@timestamp"]) ?? null) ?? ""
+      if ts != "" {
+          t, terr = parse_timestamp(ts, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+      if time_ms == 0 { dt_str = to_string(p.EventTime) ?? "" }
+
+      if includes(["256", "257", "258", "259", "260", "261", "262"], eid) && exists(ed.QNAME) {
+          # ---- Microsoft-Windows-DNSServer/Analytical ----
+          fmt = "etw"
+          is_dns = true
+          log_name = "Microsoft-Windows-DNSServer/Analytical"
+          qname = to_string(ed.QNAME) ?? ""
+          qt = to_string(ed.QTYPE) ?? ""
+          qtype = string(get({"1": "A", "2": "NS", "5": "CNAME", "6": "SOA", "12": "PTR", "13": "HINFO", "15": "MX", "16": "TXT", "28": "AAAA", "33": "SRV", "35": "NAPTR", "43": "DS", "46": "RRSIG", "47": "NSEC", "48": "DNSKEY", "64": "SVCB", "65": "HTTPS", "251": "IXFR", "252": "AXFR", "255": "ANY", "257": "CAA"}, [qt]) ?? null) ?? qt
+          if exists(ed.XID) { xid = to_int(ed.XID) ?? -1 }
+          tcp = to_string(ed.TCP) ?? ""
+          if tcp == "1" { proto = "tcp" } else if tcp == "0" { proto = "udp" }
+          if exists(ed.RCODE) { rcode_num = to_int(ed.RCODE) ?? -1 }
+          if exists(ed.Flags) { flags_word = to_int(ed.Flags) ?? -1 }
+          iface = to_string(ed.InterfaceIP) ?? ""
+          src = to_string(ed.Source) ?? ""
+          dst = to_string(ed.Destination) ?? ""
+          port = to_int(ed.Port) ?? 0
+          if exists(ed.ElapsedTime) { elapsed_ms = to_int(ed.ElapsedTime) ?? -1 }
+          status_detail = to_string(ed.Reason) ?? ""
+          # the server's own view: what it received is Inbound, what it sent Outbound
+          sr = if includes(["256", "259", "261"], eid) { "Rcv" } else { "Snd" }
+          if eid == "256" || eid == "259" {
+              client_ip = src; client_port = port; server_ip = iface
+          } else if eid == "257" || eid == "258" {
+              is_resp = true
+              client_ip = dst; client_port = port; server_ip = iface
+          } else if eid == "260" || eid == "262" {
+              client_ip = iface; server_ip = dst; server_port = port
+          } else {
+              is_resp = true
+              client_ip = iface; server_ip = src; server_port = port
+          }
+          if eid == "259" { status_id = 2 }
+          if eid == "258" { status_id = 2 }
+          if eid == "262" {
+              status_id = 2
+              activity_id = 99
+              activity_name = "Other"
+              if status_detail == "" { status_detail = "Recursive query timed out" }
+          }
+      } else if exists(p.QuestionName) || exists(p.SendReceiveIndicator) {
+          # ---- NXLog xm_msdns parsed debug log record ----
+          fmt = "msdns"
+          is_dns = true
+          proto = downcase(to_string(p.Protocol) ?? "")
+          sr = to_string(p.SendReceiveIndicator) ?? ""
+          remote_ip = to_string(p.RemoteIP) ?? ""
+          xid = parse_int(to_string(p.Xid) ?? "", base: 16) ?? -1
+          is_resp = downcase(to_string(p.QueryResponseIndicator) ?? "") == "response"
+          op = downcase(to_string(p.Opcode) ?? "")
+          if op == "standard query" { opcode_id = 0 } else if op == "notify" { opcode_id = 4 } else if op == "update" { opcode_id = 5 } else if op != "" { opcode_id = 99 }
+          if p.AuthoritativeAnswer == true { flag_chars = flag_chars + "A" }
+          if p.TruncatedResponse == true { flag_chars = flag_chars + "T" }
+          if p.RecursionDesired == true { flag_chars = flag_chars + "D" }
+          if p.RecursionAvailable == true { flag_chars = flag_chars + "R" }
+          if flag_chars == "" { flag_chars = to_string(p.FlagsChar) ?? "" }
+          rcode_txt = to_string(p.ResponseCode) ?? ""
+          qtype = to_string(p.QuestionType) ?? ""
+          qname = to_string(p.QuestionName) ?? ""
+      } else if contains(downcase(provider), "dns") || contains(downcase(chan), "dns") {
+          # ---- Microsoft-Windows-DNSServer/Audit and other DNS Server events ----
+          fmt = "audit"
+          log_name = if chan != "" { chan } else { "Microsoft-Windows-DNSServer" }
+          message = to_string(p.message) ?? ""
+          if message == "" { message = to_string(p.Message) ?? "" }
+          if message == "" { message = "Microsoft DNS Server event " + eid }
+      }
+  }
+
+  # ---- clock for the text forms (no zone in the source: read as UTC) ----
+  if time_ms == 0 && dt_str != "" {
+      fmts = ["%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%d.%m.%Y %H:%M:%S"]
+      if match(dt_str, r'[AP]M$') { fmts = ["%m/%d/%Y %I:%M:%S %p", "%d/%m/%Y %I:%M:%S %p"] }
+      for_each(fmts) -> |_i, f| {
+          if time_ms == 0 {
+              tt, tterr = parse_timestamp(dt_str, string!(f), timezone: "UTC")
+              if tterr == null { time_ms = to_unix_timestamp(tt, unit: "milliseconds") }
+          }
+      }
+  }
+  if time_ms == 0 { time_ms = to_unix_timestamp(now(), unit: "milliseconds") }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": sha2("windows_dns|raw|" + raw_log, variant: "SHA-256"),
+      "log_name": log_name,
+      "log_provider": "Microsoft-Windows-DNSServer",
+      "product": { "name": "Windows DNS Server", "vendor_name": "Microsoft" }
+  }
+  if eid != "" { metadata.event_code = eid }
+  device = {}
+  if host != "" {
+      device = { "hostname": host, "type_id": 1, "type": "Server" }
+      metadata.profiles = ["host"]
+  }
+  unmapped = {}
+
+  if is_dns {
+      # ---- roles from the debug log direction ----
+      if remote_ip != "" {
+          if (sr == "Rcv" && !is_resp) || (sr == "Snd" && is_resp) { client_ip = remote_ip } else { server_ip = remote_ip }
+      }
+      if is_resp && activity_id == 1 { activity_id = 2; activity_name = "Response" }
+
+      # ---- response code ----
+      rcode_names = ["NoError", "FormError", "ServError", "NXDomain", "NotImp", "Refused", "YXDomain", "YXRRSet", "NXRRSet", "NotAuth", "NotZone"]
+      if rcode_txt != "" {
+          rcode_num = to_int(get({"NOERROR": 0, "FORMERR": 1, "SERVFAIL": 2, "NXDOMAIN": 3, "NOTIMP": 4, "NOTIMPL": 4, "REFUSED": 5, "YXDOMAIN": 6, "YXRRSET": 7, "NXRRSET": 8, "NOTAUTH": 9, "NOTZONE": 10}, [upcase(rcode_txt)]) ?? 99) ?? 99
+      }
+      if is_resp && rcode_num >= 0 {
+          if rcode_num == 0 && status_id == 0 { status_id = 1 }
+          if rcode_num != 0 { status_id = 2 }
+      }
+
+      # ---- header flags: decimal word (ETW) or the debug log letters ----
+      flag_ids = []
+      flags = []
+      if flags_word >= 0 {
+          if opcode_id < 0 { opcode_id = mod(to_int(floor(flags_word / 2048)), 16) }
+          if mod(to_int(floor(flags_word / 1024)), 2) == 1 { flag_ids = push(flag_ids, 1); flags = push(flags, "Authoritative Answer") }
+          if mod(to_int(floor(flags_word / 512)), 2) == 1 { flag_ids = push(flag_ids, 2); flags = push(flags, "Truncated Response") }
+          if mod(to_int(floor(flags_word / 256)), 2) == 1 { flag_ids = push(flag_ids, 3); flags = push(flags, "Recursion Desired") }
+          if mod(to_int(floor(flags_word / 128)), 2) == 1 { flag_ids = push(flag_ids, 4); flags = push(flags, "Recursion Available") }
+          if mod(to_int(floor(flags_word / 32)), 2) == 1 { flag_ids = push(flag_ids, 5); flags = push(flags, "Authentic Data") }
+          if mod(to_int(floor(flags_word / 16)), 2) == 1 { flag_ids = push(flag_ids, 6); flags = push(flags, "Checking Disabled") }
+      } else {
+          if contains(flag_chars, "A") { flag_ids = push(flag_ids, 1); flags = push(flags, "Authoritative Answer") }
+          if contains(flag_chars, "T") { flag_ids = push(flag_ids, 2); flags = push(flags, "Truncated Response") }
+          if contains(flag_chars, "D") { flag_ids = push(flag_ids, 3); flags = push(flags, "Recursion Desired") }
+          if contains(flag_chars, "R") { flag_ids = push(flag_ids, 4); flags = push(flags, "Recursion Available") }
+      }
+
+      # ---- question ----
+      qname = replace(replace(qname, r'^\.+', ""), r'\.+$', "")
+      if qname == "" { qname = "." }
+      query = { "hostname": qname }
+      if qtype != "" { query.type = qtype }
+      if opcode_id >= 0 {
+          op_name = string(get({"0": "Query", "1": "Inverse Query", "2": "Status", "3": "Reserved", "4": "Notify", "5": "Update", "6": "DSO Message"}, [to_string(opcode_id)]) ?? null) ?? "Other"
+          if op_name == "Other" { opcode_id = 99 }
+          query.opcode_id = opcode_id
+          query.opcode = op_name
+      }
+
+      src_endpoint = {}
+      if client_ip != "" { src_endpoint.ip = downcase(client_ip) }
+      if client_port > 0 { src_endpoint.port = client_port }
+      dst_endpoint = {}
+      if server_ip != "" { dst_endpoint.ip = downcase(server_ip) }
+      if server_port > 0 { dst_endpoint.port = server_port }
+      if length(keys(src_endpoint)) == 0 && length(keys(dst_endpoint)) == 0 { src_endpoint.ip = "0.0.0.0" }
+
+      connection_info = {}
+      if proto == "udp" { connection_info = { "protocol_name": "udp", "protocol_num": 17 } }
+      if proto == "tcp" { connection_info = { "protocol_name": "tcp", "protocol_num": 6 } }
+      if sr == "Rcv" { connection_info.direction_id = 1; connection_info.direction = "Inbound" }
+      if sr == "Snd" { connection_info.direction_id = 2; connection_info.direction = "Outbound" }
+      if length(keys(connection_info)) > 0 && !exists(connection_info.direction_id) { connection_info.direction_id = 0; connection_info.direction = "Unknown" }
+
+      status = string(get({"0": "Unknown", "1": "Success", "2": "Failure"}, [to_string(status_id)]) ?? null) ?? "Unknown"
+      ocsf = {
+          "class_uid": 4003,
+          "class_name": "DNS Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": 400300 + activity_id,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": status_id,
+          "status": status,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "query": query
+      }
+      if length(keys(src_endpoint)) > 0 { ocsf.src_endpoint = src_endpoint }
+      if length(keys(dst_endpoint)) > 0 { ocsf.dst_endpoint = dst_endpoint }
+      if length(keys(connection_info)) > 0 { ocsf.connection_info = connection_info }
+      if is_resp && rcode_num >= 0 {
+          if rcode_num > 10 && rcode_num != 99 { rcode_num = 99 }
+          ocsf.rcode_id = rcode_num
+          ocsf.rcode = string(get(rcode_names, [rcode_num]) ?? null) ?? "Other"
+      }
+      if length(flag_ids) > 0 { ocsf.flag_ids = flag_ids; ocsf.flags = flags }
+      if xid >= 0 { ocsf.transaction_id = xid }
+      if elapsed_ms >= 0 { ocsf.duration = elapsed_ms }
+      if status_detail != "" { ocsf.status_detail = status_detail }
+      if length(keys(device)) > 0 { ocsf.device = device }
+      . = ocsf
+  } else {
+      # ---- Base Event: audit / debug EVENT lines / header lines / fallback ----
+      base_activity = 0
+      base_activity_name = "Unknown"
+      if fmt == "audit" || fmt == "debug_event" || fmt == "packet_unparsed" { base_activity = 99; base_activity_name = "Other" }
+      ocsf = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": base_activity,
+          "activity_name": base_activity_name,
+          "type_uid": base_activity,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata
+      }
+      if message != "" { ocsf.message = message }
+      if length(keys(device)) > 0 { ocsf.device = device }
+      if line_kind != "" { unmapped.log_line_type = line_kind }
+      if length(keys(unmapped)) > 0 { ocsf.unmapped = unmapped }
+      . = ocsf
+      if fmt == "unknown" {
+          # NAN-5264: explicit fallback marker; nano parser health counts it.
+          .metadata.log_level = "error"
+          . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+      } else if fmt == "json" {
+          . = set!(., ["unmapped", "parse_fallback"], "JSON record is not a Windows DNS Server event")
+      } else if fmt == "packet_unparsed" {
+          . = set!(., ["unmapped", "parse_fallback"], "unrecognized debug log PACKET layout")
+      }
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # datetime: Debug log local clock (no zone, read as UTC) in this locale layout; consume only when the emitted clock matches.
+  # datetime: Debug log local clock (no zone, read as UTC) in this locale layout; consume only when the emitted clock matches.
+  # datetime: Debug log local clock (no zone, read as UTC) in this locale layout; consume only when the emitted clock matches.
+  # datetime: Debug log local clock (no zone, read as UTC) in this locale layout; consume only when the emitted clock matches.
+  # datetime: Debug log local clock (no zone, read as UTC) in this locale layout; consume only when the emitted clock matches.
+  # datetime: Debug log local clock (no zone, read as UTC) in this locale layout; consume only when the emitted clock matches.
+  # EventTime: NXLog EventTime (no zone, read as UTC); consume only when the emitted clock matches.
+  # @timestamp: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # protocol: Transport name lowercased into connection_info.protocol_name.
+  # Protocol: Transport name lowercased into connection_info.protocol_name.
+  # remote_ip: IP addresses are lowercased (IPv6) on the emitted endpoint.
+  # RemoteIP: IP addresses are lowercased (IPv6) on the emitted endpoint.
+  # winlog.event_data.InterfaceIP: IP addresses are lowercased (IPv6) on the emitted endpoint.
+  # winlog.event_data.Source: IP addresses are lowercased (IPv6) on the emitted endpoint.
+  # winlog.event_data.Destination: IP addresses are lowercased (IPv6) on the emitted endpoint.
+  # event_data.InterfaceIP: IP addresses are lowercased (IPv6) on the emitted endpoint.
+  # event_data.Source: IP addresses are lowercased (IPv6) on the emitted endpoint.
+  # event_data.Destination: IP addresses are lowercased (IPv6) on the emitted endpoint.
+  # InterfaceIP: IP addresses are lowercased (IPv6) on the emitted endpoint.
+  # Source: IP addresses are lowercased (IPv6) on the emitted endpoint.
+  # Destination: IP addresses are lowercased (IPv6) on the emitted endpoint.
+  # direction: Debug log Snd/Rcv normalized to the OCSF direction; consume only when the expected ID is emitted.
+  # SendReceiveIndicator: Debug log Snd/Rcv normalized to the OCSF direction; consume only when the expected ID is emitted.
+  # opcode: Debug log opcode letter normalized to the OCSF opcode caption.
+  # Opcode: xm_msdns opcode name normalized to the OCSF opcode caption.
+  # rcode: Response code mnemonic normalized to the OCSF rcode caption (responses only).
+  # ResponseCode: Response code mnemonic normalized to the OCSF rcode caption (responses only).
+  # winlog.event_data.QTYPE: ETW numeric question type mapped to its mnemonic on query.type.
+  # winlog.event_data.TCP: ETW TCP indicator mapped to the transport name.
+  # event_data.QTYPE: ETW numeric question type mapped to its mnemonic on query.type.
+  # event_data.TCP: ETW TCP indicator mapped to the transport name.
+  # QTYPE: ETW numeric question type mapped to its mnemonic on query.type.
+  # TCP: ETW TCP indicator mapped to the transport name.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        datetime
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%m/%d/%Y %I:%M:%S %p")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        datetime
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%d/%m/%Y %I:%M:%S %p")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        datetime
+      | EventTime
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%Y-%m-%d %H:%M:%S")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        datetime
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%d/%m/%Y %H:%M:%S")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        datetime
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%m/%d/%Y %H:%M:%S")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        datetime
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%d.%m.%Y %H:%M:%S")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        @timestamp
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        protocol
+      | Protocol
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if ."connection_info"."protocol_name" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        remote_ip
+      | RemoteIP
+      | winlog\.event_data\.InterfaceIP
+      | winlog\.event_data\.Source
+      | winlog\.event_data\.Destination
+      | event_data\.InterfaceIP
+      | event_data\.Source
+      | event_data\.Destination
+      | InterfaceIP
+      | Source
+      | Destination
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        direction
+      | SendReceiveIndicator
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"rcv": 1, "snd": 2}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."connection_info"."direction_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        opcode
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"q": "Query", "n": "Notify", "u": "Update"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."query"."opcode" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        Opcode
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"standard query": "Query", "notify": "Notify", "update": "Update"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."query"."opcode" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        rcode
+      | ResponseCode
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"noerror": "NoError", "formerr": "FormError", "servfail": "ServError", "nxdomain": "NXDomain", "notimp": "NotImp", "notimpl": "NotImp", "refused": "Refused", "yxdomain": "YXDomain", "yxrrset": "YXRRSet", "nxrrset": "NXRRSet", "notauth": "NotAuth", "notzone": "NotZone"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."rcode" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        winlog\.event_data\.QTYPE
+      | event_data\.QTYPE
+      | QTYPE
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"1": "A", "2": "NS", "5": "CNAME", "6": "SOA", "12": "PTR", "13": "HINFO", "15": "MX", "16": "TXT", "28": "AAAA", "33": "SRV", "35": "NAPTR", "43": "DS", "46": "RRSIG", "47": "NSEC", "48": "DNSKEY", "64": "SVCB", "65": "HTTPS", "251": "IXFR", "252": "AXFR", "255": "ANY", "257": "CAA"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."query"."type" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        winlog\.event_data\.TCP
+      | event_data\.TCP
+      | TCP
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"0": "udp", "1": "tcp"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."connection_info"."protocol_name" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    @timestamp
+  | Destination
+  | ElapsedTime
+  | EventID
+  | EventTime
+  | Flags
+  | Hostname
+  | InterfaceIP
+  | Message
+  | Opcode
+  | Port
+  | Protocol
+  | ProviderName
+  | QNAME
+  | QTYPE
+  | QuestionName
+  | QuestionType
+  | RCODE
+  | Reason
+  | RemoteIP
+  | ResponseCode
+  | SendReceiveIndicator
+  | Source
+  | SourceName
+  | TCP
+  | XID
+  | context
+  | datetime
+  | detail
+  | direction
+  | event\.code
+  | event\.provider
+  | event_data\.Destination
+  | event_data\.ElapsedTime
+  | event_data\.Flags
+  | event_data\.InterfaceIP
+  | event_data\.Port
+  | event_data\.QNAME
+  | event_data\.QTYPE
+  | event_data\.RCODE
+  | event_data\.Reason
+  | event_data\.Source
+  | event_data\.TCP
+  | event_data\.XID
+  | event_id
+  | host\.name
+  | message
+  | opcode
+  | protocol
+  | qtype
+  | rcode
+  | remote_ip
+  | winlog\.computer_name
+  | winlog\.event_data\.Destination
+  | winlog\.event_data\.ElapsedTime
+  | winlog\.event_data\.Flags
+  | winlog\.event_data\.InterfaceIP
+  | winlog\.event_data\.Port
+  | winlog\.event_data\.QNAME
+  | winlog\.event_data\.QTYPE
+  | winlog\.event_data\.RCODE
+  | winlog\.event_data\.Reason
+  | winlog\.event_data\.Source
+  | winlog\.event_data\.TCP
+  | winlog\.event_data\.XID
+  | winlog\.event_id
+  | winlog\.provider_name
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+# Sample provenance (sidecar samples/ and the inline samples below):
+#   debug_*.json   DNS debug log PACKET / EVENT / header lines, field layout per
+#                  Microsoft's "Message logging key" legend written at the top of
+#                  every dns.log, the NXLog xm_msdns reference
+#                  https://docs.nxlog.co/agent/v6.10/xm/msdns.html and the Splunk
+#                  community format review
+#                  https://community.splunk.com/t5/Getting-Data-In/DNS-debug-log-dns-log-Format-Review/m-p/137291
+#   nxlog_msdns_query.json  xm_msdns field set from the NXLog reference above
+#   etw_256..262.json, audit_577_policy_create.json  Elastic integrations
+#                  microsoft_dnsserver pipeline test fixtures
+#                  https://github.com/elastic/integrations/tree/main/packages/microsoft_dnsserver/data_stream/analytical/_dev/test/pipeline
+#                  https://github.com/elastic/integrations/tree/main/packages/microsoft_dnsserver/data_stream/audit/_dev/test/pipeline
+#                  (PacketData dropped, IPs/names/SIDs replaced with documentation values)
+#   nxlog_etw_flat_256.json, audit_515_record_create.json  event fields per
+#                  https://learn.microsoft.com/en-us/windows-server/networking/dns/dns-logging-and-diagnostics
+samples:
+  - raw: '11/21/2026 2:15:31 PM 0B4C PACKET  000001D4C2A1B2C0 UDP Rcv 192.0.2.10      1a2b   Q [0001   D   NOERROR] A      (3)www(7)example(3)com(0)'
+    expect:
+      class_uid: "4003"
+      activity_id: "1"
+      query.hostname: www.example.com
+      query.type: A
+      src_endpoint.ip: 192.0.2.10
+      transaction_id: "6699"
+      connection_info.direction_id: "1"
+      time: "1795270531000"
+  - raw: '11/21/2026 2:15:32 PM 0B4C PACKET  000001D4C2A1C010 UDP Snd 192.0.2.10      5c3d R Q [8183   DR NXDOMAIN] AAAA   (7)missing(7)example(3)com(0)'
+    expect:
+      activity_id: "2"
+      rcode_id: "3"
+      rcode: NXDomain
+      status_id: "2"
+      flag_ids.1: "4"
+  - raw: '21/11/2026 14:16:02 0C10 PACKET  000001D4C2A1E200 TCP Rcv 2001:db8::25    0004   Q [0000       NOERROR] AXFR   (7)example(3)com(0)'
+    expect:
+      connection_info.protocol_name: tcp
+      query.type: AXFR
+      src_endpoint.ip: "2001:db8::25"
+      time: "1795270562000"
+  - raw: '{"EventTime":"2026-11-21 14:15:31","Hostname":"dns01","SourceName":"Microsoft-Windows-DNSServer","Channel":"Microsoft-Windows-DNSServer/Analytical","EventID":258,"TCP":"0","InterfaceIP":"192.0.2.53","Destination":"192.0.2.10","QNAME":"bad.example.com.","QTYPE":"1","XID":"77","RCODE":"2","Port":"50999","Flags":"33154","Reason":"System","Zone":"..Cache"}'
+    expect:
+      class_uid: "4003"
+      activity_id: "2"
+      rcode_id: "2"
+      status_id: "2"
+      src_endpoint.ip: 192.0.2.10
+      src_endpoint.port: "50999"
+      dst_endpoint.ip: 192.0.2.53
+      query.hostname: bad.example.com
+      device.hostname: dns01
+      metadata.event_code: "258"
+  - raw: 'DNS Server log file creation at 11/21/2026 2:00:00 PM UTC'
+    expect:
+      class_uid: "0"
+      unmapped.log_line_type: header
+  - raw: 'not a dns log'
+    expect:
+      class_uid: "0"
+      unmapped.parse_fallback: unparsable input
+  # Review fix: authoritative AD DC replies write spaced flag slots ("A DR", "A  R").
+  - raw: "11/21/2026 2:16:02 PM 0B4C PACKET  000001D4C2A1B2F0 UDP Snd 192.0.2.10      3c4d R Q [8580 A DR NOERROR] A      (4)dc01(4)corp(7)example(3)com(0)"
+    expect:
+      class_uid: 4003
+      activity_id: 2
+      rcode_id: 0
+      "query.hostname": "dc01.corp.example.com"
+      "flag_ids.0": 1
+      "flag_ids.2": 4
+  - raw: "11/21/2026 2:16:05 PM 0B4C PACKET  000001D4C2A1B300 UDP Snd 192.0.2.11      3c4e R Q [8583 A DR NXDOMAIN] A      (7)missing(4)corp(7)example(3)com(0)"
+    expect:
+      class_uid: 4003
+      rcode_id: 3
+      "query.hostname": "missing.corp.example.com"
+  - raw: "11/21/2026 2:16:09 PM 0B4C PACKET  000001D4C2A1B310 UDP Snd 192.0.2.12      3c4f R Q [8480 A  R NOERROR] SRV    (6)_ldap(4)_tcp(4)corp(7)example(3)com(0)"
+    expect:
+      class_uid: 4003
+      "query.type": "SRV"
+      "flag_ids.0": 1
+      "flag_ids.1": 4
+  # A PACKET line in an unknown layout is a Base Event marked as a degraded parse.
+  - raw: "11/21/2026 2:16:12 PM 0B4C PACKET  000001D4C2A1B320 UDP Snd 192.0.2.13 truncated-line"
+    expect:
+      class_uid: 0
+      "unmapped.parse_fallback": "unrecognized debug log PACKET layout"
