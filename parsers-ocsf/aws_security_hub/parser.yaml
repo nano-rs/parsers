@@ -18,6 +18,10 @@ description: >
   VerificationState to verdict, the originating integration to
   metadata.product.feature.name and finding_info.product, Resources[] to
   resources[] with their tags, and Network / Action / Process to evidences[].
+  A GuardDuty finding imported without an Action object has its action read
+  from ProductFields aws/guardduty/service/action/*. The API call is also
+  promoted to api, the Process to actor.process (uid "unknown" when ASFF has
+  no Pid) and the first EC2 instance resource to device (host profile).
   metadata.uid is Id + UpdatedAt, so each update of a finding is its own record.
   Accepts a bare ASFF finding (GetFindings, Firehose, S3 export) or the
   EventBridge "Security Hub Findings - Imported" envelope, which carries one
@@ -201,9 +205,32 @@ parser_vrl: |
       region = to_string(f.Region) ?? ""
       if region != "" { cloud.region = region }
 
-      # ---- resources ----
+      # ---- resources (the first EC2 instance is also the device) ----
       resources = []
+      device = {}
       for_each(array(f.Resources) ?? []) -> |_i, r| {
+          ec2 = object(get(r, ["Details", "AwsEc2Instance"]) ?? {}) ?? {}
+          rtype0 = to_string(get(r, ["Type"]) ?? "") ?? ""
+          if length(keys(device)) == 0 && (rtype0 == "AwsEc2Instance" || length(keys(ec2)) > 0) {
+              did = to_string(get(r, ["Id"]) ?? "") ?? ""
+              dparts = split(did, "/")
+              iid = to_string(get(dparts, [length(dparts) - 1]) ?? "") ?? ""
+              if iid != "" {
+                  device = { "type_id": 6, "type": "Virtual", "uid": iid, "instance_uid": iid, "hostname": iid }
+                  dns = to_string(ec2.PrivateDnsName) ?? ""
+                  if dns != "" { device.hostname = dns }
+                  dname = to_string(get(r, ["Tags", "Name"]) ?? "") ?? ""
+                  if dname != "" { device.name = dname }
+                  dip = to_string(get(array(ec2.IpV4Addresses) ?? [], [0]) ?? "") ?? ""
+                  if dip != "" { device.ip = downcase(dip) }
+                  dvpc = to_string(ec2.VpcId) ?? ""
+                  if dvpc != "" { device.vpc_uid = dvpc }
+                  dsub = to_string(ec2.SubnetId) ?? ""
+                  if dsub != "" { device.subnet_uid = dsub }
+                  dreg = to_string(get(r, ["Region"]) ?? "") ?? ""
+                  if dreg != "" { device.region = dreg }
+              }
+          }
           rid = to_string(get(r, ["Id"]) ?? "") ?? ""
           res = {}
           if rid != "" {
@@ -291,6 +318,63 @@ parser_vrl: |
       }
 
       act = object(f.Action) ?? {}
+      # GuardDuty findings imported into Security Hub carry no Action object:
+      # the action is flattened into ProductFields "aws/guardduty/service/action/...".
+      # Rebuild the ASFF Action shape from it so one code path maps both.
+      pf = object(f.ProductFields) ?? {}
+      gp = "aws/guardduty/service/action/"
+      g_type = to_string(get(pf, [gp + "actionType"]) ?? "") ?? ""
+      if length(keys(act)) == 0 && g_type != "" {
+          act.ActionType = g_type
+          gd_remote = {}
+          for_each(["networkConnectionAction", "awsApiCallAction"]) -> |_i, kind| {
+              rp = gp + string!(kind) + "/remoteIpDetails/"
+              rd = {}
+              rv = to_string(get(pf, [rp + "ipAddressV4"]) ?? "") ?? ""
+              if rv != "" { rd.IpAddressV4 = rv }
+              rv = to_string(get(pf, [rp + "country/countryName"]) ?? "") ?? ""
+              if rv != "" { rd.Country = { "CountryName": rv } }
+              rv = to_string(get(pf, [rp + "city/cityName"]) ?? "") ?? ""
+              if rv != "" { rd.City = { "CityName": rv } }
+              org = {}
+              rv = to_string(get(pf, [rp + "organization/asn"]) ?? "") ?? ""
+              if rv != "" { org.Asn = rv }
+              rv = to_string(get(pf, [rp + "organization/asnOrg"]) ?? "") ?? ""
+              if rv != "" { org.AsnOrg = rv }
+              rv = to_string(get(pf, [rp + "organization/isp"]) ?? "") ?? ""
+              if rv != "" { org.Isp = rv }
+              rv = to_string(get(pf, [rp + "organization/org"]) ?? "") ?? ""
+              if rv != "" { org.Org = rv }
+              if length(keys(org)) > 0 { rd.Organization = org }
+              if length(keys(rd)) > 0 { gd_remote = set!(gd_remote, [string!(kind)], rd) }
+          }
+          np = gp + "networkConnectionAction/"
+          gnc = {}
+          gv = to_string(get(pf, [np + "connectionDirection"]) ?? "") ?? ""
+          if gv != "" { gnc.ConnectionDirection = gv }
+          gv = to_string(get(pf, [np + "protocol"]) ?? "") ?? ""
+          if gv != "" { gnc.Protocol = gv }
+          gv = to_string(get(pf, [np + "localPortDetails/port"]) ?? "") ?? ""
+          if gv != "" { gnc.LocalPortDetails = { "Port": gv } }
+          gv = to_string(get(pf, [np + "remotePortDetails/port"]) ?? "") ?? ""
+          if gv != "" { gnc.RemotePortDetails = { "Port": gv } }
+          gv = to_string(get(pf, [np + "localIpDetails/ipAddressV4"]) ?? "") ?? ""
+          if gv != "" { gnc.LocalIpDetails = { "IpAddressV4": gv } }
+          gr = object(get(gd_remote, ["networkConnectionAction"]) ?? {}) ?? {}
+          if length(keys(gr)) > 0 { gnc.RemoteIpDetails = gr }
+          if length(keys(gnc)) > 0 { act.NetworkConnectionAction = gnc }
+          ap = gp + "awsApiCallAction/"
+          gac = {}
+          gv = to_string(get(pf, [ap + "api"]) ?? "") ?? ""
+          if gv != "" { gac.Api = gv }
+          gv = to_string(get(pf, [ap + "serviceName"]) ?? "") ?? ""
+          if gv != "" { gac.ServiceName = gv }
+          gr = object(get(gd_remote, ["awsApiCallAction"]) ?? {}) ?? {}
+          if length(keys(gr)) > 0 { gac.RemoteIpDetails = gr }
+          if length(keys(gac)) > 0 { act.AwsApiCallAction = gac }
+          gv = to_string(get(pf, [gp + "dnsRequestAction/domain"]) ?? "") ?? ""
+          if gv != "" { act.DnsRequestAction = { "Domain": gv } }
+      }
       api = {}
       query = {}
       remote = {}
@@ -310,6 +394,14 @@ parser_vrl: |
           if cdir == "OUTBOUND" { conn.direction_id = 2; conn.direction = "Outbound" }
           aproto = to_string(net_act.Protocol) ?? ""
           if aproto != "" && !exists(conn.protocol_name) { conn.protocol_name = downcase(aproto) }
+          lip = to_string(get(net_act, ["LocalIpDetails", "IpAddressV4"]) ?? "") ?? ""
+          if lip != "" {
+              if cdir == "OUTBOUND" {
+                  if !exists(src_ep.ip) { src_ep.ip = downcase(lip) }
+              } else if !exists(dst_ep.ip) {
+                  dst_ep.ip = downcase(lip)
+              }
+          }
           lport = to_int(get(net_act, ["LocalPortDetails", "Port"]) ?? 0) ?? 0
           rport = to_int(get(net_act, ["RemotePortDetails", "Port"]) ?? 0) ?? 0
           if cdir == "OUTBOUND" {
@@ -370,8 +462,11 @@ parser_vrl: |
       if length(keys(proc_src)) > 0 {
           pname = to_string(proc_src.Name) ?? ""
           if pname != "" { process.name = pname }
-          ppid = to_int(proc_src.Pid) ?? 0
-          process.pid = ppid
+          # pid is optional in ASFF; uid "unknown" satisfies the OCSF process
+          # constraint without inventing pid 0 (a real kernel pid).
+          ppid = -1
+          if proc_src.Pid != null { ppid = to_int(proc_src.Pid) ?? -1 }
+          if ppid >= 0 { process.pid = ppid } else { process.uid = "unknown" }
           ppath = to_string(proc_src.Path) ?? ""
           if ppath != "" {
               fparts = split(ppath, "/")
@@ -449,8 +544,21 @@ parser_vrl: |
       if verification == "FALSE_POSITIVE" { ocsf.verdict_id = 1; ocsf.verdict = "False Positive" }
       if verification == "TRUE_POSITIVE" { ocsf.verdict_id = 2; ocsf.verdict = "True Positive" }
       if verification == "BENIGN_POSITIVE" { ocsf.verdict_id = 5; ocsf.verdict = "Benign" }
+      # Promote the API call, the process (as the actor) and the EC2 instance
+      # (as the device) to the top level, where nano's promoted columns read them.
+      profiles = ["cloud", "security_control"]
+      if length(keys(api)) > 0 { ocsf.api = api }
+      if length(keys(process)) > 0 {
+          ocsf.actor = { "process": process }
+          profiles = push(profiles, "host")
+      }
+      if length(keys(device)) > 0 {
+          ocsf.device = device
+          if !includes(profiles, "host") { profiles = push(profiles, "host") }
+      }
       # verdict is bound to the incident profile.
-      if exists(ocsf.verdict_id) { ocsf.metadata.profiles = ["cloud", "security_control", "incident"] }
+      if exists(ocsf.verdict_id) { profiles = push(profiles, "incident") }
+      ocsf.metadata.profiles = profiles
       note = to_string(get(f, ["Note", "Text"]) ?? "") ?? ""
       if note != "" { ocsf.comment = note }
 
@@ -481,6 +589,10 @@ parser_vrl: |
                   vuln.cve = cve
               } else if vid != "" {
                   vuln.advisory = { "uid": vid, "title": vid }
+              } else {
+                  # OCSF needs one of cve / advisory / cwe: name it by the finding.
+                  vuln.advisory = { "uid": finding_id, "title": finding_info.title }
+                  vuln.title = finding_info.title
               }
               vvendor = to_string(get(vsrc, ["Vendor", "Name"]) ?? "") ?? ""
               if vvendor != "" { vuln.vendor_name = vvendor }
@@ -650,6 +762,8 @@ parser_vrl: |
   # VerificationState: The ASFF verification state normalized to the OCSF verdict; consume only when the expected ID is emitted.
   # Network.Direction: Connection direction normalized to the OCSF direction_id in the evidence; consume only when that ID is emitted.
   # Action.NetworkConnectionAction.ConnectionDirection: Connection direction normalized to the OCSF direction_id in the evidence; consume only when that ID is emitted.
+  # ProductFields.aws/guardduty/service/action/networkConnectionAction/protocol: Parser lowercases the GuardDuty protocol; consume only when the normalized value is emitted.
+  # ProductFields.aws/guardduty/service/action/networkConnectionAction/connectionDirection: GuardDuty connection direction normalized to the OCSF direction_id in the evidence; consume only when that ID is emitted.
   for_each(flatten(__source_kv)) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
@@ -723,6 +837,7 @@ parser_vrl: |
         Network\.Protocol
       | Action\.NetworkConnectionAction\.Protocol
       | Network\.SourceMac
+      | ProductFields\.aws/guardduty/service/action/networkConnectionAction/protocol
       )\z') {
           __value = value
           if is_string(__value) {
@@ -792,6 +907,18 @@ parser_vrl: |
               }
           }
       }
+      if match(key, r'(?x)
+      \A(?:
+        ProductFields\.aws/guardduty/service/action/networkConnectionAction/connectionDirection
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"inbound": 1, "outbound": 2}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
   }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
   __candidates = r'(?x)
@@ -808,6 +935,7 @@ parser_vrl: |
   | Action\.AwsApiCallAction\.ServiceName
   | Action\.DnsRequestAction\.Domain
   | Action\.NetworkConnectionAction\.ConnectionDirection
+  | Action\.NetworkConnectionAction\.LocalIpDetails\.IpAddressV4
   | Action\.NetworkConnectionAction\.LocalPortDetails\.Port
   | Action\.NetworkConnectionAction\.Protocol
   | Action\.NetworkConnectionAction\.RemoteIpDetails\.City\.CityName
@@ -852,6 +980,29 @@ parser_vrl: |
   | Process\.TerminatedAt
   | ProcessedAt
   | ProductArn
+  | ProductFields\.aws/guardduty/service/action/actionType
+  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/api
+  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/city/cityName
+  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/country/countryName
+  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/ipAddressV4
+  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/organization/asn
+  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/organization/asnOrg
+  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/organization/isp
+  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/organization/org
+  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/serviceName
+  | ProductFields\.aws/guardduty/service/action/dnsRequestAction/domain
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/connectionDirection
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/localIpDetails/ipAddressV4
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/localPortDetails/port
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/protocol
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/city/cityName
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/country/countryName
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV4
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/asn
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/asnOrg
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/isp
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/org
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remotePortDetails/port
   | ProductFields\.aws/securityhub/CompanyName
   | ProductFields\.aws/securityhub/ProductName
   | ProductName
@@ -1142,6 +1293,35 @@ samples:
       evidences.0.dst_endpoint.port: 22
       evidences.0.connection_info.direction_id: 1
       metadata.product.feature.name: GuardDuty
+  # Review P1: GuardDuty imported into Security Hub has no Action object; ProductFields carry it. The EC2 resource is the device.
+  - raw: '{"SchemaVersion":"2018-10-08","Id":"arn:aws:guardduty:us-east-1:123456789012:detector/d4b040365221be2b54a6264dc9a4bc64/finding/46ba0ac2845071e23ccdeb2ae03bfdea","ProductArn":"arn:aws:securityhub:us-east-1:product/aws/guardduty","GeneratorId":"arn:aws:guardduty:us-east-1:123456789012:detector/d4b040365221be2b54a6264dc9a4bc64","AwsAccountId":"123456789012","Types":["TTPs/Initial Access/UnauthorizedAccess:EC2-SSHBruteForce"],"FirstObservedAt":"2020-08-22T09:15:57Z","LastObservedAt":"2020-09-30T11:56:49Z","CreatedAt":"2020-08-22T09:34:34.146Z","UpdatedAt":"2020-09-30T12:14:00.206Z","Severity":{"Product":2,"Label":"MEDIUM","Normalized":40},"Title":"198.51.100.23 is performing SSH brute force attacks against i-0c10c2c7863d1a356.","Description":"198.51.100.23 is performing SSH brute force attacks against i-0c10c2c7863d1a356. Brute force attacks are used to gain unauthorized access to your instance by guessing the SSH password.","SourceUrl":"https://us-east-1.console.aws.amazon.com/guardduty/home?region=us-east-1#/findings?macros=current&fId=46ba0ac2845071e23ccdeb2ae03bfdea","ProductFields":{"aws/guardduty/service/action/networkConnectionAction/remotePortDetails/portName":"Unknown","aws/guardduty/service/archived":"false","aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/asnOrg":"EXAMPLE-ASN-ORG","aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/geoLocation/lat":"42.5122","aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV4":"198.51.100.23","aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/geoLocation/lon":"-90.7384","aws/guardduty/service/action/networkConnectionAction/blocked":"false","aws/guardduty/service/action/networkConnectionAction/remotePortDetails/port":"46717","aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/country/countryName":"United States","aws/guardduty/service/serviceName":"guardduty","aws/guardduty/service/evidence":"","aws/guardduty/service/action/networkConnectionAction/localIpDetails/ipAddressV4":"192.0.2.6","aws/guardduty/service/detectorId":"d4b040365221be2b54a6264dc9a4bc64","aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/org":"ExampleISP","aws/guardduty/service/action/networkConnectionAction/connectionDirection":"INBOUND","aws/guardduty/service/eventFirstSeen":"2020-08-22T09:15:57Z","aws/guardduty/service/eventLastSeen":"2020-09-30T11:56:49Z","aws/guardduty/service/action/networkConnectionAction/localPortDetails/portName":"SSH","aws/guardduty/service/action/actionType":"NETWORK_CONNECTION","aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/city/cityName":"Example City","aws/guardduty/service/additionalInfo":"","aws/guardduty/service/resourceRole":"TARGET","aws/guardduty/service/action/networkConnectionAction/localPortDetails/port":"22","aws/guardduty/service/action/networkConnectionAction/protocol":"TCP","aws/guardduty/service/count":"74","aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/asn":"209","aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/isp":"ExampleISP","aws/securityhub/FindingId":"arn:aws:securityhub:us-east-1::product/aws/guardduty/arn:aws:guardduty:us-east-1:123456789012:detector/d4b040365221be2b54a6264dc9a4bc64/finding/46ba0ac2845071e23ccdeb2ae03bfdea","aws/securityhub/ProductName":"GuardDuty","aws/securityhub/CompanyName":"Amazon"},"Resources":[{"Type":"AwsEc2Instance","Id":"arn:aws:ec2:us-east-1:123456789012:instance/i-0c10c2c7863d1a356","Partition":"aws","Region":"us-east-1","Tags":{"Name":"kubectl"},"Details":{"AwsEc2Instance":{"Type":"t2.micro","ImageId":"ami-02354e95b39ca8dec","IpV4Addresses":["203.0.113.16","192.0.2.6"],"VpcId":"vpc-a0c2d7c7","SubnetId":"subnet-4975b475","LaunchedAt":"2020-08-03T23:21:57Z"}}}],"WorkflowState":"NEW","Workflow":{"Status":"NEW"},"RecordState":"ACTIVE"}'
+    expect:
+      evidences.0.src_endpoint.ip: 198.51.100.23
+      evidences.0.src_endpoint.port: 46717
+      evidences.0.dst_endpoint.ip: 192.0.2.6
+      evidences.0.dst_endpoint.port: 22
+      evidences.0.connection_info.protocol_name: tcp
+      evidences.0.connection_info.direction_id: 1
+      evidences.0.name: NETWORK_CONNECTION
+      device.instance_uid: i-0c10c2c7863d1a356
+      device.vpc_uid: vpc-a0c2d7c7
+  # Review P1/P2: AwsApiCallAction promotes to api, Process to actor.process (uid unknown with no Pid, never pid 0).
+  - raw: '{"SchemaVersion":"2018-10-08","Id":"arn:aws:guardduty:us-east-1:123456789012:detector/abc/finding/0a1b2c3d","ProductArn":"arn:aws:securityhub:us-east-1::product/aws/guardduty","ProductName":"GuardDuty","CompanyName":"Amazon","Region":"us-east-1","GeneratorId":"arn:aws:guardduty:us-east-1:123456789012:detector/abc","AwsAccountId":"123456789012","Types":["TTPs/Discovery/Recon:IAMUser-MaliciousIPCaller"],"CreatedAt":"2026-08-18T20:00:00.000Z","UpdatedAt":"2026-08-18T20:00:00.000Z","Severity":{"Label":"HIGH","Normalized":70},"Title":"API ListBuckets was invoked from a known malicious IP address.","Action":{"ActionType":"AWS_API_CALL","AwsApiCallAction":{"Api":"ListBuckets","ServiceName":"s3.amazonaws.com","CallerType":"Remote IP","RemoteIpDetails":{"IpAddressV4":"203.0.113.77","Organization":{"Asn":64501,"AsnOrg":"EXAMPLE-NET"},"Country":{"CountryName":"Example Country"}}}},"Process":{"Name":"aws-cli","Path":"/usr/local/bin/aws"},"Resources":[{"Type":"AwsEc2Instance","Id":"arn:aws:ec2:us-east-1:123456789012:instance/i-0abcdef1234567890","Partition":"aws","Region":"us-east-1","Tags":{"Name":"build-runner"},"Details":{"AwsEc2Instance":{"Type":"t3.micro","IpV4Addresses":["192.0.2.44"],"VpcId":"vpc-0a1b2c3d","SubnetId":"subnet-0a1b2c3d","PrivateDnsName":"ip-192-0-2-44.ec2.internal"}}}],"Workflow":{"Status":"NEW"},"RecordState":"ACTIVE"}'
+    expect:
+      api.operation: ListBuckets
+      api.service.name: s3.amazonaws.com
+      actor.process.name: aws-cli
+      actor.process.uid: unknown
+      actor.process.pid: "<missing>"
+      device.hostname: ip-192-0-2-44.ec2.internal
+      device.ip: 192.0.2.44
+      evidences.0.src_endpoint.ip: 203.0.113.77
+  # Review P2: a Vulnerabilities[] entry without Id is named by the finding (OCSF needs cve, advisory or cwe).
+  - raw: '{"SchemaVersion":"2018-10-08","Id":"arn:aws:inspector2:us-east-1:123456789012:finding/0000aaaa","ProductArn":"arn:aws:securityhub:us-east-1::product/aws/inspector","ProductName":"Inspector","CompanyName":"Amazon","Region":"us-east-1","GeneratorId":"AWSInspector","AwsAccountId":"123456789012","Types":["Software and Configuration Checks/Vulnerabilities/CVE"],"CreatedAt":"2026-08-18T20:00:00Z","UpdatedAt":"2026-08-18T20:00:00Z","Severity":{"Label":"MEDIUM"},"Title":"Package finding without an identifier","Vulnerabilities":[{"VulnerablePackages":[{"Name":"libexample","Version":"1.2.3"}]}],"Workflow":{"Status":"NEW"},"RecordState":"ACTIVE"}'
+    expect:
+      class_uid: 2002
+      vulnerabilities.0.advisory.uid: "arn:aws:inspector2:us-east-1:123456789012:finding/0000aaaa"
+      vulnerabilities.0.affected_packages.0.name: libexample
   - raw: "not a finding"
     expect:
       class_uid: 0

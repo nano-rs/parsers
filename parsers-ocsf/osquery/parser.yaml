@@ -11,10 +11,13 @@ description: >
   pack_incident-response_ are fine): processes / process_events -> Process
   Activity (1007, added = Launch, removed = Terminate); listening_ports ->
   Network Activity (4001, added = Listen, removed = Close); logged_in_users ->
-  Authentication (3002, added = Logon, removed = Logoff); file_events -> File
+  Authentication (3002, added = Logon, removed = Logoff; only rows naming a
+  user, so boot_time / run_level / dead utmp records stay Base Events);
+  file_events -> File
   System Activity (1001, the FIM action mapped to Create / Update / Delete /
   Rename / Set Attributes / Open / Read, with md5 / sha1 / sha256 on
-  file.hashes). Every other query is a Base Event whose columns are kept under
+  file.hashes; no acting process is known, so actor.app_name is "unknown"
+  rather than an invented pid). Every other query is a Base Event whose columns are kept under
   unmapped.columns.*. hostIdentifier and the host_uuid / hostname decorations
   land on device. One row per event: a snapshot or a batched diffResults record
   with a single row is mapped like an event row; one with several rows is kept
@@ -162,9 +165,15 @@ parser_vrl: |
 
       n = downcase(qname)
       kind = "generic"
-      if match(n, r'(?:^|_)process(?:es|_events)$') && row.pid != null { kind = "process" }
+      row_pid = -1
+      if row.pid != null { row_pid = to_int(row.pid) ?? -1 }
+      if match(n, r'(?:^|_)process(?:es|_events)$') && row_pid >= 0 { kind = "process" }
       if match(n, r'(?:^|_)listening_ports$') && row.port != null { kind = "listen" }
-      if match(n, r'(?:^|_)logged_in_users$') && row.user != null { kind = "login" }
+      # utmp also holds boot_time / run_level / init / dead records with no user;
+      # only a row naming a user is a session.
+      login_user = to_string(row.user) ?? ""
+      login_type = downcase(to_string(row.type) ?? "")
+      if match(n, r'(?:^|_)logged_in_users$') && login_user != "" && !includes(["boot_time", "run_level", "init", "dead", "new_time", "old_time", "accounting"], login_type) { kind = "login" }
       if match(n, r'(?:^|_)file_events$') && row.target_path != null { kind = "file" }
       if multi_count > 0 || length(keys(row)) == 0 { kind = "generic" }
 
@@ -190,7 +199,7 @@ parser_vrl: |
 
       if kind == "process" {
           process = {}
-          pid = to_int(row.pid) ?? -1
+          pid = row_pid
           process.pid = pid
           ppath = to_string(row.path) ?? ""
           pname = to_string(row.name) ?? ""
@@ -226,8 +235,9 @@ parser_vrl: |
               pauid = to_int(row.auid) ?? -1
               if pauid >= 0 && pauid < 4294967295 { actor.user = { "uid": to_string(pauid) } }
           }
-          # Actor is required; pid 0 marks an unknown launcher (repo convention).
-          if length(keys(actor)) == 0 { actor.process = { "pid": 0 } }
+          # Actor is required. With no parent or audit uid the launcher is unknown:
+          # app_name says so without inventing a pid (pid 0 is a real kernel pid).
+          if length(keys(actor)) == 0 { actor.app_name = "unknown" }
           activity_id = 99
           activity_name = "Other"
           if action == "added" { activity_id = 1; activity_name = "Launch" }
@@ -286,6 +296,7 @@ parser_vrl: |
                       lbase = to_string(get(lparts, [length(lparts) - 1]) ?? "") ?? ""
                       if lbase == "" { lbase = lpath }
                       lproc.file = { "path": lpath, "name": lbase, "type_id": 1, "type": "Regular File" }
+                      lproc.name = lbase
                   }
                   ocsf.actor = { "process": lproc }
               }
@@ -406,8 +417,9 @@ parser_vrl: |
               "status": "Success",
               "message": "osquery " + qname + ": " + fim_action + " " + fpath,
               "file": file,
-              # FIM events carry no actor; pid 0 marks it unknown (repo convention).
-              "actor": { "process": { "pid": 0 } }
+              # FIM events carry no actor; app_name says it is unknown without
+              # inventing a pid.
+              "actor": { "app_name": "unknown" }
           })
           . = ocsf
       } else {
@@ -939,6 +951,39 @@ samples:
       severity_id: 4
       metadata.log_level: ERROR
       metadata.product.version: 5.12.1
+  # Review P2: no parent / auid -> actor.app_name unknown, never pid 0.
+  - raw: '{"action":"removed","columns":{"name":"osqueryd","path":"/opt/osquery/bin/osqueryd","pid":"97650"},"name":"processes","hostIdentifier":"host01.example.com","unixTime":1412123850}'
+    expect:
+      class_uid: 1007
+      activity_id: 2
+      actor.app_name: unknown
+      actor.process: <missing>
+  # A real parent pid 0 (kthreadd) is kept as the real value it is.
+  - raw: '{"action":"added","columns":{"name":"kthreadd","path":"","pid":"2","parent":"0","uid":"0"},"name":"pack_incident-response_processes","hostIdentifier":"host01.example.com","unixTime":1787083600}'
+    expect:
+      class_uid: 1007
+      process.pid: 2
+      actor.process.pid: 0
+      process.parent_process.pid: 0
+  # Review P2: a non-numeric pid is not a process row.
+  - raw: '{"action":"added","columns":{"name":"x","path":"/bin/x","pid":""},"name":"processes","hostIdentifier":"host01.example.com","unixTime":1787083600}'
+    expect:
+      class_uid: 0
+  # Review P2: a boot_time utmp record is not a logon.
+  - raw: '{"action":"added","columns":{"type":"boot_time","user":"","tty":"~","host":"6.1.0-18-amd64","time":"1787000000","pid":"0","sid":"","registry_hive":""},"name":"pack_incident-response_logged_in_users","hostIdentifier":"host01.example.com","unixTime":1787083600}'
+    expect:
+      class_uid: 0
+  # Review P2: the listening process gets its name.
+  - raw: '{"action":"added","columns":{"pid":"811","port":"22","protocol":"6","family":"2","address":"0.0.0.0","fd":"3","socket":"20145","path":"/usr/sbin/sshd","net_namespace":"4026531840"},"name":"pack_incident-response_listening_ports","hostIdentifier":"host01.example.com","unixTime":1787083600}'
+    expect:
+      actor.process.name: sshd
+      actor.process.file.path: /usr/sbin/sshd
+  - raw: '{"name":"file_events","hostIdentifier":"host01.example.com","unixTime":"1429208713","action":"added","columns":{"action":"DELETED","target_path":"/etc/cron.d/backdoor","time":"1429208712"}}'
+    expect:
+      class_uid: 1001
+      activity_id: 4
+      actor.app_name: unknown
+      actor.process: <missing>
   - raw: "I0818 20:00:00.000000 12345 scheduler.cpp:83] Executing scheduled query"
     expect:
       class_uid: 0

@@ -10,13 +10,16 @@ description: >
   profiles. The rule lands on finding_info.title / analytic, the priority on
   severity (Emergency / Alert / Critical -> Critical, Error -> High, Warning ->
   Medium, Notice -> Low, Informational / Debug -> Informational), MITRE tags
-  (mitre_<tactic>, TA####, T####) on finding_info.attacks, the tags on
+  (mitre_<tactic>, TA####, T####, T####.### as a sub_technique) on
+  finding_info.attacks, the tags on
   metadata.labels, the rule source on finding_info.data_sources, and the
   output_fields on evidences[]: the process (name, pid, cmd_line, executable,
   parent, user), the file descriptor name (fd.name) as a file, the
-  container (id, name, image), Kubernetes namespace and pod on resources[], and
-  for the k8s_audit source the requesting user on actor. Non-JSON output (a
-  plain text alert line) falls back to Base Event with the raw line kept.
+  container (id, name, image), Kubernetes namespace and pod on resources[]. The
+  process and its user are also the actor (actor.process / actor.user), or for
+  the k8s_audit source the requesting user. Falco outputs without proc.pid get
+  process uid "unknown" (never pid 0). Non-JSON output (a plain text alert line)
+  falls back to Base Event with the raw line kept.
 match_values:
   - falco
 category: endpoint
@@ -109,7 +112,12 @@ parser_vrl: |
       for_each(tactic_uids) -> |_i, tu| { tactics = push(tactics, { "uid": string!(tu) }) }
       attacks = []
       for_each(techniques) -> |_i, tech| {
-          atk = { "technique": { "uid": string!(tech) } }
+          tech_s = string!(tech)
+          # T1059.004 is a sub-technique of T1059.
+          atk = { "technique": { "uid": tech_s } }
+          if contains(tech_s, ".") {
+              atk = { "technique": { "uid": slice!(tech_s, 0, 5) }, "sub_technique": { "uid": tech_s } }
+          }
           if length(tactics) > 0 { atk.tactics = tactics }
           attacks = push(attacks, atk)
       }
@@ -164,10 +172,10 @@ parser_vrl: |
       parent_cmd = to_string(get(of, ["proc.pcmdline"]) ?? "") ?? ""
       if parent_cmd != "" { parent.cmd_line = parent_cmd }
       # The OCSF process object needs one of pid / uid / cpid. Most stock Falco
-      # rule outputs carry no proc.pid, so pid 0 marks it unknown (the repo's
-      # convention, as in crowdstrike_falcon) rather than dropping the process.
+      # rule outputs carry no proc.pid; uid "unknown" satisfies the constraint
+      # and leaves *.pid genuinely unset (pid 0 is a real kernel pid).
       if length(keys(parent)) > 0 {
-          if !exists(parent.pid) { parent.pid = 0 }
+          if !exists(parent.pid) { parent.uid = "unknown" }
           process.parent_process = parent
       }
       user = {}
@@ -180,7 +188,7 @@ parser_vrl: |
       }
       if length(keys(user)) > 0 { process.user = user }
       if length(keys(process)) > 0 {
-          if !exists(process.pid) { process.pid = 0 }
+          if !exists(process.pid) { process.uid = "unknown" }
           ev.process = process
       }
 
@@ -229,6 +237,12 @@ parser_vrl: |
           actor.user = { "name": ka_user }
           ev.actor = actor
       }
+      # Syscall alerts: the observed process and its user are the actor, so the
+      # promoted actor.process.* / actor.user.* columns carry them.
+      if ka_user == "" {
+          if length(keys(process)) > 0 { actor.process = ev.process }
+          if length(keys(user)) > 0 { actor.user = user }
+      }
       ka_target = to_string(get(of, ["ka.target.name"]) ?? "") ?? ""
       if ka_target != "" {
           kres = { "name": ka_target }
@@ -243,6 +257,8 @@ parser_vrl: |
       if evt_type != "" { ev.name = evt_type }
 
       hostname = to_string(p.hostname) ?? ""
+      out_msg = to_string(p.output) ?? ""
+      if out_msg == "" { out_msg = rule }
 
       ocsf = {
           "class_uid": 2004,
@@ -258,7 +274,7 @@ parser_vrl: |
           "status": "New",
           "is_alert": true,
           "time": time_ms,
-          "message": to_string(p.output) ?? rule,
+          "message": out_msg,
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
@@ -661,6 +677,27 @@ samples:
       evidences.0.process.name: event-generator
       evidences.0.container.uid: 9656db3bb358
       device.hostname: node-01.example.com
+  # Review P1/P2: a syscall alert puts the process and user on actor; no proc.pid
+  # means uid "unknown", never pid 0; a sub-technique tag splits; no output -> rule.
+  - raw: '{"hostname":"node-03.example.com","priority":"Notice","rule":"Run shell untrusted","source":"syscall","tags":["T1059.004","mitre_execution","process"],"time":"2026-08-18T22:00:00.000000000Z","output_fields":{"proc.name":"bash","proc.cmdline":"bash -i","proc.exepath":"/usr/bin/bash","proc.pname":"nginx","user.name":"www-data","user.uid":33}}'
+    expect:
+      message: Run shell untrusted
+      actor.process.name: bash
+      actor.process.cmd_line: bash -i
+      actor.process.uid: unknown
+      actor.process.pid: <missing>
+      actor.process.parent_process.uid: unknown
+      actor.process.parent_process.pid: <missing>
+      actor.user.name: www-data
+      actor.user.uid: "33"
+      finding_info.attacks.0.technique.uid: T1059
+      finding_info.attacks.0.sub_technique.uid: T1059.004
+  - raw: '{"hostname":"node-02.example.com","priority":"Error","rule":"Write below binary dir","source":"syscall","time":"2026-08-18T21:45:02.123456789Z","output":"Error File below a known binary directory opened for writing","output_fields":{"proc.name":"curl","proc.pid":48211,"proc.ppid":48100,"user.name":"root","user.uid":0}}'
+    expect:
+      actor.process.pid: 48211
+      actor.process.parent_process.pid: 48100
+      actor.process.uid: <missing>
+      actor.user.uid: "0"
   - raw: "Falco internal: Runtime error: event drop detected"
     expect:
       class_uid: 0

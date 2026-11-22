@@ -10,8 +10,9 @@ description: >
   "Network Activity" (class_uid 4001) Traffic records carrying the cloud profile.
   The 5-tuple lands on src_endpoint / dst_endpoint / connection_info, the VM,
   zone, VPC and subnet on each endpoint, the geo and ASN on location /
-  autonomous_system, and bytes_sent / packets_sent on traffic (also as
-  bytes_out or bytes_in from the reporting VM's side). The match is narrow on
+  autonomous_system, and bytes_sent / packets_sent on traffic.bytes / packets
+  and bytes_out / packets_out (a flow entry is one direction, src -> dest, so
+  bytes_in is never set; the reporting side is connection_info.direction). The match is narrow on
   purpose: only entries whose logName ends in `vpc_flows` (compute.googleapis.com
   or networkmanagement.googleapis.com) are mapped, so this lane never claims
   Cloud Audit Logs (gcp_audit) or other Cloud Logging entries. Anything else
@@ -184,8 +185,11 @@ parser_vrl: |
       bytes_sent = to_int(jp.bytes_sent) ?? 0
       packets_sent = to_int(jp.packets_sent) ?? 0
       traffic = { "bytes": bytes_sent, "packets": packets_sent }
-      if reporter == "SRC" { traffic.bytes_out = bytes_sent; traffic.packets_out = packets_sent }
-      if reporter == "DEST" { traffic.bytes_in = bytes_sent; traffic.packets_in = packets_sent }
+      # OCSF bytes_out is src_endpoint -> dst_endpoint (NAN-2995, as aws_vpc_flow).
+      # A VPC flow entry is one direction, src -> dest, whichever VM reported it,
+      # so bytes_sent is always bytes_out; bytes_in stays unset.
+      traffic.bytes_out = bytes_sent
+      traffic.packets_out = packets_sent
 
       # ---- cloud: the project and zone of the logging subnetwork ----
       cloud = { "provider": "GCP" }
@@ -676,6 +680,14 @@ samples:
       connection_info.direction_id: 2
       traffic.bytes_out: 1776
       cloud.project_uid: example-project
+  # Review P1: a DEST-reported flow still sent its bytes src -> dest, so they are bytes_out.
+  - raw: '{"insertId":"ut8lbrffooxzc","jsonPayload":{"bytes_sent":"52","connection":{"dest_ip":"192.0.2.76","dest_port":22,"protocol":6,"src_ip":"198.51.100.200","src_port":51234},"dest_instance":{"project_id":"example-project","region":"us-east1","vm_name":"kibana","zone":"us-east1-b"},"end_time":"2019-06-14T03:41:02.100000000Z","packets_sent":"1","reporter":"DEST","start_time":"2019-06-14T03:41:02.100000000Z"},"logName":"projects/example-project/logs/compute.googleapis.com%2Fvpc_flows","resource":{"labels":{"project_id":"example-project"}},"timestamp":"2019-06-14T03:42:10Z"}'
+    expect:
+      connection_info.direction_id: 1
+      traffic.bytes_out: 52
+      traffic.packets_out: 1
+      traffic.bytes_in: <missing>
+      traffic.packets_in: <missing>
   - raw: '{"insertId":"fw0001","jsonPayload":{"connection":{"dest_ip":"192.0.2.76","dest_port":22,"protocol":6,"src_ip":"198.51.100.200","src_port":51234},"disposition":"DENIED"},"logName":"projects/example-project/logs/compute.googleapis.com%2Ffirewall","timestamp":"2026-08-18T21:11:00Z"}'
     expect:
       class_uid: 0
