@@ -37,3 +37,16 @@ source_normalize:
   reason: A JSON log message is moved under message_json so its fields spill one by
     one and secret keys are redacted (its raw text stays only in raw_data); never
     overwrites an existing message_json.
+- kind: withhold
+  paths:
+  - logEvents.message
+  - message
+  match: '^\s*\x7B'
+  reason: JSON-looking message text that could not be moved (invalid JSON, or an input
+    message_json key) cannot be key-redacted, so only its byte length and sha256 stay.
+- kind: withhold
+  paths:
+  - logEvents
+  match: '^\x5B[^\x5D]'
+  reason: A multi-event batch (nano cannot fan out) keeps its events only in raw_data;
+    their message text cannot be key-redacted, so only its byte length and sha256 stay.

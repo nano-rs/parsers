@@ -21,3 +21,5 @@ Account IDs use 123456789012 / 210987654321 and IPs documentation ranges.
 | `envelope_empty_log_events.json` | review regression: `logEvents: []` (fallback "envelope without log events") | constructed |
 | `malformed.json` | not a CloudWatch shape (Base Event fallback) | synthetic |
 | `forwarder_preexisting_message_json.json` | review regression: an input key `message_json` is kept, never overwritten by the parsed JSON message | constructed |
+| `forwarder_unmovable_json_secret_withheld.json` | review regression: a JSON message that cannot be moved (input `message_json`) carrying a credential is withheld and not echoed in `message` | constructed |
+| `envelope_batch_json_secret_withheld.json` | review regression: a multi-event batch whose events carry a credential is withheld whole (byte length + sha256) | constructed |

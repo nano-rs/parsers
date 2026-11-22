@@ -70,6 +70,13 @@ parser_vrl: |
               if !collide { __source_kv = merge(e, w) }
           }
       }
+      # A Pub/Sub body left in place (it did not decode to a LogEntry, or its keys
+      # collide with the wrapper) would spill base64 that redaction cannot see
+      # into, so it is withheld: only its size and sha256 stay (raw_data keeps it).
+      if is_string(__source_kv.message.data) && match(string!(__source_kv.message.data), r'^[\s\S]') {
+          wt = string!(__source_kv.message.data)
+          __source_kv = set!(__source_kv, ["message", "data"], {"withheld": true, "bytes": length(wt), "sha256": sha2(wt, variant: "SHA-256")})
+      }
       is_entry = exists(e.logName) || exists(e.insertId) || exists(e.textPayload) || exists(e.jsonPayload) || exists(e.protoPayload) || (exists(e.resource) && exists(e.timestamp))
   }
 
