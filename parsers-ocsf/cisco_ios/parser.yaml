@@ -1,0 +1,993 @@
+name: cisco_ios_ocsf
+display_name: Cisco IOS / IOS-XE (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields, unaltered, in dotted snake_case unmapped keys.
+  Parses Cisco IOS, IOS-XE (and the IOS-XR lines that share the same
+  %FACILITY-SEVERITY-MNEMONIC tag) syslog into OCSF 1.9.0. The header in
+  front of the tag varies per device (optional PRI, relay BSD header, sequence
+  number, hostname, uptime or a device clock with or without year, msec and
+  time zone), so each part is independently optional; the message severity
+  comes from the tag. Routing: SEC_LOGIN LOGIN_SUCCESS / LOGIN_FAILED,
+  SSH2_USERAUTH, SYS-6-LOGOUT and AAA USER_LOCKED -> Authentication (3002);
+  SEC_LOGIN QUIET_MODE_ON (login block after repeated failures) -> Detection
+  Finding (2004); SYS-5-CONFIG_I and PARSER-5-CFGLOG_LOGGEDCMD (archive log
+  config) -> API Activity (6003) Update with the command in api.operation;
+  ACL log messages (SEC IPACCESSLOG*, IPV6 ACCESSLOG*, FMANFP and IOS-XR
+  IPV4_ACL) -> Network Activity (4001), permitted as Traffic / Allowed and
+  denied as Refuse / Denied, with the ACL in firewall_rule and the packet
+  count in traffic.packets. LINK and LINEPROTO up/down and every other tag
+  -> Base Event (0) with the tag in metadata.event_code and the interface in
+  device.network_interfaces. Device clocks are read as UTC (the zone
+  abbreviation is kept in unmapped); a clock without a year takes the current
+  year. A line with no tag and no PRI is a Base Event marked with
+  unmapped.parse_fallback.
+match_values:
+  - cisco_ios
+category: network
+vendor: "Cisco"
+product: "IOS"
+parser_vrl: |
+  # Cisco IOS / IOS-XE -> OCSF 1.9.0 Authentication (3002) / API Activity (6003)
+  # / Network Activity (4001) / Detection Finding (2004) / Base Event (0)
+  raw_log = if is_string(.message) { string!(.message) } else { encode_json(.) }
+  __raw_body = raw_log
+  __source_kv = {}
+
+  time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
+  body = raw_log
+  hdr = {}
+  pri = -1
+  pm, pe = parse_regex(body, r'^<(?P<pri>\d{1,3})>\s*(?P<rest>.*)$')
+  if pe == null {
+      hdr.pri = pm.pri
+      pri = to_int(pm.pri) ?? -1
+      body = string!(pm.rest)
+  }
+
+  # ---- the %FACILITY-SEVERITY-MNEMONIC tag ----
+  tagged = false
+  facility = ""
+  mnemonic = ""
+  sev_num = -1
+  msg = body
+  head = ""
+  tm, te = parse_regex(body, r'^(?P<prefix>.*?)%(?P<facility>[A-Z][A-Z0-9_]*(?:-[A-Z0-9_]+)*?)-(?P<sev>[0-7])-(?P<mnemonic>[A-Z][A-Z0-9_]*)\s*:\s?(?P<msg>.*)$')
+  if te == null {
+      tagged = true
+      facility = string!(tm.facility)
+      mnemonic = string!(tm.mnemonic)
+      sev_num = to_int(tm.sev) ?? 6
+      msg = string!(tm.msg)
+      head = string!(tm.prefix)
+      __source_kv.tag = { "facility": tm.facility, "severity": tm.sev, "mnemonic": tm.mnemonic }
+  }
+  if sev_num < 0 && pri >= 0 { sev_num = mod(pri, 8) }
+  if sev_num < 0 { sev_num = 6 }
+  event_code = if tagged { facility + "-" + to_string(sev_num) + "-" + mnemonic } else { "" }
+
+  # ---- header in front of the tag ----
+  host = ""
+  host_ip = ""
+  seq = -1
+  if tagged {
+      # device clock: [*|.][YYYY ]Mon dd[ YYYY] hh:mm:ss[.fff][ TZ]:
+      dm, de = parse_regex(head, r'^(?P<head>.*?)[*.]?(?:(?P<year1>\d{4})\s+)?(?P<mon>[A-Z][a-z]{2})\s+(?P<day>\d{1,2})(?:\s+(?P<year>\d{4}))?\s+(?P<hms>\d{2}:\d{2}:\d{2})(?P<frac>\.\d+)?(?:\s+(?P<tz>[A-Za-z][A-Za-z0-9+:_-]*))?:\s*(?P<tail>.*?)\s*$')
+      if de == null {
+          head = string!(dm.head)
+          ts_text = string!(dm.mon) + " " + string!(dm.day) + " " + string!(dm.hms) + (string(dm.frac) ?? "")
+          hdr.ts = ts_text
+          year = string(dm.year) ?? string(dm.year1) ?? format_timestamp!(now(), "%Y")
+          if dm.year != null { hdr.year = dm.year }
+          if dm.year1 != null { hdr.year = dm.year1 }
+          if dm.tz != null { hdr.tz = dm.tz }
+          if dm.tail != null && dm.tail != "" { hdr.process = dm.tail }
+          tsp, tse = parse_timestamp(string!(dm.mon) + " " + string!(dm.day) + " " + year + " " + string!(dm.hms) + (string(dm.frac) ?? ""), "%b %d %Y %H:%M:%S%.f", timezone: "UTC")
+          if tse == null { time_ms = to_unix_timestamp(tsp, unit: "milliseconds") }
+      } else {
+          im, ie = parse_regex(head, r'^(?P<iso>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s+(?P<rest>.*)$')
+          if ie == null {
+              hdr.iso_ts = im.iso
+              head = string!(im.rest)
+              tsi, tsie = parse_timestamp(string!(im.iso), "%+")
+              if tsie == null { time_ms = to_unix_timestamp(tsi, unit: "milliseconds") }
+          }
+      }
+      # relay BSD header (collector clock + reporting host)
+      om, oe = parse_regex(head, r'^(?P<outer_ts>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(?P<outer_host>[^\s:]+)\s*(?P<rest>.*)$')
+      if oe == null {
+          hdr.outer_ts = om.outer_ts
+          hdr.outer_host = om.outer_host
+          head = string!(om.rest)
+          oh = string!(om.outer_host)
+          if is_ipv4(oh) || is_ipv6(oh) { host_ip = oh } else { host = oh }
+          if !exists(hdr.ts) && !exists(hdr.iso_ts) {
+              ob = replace(string!(om.outer_ts), r'\s+', " ")
+              tso, tsoe = parse_timestamp(ob + " " + format_timestamp!(now(), "%Y"), "%b %d %H:%M:%S %Y", timezone: "UTC")
+              if tsoe == null { time_ms = to_unix_timestamp(tso, unit: "milliseconds") }
+          }
+      }
+      # remaining "seq: host: seq: uptime:" tokens
+      extra = []
+      for_each(split(head, r':\s+|:$|\s+')) -> |_i, tok| {
+          t = strip_whitespace(string!(tok))
+          if t != "" {
+              if match(t, r'^\d+$') {
+                  if seq < 0 { seq = to_int(t) ?? -1; hdr.seq = t } else { extra = push(extra, t) }
+              } else if match(t, r'^\d+[ywdhms]\d+[ywdhms]?$') {
+                  hdr.uptime = t
+              } else if host == "" && host_ip == "" && match(t, r'^[A-Za-z][A-Za-z0-9._-]*$') {
+                  host = t
+                  hdr.host = t
+              } else if host == "" && (is_ipv4(t) || is_ipv6(t)) && host_ip == "" {
+                  host_ip = t
+                  hdr.host = t
+              } else if host == "" && host_ip != "" && match(t, r'^[A-Za-z][A-Za-z0-9._-]*$') {
+                  host = t
+                  hdr.host = t
+              } else {
+                  extra = push(extra, t)
+              }
+          }
+      }
+      if length(extra) > 0 { hdr.extra = join!(extra, " ") }
+  }
+  if length(hdr) > 0 { __source_kv.header = hdr }
+
+  severity_id = 1
+  severity = "Informational"
+  if sev_num == 0 { severity_id = 6; severity = "Fatal" }
+  if sev_num == 1 || sev_num == 2 { severity_id = 5; severity = "Critical" }
+  if sev_num == 3 { severity_id = 4; severity = "High" }
+  if sev_num == 4 { severity_id = 3; severity = "Medium" }
+  if sev_num == 5 { severity_id = 2; severity = "Low" }
+
+  route = "base"
+  activity_id = 99
+  activity_name = "Other"
+  action_id = 0
+  action = "Unknown"
+  disposition_id = 0
+  disposition = "Unknown"
+  status_id = 0
+  status_str = "Unknown"
+  status_detail = ""
+  user_name = ""
+  src = {}
+  dst = {}
+  conn = {}
+  packets = 0
+  acl = ""
+  api_op = ""
+  terminal = ""
+  iface = ""
+  logon_proto = ""
+  ev = {}
+
+  if tagged && (facility == "SEC_LOGIN" || facility == "SECLOGIN") {
+      lm, le = parse_regex(msg, r'\x5Buser:\s*(?P<user>[^\x5D]*)\x5D\s*\x5BSource:\s*(?P<source>[^\x5D]*)\x5D\s*\x5Blocalport:\s*(?P<localport>\d+)\x5D(?:\s*\x5BReason:\s*(?P<reason>[^\x5D]*)\x5D)?(?:\s*\x5BACL:\s*(?P<acl>[^\x5D]*)\x5D)?(?:\s+at\s+(?P<at>.*?))?\s*$')
+      if le == null {
+          ev = compact(object!(lm), string: true, null: true)
+          user_name = string!(lm.user)
+          s_ip = string!(lm.source)
+          if is_ipv4(s_ip) || is_ipv6(s_ip) { src.ip = s_ip } else if s_ip != "" { src.name = s_ip }
+          dst.port = to_int(lm.localport) ?? 0
+          if lm.reason != null { status_detail = string!(lm.reason) }
+          if mnemonic == "LOGIN_SUCCESS" {
+              route = "auth"
+              activity_id = 1; activity_name = "Logon"
+              status_id = 1; status_str = "Success"
+              action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed"
+          } else if mnemonic == "LOGIN_FAILED" {
+              route = "auth"
+              activity_id = 1; activity_name = "Logon"
+              status_id = 2; status_str = "Failure"
+              action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
+          } else if mnemonic == "QUIET_MODE_ON" {
+              route = "finding"
+              if lm.acl != null { acl = string!(lm.acl) }
+          }
+      }
+      if route == "base" && mnemonic == "QUIET_MODE_OFF" {
+          ev = { "text": msg }
+      }
+  } else if tagged && facility == "SSH" && mnemonic == "SSH2_USERAUTH" {
+      sm, se = parse_regex(msg, r'^User\s+\x27(?P<user>[^\x27]*)\x27\s+authentication for SSH2 Session from\s+(?P<src_ip>[0-9A-Fa-f.:]+)\s+\x28tty = (?P<tty>\d+)\x29\s+using crypto cipher\s+\x27(?P<cipher>[^\x27]*)\x27,\s+hmac\s+\x27(?P<hmac>[^\x27]*)\x27\s+(?P<result>Succeeded|Failed)')
+      if se == null {
+          ev = object!(sm)
+          route = "auth"
+          logon_proto = "SSH2"
+          user_name = string!(sm.user)
+          src.ip = sm.src_ip
+          dst.port = 22
+          activity_id = 1; activity_name = "Logon"
+          if sm.result == "Succeeded" {
+              status_id = 1; status_str = "Success"
+              action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed"
+          } else {
+              status_id = 2; status_str = "Failure"
+              action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
+          }
+      }
+  } else if tagged && facility == "SYS" && mnemonic == "LOGOUT" {
+      xm, xe = parse_regex(msg, r'^User\s+(?P<user>\S+)\s+has exited tty session\s+(?P<tty>\d+)\s*(?:\x28(?P<src_ip>[0-9A-Fa-f.:]+)\x29)?')
+      if xe == null {
+          ev = compact(object!(xm), string: true, null: true)
+          route = "auth"
+          user_name = string!(xm.user)
+          if xm.src_ip != null { src.ip = xm.src_ip }
+          terminal = string!(xm.tty)
+          activity_id = 2; activity_name = "Logoff"
+          status_id = 1; status_str = "Success"
+      }
+  } else if tagged && facility == "AAA" && mnemonic == "USER_LOCKED" {
+      am, ae = parse_regex(msg, r'^User\s+(?P<user>\S+)\s+locked out\s*(?P<reason>.*?)\s*$')
+      if ae == null {
+          ev = compact(object!(am), string: true, null: true)
+          route = "auth"
+          user_name = string!(am.user)
+          activity_id = 1; activity_name = "Logon"
+          status_id = 2; status_str = "Failure"
+          status_detail = "locked out " + string!(am.reason)
+          action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
+      }
+  } else if tagged && facility == "SYS" && mnemonic == "CONFIG_I" {
+      cm, ce = parse_regex(msg, r'^Configured from\s+(?P<method>\S+)\s+by\s+(?P<by>\S+)(?:\s+on\s+(?P<line>\S+))?(?:\s+\x28(?P<src_ip>[0-9A-Fa-f.:]+)\x29)?\s*$')
+      if ce == null {
+          ev = compact(object!(cm), string: true, null: true)
+          route = "api"
+          api_op = "configure " + string!(cm.method)
+          # "by console" names the line, "by <user> on vty0" names the user
+          # "by console" / "by vty0" names the line; "by admin on vty0" (or
+          # "by admin" alone) names the user
+          by = string!(cm.by)
+          if cm.line != null {
+              user_name = by; terminal = string!(cm.line)
+          } else if match(by, r'^(?i)(?:console|con\d*|vty\d*|aux\d*|tty\d*)$') {
+              terminal = by
+          } else {
+              user_name = by
+              method = string!(cm.method)
+              if match(method, r'^(?i)(?:console|con\d*|vty\d*|aux\d*|tty\d*)$') { terminal = method }
+          }
+          # no address and no line (e.g. "from memory by admin"): leave src
+          # empty so the device-as-source fallback below fills it
+          if cm.src_ip != null { src.ip = cm.src_ip } else if terminal != "" { src.name = terminal }
+      }
+  } else if tagged && facility == "PARSER" && mnemonic == "CFGLOG_LOGGEDCMD" {
+      gm, ge = parse_regex(msg, r'^User:\s*(?P<user>.+?)\s+logged command:\s*(?P<command>.*?)\s*$')
+      if ge == null {
+          ev = object!(gm)
+          route = "api"
+          user_name = string!(gm.user)
+          api_op = string!(gm.command)
+      }
+  } else if tagged && (facility == "LINK" || facility == "LINEPROTO") {
+      um, ue = parse_regex(msg, r'^(?:Line protocol on\s+)?Interface\s+(?P<interface>[^,\s]+),\s+changed state to\s+(?P<state>.+?)\s*$')
+      if ue == null {
+          ev = object!(um)
+          iface = string!(um.interface)
+      }
+  } else if tagged && match(mnemonic, r'ACCESSLOG') {
+      nm, ne = parse_regex(msg, r'(?:list|access-list)\s+(?P<acl>\S+)\s+(?P<verdict>permitted|denied|permit|deny)\s+(?P<protocol>[A-Za-z0-9-]+)\s+(?P<src_ip>[0-9A-Fa-f.:]+?)(?:\x28(?P<src_port>\d+)\x29)?(?:\s+\x28(?P<src_detail>[^\x29]*)\x29)?\s*->\s*(?P<dst_ip>[0-9A-Fa-f.:]+?)(?:\x28(?P<dst_port>\d+)\x29)?(?:\s+\x28(?P<icmp>[^\x29]*)\x29)?,\s+(?P<packets>\d+)\s+packets?')
+      if ne != null {
+          # standard ACL: "list 10 denied 192.0.2.1 1 packet"
+          nm, ne = parse_regex(msg, r'(?:list|access-list)\s+(?P<acl>\S+)\s+(?P<verdict>permitted|denied|permit|deny)\s+(?P<src_ip>[0-9A-Fa-f.:]+?)(?:\s+\x28(?P<src_detail>[^\x29]*)\x29)?,?\s+(?P<packets>\d+)\s+packets?')
+      }
+      if ne == null {
+          ev = compact(object!(nm), string: true, null: true)
+          route = "network"
+          acl = string!(nm.acl)
+          verdict = string!(nm.verdict)
+          if verdict == "permitted" || verdict == "permit" {
+              activity_id = 6; activity_name = "Traffic"
+              action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed"
+              status_id = 1; status_str = "Success"
+          } else {
+              activity_id = 5; activity_name = "Refuse"
+              action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
+              status_id = 2; status_str = "Failure"
+          }
+          src.ip = nm.src_ip
+          dst_ip = string(nm.dst_ip) ?? ""
+          if dst_ip != "" { dst.ip = dst_ip }
+          sp = to_int(nm.src_port) ?? 0
+          dp = to_int(nm.dst_port) ?? 0
+          if sp > 0 { src.port = sp }
+          if dp > 0 { dst.port = dp }
+          packets = to_int(nm.packets) ?? 0
+          conn = { "direction_id": 0 }
+          proto = downcase(string(nm.protocol) ?? "")
+          pnums = { "icmp": 1, "igmp": 2, "tcp": 6, "udp": 17, "gre": 47, "esp": 50, "ahp": 51, "ah": 51, "icmpv6": 58, "ipv6-icmp": 58, "eigrp": 88, "ospf": 89, "pim": 103, "sctp": 132 }
+          pnum = get(pnums, [proto]) ?? null
+          if pnum == null && match(proto, r'^\d+$') { pnum = to_int(proto) ?? null }
+          if pnum != null { conn.protocol_num = pnum }
+          if proto != "" && !match(proto, r'^\d+$') && proto != "ipv6" && proto != "ip" { conn.protocol_name = proto }
+      }
+  }
+  if length(ev) > 0 { __source_kv.event = ev }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": sha2("cisco_ios|raw|" + raw_log, variant: "SHA-256"),
+      "log_name": "cisco_ios",
+      "product": { "name": "IOS", "vendor_name": "Cisco" }
+  }
+  if event_code != "" { metadata.event_code = event_code }
+  if facility != "" { metadata.log_provider = facility }
+  if seq >= 0 { metadata.sequence = seq }
+
+  device = {}
+  if host != "" || host_ip != "" {
+      device = { "type_id": 12, "type": "Router" }
+      if host != "" { device.hostname = host }
+      if host_ip != "" { device.ip = host_ip }
+  }
+
+  base = {
+      "time": time_ms,
+      "raw_data": raw_log,
+      "metadata": metadata,
+      "severity_id": severity_id,
+      "severity": severity,
+      "message": msg
+  }
+  if tagged { __source_kv.message = msg }
+
+  if route == "auth" {
+      # an empty [user: ] still is an authentication attempt
+      if strip_whitespace(user_name) == "" { user_name = "unknown" }
+      if status_id == 2 && severity_id < 3 { severity_id = 3; severity = "Medium" }
+      . = merge(base, {
+          "class_uid": 3002, "class_name": "Authentication",
+          "category_uid": 3, "category_name": "Identity & Access Management",
+          "activity_id": activity_id, "activity_name": activity_name,
+          "type_uid": 300200 + activity_id,
+          "severity_id": severity_id, "severity": severity,
+          "status_id": status_id, "status": status_str,
+          "user": { "name": user_name },
+          "is_remote": exists(src.ip),
+          "service": { "name": "Cisco IOS management" }
+      })
+      if action_id > 0 {
+          .action_id = action_id; .action = action
+          .disposition_id = disposition_id; .disposition = disposition
+          .metadata.profiles = ["security_control"]
+      }
+      if status_detail != "" { .status_detail = status_detail }
+      if logon_proto != "" { .auth_protocol = logon_proto; .auth_protocol_id = 99 }
+      if terminal != "" { .session = { "terminal": terminal } }
+      if length(src) > 0 { .src_endpoint = src }
+      dstd = dst
+      if host != "" { dstd.hostname = host }
+      if host_ip != "" { dstd.ip = host_ip }
+      dport = to_int(dst.port)
+      svc = get({ "22": "ssh", "23": "telnet", "80": "http", "443": "https" }, [to_string(dport)]) ?? null
+      if svc != null { dstd.svc_name = svc }
+      if exists(dstd.hostname) || exists(dstd.ip) || exists(dstd.svc_name) { .dst_endpoint = dstd }
+  } else if route == "finding" {
+      . = merge(base, {
+          "class_uid": 2004, "class_name": "Detection Finding",
+          "category_uid": 2, "category_name": "Findings",
+          "activity_id": 1, "activity_name": "Create",
+          "type_uid": 200401,
+          "severity_id": 4, "severity": "High",
+          "status_id": 1, "status": "New",
+          "action_id": 2, "action": "Denied",
+          "disposition_id": 2, "disposition": "Blocked",
+          "finding_info": {
+              "uid": sha2("cisco_ios|quiet_mode|" + raw_log, variant: "SHA-256"),
+              "title": "Cisco IOS login block (quiet mode) after repeated login failures",
+              "types": [event_code],
+              "analytic": { "name": "login block-for", "type_id": 1, "type": "Rule" }
+          },
+          "evidences": [{ "user": { "name": user_name }, "src_endpoint": src }]
+      })
+      .metadata.profiles = ["security_control"]
+      if status_detail != "" { .status_detail = status_detail }
+      if acl != "" { .firewall_rule = { "name": acl, "uid": acl } }
+  } else if route == "api" {
+      actor = {}
+      if user_name != "" { actor.user = { "name": user_name } }
+      if terminal != "" { actor.session = { "terminal": terminal } }
+      . = merge(base, {
+          "class_uid": 6003, "class_name": "API Activity",
+          "category_uid": 6, "category_name": "Application Activity",
+          "activity_id": 3, "activity_name": "Update",
+          "type_uid": 600303,
+          "status_id": 1, "status": "Success",
+          "actor": actor,
+          "api": { "operation": api_op, "service": { "name": "Cisco IOS CLI" } }
+      })
+      # src_endpoint is required: without a logged client address the command
+      # was entered on the device's own CLI, so the device is the source.
+      if length(src) == 0 {
+          if host != "" { src.hostname = host }
+          if host_ip != "" { src.ip = host_ip }
+          if length(src) == 0 { src.svc_name = "cli" }
+      }
+      .src_endpoint = src
+      dstd = {}
+      if host != "" { dstd.hostname = host }
+      if host_ip != "" { dstd.ip = host_ip }
+      if length(dstd) > 0 { .dst_endpoint = dstd }
+  } else if route == "network" {
+      . = merge(base, {
+          "class_uid": 4001, "class_name": "Network Activity",
+          "category_uid": 4, "category_name": "Network Activity",
+          "activity_id": activity_id, "activity_name": activity_name,
+          "type_uid": 400100 + activity_id,
+          "status_id": status_id, "status": status_str,
+          "action_id": action_id, "action": action,
+          "disposition_id": disposition_id, "disposition": disposition,
+          "connection_info": conn,
+          "src_endpoint": src,
+          "firewall_rule": { "name": acl, "uid": acl }
+      })
+      .metadata.profiles = ["security_control"]
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if packets > 0 { .traffic = { "packets": packets } }
+  } else {
+      . = merge(base, {
+          "class_uid": 0, "class_name": "Base Event",
+          "category_uid": 0, "category_name": "Uncategorized",
+          "activity_id": 99, "activity_name": "Other",
+          "type_uid": 99,
+          "status_id": 0, "status": "Unknown"
+      })
+      if !tagged && pri < 0 {
+          . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+      } else if !tagged {
+          __source_kv.message = msg
+      }
+      if iface != "" {
+          if length(device) == 0 { device = { "type_id": 12, "type": "Router" } }
+          device.network_interfaces = [{ "name": iface }]
+      }
+  }
+  if length(device) > 0 {
+      .device = device
+      .metadata.profiles = push(array(.metadata.profiles) ?? [], "host")
+  }
+
+  .
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # Values spill exactly as parsed: a parser never masks, redacts or withholds
+  # anything (masking is an opt-in pipeline step, never a parser concern).
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __copy = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __copy_json = encode_json(__copy)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__copy_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # header.iso_ts: RFC 3339 header clock converted to event milliseconds; device clocks without a year remain residual.
+  # event.protocol: ACL protocol keyword lowercased into connection_info.protocol_name.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        header\.iso_ts
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if __mapped."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        event\.protocol
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    header\.host
+  | header\.outer_host
+  | header\.seq
+  | tag\.facility
+  | event\.user
+  | event\.source
+  | event\.localport
+  | event\.reason
+  | event\.acl
+  | event\.src_ip
+  | event\.src_port
+  | event\.dst_ip
+  | event\.dst_port
+  | event\.packets
+  | event\.protocol
+  | event\.tty
+  | event\.line
+  | event\.by
+  | event\.interface
+  | event\.command
+  | message
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if !contains(__consumed, __token) && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # The canonical source spill above is the authoritative representation of
+  # containers. The cheap conditions run first; the source value set is built on
+  # first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, as-is. These
+  # entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__copy.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # Sources (lines from the Elastic cisco_ios integration test fixtures, the
+  # napalm-logs IOS fixtures and Cisco configuration guides; addresses, hosts and
+  # users replaced with documentation values):
+  #   https://github.com/elastic/integrations/tree/main/packages/cisco_ios/data_stream/log/_dev/test/pipeline
+  #   https://github.com/napalm-automation/napalm-logs/tree/develop/tests/config/ios
+  #   https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/sec_usr_cfg/configuration/xe-16/sec-usr-cfg-xe-16-book/sec-login-enhance.html
+  #   https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/config-mgmt/configuration/xe-16/config-mgmt-xe-16-book/cm-config-logger.html
+  #   https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/sec_usr_ssh/configuration/xe-16/sec-usr-ssh-xe-16-book/sec-usr-ssh-sec-shell.html
+  #   https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/sec_usr_aaa/configuration/xe-16/sec-usr-aaa-xe-16-book/sec-login-pwd-retry-lockout.html
+  # Extended ACL deny, relay header + sequence + device clock (test-cisco-ios.log)
+  - raw: 'Jun 20 02:43:09 192.0.2.2 1663321: Jun 20 02:43:08.454: %SEC-6-IPACCESSLOGP: list 150 denied tcp 192.0.2.12(59832) -> 203.0.113.144(80), 1 packet'
+    expect:
+      class_uid: 4001
+      activity_id: 5
+      action_id: 2
+      src_endpoint.ip: 192.0.2.12
+      src_endpoint.port: 59832
+      dst_endpoint.port: 80
+      connection_info.protocol_num: 6
+      firewall_rule.name: "150"
+      traffic.packets: 1
+      device.ip: 192.0.2.2
+      metadata.event_code: SEC-6-IPACCESSLOGP
+  - raw: 'Jun 20 02:43:29 192.0.2.2 1663326: Jun 20 02:43:28.403: %SEC-6-IPACCESSLOGDP: list 150 denied icmp 192.0.2.12 -> 192.0.2.1 (3/3), 32 packets'
+    expect:
+      class_uid: 4001
+      connection_info.protocol_num: 1
+      traffic.packets: 32
+  - raw: 'Feb  8 04:00:48 192.0.2.2 585917: Feb  8 04:00:47.272: %SEC-6-IPACCESSLOGRP: list 177 denied igmp 192.0.2.197 -> 224.0.0.22, 1 packet'
+    expect:
+      class_uid: 4001
+      connection_info.protocol_num: 2
+  - raw: 'Feb  9 04:00:48 192.0.2.2 585918: Feb  9 04:00:47.272: %SEC-6-IPACCESSLOGSP: list INBOUND-ON-F11 denied igmp 192.0.2.2 -> 224.0.0.2 (20), 1 packet'
+    expect:
+      class_uid: 4001
+      firewall_rule.name: INBOUND-ON-F11
+  # IPv6 ACL permit
+  - raw: 'May  3 19:11:33 192.0.2.2 585920: May  3 19:11:32.619: %IPV6-6-ACCESSLOGP: list ACL-IPv6-E0/0-IN/10 permitted tcp 2001:db8:add:4002::6fc6(1027) -> 2001:db8:add:4002::1(22), 9 packets'
+    expect:
+      class_uid: 4001
+      activity_id: 6
+      action_id: 1
+      src_endpoint.ip: 2001:db8:add:4002::6fc6
+      dst_endpoint.port: 22
+      traffic.packets: 9
+  # IOS-XE data plane (FMANFP)
+  - raw: 'Jul 11 09:34:00 rtr01.example.com 1663312: Jul 11 09:34:00.020: %FMANFP-6-IPACCESSLOGP: R0/0: fman_fp_image: list internet_in_gig0 permitted tcp 172.16.0.26(59144) -> 10.100.8.34(1103), 1 packet'
+    expect:
+      class_uid: 4001
+      activity_id: 6
+      device.hostname: rtr01.example.com
+  - raw: '<182>: host-1: 115649616: Jan 23 14:54:28.511 CET: %FMANFP-6-IPV6ACCESSLOGP: R0/0: fman_fp_image: list ACL-IPv6-OUTSIDE denied udp 2001:db8::(38370) -> 2001:db8:1::(3370), 1 packet'
+    expect:
+      class_uid: 4001
+      src_endpoint.ip: "2001:db8::"
+      dst_endpoint.port: 3370
+      device.hostname: host-1
+  # IOS-XR shares the tag form (test-syslog.log)
+  - raw: '<190>Oct 7 07:19:44 edge-mgmt RP/0/RP0/CPU0:Oct 7 07:19:43.630 UTC: ipv4_acl_mgr[310]: %ACL-IPV4_ACL-6-IPACCESSLOGP : access-list outgoing-to-GW deny tcp 198.51.100.128(39527) -> 203.0.113.128(1830), 1 packet'
+    expect:
+      class_uid: 4001
+      activity_id: 5
+      firewall_rule.name: outgoing-to-GW
+      device.hostname: edge-mgmt
+  # standard ACL
+  - raw: '<190>1201: sw01: Mar  4 10:02:11.012: %SEC-6-IPACCESSLOGS: list 10 denied 198.51.100.9 1 packet'
+    expect:
+      class_uid: 4001
+      src_endpoint.ip: 198.51.100.9
+  # rate-limit notice is not a flow
+  - raw: 'Jun 20 02:42:28 192.0.2.2 1663313: Jun 20 02:42:28.374: %SEC-6-IPACCESSLOGRL: access-list logging rate-limited or missed 18 packets'
+    expect:
+      class_uid: 0
+      metadata.event_code: SEC-6-IPACCESSLOGRL
+  # Login enhancements (test-cisco-ios.log, Cisco login enhancements guide)
+  - raw: 'Mar 24 18:06:03 192.0.2.2 1991219: Mar 24 18:06:03.424 UTC: %SEC_LOGIN-5-LOGIN_SUCCESS: Login Success [user: jsmith] [Source: 198.51.100.3] [localport: 22] at 12:06:03 MST Wed Mar 24 2021'
+    expect:
+      class_uid: 3002
+      activity_id: 1
+      status_id: 1
+      user.name: jsmith
+      src_endpoint.ip: 198.51.100.3
+      dst_endpoint.port: 22
+  - raw: '00:04:32: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: test] [Source: 198.51.100.11] [localport: 23] [Reason: Invalid login] at 20:55:40 UTC Fri Feb 28 2003'
+    expect:
+      class_uid: 3002
+      status_id: 2
+      action_id: 2
+      status_detail: Invalid login
+      severity_id: 3
+  - raw: '00:01:07: %SEC_LOGIN-1-QUIET_MODE_ON: Still timeleft for watching failures is 158 secs, [user: sfd] [Source: 198.51.100.11] [localport: 23] [Reason: Invalid login] [ACL: sl_def_acl] at 16:17:23 UTC Wed Feb 26 2003'
+    expect:
+      class_uid: 2004
+      activity_id: 1
+      severity_id: 4
+      evidences.0.src_endpoint.ip: 198.51.100.11
+      firewall_rule.name: sl_def_acl
+  # ASR920 uptime clock (test-asr920.log)
+  - raw: '<165>7433: ASR920: 007439: 2y10w: %SEC_LOGIN-5-LOGIN_SUCCESS: Login Success [user: netops] [Source: 192.0.2.1] [localport: 22] at 07:57:58 VIENNA Thu Jan 27 2022'
+    expect:
+      class_uid: 3002
+      device.hostname: ASR920
+      metadata.sequence: 7433
+  - raw: '<166>7432: ASR920: 007438: 2y10w: %SYS-6-LOGOUT: User netops has exited tty session 3(192.0.2.1)'
+    expect:
+      class_uid: 3002
+      activity_id: 2
+      session.terminal: "3"
+  # SSH user authentication (Cisco Secure Shell guide)
+  - raw: "<189>311: rtr01: Mar 12 09:14:02.551 UTC: %SSH-5-SSH2_USERAUTH: User 'admin' authentication for SSH2 Session from 198.51.100.20 (tty = 0) using crypto cipher 'aes256-ctr', hmac 'hmac-sha2-256' Succeeded"
+    expect:
+      class_uid: 3002
+      status_id: 1
+      user.name: admin
+  - raw: "<189>312: rtr01: Mar 12 09:14:30.017 UTC: %SSH-5-SSH2_USERAUTH: User 'oper' authentication for SSH2 Session from 203.0.113.66 (tty = 1) using crypto cipher 'aes256-ctr', hmac 'hmac-sha2-256' Failed"
+    expect:
+      class_uid: 3002
+      status_id: 2
+  # AAA lockout (login password retry lockout guide)
+  - raw: '<189>418: rtr01: Mar 12 09:20:11.903 UTC: %AAA-5-USER_LOCKED: User admin locked out on authentication failure'
+    expect:
+      class_uid: 3002
+      status_id: 2
+      user.name: admin
+  # Configuration (napalm-logs USER_EXIT_CONFIG_MODE, test-syslog.log)
+  - raw: '<189>30: test-ztp: May 23 13:56:15.055: %SYS-5-CONFIG_I: Configured from console by admin on vty0 (10.31.0.24)'
+    expect:
+      class_uid: 6003
+      activity_id: 3
+      actor.user.name: admin
+      actor.session.terminal: vty0
+      src_endpoint.ip: 10.31.0.24
+      api.operation: configure console
+  - raw: '<189>2360957: Jan  6 2022 20:52:12.861: %SYS-5-CONFIG_I: Configured from console by jdoe on vty0 (10.100.11.10)'
+    expect:
+      class_uid: 6003
+      time: 1641502332861
+  - raw: '<189>24: test-ztp: May 23 15:49:32.302: %SYS-5-CONFIG_I: Configured from tftp://192.0.2.224//cisco-bootstrap by console'
+    expect:
+      class_uid: 6003
+      actor.session.terminal: console
+      src_endpoint.name: console
+  - raw: '<189>2161: rtr01: Mar 26 16:12:30.455 UTC: %PARSER-5-CFGLOG_LOGGEDCMD: User:admin  logged command:interface GigabitEthernet0/1'
+    expect:
+      class_uid: 6003
+      api.operation: interface GigabitEthernet0/1
+      actor.user.name: admin
+  # archive log with no AAA user name
+  - raw: '<189>2162: rtr01: Mar 26 16:13:02.101 UTC: %PARSER-5-CFGLOG_LOGGEDCMD: User:unknown user  logged command:interface GigabitEthernet0/1'
+    expect:
+      class_uid: 6003
+      actor.user.name: unknown user
+      api.operation: interface GigabitEthernet0/1
+  # CONFIG_I without "on <line>": the user is the "by" token, the line is the "from" token
+  - raw: '<189>31: test-ztp: May 23 13:58:01.002: %SYS-5-CONFIG_I: Configured from vty0 by admin (198.51.100.20)'
+    expect:
+      class_uid: 6003
+      actor.user.name: admin
+      actor.session.terminal: vty0
+      src_endpoint.ip: 198.51.100.20
+  - raw: '<189>32: test-ztp: May 23 13:59:44.410: %SYS-5-CONFIG_I: Configured from console by vty0 (198.51.100.21)'
+    expect:
+      class_uid: 6003
+      actor.session.terminal: vty0
+      actor.user.name: <missing>
+  # empty user field
+  - raw: '<180>1235: rtr01: *Mar  1 00:12:50.004: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: ] [Source: 198.51.100.78] [localport: 22] [Reason: Login Authentication Failed] at 00:12:50 UTC Fri Mar 1 2024'
+    expect:
+      class_uid: 3002
+      status_id: 2
+      user.name: unknown
+  # Interface state (test-asr920.log, napalm-logs, test-syslog.log)
+  - raw: '<165>2029: ASR920: Aug 3 08:11:02.204: %LINEPROTO-5-UPDOWN: Line protocol on Interface GigabitEthernet0/0/7, changed state to up'
+    expect:
+      class_uid: 0
+      device.network_interfaces.0.name: GigabitEthernet0/0/7
+  - raw: '<189>521: router1: *Nov 14 08:30:56.699: %LINK-5-CHANGED: Interface GigabitEthernet2, changed state to administratively down'
+    expect:
+      class_uid: 0
+      device.hostname: router1
+  - raw: '<187>98: sw01: Mar  1 00:01:05.123: %LINK-3-UPDOWN: Interface GigabitEthernet1/0/3, changed state to down'
+    expect:
+      class_uid: 0
+      severity_id: 4
+  - raw: '<189>2024-10-11T10:15:31.208321-05:00 TestDevice %LINEPROTO-5-UPDOWN: Line protocol on Interface TenGigabitEthernet1/0/1, changed state to up'
+    expect:
+      class_uid: 0
+      time: 1728659731208
+      device.hostname: TestDevice
+  # Other tags -> Base Event
+  - raw: 'Mar 24 12:09:35 192.0.2.2 1991217: Mar 24 12:09:35.367: %OSPF-4-NOVALIDKEY: No valid authentication send key is available on interface eth0'
+    expect:
+      class_uid: 0
+      severity_id: 3
+  - raw: '<190>9004: Dec 8 20:07:53.081: %TCP-6-BADAUTH: Invalid MD5 digest from 192.0.2.1(1234) to 192.0.2.2(179) tableid - 3'
+    expect:
+      class_uid: 0
+      metadata.event_code: TCP-6-BADAUTH
+  - raw: '<190>: 2025 Jul 21 12:33:58 EAT: %AAA-6-AAA_ACCOUNTING_MESSAGE: update:process:NTP:New time: Mon Jul 21 12:33:57 2025'
+    expect:
+      class_uid: 0
+      time: 1753101238000
+  - raw: '<189>387448: host-01: May 6 16:13:09.123 UTC+1: %DOT1X-5-FAIL: Authentication failed for client (001e.0b80.13b5) on Interface Gi1/0/16 AuditSessionID 000000000000011D51B826E5'
+    expect:
+      class_uid: 0
+      device.hostname: host-01
+  # Untagged lines
+  - raw: '<191>2637085: rt401: Aug 18 07:15:04.461 CEST: NTP Core (NOTICE): Clock synchronization lost.'
+    expect:
+      class_uid: 0
+  - raw: 'not a cisco line'
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: unparsable input
+  # neon #80 r2: no line and no address leaves the device as the source
+  - raw: '<189>42: rtr01: *Mar  1 00:01:00.000: %SYS-5-CONFIG_I: Configured from memory by admin'
+    expect:
+      class_uid: 6003
+      actor.user.name: admin
+      src_endpoint.hostname: rtr01

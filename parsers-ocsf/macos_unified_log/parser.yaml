@@ -1,0 +1,847 @@
+name: macos_unified_log_ocsf
+display_name: macOS Unified Log (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields, unaltered, in dotted snake_case unmapped keys.
+  Parses macOS unified log entries, one JSON object per entry as written by
+  `log show --style ndjson` / `log stream --style ndjson` (subsystem,
+  category, processImagePath, processID, messageType, eventMessage, ...),
+  into OCSF 1.9.0. The emitting process is actor.process (name, path, pid,
+  tid, uid) and messageType sets the severity (Fault High, Error Medium,
+  everything else Informational). Security-relevant subsystems with a stable
+  message shape are sub-parsed: sshd / sshd-session Accepted, Failed and
+  Invalid user -> Authentication (3002) Logon; sudo command and sudo
+  failure -> Authentication (3002) Account Switch with the command on
+  actor.process.cmd_line; loginwindow doLogin -> Authentication Logon;
+  opendirectoryd "Failed to authenticate user" -> Logon failure; authd right
+  authorization (Succeeded authorizing / Failed to authorize / Sandbox
+  denied) -> Authentication activity Other with the right in service.name,
+  the requesting client as actor.process and authd as logon_process; TCC
+  "Update Access Record" permission changes -> Entity Management (3004)
+  Update with the TCC service and client; Gatekeeper / syspolicyd /
+  XProtect verdicts that reject, block or report malware -> Detection
+  Finding (2004) with the file path as evidence. Every other entry is a Base
+  Event (0) with all fields kept. The JSON array that `log show --style
+  json` writes is not split here (send ndjson); an array or a line that is
+  not a JSON object, or a JSON object with none of the unified log keys,
+  is kept whole as a Base Event marked with unmapped.parse_fallback.
+match_values:
+  - macos_unified_log
+category: endpoint
+vendor: "Apple"
+product: "macOS"
+parser_vrl: |
+  # macOS unified log (ndjson) -> OCSF 1.9.0 Authentication (3002) / Entity
+  # Management (3004) / Detection Finding (2004) / Base Event (0)
+  raw_log = if is_string(.message) { string!(.message) } else { encode_json(.message) }
+  __raw_body = raw_log
+  __source_kv = {}
+  entry = {}
+  decoded = false
+  if is_object(.message) {
+      entry = object!(.message)
+      __source_kv = entry
+      decoded = true
+  } else {
+      parsed, perr = parse_json(raw_log)
+      if perr == null && is_object(parsed) {
+          entry = object!(parsed)
+          __source_kv = entry
+          decoded = true
+      }
+  }
+
+  # A JSON object is a unified log entry only if it carries one of the keys
+  # `log --style ndjson` always writes; anything else is a misrouted stream.
+  if decoded && !(exists(entry.eventMessage) || exists(entry.subsystem) || exists(entry.processImagePath) || exists(entry.messageType) || exists(entry.eventType) || exists(entry.timestamp)) {
+      decoded = false
+  }
+
+  msg_text = to_string(entry.eventMessage) ?? ""
+  subsystem = to_string(entry.subsystem) ?? ""
+  category = to_string(entry.category) ?? ""
+  cl = downcase(category)
+  msg_type = to_string(entry.messageType) ?? ""
+  image_path = to_string(entry.processImagePath) ?? ""
+  proc_name = to_string(entry.process) ?? ""
+  if proc_name == "" && image_path != "" {
+      bn, bne = parse_regex(image_path, r'(?P<name>[^/]+)$')
+      if bne == null { proc_name = string!(bn.name) }
+  }
+  pid = to_int(entry.processID) ?? 0
+  tid = to_int(entry.threadID) ?? 0
+  uid = to_string(entry.userID) ?? ""
+  boot_uid = to_string(entry.bootUUID) ?? ""
+  # `log` itself writes no host name; a forwarder that adds one is honored.
+  host_name = to_string(entry.hostname) ?? to_string(entry.host) ?? ""
+  ts_text = to_string(entry.timestamp) ?? ""
+
+  time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
+  if ts_text != "" {
+      tp, tpe = parse_timestamp(ts_text, "%Y-%m-%d %H:%M:%S%.f%z")
+      if tpe != null { tp, tpe = parse_timestamp(ts_text, "%+") }
+      if tpe == null { time_ms = to_unix_timestamp(tp, unit: "milliseconds") }
+  }
+
+  severity_id = 1
+  severity = "Informational"
+  mt = downcase(msg_type)
+  if mt == "fault" { severity_id = 4; severity = "High" }
+  if mt == "error" { severity_id = 3; severity = "Medium" }
+
+  route = "base"
+  activity_id = 99
+  activity_name = "Other"
+  status_id = 0
+  status_str = "Unknown"
+  action_id = 0
+  action = "Unknown"
+  disposition_id = 0
+  disposition = "Unknown"
+  user_name = ""
+  login_uid = ""
+  client_path = ""
+  client_pid = 0
+  auth_creator = ""
+  is_authd = false
+  actor_user = ""
+  src_ip = ""
+  src_port = 0
+  cmd_line = ""
+  status_detail = ""
+  service_name = ""
+  auth_proto = ""
+  tcc_service = ""
+  tcc_client = ""
+  tcc_value = ""
+  file_path = ""
+  analytic = ""
+  finding_title = ""
+  pl = downcase(proc_name)
+  sl = downcase(subsystem)
+
+  if (pl == "sshd" || pl == "sshd-session") && msg_text != "" {
+      sm, se = parse_regex(msg_text, r'^(?P<result>Accepted|Failed)\s+(?P<method>\S+)\s+for\s+(?:invalid user\s+)?(?P<user>\S+)\s+from\s+(?P<ip>[0-9A-Fa-f.:]+)\s+port\s+(?P<port>\d+)')
+      if se == null {
+          route = "auth"
+          user_name = string!(sm.user)
+          src_ip = string!(sm.ip)
+          src_port = to_int(sm.port) ?? 0
+          auth_proto = string!(sm.method)
+          service_name = "sshd"
+          activity_id = 1; activity_name = "Logon"
+          if sm.result == "Accepted" {
+              status_id = 1; status_str = "Success"
+              action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed"
+          } else {
+              status_id = 2; status_str = "Failure"
+              action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
+          }
+      } else {
+          im, ie = parse_regex(msg_text, r'^Invalid user\s+(?P<user>\S*)\s+from\s+(?P<ip>[0-9A-Fa-f.:]+)\s+port\s+(?P<port>\d+)')
+          if ie == null {
+              route = "auth"
+              user_name = string!(im.user)
+              src_ip = string!(im.ip)
+              src_port = to_int(im.port) ?? 0
+              service_name = "sshd"
+              activity_id = 1; activity_name = "Logon"
+              status_id = 2; status_str = "Failure"; status_detail = "Invalid user"
+              action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
+          }
+      }
+  } else if pl == "sudo" && msg_text != "" {
+      dm, de = parse_regex(msg_text, r'^\s*(?P<user>\S+)\s*:\s+(?:(?P<reason>[^;]*?)\s*;\s+)?TTY=(?P<tty>\S+)\s*;\s*PWD=(?P<pwd>.*?)\s*;\s*USER=(?P<target>\S+)(?P<extra>(?:\s*;\s*[A-Z_]+=[^;]*?)*)\s*;\s*COMMAND=(?P<command>.*?)\s*$')
+      if de == null {
+          route = "auth"
+          actor_user = string!(dm.user)
+          user_name = string!(dm.target)
+          cmd_line = string!(dm.command)
+          service_name = "sudo"
+          activity_id = 7; activity_name = "Account Switch"
+          reason = string(dm.reason) ?? ""
+          if reason == "" {
+              status_id = 1; status_str = "Success"
+              action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed"
+          } else {
+              status_id = 2; status_str = "Failure"; status_detail = reason
+              action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
+          }
+      }
+  } else if pl == "loginwindow" && msg_text != "" {
+      lm, le = parse_regex(msg_text, r'doLogin\x5D\s*\|\s*shortUsername = (?P<user>[^,]+), userID = (?P<uid>-?\d+)')
+      if le == null {
+          route = "auth"
+          user_name = string!(lm.user)
+          login_uid = string!(lm.uid)
+          activity_id = 1; activity_name = "Logon"
+          status_id = 1; status_str = "Success"
+          service_name = "loginwindow"
+      }
+  } else if pl == "opendirectoryd" && msg_text != "" {
+      om, oe = parse_regex(msg_text, r'^Failed to authenticate user\s+<?(?P<user>[^>\s]+)>?\s*(?:\x28error:\s*(?P<code>-?\d+)\x29)?')
+      if oe == null {
+          route = "auth"
+          user_name = string!(om.user)
+          activity_id = 1; activity_name = "Logon"
+          status_id = 2; status_str = "Failure"
+          if om.code != null { status_detail = "error " + string!(om.code) }
+          action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
+          service_name = "opendirectoryd"
+      }
+  } else if (pl == "authd" || sl == "com.apple.authorization") && msg_text != "" {
+      am, ae = parse_regex(msg_text, r'^(?P<result>Succeeded authorizing|Failed to authorize|Sandbox denied authorizing) right\s+\x27(?P<right>[^\x27]+)\x27\s+by client\s+\x27(?P<client>[^\x27]+)\x27(?:\s+\x5B(?P<client_pid>\d+)\x5D)?(?:\s+for authorization created by\s+\x27(?P<creator>[^\x27]+)\x27)?(?:.*?\x28(?P<code>-\d+)\x29)?')
+      if ae == null {
+          route = "auth"
+          service_name = string!(am.right)
+          # the requesting client is the actor; authd itself is the logon process
+          client_path = string!(am.client)
+          client_pid = to_int(am.client_pid) ?? 0
+          if am.creator != null { auth_creator = string!(am.creator) }
+          is_authd = true
+          activity_id = 99; activity_name = "Other"
+          if am.result == "Succeeded authorizing" {
+              status_id = 1; status_str = "Success"
+              action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed"
+          } else {
+              status_id = 2; status_str = "Failure"
+              if am.code != null { status_detail = "OSStatus " + string!(am.code) }
+              action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
+          }
+      }
+  } else if (sl == "com.apple.tcc" || pl == "tccd") && msg_text != "" {
+      tm, te = parse_regex(msg_text, r'Update Access Record:\s+(?P<service>kTCCService[A-Za-z0-9]+)\s+for\s+(?P<client>\S+)\s+to\s+(?P<value>[A-Za-z]+)')
+      if te == null {
+          route = "tcc"
+          tcc_service = string!(tm.service)
+          tcc_client = string!(tm.client)
+          tcc_value = string!(tm.value)
+      }
+  } else if (contains(sl, "systempolicy") || contains(sl, "xprotect") || pl == "syspolicyd" || contains(pl, "xprotect") || cl == "gatekeeper" || cl == "xprotect") && msg_text != "" {
+      # an "allowed" verdict is not a finding, but "not allowed" is a block
+      negative = match(msg_text, r'(?i)\bmalware\b|\b(?:rejected|blocked|denied|not allowed|quarantin\w*)\b')
+      allowed_verdict = match(msg_text, r'(?i)result:\s*allowed|\ballowed\s*$') && !match(msg_text, r'(?i)\bnot\s+allowed\b')
+      if negative && !allowed_verdict {
+          route = "finding"
+          analytic = if contains(sl, "xprotect") || contains(pl, "xprotect") || cl == "xprotect" { "XProtect" } else { "Gatekeeper" }
+          # an app bundle path may contain spaces; any other path ends at whitespace
+          fm, fe = parse_regex(msg_text, r'(?P<path>/[^:,\x28\x29]*?\.app)\b')
+          if fe != null { fm, fe = parse_regex(msg_text, r'(?P<path>/[^\s:,\x28\x29]+)') }
+          if fe == null { file_path = string!(fm.path) }
+          finding_title = analytic + ": " + msg_text
+          if length(finding_title) > 200 { finding_title = slice!(finding_title, 0, 200) }
+      }
+  }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": sha2("macos_unified_log|raw|" + raw_log, variant: "SHA-256"),
+      "log_name": "unified_log",
+      "product": { "name": "macOS", "vendor_name": "Apple" }
+  }
+  if subsystem != "" { metadata.log_provider = subsystem }
+  if msg_type != "" { metadata.log_level = msg_type }
+  if ts_text != "" { metadata.original_time = ts_text }
+
+  device = {}
+  if host_name != "" {
+      device = { "hostname": host_name, "type_id": 0, "type": "Unknown", "os": { "name": "macOS", "type_id": 300, "type": "macOS" } }
+      if boot_uid != "" { device.boot_uid = boot_uid }
+  }
+
+  proc = {}
+  if proc_name != "" { proc.name = proc_name }
+  if image_path != "" { proc.path = image_path }
+  if pid > 0 { proc.pid = pid }
+  if tid > 0 { proc.tid = tid }
+  if uid != "" { proc.user = { "uid": uid } }
+  if cmd_line != "" { proc.cmd_line = cmd_line }
+  actor = {}
+  if length(proc) > 0 { actor.process = proc }
+  if actor_user != "" { actor.user = { "name": actor_user } }
+
+  base = {
+      "time": time_ms,
+      "raw_data": raw_log,
+      "metadata": metadata,
+      "severity_id": severity_id,
+      "severity": severity
+  }
+  if msg_text != "" { base.message = msg_text }
+
+  if route == "auth" {
+      if status_id == 2 && severity_id < 3 { severity_id = 3; severity = "Medium" }
+      # authd names no subject user (entry.userID is authd's own uid)
+      if user_name == "" { user_name = "unknown" }
+      subject = { "name": user_name }
+      if login_uid != "" { subject.uid = login_uid }
+      . = merge(base, {
+          "class_uid": 3002, "class_name": "Authentication",
+          "category_uid": 3, "category_name": "Identity & Access Management",
+          "activity_id": activity_id, "activity_name": activity_name,
+          "type_uid": 300200 + activity_id,
+          "severity_id": severity_id, "severity": severity,
+          "status_id": status_id, "status": status_str,
+          "user": subject
+      })
+      if action_id > 0 {
+          .action_id = action_id; .action = action
+          .disposition_id = disposition_id; .disposition = disposition
+          .metadata.profiles = ["security_control"]
+      }
+      if status_detail != "" { .status_detail = status_detail }
+      if service_name != "" { .service = { "name": service_name } }
+      if auth_proto != "" { .auth_protocol = auth_proto; .auth_protocol_id = 99 }
+      if src_ip != "" {
+          .is_remote = true
+          .src_endpoint = { "ip": src_ip }
+          if src_port > 0 { .src_endpoint.port = src_port }
+      }
+      if activity_id == 7 { .account_switch_type_id = 99; .account_switch_type = "sudo" }
+      if is_authd {
+          cproc = { "path": client_path }
+          cn, cne = parse_regex(client_path, r'(?P<name>[^/]+)$')
+          if cne == null { cproc.name = cn.name }
+          if client_pid > 0 { cproc.pid = client_pid }
+          actor = { "process": cproc }
+          if pid > 0 { .logon_process = proc }
+          if auth_creator != "" { . = set!(., ["unmapped", "authd_creator_path"], auth_creator) }
+      }
+  } else if route == "tcc" {
+      . = merge(base, {
+          "class_uid": 3004, "class_name": "Entity Management",
+          "category_uid": 3, "category_name": "Identity & Access Management",
+          "activity_id": 3, "activity_name": "Update",
+          "type_uid": 300403,
+          "status_id": 1, "status": "Success",
+          "entity": { "name": tcc_service, "type": "TCC access record", "uid": tcc_client, "data": { "auth_value": tcc_value } }
+      })
+      if severity_id < 2 { .severity_id = 2; .severity = "Low" }
+  } else if route == "finding" {
+      ev = {}
+      if length(proc) > 0 { ev.process = proc }
+      if file_path != "" {
+          fnm, fne = parse_regex(file_path, r'(?P<name>[^/]+)/?$')
+          fobj = { "path": file_path, "type_id": 1, "type": "Regular File" }
+          if fne == null { fobj.name = fnm.name }
+          if ends_with(file_path, ".app") { fobj.type_id = 2; fobj.type = "Folder" }
+          ev.file = fobj
+      }
+      fsev_id = 3
+      fsev = "Medium"
+      if match(msg_text, r'(?i)\bmalware\b') { fsev_id = 4; fsev = "High" }
+      . = merge(base, {
+          "class_uid": 2004, "class_name": "Detection Finding",
+          "category_uid": 2, "category_name": "Findings",
+          "activity_id": 1, "activity_name": "Create",
+          "type_uid": 200401,
+          "severity_id": fsev_id,
+          "severity": fsev,
+          "status_id": 1, "status": "New",
+          "action_id": 2, "action": "Denied",
+          "disposition_id": 2, "disposition": "Blocked",
+          "finding_info": {
+              "uid": sha2("macos_unified_log|finding|" + raw_log, variant: "SHA-256"),
+              "title": finding_title,
+              "analytic": { "name": analytic, "type_id": 1, "type": "Rule" }
+          },
+          "evidences": [ev]
+      })
+      .metadata.profiles = ["security_control"]
+  } else {
+      . = merge(base, {
+          "class_uid": 0, "class_name": "Base Event",
+          "category_uid": 0, "category_name": "Uncategorized",
+          "activity_id": 99, "activity_name": "Other",
+          "type_uid": 99,
+          "status_id": 0, "status": "Unknown"
+      })
+      if !decoded { . = set!(., ["unmapped", "parse_fallback"], "not a unified log ndjson object") }
+  }
+  if decoded {
+      # actor (and device) on Base Event / Detection Finding come from the host profile
+      if length(actor) > 0 { .actor = actor }
+      if length(device) > 0 { .device = device }
+      if length(actor) > 0 || length(device) > 0 {
+          .metadata.profiles = push(array(.metadata.profiles) ?? [], "host")
+      }
+  }
+
+  .
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # Values spill exactly as parsed: a parser never masks, redacts or withholds
+  # anything (masking is an opt-in pipeline step, never a parser concern).
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __copy = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __copy_json = encode_json(__copy)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__copy_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    eventMessage
+  | subsystem
+  | messageType
+  | processImagePath
+  | process
+  | processID
+  | threadID
+  | userID
+  | bootUUID
+  | timestamp
+  | hostname
+  | host
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if !contains(__consumed, __token) && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # The canonical source spill above is the authoritative representation of
+  # containers. The cheap conditions run first; the source value set is built on
+  # first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, as-is. These
+  # entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__copy.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # Sources:
+  #   Elastic macOS integration fixtures (unified log ndjson records):
+  #     https://github.com/elastic/integrations/tree/main/packages/macos/data_stream/authentication/_dev/test/pipeline
+  #     https://github.com/elastic/integrations/tree/main/packages/macos/data_stream/system_change/_dev/test/pipeline
+  #     https://github.com/elastic/integrations/tree/main/packages/macos/data_stream/user_and_account_management/_dev/test/pipeline
+  #   Record shape: log(1), `log show --style ndjson`; the other records reuse the fixture's field set.
+  #   Message formats: OpenSSH auth.c auth_log (https://github.com/openssh/openssh-portable/blob/master/auth.c),
+  #     sudoers(5) log format (https://www.sudo.ws/docs/man/sudoers.man/),
+  #     authd engine.m os_log strings (https://github.com/apple-oss-distributions/Security/blob/main/OSX/authd/engine.m),
+  #     tccd Update Access Record (https://www.mac4n6.com/blog/tag/app).
+  # Users, hosts, addresses and UUIDs replaced with documentation values.
+  # Elastic macos authentication fixture: loginwindow doLogin
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%s | shortUsername = %s, userID = %d, groupID = %d\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.loginwindow.logging\", \"category\": \"Standard\", \"threadID\": 778, \"senderImageUUID\": \"2F16B6B6-41B5-34D4-88A1-06CAFCE952EF\", \"backtrace\": {\"frames\": [{\"imageOffset\": 56811, \"imageUUID\": \"2F16B6B6-41B5-34D4-88A1-06CAFCE952EF\"}]}, \"bootUUID\": \"218031E6-E47F-4A77-B7FC-5A57B049F4BC\", \"processImagePath\": \"/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow\", \"senderImagePath\": \"/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow\", \"timestamp\": \"2025-09-25 23:32:36.119492-0700\", \"machTimestamp\": 191058676868, \"eventMessage\": \"-[Login1 doLogin] | shortUsername = _mbsetupuser, userID = 248, groupID = 248\", \"processImageUUID\": \"2F16B6B6-41B5-34D4-88A1-06CAFCE952EF\", \"traceID\": 3508679143981060, \"processID\": 100, \"senderProgramCounter\": 56811, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 3002
+      activity_id: 1
+      user.name: "_mbsetupuser"
+      user.uid: "248"
+      actor.process.name: "loginwindow"
+      actor.process.pid: 100
+      time: 1758868356119
+  # Elastic macos authentication fixture: other loginwindow entry
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%s | enter\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.loginwindow.logging\", \"category\": \"Standard\", \"threadID\": 13692, \"senderImageUUID\": \"2F16B6B6-41B5-34D4-88A1-06CAFCE952EF\", \"backtrace\": {\"frames\": [{\"imageOffset\": 75080, \"imageUUID\": \"2F16B6B6-41B5-34D4-88A1-06CAFCE952EF\"}]}, \"bootUUID\": \"218031E6-E47F-4A77-B7FC-5A57B049F4BC\", \"processImagePath\": \"/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow\", \"senderImagePath\": \"/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow\", \"timestamp\": \"2025-09-25 23:46:06.773373-0700\", \"machTimestamp\": 1001013698208, \"eventMessage\": \"-[Login1 isGuestAccount] | enter\", \"processImageUUID\": \"2F16B6B6-41B5-34D4-88A1-06CAFCE952EF\", \"traceID\": 3412540596027396, \"processID\": 1062, \"senderProgramCounter\": 75080, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 0
+      metadata.log_provider: "com.apple.loginwindow.logging"
+      metadata.log_name: "unified_log"
+  # Elastic macos authentication fixture: multi-line session dictionary
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%s | ApplicationManager: Checked in app : %@\", \"userID\": 501, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.loginwindow.logging\", \"category\": \"Standard\", \"threadID\": 13692, \"senderImageUUID\": \"2F16B6B6-41B5-34D4-88A1-06CAFCE952EF\", \"backtrace\": {\"frames\": [{\"imageOffset\": 109999, \"imageUUID\": \"2F16B6B6-41B5-34D4-88A1-06CAFCE952EF\"}]}, \"bootUUID\": \"\", \"processImagePath\": \"/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow\", \"senderImagePath\": \"/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow\", \"timestamp\": \"2025-10-09 12:02:22.345217+0530\", \"eventMessage\": \"-[SessionLogoutManager buildSessionDictionary] |      final sessionDictionary:{\\n    DirectLogoutType = 5;\\n    GroupID = 248;\\n    GuestAccount = 0;\\n    HomeDirectoryPath = \\\"/var/setup\\\";\\n    SessionAgentPID = 100;\\n    UserGUID = \\\"FFFFEEEE-DDDD-CCCC-BBBB-AAAA000000F8\\\";\\n    UserID = 248;\\n    UserLongName = \\\"Setup User\\\";\\n    UserName = \\\"_mbsetupuser\\\";\\n}\", \"processImageUUID\": \"2F16B6B6-41B5-34D4-88A1-06CAFCE952EF\", \"traceID\": 3714562696282116, \"processID\": 1062, \"senderProgramCounter\": 109999, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 0
+      actor.process.user.uid: "501"
+  # Elastic macos user_and_account_management fixture: opendirectoryd
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"SecureTokenStatus users: admin %llu, admin w/SecureToken %llu, admin w/o SecureToken %llu, standard %llu, standard w/SecureToken %llu, standard w/o SecureToken %llu\", \"userID\": 0, \"activityIdentifier\": 80, \"subsystem\": \"com.apple.opendirectoryd\", \"category\": \"auth\", \"threadID\": 3864, \"senderImageUUID\": \"B327C6FB-1480-39ED-B23A-F3D283CBFA1E\", \"backtrace\": {\"frames\": [{\"imageOffset\": 49542, \"imageUUID\": \"B327C6FB-1480-39ED-B23A-F3D283CBFA1E\"}]}, \"bootUUID\": \"218031E6-E47F-4A77-B7FC-5A57B049F4BC\", \"processImagePath\": \"/usr/libexec/opendirectoryd\", \"senderImagePath\": \"/System/Library/OpenDirectory/Modules/PlistFile.bundle/Contents/MacOS/PlistFile\", \"timestamp\": \"2025-09-25 23:31:36.868722-0700\", \"machTimestamp\": 131807906844, \"eventMessage\": \"SecureTokenStatus users: admin 0, admin w/SecureToken 0, admin w/o SecureToken 0, standard 0, standard w/SecureToken 0, standard w/o SecureToken 0\", \"processImageUUID\": \"D8FEDD38-55EF-31D4-9A85-CC8ADF519F32\", \"traceID\": 1597384271003652, \"processID\": 66, \"senderProgramCounter\": 49542, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 0
+      actor.process.name: "opendirectoryd"
+  # Elastic macos system_change fixture: syspolicyd allowed
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"Evaluated system policy for %{public}@ %{public}@\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.systempolicy\", \"category\": \"default\", \"threadID\": 28456, \"senderImageUUID\": \"A1B2C3D4-E5F6-7890-ABCD-EF1234567890\", \"backtrace\": {\"frames\": [{\"imageOffset\": 12345, \"imageUUID\": \"A1B2C3D4-E5F6-7890-ABCD-EF1234567890\"}]}, \"bootUUID\": \"218031E6-E47F-4A77-B7FC-5A57B049F4BC\", \"processImagePath\": \"/usr/libexec/syspolicyd\", \"senderImagePath\": \"/usr/libexec/syspolicyd\", \"timestamp\": \"2025-10-13 15:45:56.155816+0530\", \"machTimestamp\": 725858385613246, \"eventMessage\": \"Evaluated system policy for application: /Applications/Safari.app allowed\", \"processImageUUID\": \"CD58B635-1F96-38BD-BF3B-DBA7CA293E28\", \"traceID\": 1202012843394990084, \"processID\": 200, \"senderProgramCounter\": 12345, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 0
+  # Elastic macos system_change fixture: Gatekeeper allowed
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"Gatekeeper assessment for %{public}@ result: %{public}@\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.systempolicy\", \"category\": \"gatekeeper\", \"threadID\": 90123, \"senderImageUUID\": \"A7B8C9D0-E1F2-3456-ABCD-567890123456\", \"backtrace\": {\"frames\": [{\"imageOffset\": 78901, \"imageUUID\": \"A7B8C9D0-E1F2-3456-ABCD-567890123456\"}]}, \"bootUUID\": \"218031E6-E47F-4A77-B7FC-5A57B049F4BC\", \"processImagePath\": \"/usr/libexec/syspolicyd\", \"senderImagePath\": \"/System/Library/PrivateFrameworks/SystemPolicy.framework/Versions/A/SystemPolicy\", \"timestamp\": \"2025-10-15 16:25:30.987654+0530\", \"machTimestamp\": 739361987654321, \"eventMessage\": \"Gatekeeper assessment for /Applications/Visual Studio Code.app result: allowed (Developer ID certified)\", \"processImageUUID\": \"CD58B635-1F96-38BD-BF3B-DBA7CA293E28\", \"traceID\": 405718141415784453, \"processID\": 205, \"senderProgramCounter\": 78901, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 0
+  # Elastic macos system_change fixture: XProtect signature update
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"XProtect: Signature database updated to version %{public}@\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.security\", \"category\": \"xprotect\", \"threadID\": 12345, \"senderImageUUID\": \"B8C9D0E1-F2A3-4567-BCDE-678901234567\", \"backtrace\": {\"frames\": [{\"imageOffset\": 89012, \"imageUUID\": \"B8C9D0E1-F2A3-4567-BCDE-678901234567\"}]}, \"bootUUID\": \"218031E6-E47F-4A77-B7FC-5A57B049F4BC\", \"processImagePath\": \"/usr/libexec/XProtectService\", \"senderImagePath\": \"/System/Library/PrivateFrameworks/XProtect.framework/Versions/A/XProtect\", \"timestamp\": \"2025-10-15 16:30:00.123456+0530\", \"machTimestamp\": 739500123456789, \"eventMessage\": \"XProtect: Signature database updated to version 2187\", \"processImageUUID\": \"CD58B635-1F96-38BD-BF3B-DBA7CA293E28\", \"traceID\": 405718141415784454, \"processID\": 206, \"senderProgramCounter\": 89012, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 0
+  # Gatekeeper rejection, same shape as the Elastic fixture line with a rejected verdict
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"Gatekeeper assessment for %{public}@ result: %{public}@\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.systempolicy\", \"category\": \"gatekeeper\", \"threadID\": 90123, \"senderImageUUID\": \"A7B8C9D0-E1F2-3456-ABCD-567890123456\", \"backtrace\": {\"frames\": [{\"imageOffset\": 78901, \"imageUUID\": \"A7B8C9D0-E1F2-3456-ABCD-567890123456\"}]}, \"bootUUID\": \"218031E6-E47F-4A77-B7FC-5A57B049F4BC\", \"processImagePath\": \"/usr/libexec/syspolicyd\", \"senderImagePath\": \"/System/Library/PrivateFrameworks/SystemPolicy.framework/Versions/A/SystemPolicy\", \"timestamp\": \"2025-10-15 16:25:30.987654+0530\", \"machTimestamp\": 739361987654321, \"eventMessage\": \"Gatekeeper assessment for /Users/jdoe/Downloads/Invoice Viewer.app result: rejected (Unnotarized Developer ID)\", \"processImageUUID\": \"CD58B635-1F96-38BD-BF3B-DBA7CA293E28\", \"traceID\": 405718141415784453, \"processID\": 205, \"senderProgramCounter\": 78901, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 2004
+      action_id: 2
+      finding_info.analytic.name: "Gatekeeper"
+      evidences.0.file.path: "/Users/jdoe/Downloads/Invoice Viewer.app"
+      evidences.0.file.name: "Invoice Viewer.app"
+  # XProtect malware verdict (com.apple.xprotect, XProtectService)
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Error\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%{public}s\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.xprotect\", \"category\": \"xprotect\", \"threadID\": 1837, \"senderImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"backtrace\": {\"frames\": [{\"imageOffset\": 0, \"imageUUID\": \"00000000-0000-0000-0000-000000000000\"}]}, \"bootUUID\": \"00000000-0000-0000-0000-000000000000\", \"processImagePath\": \"/Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectService\", \"senderImagePath\": \"/Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectService\", \"timestamp\": \"2026-11-02 09:14:55.120334-0700\", \"machTimestamp\": 0, \"eventMessage\": \"XProtect detected malware OSX.Example.A in /Users/jdoe/Downloads/update.dmg\", \"processImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"traceID\": 0, \"processID\": 612, \"senderProgramCounter\": 0, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 2004
+      severity_id: 4
+      finding_info.analytic.name: "XProtect"
+      evidences.0.file.path: "/Users/jdoe/Downloads/update.dmg"
+  # sshd-session accepted (OpenSSH auth.c auth_log format)
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%{public}s\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"\", \"category\": \"\", \"threadID\": 9424, \"senderImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"backtrace\": {\"frames\": [{\"imageOffset\": 0, \"imageUUID\": \"00000000-0000-0000-0000-000000000000\"}]}, \"bootUUID\": \"00000000-0000-0000-0000-000000000000\", \"processImagePath\": \"/usr/libexec/sshd-session\", \"senderImagePath\": \"/usr/libexec/sshd-session\", \"timestamp\": \"2026-11-02 08:01:12.004521-0700\", \"machTimestamp\": 0, \"eventMessage\": \"Accepted publickey for jdoe from 198.51.100.24 port 52144 ssh2: ED25519 SHA256:AAAAexampleexampleexampleexampleexample\", \"processImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"traceID\": 0, \"processID\": 3141, \"senderProgramCounter\": 0, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 3002
+      status_id: 1
+      user.name: "jdoe"
+      src_endpoint.ip: "198.51.100.24"
+      src_endpoint.port: 52144
+      auth_protocol: "publickey"
+  # sshd failed password
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%{public}s\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"\", \"category\": \"\", \"threadID\": 9451, \"senderImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"backtrace\": {\"frames\": [{\"imageOffset\": 0, \"imageUUID\": \"00000000-0000-0000-0000-000000000000\"}]}, \"bootUUID\": \"00000000-0000-0000-0000-000000000000\", \"processImagePath\": \"/usr/sbin/sshd\", \"senderImagePath\": \"/usr/sbin/sshd\", \"timestamp\": \"2026-11-02 08:03:40.551100-0700\", \"machTimestamp\": 0, \"eventMessage\": \"Failed password for invalid user oracle from 203.0.113.45 port 40122 ssh2\", \"processImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"traceID\": 0, \"processID\": 3150, \"senderProgramCounter\": 0, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 3002
+      status_id: 2
+      user.name: "oracle"
+      severity_id: 3
+  # sshd invalid user
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%{public}s\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"\", \"category\": \"\", \"threadID\": 9454, \"senderImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"backtrace\": {\"frames\": [{\"imageOffset\": 0, \"imageUUID\": \"00000000-0000-0000-0000-000000000000\"}]}, \"bootUUID\": \"00000000-0000-0000-0000-000000000000\", \"processImagePath\": \"/usr/libexec/sshd-session\", \"senderImagePath\": \"/usr/libexec/sshd-session\", \"timestamp\": \"2026-11-02 08:03:41.000200-0700\", \"machTimestamp\": 0, \"eventMessage\": \"Invalid user test from 203.0.113.45 port 40130\", \"processImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"traceID\": 0, \"processID\": 3151, \"senderProgramCounter\": 0, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 3002
+      status_id: 2
+      status_detail: "Invalid user"
+  # sudo command (sudoers log format)
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%{public}s\", \"userID\": 501, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.sudo\", \"category\": \"\", \"threadID\": 12604, \"senderImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"backtrace\": {\"frames\": [{\"imageOffset\": 0, \"imageUUID\": \"00000000-0000-0000-0000-000000000000\"}]}, \"bootUUID\": \"00000000-0000-0000-0000-000000000000\", \"processImagePath\": \"/usr/bin/sudo\", \"senderImagePath\": \"/usr/bin/sudo\", \"timestamp\": \"2026-11-02 08:10:00.100000-0700\", \"machTimestamp\": 0, \"eventMessage\": \"  jdoe : TTY=ttys001 ; PWD=/Users/jdoe ; USER=root ; COMMAND=/usr/bin/defaults write /Library/Preferences/com.apple.loginwindow GuestEnabled -bool false\", \"processImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"traceID\": 0, \"processID\": 4201, \"senderProgramCounter\": 0, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 3002
+      activity_id: 7
+      user.name: "root"
+      actor.user.name: "jdoe"
+      actor.process.cmd_line: "/usr/bin/defaults write /Library/Preferences/com.apple.loginwindow GuestEnabled -bool false"
+  # sudo failure
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Error\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%{public}s\", \"userID\": 502, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.sudo\", \"category\": \"\", \"threadID\": 12607, \"senderImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"backtrace\": {\"frames\": [{\"imageOffset\": 0, \"imageUUID\": \"00000000-0000-0000-0000-000000000000\"}]}, \"bootUUID\": \"00000000-0000-0000-0000-000000000000\", \"processImagePath\": \"/usr/bin/sudo\", \"senderImagePath\": \"/usr/bin/sudo\", \"timestamp\": \"2026-11-02 08:11:00.200000-0700\", \"machTimestamp\": 0, \"eventMessage\": \"  guest1 : 3 incorrect password attempts ; TTY=ttys002 ; PWD=/Users/guest1 ; USER=root ; COMMAND=/bin/sh\", \"processImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"traceID\": 0, \"processID\": 4202, \"senderProgramCounter\": 0, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 3002
+      status_id: 2
+      status_detail: "3 incorrect password attempts"
+  # authd right granted (authd engine.m format)
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%{public}s\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.Authorization\", \"category\": \"authd\", \"threadID\": 871, \"senderImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"backtrace\": {\"frames\": [{\"imageOffset\": 0, \"imageUUID\": \"00000000-0000-0000-0000-000000000000\"}]}, \"bootUUID\": \"00000000-0000-0000-0000-000000000000\", \"processImagePath\": \"/System/Library/Frameworks/Security.framework/Versions/A/XPCServices/authd.xpc/Contents/MacOS/authd\", \"senderImagePath\": \"/System/Library/Frameworks/Security.framework/Versions/A/XPCServices/authd.xpc/Contents/MacOS/authd\", \"timestamp\": \"2026-11-02 08:20:00.000100-0700\", \"machTimestamp\": 0, \"eventMessage\": \"Succeeded authorizing right 'system.preferences.security' by client '/System/Applications/System Settings.app' [811] for authorization created by '/System/Applications/System Settings.app' [811] (3,0) (engine 412)\", \"processImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"traceID\": 0, \"processID\": 290, \"senderProgramCounter\": 0, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 3002
+      activity_id: 99
+      status_id: 1
+      service.name: "system.preferences.security"
+      user.name: "unknown"
+      actor.process.name: "System Settings.app"
+      actor.process.pid: 811
+      logon_process.name: "authd"
+  # authd right denied
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%{public}s\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.Authorization\", \"category\": \"authd\", \"threadID\": 871, \"senderImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"backtrace\": {\"frames\": [{\"imageOffset\": 0, \"imageUUID\": \"00000000-0000-0000-0000-000000000000\"}]}, \"bootUUID\": \"00000000-0000-0000-0000-000000000000\", \"processImagePath\": \"/System/Library/Frameworks/Security.framework/Versions/A/XPCServices/authd.xpc/Contents/MacOS/authd\", \"senderImagePath\": \"/System/Library/Frameworks/Security.framework/Versions/A/XPCServices/authd.xpc/Contents/MacOS/authd\", \"timestamp\": \"2026-11-02 08:21:00.000100-0700\", \"machTimestamp\": 0, \"eventMessage\": \"Failed to authorize right 'system.privilege.admin' by client '/usr/libexec/UserAccountUpdater' [920] for authorization created by '/usr/libexec/UserAccountUpdater' [920] (3,0) (-60005) (engine 413)\", \"processImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"traceID\": 0, \"processID\": 290, \"senderProgramCounter\": 0, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 3002
+      status_id: 2
+      status_detail: "OSStatus -60005"
+  # opendirectoryd authentication failure
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%{public}s\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.opendirectoryd\", \"category\": \"auth\", \"threadID\": 361, \"senderImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"backtrace\": {\"frames\": [{\"imageOffset\": 0, \"imageUUID\": \"00000000-0000-0000-0000-000000000000\"}]}, \"bootUUID\": \"00000000-0000-0000-0000-000000000000\", \"processImagePath\": \"/usr/libexec/opendirectoryd\", \"senderImagePath\": \"/usr/libexec/opendirectoryd\", \"timestamp\": \"2026-11-02 08:22:00.000100-0700\", \"machTimestamp\": 0, \"eventMessage\": \"Failed to authenticate user <jdoe> (error: 9).\", \"processImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"traceID\": 0, \"processID\": 120, \"senderProgramCounter\": 0, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 3002
+      status_id: 2
+      user.name: "jdoe"
+      service.name: "opendirectoryd"
+  # TCC permission change (tccd Update Access Record)
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%{public}s\", \"userID\": 501, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.TCC\", \"category\": \"access\", \"threadID\": 544, \"senderImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"backtrace\": {\"frames\": [{\"imageOffset\": 0, \"imageUUID\": \"00000000-0000-0000-0000-000000000000\"}]}, \"bootUUID\": \"00000000-0000-0000-0000-000000000000\", \"processImagePath\": \"/System/Library/PrivateFrameworks/TCC.framework/Support/tccd\", \"senderImagePath\": \"/System/Library/PrivateFrameworks/TCC.framework/Support/tccd\", \"timestamp\": \"2026-11-02 08:22:00.300100-0700\", \"machTimestamp\": 0, \"eventMessage\": \"Update Access Record: kTCCServiceScreenCapture for com.example.recorder to Allowed (v1) at 1793632920 (2026-11-02 15:22:00 +0000)\", \"processImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"traceID\": 0, \"processID\": 181, \"senderProgramCounter\": 0, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 3004
+      activity_id: 3
+      entity.name: "kTCCServiceScreenCapture"
+      entity.uid: "com.example.recorder"
+      entity.data.auth_value: "Allowed"
+  # Fault level entry
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Fault\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%{public}s\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.runningboard\", \"category\": \"process\", \"threadID\": 451, \"senderImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"backtrace\": {\"frames\": [{\"imageOffset\": 0, \"imageUUID\": \"00000000-0000-0000-0000-000000000000\"}]}, \"bootUUID\": \"00000000-0000-0000-0000-000000000000\", \"processImagePath\": \"/usr/libexec/runningboardd\", \"senderImagePath\": \"/usr/libexec/runningboardd\", \"timestamp\": \"2026-11-02 08:30:00.000100-0700\", \"machTimestamp\": 0, \"eventMessage\": \"Invalidating assertion 123-456-789 (target:[app<application.com.example.app>]) from originator [osservice<com.apple.example>]\", \"processImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"traceID\": 0, \"processID\": 150, \"senderProgramCounter\": 0, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 0
+      severity_id: 4
+      metadata.log_level: "Fault"
+  # a forwarder that adds the host name (Vector / Fluent Bit enrichment)
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%{public}s\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"\", \"category\": \"\", \"threadID\": 9451, \"senderImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"backtrace\": {\"frames\": [{\"imageOffset\": 0, \"imageUUID\": \"00000000-0000-0000-0000-000000000000\"}]}, \"bootUUID\": \"00000000-0000-0000-0000-000000000000\", \"processImagePath\": \"/usr/sbin/sshd\", \"senderImagePath\": \"/usr/sbin/sshd\", \"timestamp\": \"2026-11-02 08:03:40.551100-0700\", \"machTimestamp\": 0, \"eventMessage\": \"Failed password for invalid user oracle from 203.0.113.45 port 40122 ssh2\", \"processImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"traceID\": 0, \"processID\": 3150, \"senderProgramCounter\": 0, \"parentActivityIdentifier\": 0, \"hostname\": \"mac01.example.com\"}"
+    expect:
+      class_uid: 3002
+      device.hostname: "mac01.example.com"
+      device.os.type_id: 300
+  # Gatekeeper block ending in "not allowed" stays a finding
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"Gatekeeper assessment for %{public}@ result: %{public}@\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.systempolicy\", \"category\": \"gatekeeper\", \"threadID\": 90123, \"senderImageUUID\": \"A7B8C9D0-E1F2-3456-ABCD-567890123456\", \"backtrace\": {\"frames\": [{\"imageOffset\": 78901, \"imageUUID\": \"A7B8C9D0-E1F2-3456-ABCD-567890123456\"}]}, \"bootUUID\": \"218031E6-E47F-4A77-B7FC-5A57B049F4BC\", \"processImagePath\": \"/usr/libexec/syspolicyd\", \"senderImagePath\": \"/System/Library/PrivateFrameworks/SystemPolicy.framework/Versions/A/SystemPolicy\", \"timestamp\": \"2025-10-15 16:25:30.987654+0530\", \"machTimestamp\": 739361987654321, \"eventMessage\": \"Execution of /Users/jdoe/Downloads/Evil.app is not allowed\", \"processImageUUID\": \"CD58B635-1F96-38BD-BF3B-DBA7CA293E28\", \"traceID\": 405718141415784453, \"processID\": 205, \"senderProgramCounter\": 78901, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 2004
+      evidences.0.file.path: "/Users/jdoe/Downloads/Evil.app"
+  # capitalized category from securityd
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"Gatekeeper assessment for %{public}@ result: %{public}@\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.security\", \"category\": \"Gatekeeper\", \"threadID\": 90123, \"senderImageUUID\": \"A7B8C9D0-E1F2-3456-ABCD-567890123456\", \"backtrace\": {\"frames\": [{\"imageOffset\": 78901, \"imageUUID\": \"A7B8C9D0-E1F2-3456-ABCD-567890123456\"}]}, \"bootUUID\": \"218031E6-E47F-4A77-B7FC-5A57B049F4BC\", \"processImagePath\": \"/usr/libexec/securityd\", \"senderImagePath\": \"/usr/libexec/securityd\", \"timestamp\": \"2025-10-15 16:25:30.987654+0530\", \"machTimestamp\": 739361987654321, \"eventMessage\": \"Gatekeeper assessment for /Applications/Tool.app result: rejected (no usable signature)\", \"processImageUUID\": \"CD58B635-1F96-38BD-BF3B-DBA7CA293E28\", \"traceID\": 405718141415784453, \"processID\": 205, \"senderProgramCounter\": 78901, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 2004
+      finding_info.analytic.name: "Gatekeeper"
+  # XProtect verdict without process fields: no empty evidence process
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Error\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%{public}s\", \"activityIdentifier\": 0, \"subsystem\": \"com.apple.xprotect\", \"category\": \"xprotect\", \"senderImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"backtrace\": {\"frames\": [{\"imageOffset\": 0, \"imageUUID\": \"00000000-0000-0000-0000-000000000000\"}]}, \"bootUUID\": \"00000000-0000-0000-0000-000000000000\", \"timestamp\": \"2026-11-02 09:14:55.120334-0700\", \"machTimestamp\": 0, \"eventMessage\": \"XProtect detected malware OSX.Example.A in /Users/jdoe/Downloads/update.dmg\", \"processImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"traceID\": 0, \"senderProgramCounter\": 0, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 2004
+      evidences.0.process: "<missing>"
+      evidences.0.file.name: "update.dmg"
+  # sudo with GROUP= and TSID= between USER= and COMMAND=
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%{public}s\", \"userID\": 501, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.sudo\", \"category\": \"\", \"threadID\": 12604, \"senderImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"backtrace\": {\"frames\": [{\"imageOffset\": 0, \"imageUUID\": \"00000000-0000-0000-0000-000000000000\"}]}, \"bootUUID\": \"00000000-0000-0000-0000-000000000000\", \"processImagePath\": \"/usr/bin/sudo\", \"senderImagePath\": \"/usr/bin/sudo\", \"timestamp\": \"2026-11-02 08:10:00.100000-0700\", \"machTimestamp\": 0, \"eventMessage\": \"  jdoe : TTY=ttys001 ; PWD=/Users/jdoe ; USER=root ; GROUP=wheel ; TSID=000001 ; COMMAND=/usr/bin/id\", \"processImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"traceID\": 0, \"processID\": 4201, \"senderProgramCounter\": 0, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 3002
+      activity_id: 7
+      user.name: "root"
+      actor.process.cmd_line: "/usr/bin/id"
+  # JSON objects that are not unified log entries are flagged, not silently classified
+  - raw: '{}'
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: "not a unified log ndjson object"
+  - raw: '{"foo": "bar"}'
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: "not a unified log ndjson object"
+      unmapped.foo: "bar"
+  # log show --style json writes an array: not split here
+  - raw: "[{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%s | enter\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.loginwindow.logging\", \"category\": \"Standard\", \"threadID\": 13692, \"senderImageUUID\": \"2F16B6B6-41B5-34D4-88A1-06CAFCE952EF\", \"backtrace\": {\"frames\": [{\"imageOffset\": 75080, \"imageUUID\": \"2F16B6B6-41B5-34D4-88A1-06CAFCE952EF\"}]}, \"bootUUID\": \"218031E6-E47F-4A77-B7FC-5A57B049F4BC\", \"processImagePath\": \"/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow\", \"senderImagePath\": \"/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow\", \"timestamp\": \"2025-09-25 23:46:06.773373-0700\", \"machTimestamp\": 1001013698208, \"eventMessage\": \"-[Login1 isGuestAccount] | enter\", \"processImageUUID\": \"2F16B6B6-41B5-34D4-88A1-06CAFCE952EF\", \"traceID\": 3412540596027396, \"processID\": 1062, \"senderProgramCounter\": 75080, \"parentActivityIdentifier\": 0}]"
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: "not a unified log ndjson object"
+  - raw: 'Timestamp               Thread     Type        Activity             PID    TTL'
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: "not a unified log ndjson object"
+  # neon #80 r2: the authorization creator survives the residual spill filter
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%{public}s\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.Authorization\", \"category\": \"authd\", \"threadID\": 871, \"senderImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"backtrace\": {\"frames\": [{\"imageOffset\": 0, \"imageUUID\": \"00000000-0000-0000-0000-000000000000\"}]}, \"bootUUID\": \"00000000-0000-0000-0000-000000000000\", \"processImagePath\": \"/System/Library/Frameworks/Security.framework/Versions/A/XPCServices/authd.xpc/Contents/MacOS/authd\", \"senderImagePath\": \"/System/Library/Frameworks/Security.framework/Versions/A/XPCServices/authd.xpc/Contents/MacOS/authd\", \"timestamp\": \"2026-11-02 08:20:00.000100-0700\", \"machTimestamp\": 0, \"eventMessage\": \"Succeeded authorizing right 'system.preferences.security' by client '/System/Applications/System Settings.app' [811] for authorization created by '/usr/libexec/securityd' [120] (3,0) (engine 412)\", \"processImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"traceID\": 0, \"processID\": 290, \"senderProgramCounter\": 0, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 3002
+      unmapped.authd_creator_path: /usr/libexec/securityd

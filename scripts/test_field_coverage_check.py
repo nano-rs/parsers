@@ -7,10 +7,8 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest import mock
 import field_coverage_check as fcc
 from field_coverage_check import check, inject_probe, normalize_probes, normalized_source, validate_config
-import residual_spill
 from residual_spill import generated
 
 
@@ -23,16 +21,19 @@ class ResidualTests(unittest.TestCase):
             ({'FooBar': 'first', 'foo_bar': 'second'}, {}, {'foo_bar': 'first', 'foo_bar_2': 'second'}),
             ({'x.y': 'literal', 'x': {'y': 'nested'}}, {}, {'x.y': 'nested', 'x.y_2': 'literal'}),
             ({'List': [1, 'two', False]}, {}, {'list': [1, 'two', False]}),
-            ({'List': [{'Name': 'thing', 'ApiToken': 'private'}]}, {}, {'list': '[{"ApiToken":"<redacted>","Name":"thing"}]'}),
-            ({'Password': 'private', 'Nested': {'clientSecret': 'private'}}, {}, {'password': '<redacted>', 'nested.client_secret': '<redacted>'}),
+            ({'List': [{'Name': 'thing', 'ApiToken': 'private'}]}, {}, {'list': '[{"ApiToken":"private","Name":"thing"}]'}),
+            # A parser never masks: credential-named keys spill as-is.
+            ({'Password': 'private', 'Nested': {'clientSecret': 'private'}}, {}, {'password': 'private', 'nested.client_secret': 'private'}),
             ({'Name': 'UPPER'}, {'user': {'name': 'upper'}}, {}),
             ({'Name': 'UPPER'}, {}, {'name': 'UPPER'}),
             ({'KnownList': ['one', 2]}, {'a': 'one', 'b': 2}, {}),
             ({'KnownList': ['one', 'unseen']}, {'a': 'one'}, {'known_list': ['one', 'unseen']}),
             ({'DéjàVu': 'unicode', 'HTTPStatus200': 'code'}, {}, {'déjà_vu': 'unicode', 'http_status_200': 'code'}),
             ({}, {'unmapped': {'empty': ''}}, {}),
-            ({'Headers': [{'Name': 'Authorization', 'Value': 'private'}]}, {}, {'headers': '[{"Name":"Authorization","Value":"<redacted>"}]'}),
-            ({'Details': {'Password': 'private'}}, {'unmapped': {'details_json': '{"Password":"private"}'}}, {'details.password': '<redacted>'}),
+            ({'Headers': [{'Name': 'Authorization', 'Value': 'private'}]}, {}, {'headers': '[{"Name":"Authorization","Value":"private"}]'}),
+            ({'Details': {'Password': 'private'}}, {'unmapped': {'details_json': '{"Password":"private"}'}}, {'details.password': 'private'}),
+            # Existing derived evidence under a credential-named key is kept too.
+            ({'Other': 'x'}, {'unmapped': {'session_token': 'derived-value'}}, {'other': 'x', 'session_token': 'derived-value'}),
             # NAN-3604: dotted keys inside objects inside arrays keep their dots.
             ({'Records': [{'http://a.example/claims/upn': 'u@example.com', 'x.y': {'p.q~r': 1}}]}, {}, {'records': '[{"http://a.example/claims/upn":"u@example.com","x.y":{"p.q~r":1}}]'}),
         ]
@@ -56,191 +57,11 @@ class ResidualTests(unittest.TestCase):
                         with self.assertRaises(AssertionError):
                             check(source, broken, 'raw input', rules, candidates=['Known', 'KnownList', 'Name'])
 
-    def test_truncate_kind(self):
-        # A bounded copy consumes its source only when it is the character
-        # prefix in the named target and, for an over-bound value, the event
-        # sets is_truncated and keeps the raw body as raw_data.
-        raw = {'raw_data': 'raw input'}
-        cases = [
-            ({'Query': 'abcdefgh'}, {'query_info': {'query_string': 'abcde'}, 'metadata': {'is_truncated': True}, **raw}, {}),
-            ({'Query': 'abcdefgh'}, {'query_info': {'query_string': 'abcde'}, **raw}, {'query': 'abcdefgh'}),
-            ({'Query': 'abcdefgh'}, {'query_info': {'query_string': 'abcde'}, 'metadata': {'is_truncated': True}}, {'query': 'abcdefgh'}),
-            ({'Query': 'abc'}, {'query_info': {'query_string': 'abc'}}, {}),
-            ({'Query': 'h\u00e9llo w\u00f6rld'}, {'query_info': {'query_string': 'h\u00e9llo'}, 'metadata': {'is_truncated': True}, **raw}, {}),
-            ({'Query': 'abcdefgh'}, {'query_info': {'query_string': 'abcdX'}, 'metadata': {'is_truncated': True}, **raw}, {'query': 'abcdefgh'}),
-            ({'Audit': {'Sql': 'select 1'}}, {'query_info': {'query_string': 'selec'}, 'metadata': {'is_truncated': True}, **raw}, {}),
-            ({'Audit': {'Sql': 'select 1'}}, {'query_info': {'query_string': 'selec'}, 'metadata': {'is_truncated': True}, 'raw_data': 'other'}, {'audit.sql': 'select 1'}),
-        ]
-        rules = [{'source': 'Query', 'kind': 'truncate', 'target': 'query_info.query_string', 'length': 5, 'reason': 'Bounded query text.'},
-                 {'source': 'Audit.Sql', 'kind': 'truncate', 'target': 'query_info.query_string', 'length': 5, 'reason': 'Bounded nested SQL text.'}]
-        with mock.patch.object(residual_spill, 'TRUNCATE_MIN_LENGTH', 1):
-            program = '__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'transforms': rules, 'consumed_candidates': ['Query', 'Audit.Sql']})
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            (tmp/'p.vrl').write_text(program)
-            (tmp/'events.json').write_text(''.join(json.dumps({'source': s, 'output': o})+'\n' for s,o,_ in cases))
-            run = subprocess.run(['vector', 'vrl', '--program', str(tmp/'p.vrl'), '--input', str(tmp/'events.json')], capture_output=True, text=True)
-            self.assertEqual(run.returncode, 0, run.stderr)
-            outputs = [json.loads(l) for l in run.stdout.splitlines() if l.startswith('{')]
-            self.assertEqual(len(outputs), len(cases), run.stdout + run.stderr)
-            for (source, mapped, expected), output in zip(cases, outputs):
-                with self.subTest(source=source, mapped=mapped):
-                    self.assertEqual(output.get('unmapped', {}), expected)
-                    check(source, output, 'raw input', rules, candidates=['Query', 'Audit.Sql'])
-        # A nested JSON source field bounded at 8192 (a PostgreSQL jsonlog or
-        # MySQL JSON audit statement) is consumed the same way, and only so.
-        statement = 'SELECT é' + 'x' * 9000
-        nested = [{'source': 'audit_record.sql', 'kind': 'truncate', 'target': 'query_info.query_string', 'length': 8192, 'reason': 'Bounded SQL text.'}]
-        validate_config({'transforms': nested})
-        source = {'audit_record': {'sql': statement, 'id': 1}}
-        bounded = {'query_info': {'query_string': statement[:8192]}, 'metadata': {'is_truncated': True, 'uid': 1}, 'raw_data': 'raw input'}
-        check(source, bounded, 'raw input', nested, candidates=['audit_record.id'])
-        for broken in ({**bounded, 'raw_data': 'other'}, {**bounded, 'metadata': {'uid': 1}}, {**bounded, 'query_info': {'query_string': statement[:8191]}}):
-            with self.assertRaises(AssertionError):
-                check(source, broken, 'raw input', nested, candidates=['audit_record.id'])
-        # Without a target a prefix may not ride on an unrelated mapped scalar.
-        untargeted = [{'source': 'Query', 'kind': 'truncate', 'length': 1, 'reason': 'r'}]
-        with self.assertRaises(AssertionError):
-            check({'Query': '1' + 'x' * 50}, {'status_id': 1, 'metadata': {'is_truncated': True}, 'raw_data': 'raw input'}, 'raw input', untargeted)
-
-
-class CredentialRedactionTests(unittest.TestCase):
-    def test_credential_keys_redacted(self):
-        # Keycloak CredentialRepresentation: credentials[].value, credentialData
-        # and secretData never spill.
-        rep = {'username': 'u', 'credentials': [{'type': 'password', 'value': 'nan2421-secret', 'temporary': False}],
-               'credentialData': '{"hashIterations":27500}', 'secretData': '{"value":"nan2421-secret"}'}
-        self.assertEqual(fcc.redact(rep), {'username': 'u', 'credentials': '<redacted>', 'credentialData': '<redacted>', 'secretData': '<redacted>'})
-        program = '__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'transforms': [], 'consumed_candidates': []})
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            (tmp/'p.vrl').write_text(program)
-            (tmp/'events.json').write_text(json.dumps({'source': {'representation_json': rep}, 'output': {}})+'\n')
-            run = subprocess.run(['vector', 'vrl', '--program', str(tmp/'p.vrl'), '--input', str(tmp/'events.json')], capture_output=True, text=True)
-            self.assertEqual(run.returncode, 0, run.stderr)
-            [output] = [json.loads(l) for l in run.stdout.splitlines() if l.startswith('{')]
-        self.assertNotIn('nan2421-secret', json.dumps(output))
-        self.assertEqual(output['unmapped']['representation_json.credentials'], '<redacted>')
-
-
-PROBE_PARSER = r'''
-raw_log = to_string(.message) ?? ""
-__raw_body = raw_log
-__source_kv = object(parse_json(raw_log) ?? {}) ?? {}
-if is_string(__source_kv.details) {
-    d, derr = parse_json(string!(__source_kv.details))
-    if derr == null && is_object(d) {
-        __discard = del(__source_kv.details)
-        __source_kv.details_json = d
-    } else {
-        wt = string!(__source_kv.details)
-        __source_kv.details = {"withheld": true, "bytes": length(wt), "sha256": sha2(wt, variant: "SHA-256")}
-    }
-}
-. = {"class_uid": 0, "raw_data": RAW, "message": MESSAGE}
-'''
-
-
-class RunParserTests(unittest.TestCase):
-    """End to end: withhold needs the raw body in raw_data; no secret outside it."""
-
-    def run_parser(self, raw_data='raw_log', message='"ok"'):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp)/'probe'/'parser.yaml'
-            path.parent.mkdir()
-            (path.parent/'field-coverage.yaml').write_text(json.dumps({
-                'source': 'json', 'consumed_candidates': [],
-                'source_normalize': [
-                    {'kind': 'parse_json_object', 'paths': ['details'], 'target': 'details_json', 'reason': 'r'},
-                    {'kind': 'withhold', 'paths': ['details'], 'match': '.', 'reason': 'r'}]}))
-            program = PROBE_PARSER.replace('RAW', raw_data).replace('MESSAGE', message)
-            samples = [{'raw': json.dumps({'user': 'a', 'details': '{"x": 1}'})},
-                       {'raw': json.dumps({'user': 'b', 'details': 'not json'})}]
-            body = ''.join('  ' + line + '\n' if line else '\n' for line in program.strip().splitlines())
-            path.write_text('parser_vrl: |\n' + body + 'samples: ' + json.dumps(samples) + '\n')
-            residual_spill.update(path)
-            fcc.run_parser(path)
-
-    def test_lossless(self):
-        self.run_parser()
-
-    def test_keep_without_raw_data_fails(self):
-        # parse_json_object keep withholds too: same raw_data rule, checked centrally.
-        _, any_withheld = fcc.withholds_data({'details': '{"important_action": "delete_prod_db"}'},
-                                             [{'kind': 'parse_json_object', 'paths': ['details'], 'target': 'details_json', 'keep': ['_never_exists']}])
-        self.assertTrue(any_withheld)
-        _, any_withheld = fcc.withholds_data({'details': '{"id": "1"}'},
-                                             [{'kind': 'parse_json_object', 'paths': ['details'], 'target': 'details_json', 'keep': ['id']}])
-        self.assertFalse(any_withheld)
-
-    def test_withhold_without_raw_data_fails(self):
-        with self.assertRaisesRegex(AssertionError, 'raw_data equal to the raw body'):
-            self.run_parser(raw_data='"DROPPED_NO_RAW_COPY"')
-
-    def test_secret_in_message_echo_fails(self):
-        with self.assertRaisesRegex(AssertionError, 'secret leaked outside raw_data'):
-            self.run_parser(message='raw_log')
-
-
-def emitted(parser):
-    """The events a tree parser emits for its own inline and sidecar samples."""
-    path = residual_spill.ROOT/'parsers-ocsf'/parser/'parser.yaml'
-    import yaml
-    doc = yaml.safe_load(path.read_text())
-    samples = fcc.samples_for(path, doc, None)
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        (tmp/'p.vrl').write_text(doc['parser_vrl'])
-        (tmp/'i.json').write_text(''.join(json.dumps(event)+'\n' for _, event in samples))
-        run = subprocess.run(['vector', 'vrl', '--program', str(tmp/'p.vrl'), '--input', str(tmp/'i.json'), '--print-object'], capture_output=True, text=True, timeout=300)
-    assert run.returncode == 0, run.stderr
-    outputs = [json.loads(l, strict=False) for l in run.stdout.splitlines() if l.startswith('{')]
-    return {name: output for (name, _), output in zip(samples, outputs)}
-
-
-class DescriptiveCredentialKeyTests(unittest.TestCase):
-    """Credential VALUE keys are redacted; descriptive credential telemetry is not
-    (round 5: a bare `credential` match had redacted these in main parsers)."""
-
-    KEPT = {
-        'moat_edr': {'inline_002': {'credential_reads': '~/.aws/credentials', 'moat.receipt.credential_reads': ['~/.aws/credentials']}},
-        'azure_monitor': {'inline_011': {'properties.client_credential_type': 'federatedIdentityCredential'}},
-        'windows_event_text': {'inline_004': {'event_data.account_whose_credentials_were_used.logon_guid': '{0}'}},
-    }
-
-    def test_key_classification(self):
-        for key in ('credentials', 'credentialData', 'credential_value', 'client_credential', 'clientCredential', 'credential', 'secretData', 'a.credentials', 'credentials.hash'):
-            self.assertTrue(fcc.SECRET.search(key), key)
-        for key in ('credential_type', 'credential_id', 'credential_name', 'credential_provider', 'credential_reads', 'client_credential_type', 'Account Whose Credentials Were Used', 'credential_key_id'):
-            self.assertFalse(fcc.SECRET.search(key), key)
-
-    def test_main_parsers_keep_descriptive_credential_fields(self):
-        for parser in ('moat_edr', 'azure_monitor', 'windows_event_text', 'okta'):
-            outputs = emitted(parser)
-            for sample, kept in self.KEPT.get(parser, {}).items():
-                unmapped = outputs[sample].get('unmapped', {})
-                for key, value in kept.items():
-                    with self.subTest(parser=parser, sample=sample, key=key):
-                        self.assertEqual(unmapped.get(key), value)
-            # Every redaction left is a real secret-value key.
-            for sample, output in outputs.items():
-                for key, value in (output.get('unmapped') or {}).items():
-                    if value == '<redacted>':
-                        with self.subTest(parser=parser, sample=sample, key=key):
-                            self.assertTrue(any(fcc.SECRET.search(part) for part in key.split('.')), key)
-                    if 'credential' in key and ('type' in key or 'provider' in key or 'reads' in key):
-                        self.assertNotEqual(value, '<redacted>', (parser, sample, key))
-
 
 class TargetEvidenceTests(unittest.TestCase):
     """A targeted rule is satisfied only by the mapped event (spill.vrl __mapped)."""
 
     def test_checker_ignores_unmapped_raw_data_and_raw_message(self):
-        sql = 'select ' + 'x' * 400
-        rule = [{'source': 'Sql', 'kind': 'truncate', 'target': 'unmapped.sql_short', 'length': 256, 'reason': 'r'}]
-        output = {'metadata': {'is_truncated': True}, 'raw_data': 'raw input', 'unmapped': {'sql_short': sql[:256]}}
-        with self.assertRaises(AssertionError):
-            check({'Sql': sql}, output, 'raw input', rule)
         for target, output in (('raw_data', {'raw_data': 'raw input'}), ('message', {'message': 'raw input', 'raw_data': 'raw input'})):
             lower = [{'source': 'Name', 'kind': 'lowercase', 'target': target, 'reason': 'r'}]
             with self.subTest(target=target), self.assertRaises(AssertionError):
@@ -267,31 +88,24 @@ class TargetEvidenceTests(unittest.TestCase):
 class ConfigTests(unittest.TestCase):
     """validate_config: the two opt-in lists, each entry justified and well formed."""
 
-    def truncate(self, **over):
-        rule = {'source': 'Q', 'kind': 'truncate', 'target': 'query_info.query_string', 'length': 4096, 'reason': 'Bounded.'}
-        rule.update(over)
-        return {'transforms': [rule]}
-
     def test_valid(self):
-        validate_config(self.truncate())
         validate_config({'source_normalize': [
             {'kind': 'unwrap_single', 'path': 'logEvents', 'reason': 'r'},
             {'kind': 'base64_json_merge', 'path': 'message.data', 'reason': 'r'},
             {'kind': 'parse_json_object', 'paths': ['message'], 'target': 'message_json', 'reason': 'r'},
             {'kind': 'parse_kv_merge', 'path': 'message', 'match': '^type=', 'key_value_delimiter': '=', 'field_delimiter': ', ', 'reason': 'r'},
-            {'kind': 'withhold', 'paths': ['message'], 'match': '^type=', 'reason': 'r'},
         ]})
 
-    def test_truncate_guardrails(self):
-        for bad in ({'length': 1}, {'length': 0}, {'length': 255}, {'length': 4096.0}, {'length': True}, {'target': ''}, {'target': None}, {'reason': ''}):
-            with self.subTest(bad=bad), self.assertRaises(AssertionError):
-                validate_config(self.truncate(**bad))
-        rule = self.truncate()['transforms'][0]
-        del rule['target']
+    def test_masking_kinds_rejected(self):
+        # Parsers never mask: no step or rule may withhold, allowlist, keep a
+        # subset, or truncate a value.
+        for step in ({'kind': 'withhold', 'paths': ['message'], 'match': '.', 'reason': 'r'},
+                     {'kind': 'allowlist', 'keep': ['a'], 'reason': 'r'},
+                     {'kind': 'parse_json_object', 'paths': ['m'], 'target': 't', 'keep': ['id'], 'reason': 'r'}):
+            with self.subTest(step=step), self.assertRaises(AssertionError):
+                validate_config({'source_normalize': [step]})
         with self.assertRaises(AssertionError):
-            validate_config({'transforms': [rule]})
-        with self.assertRaises(AssertionError):
-            generated({'transforms': [dict(rule, length=1, target='t')]})
+            validate_config({'transforms': [{'source': 'Q', 'kind': 'truncate', 'target': 'q', 'length': 4096, 'reason': 'r'}]})
 
     def test_step_guardrails(self):
         bad = [
@@ -300,12 +114,12 @@ class ConfigTests(unittest.TestCase):
             {'kind': 'nope', 'reason': 'r'},
             {'kind': 'parse_json_object', 'paths': [], 'target': 't', 'reason': 'r'},
             {'kind': 'parse_json_object', 'paths': ['m'], 'target': 'a.b', 'reason': 'r'},
+            {'kind': 'parse_json_object', 'paths': ['m'], 'target': 'm', 'reason': 'r'},
             {'kind': 'parse_kv_merge', 'path': 'a.b', 'match': '^', 'key_value_delimiter': '=', 'field_delimiter': ' ', 'reason': 'r'},
             {'kind': 'parse_kv_merge', 'path': 'message', 'key_value_delimiter': '=', 'field_delimiter': ' ', 'reason': 'r'},
+            {'kind': 'parse_kv_merge', 'path': 'm', 'match': '(', 'key_value_delimiter': '=', 'field_delimiter': ' ', 'reason': 'r'},
+            {'kind': 'parse_kv_merge', 'path': 'm', 'match': '^', 'key_value_delimiter': '=', 'field_delimiter': ' ', 'tail_keys': ['a b'], 'reason': 'r'},
             {'kind': 'unwrap_single', 'path': 'x', 'reason': 'r', 'extra': 1},
-            {'kind': 'withhold', 'paths': ['message'], 'reason': 'r'},
-            {'kind': 'withhold', 'paths': ['a..b'], 'match': '.', 'reason': 'r'},
-            {'kind': 'withhold', 'paths': ['m'], 'match': '(', 'reason': 'r'},
         ]
         for step in bad:
             with self.subTest(step=step), self.assertRaises(AssertionError):
@@ -320,8 +134,6 @@ class ConfigTests(unittest.TestCase):
                     validate_config({'transforms': [rule]})
                 with self.assertRaises(AssertionError):
                     generated({'transforms': [rule]})
-        with self.assertRaises(AssertionError):
-            validate_config(self.truncate(target='unmapped.sql_short'))
 
     def test_transform_parameters(self):
         base = {'source': 'S', 'reason': 'r'}
@@ -331,16 +143,6 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(rule=rule), self.assertRaises(AssertionError):
                 validate_config({'transforms': [{**base, **rule}]})
         validate_config({'transforms': [{**base, 'kind': 'scale', 'factor': 0.001}, {**base, 'kind': 'enum', 'values': {'a': 1}}, {**base, 'kind': 'epoch_ms'}]})
-
-    def test_withhold_must_follow_an_unpack_step(self):
-        withhold = {'kind': 'withhold', 'paths': ['details'], 'match': '.', 'reason': 'r'}
-        with self.assertRaises(AssertionError):
-            validate_config({'source_normalize': [withhold]})
-        validate_config({'source_normalize': [{'kind': 'parse_json_object', 'paths': ['details'], 'target': 'details_json', 'reason': 'r'}, withhold]})
-        # Bound to the unpack step's own paths: an unrelated field cannot be withheld.
-        for paths in (['command_line'], ['details', 'audit_items']):
-            with self.subTest(paths=paths), self.assertRaises(AssertionError):
-                validate_config({'source_normalize': [{'kind': 'parse_json_object', 'paths': ['details'], 'target': 'details_json', 'reason': 'r'}, dict(withhold, paths=paths)]})
 
     def test_json_envelope_retired(self):
         with self.assertRaises(AssertionError):
@@ -362,7 +164,7 @@ KV = {'kind': 'parse_kv_merge', 'path': 'message', 'match': '^(type|operationTyp
 
 
 class SourceNormalizeTests(unittest.TestCase):
-    """field-coverage.yaml `source_normalize`: the declared envelope steps, nothing more."""
+    """field-coverage.yaml `source_normalize`: lossless envelope steps, nothing more."""
 
     def test_no_rules_is_identity(self):
         original = {'a': [1], 'b': {'c': 'd'}}
@@ -401,11 +203,11 @@ class SourceNormalizeTests(unittest.TestCase):
     def test_parse_json_object(self):
         rules = [{'kind': 'unwrap_single', 'path': 'logEvents'},
                  {'kind': 'parse_json_object', 'paths': ['logEvents.message', 'message'], 'target': 'message_json'}]
-        inner = {'level': 'ERROR', 'tags': ['a'], 'status': 0}
+        inner = {'level': 'ERROR', 'tags': ['a'], 'status': 0, 'password': 'kept-as-is'}
         env = {'logEvents': [{'message': json.dumps(inner)}]}
         self.assertEqual(normalized_source(env, rules)['message_json'], inner)
         flat = {'message': json.dumps(inner), 'logGroup': 'g'}
-        # Moved, not copied: the unredacted JSON text leaves the source.
+        # Moved, not copied: the JSON text becomes its parsed fields, all of them.
         self.assertEqual(normalized_source(flat, rules), {'message_json': inner, 'logGroup': 'g'})
         self.assertEqual(normalized_source(env, rules), {'logEvents': {}, 'message_json': inner})
         text = {'message': 'START RequestId: x'}
@@ -421,26 +223,13 @@ class SourceNormalizeTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             validate_config({'source_normalize': [dict(rules[0], arrays='yes', reason='r')]})
 
-    def test_parse_json_object_keep(self):
-        import hashlib
-        keep = ['id', 'username', 'type']
-        rules = [{'kind': 'parse_json_object', 'paths': ['representation'], 'target': 'representation_json', 'keep': keep}]
-        rep = {'username': 'u', 'type': 'password', 'value': 'nan2421-secret', 'privateKey': 'k', 'attributes': {'a': 1}}
-        out = normalized_source({'representation': json.dumps(rep)}, rules)
-        rest = '{"attributes":{"a":1},"privateKey":"k","value":"nan2421-secret"}'
-        self.assertEqual(out, {'representation_json': {'username': 'u', 'type': 'password', 'withheld_fields': {
-            'withheld': True, 'bytes': len(rest), 'sha256': hashlib.sha256(rest.encode()).hexdigest()}}})
-        # An already-decoded object is filtered too; an array is not moved.
-        self.assertNotIn('nan2421-secret', json.dumps(normalized_source({'representation': rep}, rules)))
-        arr = {'representation': '[{"type": "password", "value": "x"}]'}
-        self.assertEqual(normalized_source(arr, rules), arr)
-        self.assertEqual(normalized_source({'representation': '{"id": "1"}'}, rules), {'representation_json': {'id': '1'}})
-        for bad in ({'keep': []}, {'keep': ['withheld_fields']}, {'keep': ['id'], 'arrays': True}):
-            with self.subTest(bad=bad), self.assertRaises(AssertionError):
-                validate_config({'source_normalize': [dict(rules[0], reason='r', **bad)]})
+    def test_parse_json_object_never_overwrites_target(self):
+        rules = [{'kind': 'parse_json_object', 'paths': ['message'], 'target': 'message_json'}]
+        original = {'message': '{"a": 1}', 'message_json': 'PRE_EXISTING_VALUE'}
+        self.assertEqual(normalized_source(original, rules), original)
 
     def test_parse_kv_merge_tail_key(self):
-        step = dict(KV, tail_key='representation')
+        step = dict(KV, tail_keys=['representation'])
         line = 'operationType=CREATE, realmId=r1, representation={"attributes":{"dn":"cn=a, dc=corp"},"credentials":[{"value":"x"}]}'
         out = normalized_source({'message': line}, [step])
         self.assertEqual(out, {'operationType': 'CREATE', 'realmId': 'r1', 'representation': '{"attributes":{"dn":"cn=a, dc=corp"},"credentials":[{"value":"x"}]}'})
@@ -448,15 +237,23 @@ class SourceNormalizeTests(unittest.TestCase):
         self.assertEqual(normalized_source({'message': quoted}, [step])['representation'], '{"a":"b, c"}')
         self.assertEqual(normalized_source({'message': 'type=LOGIN, realmId=r1'}, [step]), {'type': 'LOGIN', 'realmId': 'r1'})
 
-    def test_parse_json_object_never_overwrites_target(self):
-        rules = [{'kind': 'parse_json_object', 'paths': ['message'], 'target': 'message_json'}]
-        original = {'message': '{"a": 1}', 'message_json': 'PRE_EXISTING_VALUE'}
-        self.assertEqual(normalized_source(original, rules), original)
+    def test_parse_kv_merge_tail_keys_keycloak_trace(self):
+        # Keycloak TRACE lines end with representation, requestUri, cookies=[...],
+        # stackTrace; each is cut off whole, never split on ", ".
+        step = dict(KV, tail_keys=['representation', 'requestUri', 'cookies', 'stackTrace'])
+        line = ('type=LOGIN, realmId=r1, requestUri=https://sso.example.com/auth?code=abc, '
+                'cookies=[KEYCLOAK_IDENTITY=xyz, AUTH_SESSION_ID=x.node1], stackTrace=a, b')
+        out = normalized_source({'message': line}, [step])
+        self.assertEqual(out, {'type': 'LOGIN', 'realmId': 'r1', 'requestUri': 'https://sso.example.com/auth?code=abc',
+                               'cookies': '[KEYCLOAK_IDENTITY=xyz, AUTH_SESSION_ID=x.node1]', 'stackTrace': 'a, b'})
+        admin = 'operationType=CREATE, realmId=r1, representation={"username":"a, b"}, requestUri=https://h/x, cookies=[K=v]'
+        out = normalized_source({'message': admin}, [step])
+        self.assertEqual(out['representation'], '{"username":"a, b"}')
+        self.assertEqual(out['cookies'], '[K=v]')
 
     def test_parse_kv_merge(self):
         original = {'@timestamp': 't', 'message': 'type="LOGIN", username="a"'}
         self.assertEqual(normalized_source(original, [KV], fake_kv), {'@timestamp': 't', 'type': 'LOGIN', 'username': 'a'})
-        # A dropped pair, a dropped outer key, or an unremoved envelope key all differ.
         for wrong in ({'@timestamp': 't', 'type': 'LOGIN'}, {'@timestamp': 't'}, {},
                       {'type': 'LOGIN', 'username': 'a'},
                       {'@timestamp': 't', 'message': original['message'], 'type': 'LOGIN', 'username': 'a'}):
@@ -481,39 +278,6 @@ class SourceNormalizeTests(unittest.TestCase):
         trailing = {'message': 'type="LOGIN_ERROR", realmId="r1", '}
         self.assertEqual(normalized_source(trailing, [KV]), trailing)
 
-    def test_withhold(self):
-        import hashlib
-        step = {'kind': 'withhold', 'paths': ['logEvents.message', 'message'], 'match': '^type='}
-        text = 'type="LOGIN_ERROR", client_secret="s3cr3t" \u00e9'
-        out = normalized_source({'message': text, 'level': 'WARN'}, [step])
-        self.assertEqual(out, {'level': 'WARN', 'message': {'withheld': True, 'bytes': len(text.encode()), 'sha256': hashlib.sha256(text.encode()).hexdigest()}})
-        self.assertNotIn('s3cr3t', json.dumps(out))
-        # The first existing path decides; no match keeps the value.
-        nested = {'logEvents': {'message': 'plain'}, 'message': 'type=X'}
-        self.assertEqual(normalized_source(nested, [step]), nested)
-        self.assertEqual(normalized_source({'other': 1}, [step]), {'other': 1})
-        # A non-string value is matched and digested as VRL encode_json text.
-        batch = {'logEvents': [{'id': '2', 'message': 'b'}, {'id': '1', 'message': 'a'}]}
-        out = normalized_source(batch, [{'kind': 'withhold', 'paths': ['logEvents'], 'match': r'^\[[^\]]'}])
-        encoded = '[{"id":"2","message":"b"},{"id":"1","message":"a"}]'
-        self.assertEqual(out['logEvents']['sha256'], hashlib.sha256(encoded.encode()).hexdigest())
-        # Structured objects and scalars are never withheld: the spill key-redacts them.
-        for value in ({'important_action': 'delete_prod_db'}, 7, None, True):
-            self.assertEqual(normalized_source({'details': value}, [{'kind': 'withhold', 'paths': ['details'], 'match': '.'}]), {'details': value})
-        empty = {'logEvents': []}
-        self.assertEqual(normalized_source(empty, [{'kind': 'withhold', 'paths': ['logEvents'], 'match': r'^\[[^\]]'}]), empty)
-
-    def test_withhold_after_failed_unpack(self):
-        # A KV line that cannot be unpacked is withheld instead of kept as text.
-        steps = [KV, {'kind': 'withhold', 'paths': ['message'], 'match': '^(type|operationType)='}]
-        ok = {'@timestamp': 't', 'message': 'type="LOGIN", username="a"'}
-        self.assertEqual(normalized_source(ok, steps, fake_kv), {'@timestamp': 't', 'type': 'LOGIN', 'username': 'a'})
-        collide = {'type': 'forwarder', 'message': 'type="LOGIN", password="s3cr3t"'}
-        out = normalized_source(collide, steps, fake_kv)
-        self.assertEqual(out['type'], 'forwarder')
-        self.assertTrue(out['message']['withheld'])
-        self.assertNotIn('s3cr3t', json.dumps(out))
-
     def test_unknown_kind_fails(self):
         with self.assertRaises(AssertionError):
             normalized_source({}, [{'kind': 'nope'}])
@@ -527,9 +291,7 @@ class NormalizeProbeTests(unittest.TestCase):
         self.assertEqual(len(probes), len(steps))
         for _name, event in probes:
             normalized = normalized_source(json.loads(event['message']), steps, parse_kv)
-            leaves = [v for _, v in fcc.flatten(normalized)]
-            self.assertIn(fcc.NORMALIZE_UNKNOWN, leaves)
-            self.assertIn('nan2421-secret', leaves)
+            self.assertIn(fcc.NORMALIZE_UNKNOWN, [v for _, v in fcc.flatten(normalized)])
         return probes
 
     def test_each_kind(self):
@@ -540,26 +302,12 @@ class NormalizeProbeTests(unittest.TestCase):
                           [{'kind': 'unwrap_single', 'path': 'logEvents'},
                            {'kind': 'parse_json_object', 'paths': ['logEvents.message', 'message'], 'target': 'message_json'}])
 
-    def test_withhold_probe(self):
-        steps = [KV, {'kind': 'withhold', 'paths': ['message'], 'match': '^(type|operationType)='}]
-        samples = [('ok', {'message': json.dumps({'message': 'type="LOGIN"'})}),
-                   ('collide', {'message': json.dumps({'type': 'f', 'message': 'type="LOGIN"'})})]
-        probes = normalize_probes(samples, steps, fake_kv)
-        self.assertEqual([n for n, _ in probes], ['normalize_probe_0', 'withhold_probe_1'])
-        withheld = normalized_source(json.loads(probes[1][1]['message']), steps, fake_kv)
-        self.assertTrue(withheld['message']['withheld'])
-        with self.assertRaises(AssertionError):
-            normalize_probes(samples[:1], steps, fake_kv)
-
-    def test_probe_tail_key_and_decoded_keep(self):
-        step = dict(KV, tail_key='representation')
+    def test_probe_tail_key(self):
+        step = dict(KV, tail_keys=['representation'])
         samples = [('tail', {'message': json.dumps({'message': 'operationType=CREATE, realmId=r1, representation={"id":"1"}'})})]
         [(_, event)] = normalize_probes(samples, [step], fake_kv)
         planted = json.loads(event['message'])['message']
         self.assertTrue(planted.endswith(', representation={"id":"1"}'), planted)
-        keep = {'kind': 'parse_json_object', 'paths': ['representation'], 'target': 'representation_json', 'keep': ['id']}
-        decoded = [('obj', {'message': json.dumps({'representation': {'id': '1', 'x': 2}})})]
-        self.assertEqual([n for n, _ in normalize_probes(decoded, [keep])], ['withhold_probe_0'])
 
     def test_unexercised_step_fails(self):
         with self.assertRaises(AssertionError):
@@ -567,13 +315,12 @@ class NormalizeProbeTests(unittest.TestCase):
         self.assertIsNone(inject_probe({'message': 'plain'}, KV))
 
     def test_probe_catches_a_lossy_parser(self):
-        # A parser that drops the injected pair (or leaks the secret) fails.
         [(_, event)] = self.assert_probe({'@timestamp': 't', 'message': 'type="LOGIN"'}, [KV])
         probe = json.loads(event['message'])
         expected = normalized_source(probe, [KV], fake_kv)
         lossy = {k: v for k, v in expected.items() if k != 'NormalizeProbe'}
         self.assertNotEqual(lossy, expected)
-        output = {'activity_name': 'Logon', 'time': 1, 'unmapped': {'@timestamp': 't', 'type': 'LOGIN', 'client_secret': '<redacted>'}}
+        output = {'activity_name': 'Logon', 'time': 1, 'unmapped': {'@timestamp': 't', 'type': 'LOGIN'}}
         with self.assertRaises(AssertionError):
             check(expected, output, event['message'], [])
         output['unmapped']['normalize_probe'] = fcc.NORMALIZE_UNKNOWN

@@ -1,0 +1,966 @@
+name: osquery_ocsf
+display_name: osquery (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields, unaltered, in dotted snake_case unmapped keys.
+  Parses osquery logs (osqueryd results log in the default event format, plus the
+  status log as written by the tls, kafka, kinesis, firehose and other JSON logger
+  plugins) into complete OCSF 1.9.0 records carrying the host profile. Result rows
+  are mapped by the scheduled query name (pack prefixes such as
+  pack_incident-response_ are fine): processes / process_events -> Process
+  Activity (1007, added = Launch, removed = Terminate); listening_ports ->
+  Network Activity (4001, added = Listen, removed = Close); logged_in_users ->
+  Authentication (3002, added = Logon, removed = Logoff; only rows naming a
+  user, so boot_time / run_level / dead utmp records stay Base Events);
+  file_events -> File
+  System Activity (1001, the FIM action mapped to Create / Update / Delete /
+  Rename / Set Attributes / Open / Read, with md5 / sha1 / sha256 on
+  file.hashes; no acting process is known, so actor.app_name is "unknown"
+  rather than an invented pid). Every other query is a Base Event whose columns are kept under
+  unmapped.columns.*. hostIdentifier and the host_uuid / hostname decorations
+  land on device. One row per event: a snapshot or a batched diffResults record
+  with a single row is mapped like an event row; one with several rows is kept
+  whole as a Base Event with its row count (fan-out is not supported, so run
+  osqueryd with --logger_snapshot_event_type=true and the default
+  --logger_event_type=true to get one row per line). Status log lines are Base Events with their glog severity. Anything
+  unparsable falls back to Base Event with the raw line kept.
+match_values:
+  - osquery
+category: endpoint
+vendor: "osquery"
+product: "osquery"
+parser_vrl: |
+  # osquery results / status log -> OCSF 1.9.0
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+
+  parsed, err = parse_json(raw_log)
+  __source_kv = object(parsed) ?? {}
+  p = object(parsed) ?? {}
+  qname = to_string(p.name) ?? ""
+  is_status = p.filename != null && p.message != null && p.columns == null
+  is_result = qname != "" && (p.columns != null || p.snapshot != null || p.diffResults != null)
+
+  # ---- device, common to both logs ----
+  host_id = to_string(p.hostIdentifier) ?? ""
+  deco = object(p.decorations) ?? {}
+  device = { "type_id": 0, "type": "Unknown" }
+  host_uuid = to_string(deco.host_uuid) ?? ""
+  if host_uuid != "" { device.uid = host_uuid }
+  deco_host = to_string(deco.hostname) ?? ""
+  if deco_host != "" { device.hostname = deco_host }
+  if host_id != "" {
+      if match(host_id, r'^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$') {
+          if !exists(device.uid) { device.uid = host_id }
+      } else if !exists(device.hostname) {
+          device.hostname = host_id
+      }
+  }
+  if !exists(device.hostname) && !exists(device.uid) { device.hostname = "unknown" }
+
+  logged_ms = 0
+  unix_raw = p.unixTime
+  if unix_raw != null {
+      unix_s = to_int(unix_raw) ?? 0
+      if unix_s > 0 { logged_ms = unix_s * 1000 }
+  }
+
+  product = { "name": "osquery", "vendor_name": "osquery" }
+  osq_ver = to_string(p.version) ?? ""
+  if osq_ver != "" { product.version = osq_ver }
+
+  metadata = {
+      "version": "1.9.0",
+      "profiles": ["host"],
+      "uid": sha2("osquery|raw|" + raw_log, variant: "SHA-256"),
+      "log_name": "osquery results",
+      "log_provider": "osquery",
+      "product": product
+  }
+  if logged_ms > 0 { metadata.logged_time = logged_ms }
+
+  if err != null || !is_object(parsed) || (!is_status && !is_result) {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": logged_ms,
+          "message": "Unrecognized osquery log line",
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("osquery|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "osquery",
+              "product": { "name": "osquery", "vendor_name": "osquery" }
+          }
+      }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+  } else if is_status {
+      # ---- status log: glog severity 0 INFO, 1 WARNING, 2 ERROR, 3 FATAL ----
+      sev_num = to_int(p.severity) ?? 0
+      severity_id = 1
+      severity = "Informational"
+      log_level = "INFO"
+      if sev_num == 1 { severity_id = 3; severity = "Medium"; log_level = "WARNING" }
+      if sev_num == 2 { severity_id = 4; severity = "High"; log_level = "ERROR" }
+      if sev_num == 3 { severity_id = 6; severity = "Fatal"; log_level = "FATAL" }
+      metadata.log_name = "osquery status"
+      metadata.log_level = log_level
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": 99,
+          "status": "Other",
+          "time": logged_ms,
+          "message": to_string(p.message) ?? "",
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "device": device
+      }
+  } else {
+      # ---- pick the row: event format, or a single-row snapshot / batch ----
+      action = downcase(to_string(p.action) ?? "")
+      row = object(p.columns) ?? {}
+      multi_count = 0
+      if p.columns == null {
+          snap = array(p.snapshot) ?? []
+          if length(snap) == 1 {
+              row = object(get(snap, [0]) ?? {}) ?? {}
+              action = "snapshot"
+          } else if p.snapshot != null {
+              multi_count = length(snap)
+              action = "snapshot"
+          }
+          dr = object(p.diffResults) ?? {}
+          added = array(dr.added) ?? []
+          removed = array(dr.removed) ?? []
+          total = length(added) + length(removed)
+          if total == 1 {
+              if length(added) == 1 { row = object(get(added, [0]) ?? {}) ?? {}; action = "added" }
+              if length(removed) == 1 { row = object(get(removed, [0]) ?? {}) ?? {}; action = "removed" }
+          } else if total > 1 {
+              multi_count = total
+              action = "batch"
+          }
+      }
+
+      n = downcase(qname)
+      kind = "generic"
+      row_pid = -1
+      if row.pid != null { row_pid = to_int(row.pid) ?? -1 }
+      if match(n, r'(?:^|_)process(?:es|_events)$') && row_pid >= 0 { kind = "process" }
+      if match(n, r'(?:^|_)listening_ports$') && row.port != null { kind = "listen" }
+      # utmp also holds boot_time / run_level / init / dead records with no user;
+      # only a row naming a user is a session.
+      login_user = to_string(row.user) ?? ""
+      login_type = downcase(to_string(row.type) ?? "")
+      if match(n, r'(?:^|_)logged_in_users$') && login_user != "" && !includes(["boot_time", "run_level", "init", "dead", "new_time", "old_time", "accounting"], login_type) { kind = "login" }
+      if match(n, r'(?:^|_)file_events$') && row.target_path != null { kind = "file" }
+      if multi_count > 0 || length(keys(row)) == 0 { kind = "generic" }
+
+      metadata.event_code = qname
+
+      # Row clock: evented tables carry the event time in `time` (seconds).
+      row_ms = 0
+      if row.time != null {
+          row_s = to_int(row.time) ?? 0
+          if row_s > 0 { row_ms = row_s * 1000 }
+      }
+      time_ms = logged_ms
+      if row_ms > 0 { time_ms = row_ms }
+
+      base = {
+          "severity_id": 1,
+          "severity": "Informational",
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "device": device
+      }
+
+      if kind == "process" {
+          process = {}
+          pid = row_pid
+          process.pid = pid
+          ppath = to_string(row.path) ?? ""
+          pname = to_string(row.name) ?? ""
+          if ppath != "" {
+              pparts = split(ppath, "/")
+              pbase = to_string(get(pparts, [length(pparts) - 1]) ?? "") ?? ""
+              if pbase == "" { pbase = ppath }
+              if pname == "" { pname = pbase }
+              process.file = { "path": ppath, "name": pbase, "type_id": 1, "type": "Regular File" }
+          }
+          if pname != "" { process.name = pname }
+          pcmd = to_string(row.cmdline) ?? ""
+          if pcmd != "" { process.cmd_line = pcmd }
+          pcwd = to_string(row.cwd) ?? ""
+          if pcwd != "" { process.working_directory = pcwd }
+          if row.uid != null {
+              puid = to_int(row.uid) ?? -1
+              if puid >= 0 { process.user = { "uid": to_string(puid) } }
+          }
+          if row.start_time != null {
+              pst = to_int(row.start_time) ?? 0
+              if pst > 0 { process.created_time = pst * 1000 }
+          }
+          actor = {}
+          if row.parent != null {
+              ppid = to_int(row.parent) ?? -1
+              if ppid >= 0 {
+                  process.parent_process = { "pid": ppid }
+                  actor.process = { "pid": ppid }
+              }
+          }
+          if row.auid != null {
+              pauid = to_int(row.auid) ?? -1
+              if pauid >= 0 && pauid < 4294967295 { actor.user = { "uid": to_string(pauid) } }
+          }
+          # Actor is required. With no parent or audit uid the launcher is unknown:
+          # app_name says so without inventing a pid (pid 0 is a real kernel pid).
+          if length(keys(actor)) == 0 { actor.app_name = "unknown" }
+          activity_id = 99
+          activity_name = "Other"
+          if action == "added" { activity_id = 1; activity_name = "Launch" }
+          if action == "removed" { activity_id = 2; activity_name = "Terminate" }
+          . = merge(base, {
+              "class_uid": 1007,
+              "class_name": "Process Activity",
+              "category_uid": 1,
+              "category_name": "System Activity",
+              "activity_id": activity_id,
+              "activity_name": activity_name,
+              "type_uid": 100700 + activity_id,
+              "status_id": 1,
+              "status": "Success",
+              "message": "osquery " + qname + " " + action + ": " + pname + " pid " + to_string(pid),
+              "process": process,
+              "actor": actor
+          })
+      } else if kind == "listen" {
+          lport = to_int(row.port) ?? 0
+          dst_endpoint = { "port": lport }
+          laddr = to_string(row.address) ?? ""
+          if is_ipv4(laddr) || is_ipv6(laddr) { dst_endpoint.ip = downcase(laddr) }
+          connection_info = { "direction_id": 0, "direction": "Unknown" }
+          lproto = to_int(row.protocol) ?? -1
+          if lproto >= 0 { connection_info.protocol_num = lproto }
+          if lproto == 6 { connection_info.protocol_name = "tcp" }
+          if lproto == 17 { connection_info.protocol_name = "udp" }
+          if lproto == 132 { connection_info.protocol_name = "sctp" }
+          if is_ipv4(laddr) { connection_info.protocol_ver_id = 4; connection_info.protocol_ver = "Internet Protocol version 4 (IPv4)" }
+          if is_ipv6(laddr) { connection_info.protocol_ver_id = 6; connection_info.protocol_ver = "Internet Protocol version 6 (IPv6)" }
+          activity_id = 7
+          activity_name = "Listen"
+          if action == "removed" { activity_id = 2; activity_name = "Close" }
+          ocsf = merge(base, {
+              "class_uid": 4001,
+              "class_name": "Network Activity",
+              "category_uid": 4,
+              "category_name": "Network Activity",
+              "activity_id": activity_id,
+              "activity_name": activity_name,
+              "type_uid": 400100 + activity_id,
+              "status_id": 1,
+              "status": "Success",
+              "message": "osquery " + qname + " " + action + ": " + laddr + ":" + to_string(lport),
+              "dst_endpoint": dst_endpoint,
+              "connection_info": connection_info
+          })
+          if row.pid != null {
+              lpid = to_int(row.pid) ?? -1
+              if lpid > 0 {
+                  lproc = { "pid": lpid }
+                  lpath = to_string(row.path) ?? ""
+                  if lpath != "" {
+                      lparts = split(lpath, "/")
+                      lbase = to_string(get(lparts, [length(lparts) - 1]) ?? "") ?? ""
+                      if lbase == "" { lbase = lpath }
+                      lproc.file = { "path": lpath, "name": lbase, "type_id": 1, "type": "Regular File" }
+                      lproc.name = lbase
+                  }
+                  ocsf.actor = { "process": lproc }
+              }
+          }
+          . = ocsf
+      } else if kind == "login" {
+          uname = to_string(row.user) ?? ""
+          user = { "name": uname }
+          rhost = to_string(row.host) ?? ""
+          session = {}
+          tty = to_string(row.tty) ?? ""
+          if tty != "" { session.terminal = tty }
+          sid = to_string(row.sid) ?? ""
+          if sid != "" { session.uid = sid }
+          login_ms = 0
+          if row.time != null {
+              lt = to_int(row.time) ?? 0
+              if lt > 0 { login_ms = lt * 1000; session.created_time = login_ms }
+          }
+          is_remote = is_ipv4(rhost) || is_ipv6(rhost) || (rhost != "" && !starts_with(rhost, ":"))
+          if length(keys(session)) > 0 { session.is_remote = is_remote }
+          dst_host = to_string(device.hostname)
+          if dst_host == "" { dst_host = "unknown" }
+          activity_id = 1
+          activity_name = "Logon"
+          if action == "removed" { activity_id = 2; activity_name = "Logoff" }
+          # A removed row means the session ended; its row time is the logon.
+          if action == "removed" { base.time = logged_ms }
+          ocsf = merge(base, {
+              "class_uid": 3002,
+              "class_name": "Authentication",
+              "category_uid": 3,
+              "category_name": "Identity & Access Management",
+              "activity_id": activity_id,
+              "activity_name": activity_name,
+              "type_uid": 300200 + activity_id,
+              "status_id": 1,
+              "status": "Success",
+              "message": "osquery " + qname + " " + action + ": " + uname,
+              "user": user,
+              "is_remote": is_remote,
+              "dst_endpoint": { "hostname": dst_host }
+          })
+          if rhost != "" {
+              if is_ipv4(rhost) || is_ipv6(rhost) {
+                  ocsf.src_endpoint = { "ip": downcase(rhost) }
+              } else {
+                  ocsf.src_endpoint = { "hostname": rhost }
+              }
+          }
+          if length(keys(session)) > 0 { ocsf.session = session }
+          if row.pid != null {
+              spid = to_int(row.pid) ?? -1
+              if spid > 0 {
+                  sproc = { "pid": spid }
+                  spname = to_string(row.name) ?? ""
+                  if spname != "" { sproc.name = spname }
+                  spcmd = to_string(row.cmdline) ?? ""
+                  if spcmd != "" { sproc.cmd_line = spcmd }
+                  ocsf.actor = { "process": sproc }
+              }
+          }
+          . = ocsf
+      } else if kind == "file" {
+          fpath = to_string(row.target_path) ?? ""
+          fparts = split(fpath, "/")
+          fbase = to_string(get(fparts, [length(fparts) - 1]) ?? "") ?? ""
+          if fbase == "" { fbase = fpath }
+          file = { "path": fpath, "name": fbase, "type_id": 0, "type": "Unknown" }
+          if length(fparts) > 1 {
+              parent_folder = join!(slice!(fparts, 0, length(fparts) - 1), "/")
+              if parent_folder != "" { file.parent_folder = parent_folder }
+          }
+          if row.inode != null {
+              inode = to_int(row.inode) ?? 0
+              if inode > 0 { file.uid = to_string(inode) }
+          }
+          if row.size != null { file.size = to_int(row.size) ?? 0 }
+          if row.uid != null {
+              fuid = to_int(row.uid) ?? -1
+              if fuid >= 0 { file.owner = { "uid": to_string(fuid) } }
+          }
+          if row.mtime != null {
+              mt = to_int(row.mtime) ?? 0
+              if mt > 0 { file.modified_time = mt * 1000 }
+          }
+          if row.atime != null {
+              at = to_int(row.atime) ?? 0
+              if at > 0 { file.accessed_time = at * 1000 }
+          }
+          hashes = []
+          md5 = to_string(row.md5) ?? ""
+          if md5 != "" { hashes = push(hashes, { "algorithm_id": 1, "algorithm": "MD5", "value": md5 }) }
+          sha1 = to_string(row.sha1) ?? ""
+          if sha1 != "" { hashes = push(hashes, { "algorithm_id": 2, "algorithm": "SHA-1", "value": sha1 }) }
+          sha256 = to_string(row.sha256) ?? ""
+          if sha256 != "" { hashes = push(hashes, { "algorithm_id": 3, "algorithm": "SHA-256", "value": sha256 }) }
+          if length(hashes) > 0 { file.hashes = hashes }
+          fim_action = upcase(to_string(row.action) ?? "")
+          activity_id = 99
+          activity_name = "Other"
+          if fim_action == "CREATED" { activity_id = 1; activity_name = "Create" }
+          if fim_action == "ACCESSED" { activity_id = 2; activity_name = "Read" }
+          if fim_action == "UPDATED" { activity_id = 3; activity_name = "Update" }
+          if fim_action == "DELETED" { activity_id = 4; activity_name = "Delete" }
+          if fim_action == "MOVED_FROM" || fim_action == "MOVED_TO" { activity_id = 5; activity_name = "Rename" }
+          if fim_action == "ATTRIBUTES_MODIFIED" { activity_id = 6; activity_name = "Set Attributes" }
+          if fim_action == "OPENED" { activity_id = 14; activity_name = "Open" }
+          ocsf = merge(base, {
+              "class_uid": 1001,
+              "class_name": "File System Activity",
+              "category_uid": 1,
+              "category_name": "System Activity",
+              "activity_id": activity_id,
+              "activity_name": activity_name,
+              "type_uid": 100100 + activity_id,
+              "status_id": 1,
+              "status": "Success",
+              "message": "osquery " + qname + ": " + fim_action + " " + fpath,
+              "file": file,
+              # FIM events carry no actor; app_name says it is unknown without
+              # inventing a pid.
+              "actor": { "app_name": "unknown" }
+          })
+          . = ocsf
+      } else {
+          # ---- any other query: Base Event, its columns kept in unmapped ----
+          msg = "osquery " + qname + " " + action
+          if multi_count > 0 { msg = msg + " (" + to_string(multi_count) + " rows)" }
+          ocsf = merge(base, {
+              "class_uid": 0,
+              "class_name": "Base Event",
+              "category_uid": 0,
+              "category_name": "Uncategorized",
+              "activity_id": 99,
+              "activity_name": "Other",
+              "type_uid": 99,
+              "status_id": 1,
+              "status": "Success",
+              "message": msg
+          })
+          if multi_count > 0 { ocsf.count = multi_count }
+          . = ocsf
+      }
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # Values spill exactly as parsed: a parser never masks, redacts or withholds
+  # anything (masking is an opt-in pipeline step, never a parser concern).
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __copy = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __copy_json = encode_json(__copy)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__copy_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # unixTime: Epoch seconds converted to the emitted OCSF millisecond timestamp.
+  # unixTime: Epoch seconds converted to the emitted OCSF millisecond timestamp.
+  # columns.time: Epoch seconds converted to the emitted OCSF millisecond timestamp.
+  # columns.time: Epoch seconds converted to the emitted OCSF millisecond timestamp.
+  # columns.start_time: Epoch seconds converted to the emitted OCSF millisecond timestamp.
+  # columns.mtime: Epoch seconds converted to the emitted OCSF millisecond timestamp.
+  # columns.atime: Epoch seconds converted to the emitted OCSF millisecond timestamp.
+  # action: Differential added / removed normalized to Launch / Terminate, Logon / Logoff or Close; consume only when the expected ID is emitted.
+  # action: A listening_ports row that was added is a Listen; consume only when the expected ID is emitted.
+  # columns.action: The FIM action normalized to the OCSF File System Activity activity; consume only when the expected ID is emitted.
+  # severity: The glog status severity normalized to the OCSF severity; consume only when the expected ID is emitted.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        unixTime
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if __mapped."metadata"."logged_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        unixTime
+      | columns\.time
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if __mapped."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        columns\.time
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if __mapped."session"."created_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        columns\.start_time
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if __mapped."process"."created_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        columns\.mtime
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if __mapped."file"."modified_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        columns\.atime
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if __mapped."file"."accessed_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        action
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"added": 1, "removed": 2}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if __mapped."activity_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        action
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"added": 7}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if __mapped."activity_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        columns\.action
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"created": 1, "accessed": 2, "updated": 3, "deleted": 4, "moved_from": 5, "moved_to": 5, "attributes_modified": 6, "opened": 14}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if __mapped."activity_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        severity
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"0": 1, "1": 3, "2": 4, "3": 6}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if __mapped."severity_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    action
+  | columns\.action
+  | columns\.address
+  | columns\.atime
+  | columns\.auid
+  | columns\.cmdline
+  | columns\.cwd
+  | columns\.host
+  | columns\.inode
+  | columns\.md5
+  | columns\.mtime
+  | columns\.name
+  | columns\.parent
+  | columns\.path
+  | columns\.pid
+  | columns\.port
+  | columns\.protocol
+  | columns\.sha1
+  | columns\.sha256
+  | columns\.sid
+  | columns\.size
+  | columns\.start_time
+  | columns\.target_path
+  | columns\.time
+  | columns\.tty
+  | columns\.uid
+  | columns\.user
+  | decorations\.host_uuid
+  | decorations\.hostname
+  | hostIdentifier
+  | message
+  | name
+  | severity
+  | unixTime
+  | version
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if !contains(__consumed, __token) && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # The canonical source spill above is the authoritative representation of
+  # containers. The cheap conditions run first; the source value set is built on
+  # first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, as-is. These
+  # entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__copy.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+# Sample provenance (sidecar samples/ directory). Host names, host UUIDs and
+# IPs are replaced with documentation values.
+#   osq_processes_added.json, osq_processes_removed.json,
+#   osq_snapshot_multi_row.json, osq_batched_diff_results.json:
+#     osquery docs, "Logging" (differential, snapshot and batched formats)
+#     https://github.com/osquery/osquery/blob/master/docs/wiki/deployment/logging.md
+#   osq_file_events_attributes.json: the FIM docs sample row in the results-log
+#     envelope https://github.com/osquery/osquery/blob/master/docs/wiki/deployment/file-integrity-monitoring.md
+#   osq_file_events_created.json, osq_process_events.json,
+#   osq_listening_ports.json, osq_logged_in_users.json,
+#   osq_logged_in_users_removed.json: rows built on the osquery table specs and
+#     the incident-response pack query names
+#     https://github.com/osquery/osquery/tree/master/specs
+#     https://github.com/osquery/osquery/blob/master/packs/incident-response.conf
+#   osq_generic_mounts_removed.json, osq_generic_kernel_info.json:
+#     Elastic integrations test fixture
+#     https://github.com/elastic/integrations/blob/main/packages/osquery/data_stream/result/_dev/test/pipeline/test-osquery.log
+#   osq_status_info.json, osq_status_error.json: status log key set from the
+#     JSON status serializer https://github.com/osquery/osquery/blob/master/plugins/logger/buffered.cpp
+#   junk.json: a glog text line, Base Event fallback
+samples:
+  - raw: '{"action":"added","columns":{"name":"osqueryd","path":"/opt/osquery/bin/osqueryd","pid":"97830"},"name":"processes","hostIdentifier":"host01.example.com","calendarTime":"Wed Oct  1 00:37:30 2014 UTC","unixTime":1412123850,"epoch":314159265,"counter":1,"numerics":false}'
+    expect:
+      class_uid: 1007
+      activity_id: 1
+      process.pid: 97830
+      process.name: osqueryd
+      process.file.path: /opt/osquery/bin/osqueryd
+      device.hostname: host01.example.com
+      time: 1412123850000
+  - raw: '{"name":"pack_incident-response_listening_ports","hostIdentifier":"host01.example.com","calendarTime":"Tue Aug 18 20:01:40 2026 UTC","unixTime":"1787083300","epoch":"0","counter":"3","numerics":false,"action":"added","columns":{"pid":"3121","port":"4444","protocol":"6","family":"2","address":"0.0.0.0","fd":"3","socket":"1234567","path":"","net_namespace":"4026531840"}}'
+    expect:
+      class_uid: 4001
+      activity_id: 7
+      dst_endpoint.port: 4444
+      connection_info.protocol_name: tcp
+      actor.process.pid: 3121
+  - raw: '{"name":"file_events","hostIdentifier":"host01.example.com","unixTime":"1429208713","action":"added","columns":{"action":"ATTRIBUTES_MODIFIED","category":"homes","md5":"bf3c734e1e161d739d5bf436572c32bf","target_path":"/root/.ssh/authorized_keys","time":"1429208712","transaction_id":"0"}}'
+    expect:
+      class_uid: 1001
+      activity_id: 6
+      file.path: /root/.ssh/authorized_keys
+      file.parent_folder: /root/.ssh
+      file.hashes.0.value: bf3c734e1e161d739d5bf436572c32bf
+  - raw: '{"hostIdentifier":"host01.example.com","calendarTime":"Tue Aug 18 20:00:05 2026 UTC","unixTime":1787083205,"severity":2,"filename":"tls.cpp","line":242,"message":"TLS/HTTPS POST request failed","version":"5.12.1"}'
+    expect:
+      class_uid: 0
+      severity_id: 4
+      metadata.log_level: ERROR
+      metadata.product.version: 5.12.1
+  # Review P2: no parent / auid -> actor.app_name unknown, never pid 0.
+  - raw: '{"action":"removed","columns":{"name":"osqueryd","path":"/opt/osquery/bin/osqueryd","pid":"97650"},"name":"processes","hostIdentifier":"host01.example.com","unixTime":1412123850}'
+    expect:
+      class_uid: 1007
+      activity_id: 2
+      actor.app_name: unknown
+      actor.process: <missing>
+  # A real parent pid 0 (kthreadd) is kept as the real value it is.
+  - raw: '{"action":"added","columns":{"name":"kthreadd","path":"","pid":"2","parent":"0","uid":"0"},"name":"pack_incident-response_processes","hostIdentifier":"host01.example.com","unixTime":1787083600}'
+    expect:
+      class_uid: 1007
+      process.pid: 2
+      actor.process.pid: 0
+      process.parent_process.pid: 0
+  # Review P2: a non-numeric pid is not a process row.
+  - raw: '{"action":"added","columns":{"name":"x","path":"/bin/x","pid":""},"name":"processes","hostIdentifier":"host01.example.com","unixTime":1787083600}'
+    expect:
+      class_uid: 0
+  # Review P2: a boot_time utmp record is not a logon.
+  - raw: '{"action":"added","columns":{"type":"boot_time","user":"","tty":"~","host":"6.1.0-18-amd64","time":"1787000000","pid":"0","sid":"","registry_hive":""},"name":"pack_incident-response_logged_in_users","hostIdentifier":"host01.example.com","unixTime":1787083600}'
+    expect:
+      class_uid: 0
+  # Review P2: the listening process gets its name.
+  - raw: '{"action":"added","columns":{"pid":"811","port":"22","protocol":"6","family":"2","address":"0.0.0.0","fd":"3","socket":"20145","path":"/usr/sbin/sshd","net_namespace":"4026531840"},"name":"pack_incident-response_listening_ports","hostIdentifier":"host01.example.com","unixTime":1787083600}'
+    expect:
+      actor.process.name: sshd
+      actor.process.file.path: /usr/sbin/sshd
+  - raw: '{"name":"file_events","hostIdentifier":"host01.example.com","unixTime":"1429208713","action":"added","columns":{"action":"DELETED","target_path":"/etc/cron.d/backdoor","time":"1429208712"}}'
+    expect:
+      class_uid: 1001
+      activity_id: 4
+      actor.app_name: unknown
+      actor.process: <missing>
+  - raw: "I0818 20:00:00.000000 12345 scheduler.cpp:83] Executing scheduled query"
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: unparsable input
