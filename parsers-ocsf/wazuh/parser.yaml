@@ -1,12 +1,14 @@
 name: wazuh_ocsf
 display_name: Wazuh Alerts (OCSF)
-version: "1.0.0"
+version: "1.1.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses Wazuh manager alerts (alerts.json, one JSON alert per line, or the
   same alert as a wazuh-alerts-* indexer document) into OCSF 1.9.0 with the
-  host and security_control profiles. A syscheck / FIM alert on a file is a
+  host and security_control profiles. A syscheck / FIM alert on a file (not
+  a registry key or value: [x64] HKEY_..., short hives such as HKLM\, or a
+  syscheck_registry rule) is a
   "File System Activity" (1001): syscheck.event added / modified / deleted is
   Create / Update / Delete, the file carries path, parent folder, size, MD5 /
   SHA-1 / SHA-256 and owner (the _after values, or _before for a deletion),
@@ -15,10 +17,10 @@ description: >
   rule as the analytic (uid = rule.id, name = rule.description, category =
   decoder), rule.groups as finding types and metadata.labels, full_log as the
   finding description and the decoded data (srcip / srcport, dstip /
-  dstport, dstuser / srcuser, Windows eventdata image / processId /
-  targetObject) as evidences. rule.level 0-15 maps to severity_id the way
+  dstport, dstuser / srcuser, Windows eventdata image or newProcessName,
+  decimal or hex processId / newProcessId, targetObject) as evidences. rule.level 0-15 maps to severity_id the way
   Wazuh's own OCSF converter does (15 Critical, 11-14 High, 8-10 Medium, 4-7
-  Low, 0-3 Informational); rule.mitre id / tactic / technique become attacks
+  Low, 0-3 Informational; no level is Unknown); rule.mitre id / tactic / technique become attacks
   with sub-techniques split out; rule.firedtimes is count; the agent is the
   device and the manager the reporter; location is metadata.log_name.
   Compliance mappings (pci_dss, gdpr, hipaa, nist_800_53, tsc, gpg13) are kept
@@ -80,7 +82,9 @@ parser_vrl: |
 
       # ---- severity: rule.level 0-15, normalized as Wazuh's own OCSF
       # converter does (15 Critical, 11-14 High, 8-10 Medium, 4-7 Low, 0-3 Info)
-      level = to_int(rule.level) ?? -1
+      # to_int(null) is 0, so an alert without a level stays Unknown.
+      level = -1
+      if rule.level != null { level = to_int(rule.level) ?? -1 }
       severity_id = 0
       severity = "Unknown"
       if level >= 0 { severity_id = 1; severity = "Informational" }
@@ -158,7 +162,10 @@ parser_vrl: |
       sc = object(e.syscheck) ?? {}
       fim_path = to_string(sc.path) ?? ""
       fim_event = downcase(to_string(sc.event) ?? "")
-      is_file = fim_path != "" && !match(fim_path, r'^\x5Bx') && !starts_with(upcase(fim_path), "HKEY_")
+      # Registry FIM ([x64] HKEY_..., HKLM\..., or a syscheck_registry rule)
+      # stays a Detection Finding; only file paths are File System Activity.
+      is_registry = includes(groups, "syscheck_registry") || includes(groups, "syscheck_registry_value") || includes(groups, "syscheck_registry_key") || sc.value_name != null || sc.value_type != null || match(upcase(fim_path), r'^(?:\x5BX(?:32|64)\x5D\s*)?(?:HKEY_|HK(?:LM|CU|CR|U|CC)(?:\\|$))')
+      is_file = fim_path != "" && !is_registry
 
       if is_file {
           # ---- File System Activity for a syscheck file alert ----
@@ -240,6 +247,8 @@ parser_vrl: |
               "type_uid": 100100 + activity_id,
               "severity_id": severity_id,
               "severity": severity,
+              "status_id": 1,
+              "status": "Success",
               "time": time_ms,
               "message": rule_desc,
               "raw_data": raw_log,
@@ -275,15 +284,47 @@ parser_vrl: |
           if tuser != "" { ev.user = { "name": tuser } }
           wed = object(get(d, ["win", "eventdata"]) ?? {}) ?? {}
           image = to_string(wed.image) ?? ""
+          if image == "" { image = to_string(wed.newProcessName) ?? "" }
           if image != "" {
               ip_parts = split(image, r'[/\\]')
               ibase = to_string(get(ip_parts, [length(ip_parts) - 1]) ?? "") ?? ""
               if ibase == "" { ibase = image }
-              proc = { "pid": to_int(wed.processId) ?? 0, "name": ibase, "file": { "path": image, "name": ibase, "type_id": 1, "type": "Regular File" } }
+              # Sysmon writes decimal pids, Security events hex (0x2d0).
+              # In a 4688, newProcessId is the new process and processId its creator.
+              wpid_s = downcase(to_string(wed.processId) ?? "")
+              ppid_s = ""
+              if wed.newProcessId != null {
+                  ppid_s = wpid_s
+                  wpid_s = downcase(to_string(wed.newProcessId) ?? "")
+              }
+              wpid = null
+              if starts_with(wpid_s, "0x") { wpid = parse_int(slice!(wpid_s, 2), base: 16) ?? null } else if match(wpid_s, r'^\d+$') { wpid = to_int(wpid_s) ?? null }
+              proc = { "name": ibase, "file": { "path": image, "name": ibase, "type_id": 1, "type": "Regular File" } }
+              if wpid != null { proc.pid = wpid }
+              wppid = null
+              if starts_with(ppid_s, "0x") { wppid = parse_int(slice!(ppid_s, 2), base: 16) ?? null } else if match(ppid_s, r'^\d+$') { wppid = to_int(ppid_s) ?? null }
+              if wppid != null {
+                  proc.parent_process = { "pid": wppid }
+                  pname = to_string(wed.parentProcessName) ?? ""
+                  if pname != "" {
+                      pnp = split(pname, r'[/\\]')
+                      pnb = to_string(get(pnp, [length(pnp) - 1]) ?? "") ?? ""
+                      if pnb == "" { pnb = pname }
+                      proc.parent_process.name = pnb
+                      proc.parent_process.file = { "path": pname, "name": pnb, "type_id": 1, "type": "Regular File" }
+                  }
+              }
               pguid = to_string(wed.processGuid) ?? ""
               if pguid != "" { proc.uid = pguid }
+              # The OCSF process needs a pid or uid; neither known means an
+              # event-scoped uid rather than a fabricated pid 0.
+              if !exists(proc.pid) && !exists(proc.uid) { proc.uid = "wazuh|" + alert_id + "|" + image }
               puser = to_string(wed.user) ?? ""
               if puser != "" { proc.user = { "name": puser } }
+              if !exists(proc.user) {
+                  suser = to_string(wed.subjectUserName) ?? ""
+                  if suser != "" { proc.user = { "name": suser } }
+              }
               pcmd = to_string(wed.commandLine) ?? ""
               if pcmd != "" { proc.cmd_line = pcmd }
               ev.process = proc
@@ -407,6 +448,7 @@ parser_vrl: |
   # syscheck.sha256_after: Parser lowercases file hashes; consume only when the normalized value is emitted.
   # syscheck.md5_before: Parser lowercases file hashes; consume only when the normalized value is emitted.
   # syscheck.sha1_before: Parser lowercases file hashes; consume only when the normalized value is emitted.
+  # syscheck.sha256_before: Parser lowercases file hashes; consume only when the normalized value is emitted.
   # syscheck.event: The FIM event drives the File System Activity (Create / Update / Delete); consume only when that activity is emitted.
   for_each(flatten(__source_kv)) -> |key, value| {
       if match(key, r'(?x)
@@ -429,6 +471,7 @@ parser_vrl: |
       | syscheck\.sha256_after
       | syscheck\.md5_before
       | syscheck\.sha1_before
+      | syscheck\.sha256_before
       )\z') {
           __value = value
           if is_string(__value) {
@@ -467,6 +510,10 @@ parser_vrl: |
   | data\.win\.eventdata\.processId
   | data\.win\.eventdata\.targetObject
   | data\.win\.eventdata\.user
+  | data\.win\.eventdata\.newProcessId
+  | data\.win\.eventdata\.newProcessName
+  | data\.win\.eventdata\.subjectUserName
+  | data\.win\.eventdata\.parentProcessName
   | decoder\.name
   | full_log
   | id
@@ -745,6 +792,11 @@ parser_vrl: |
 #     built from the syscheck alert field set (rules 554 / 553, whodata audit)
 #     https://github.com/wazuh/wazuh-dashboard-plugins/blob/main/plugins/main/server/lib/generate-alerts/sample-data/integrity-monitoring.js
 #     https://documentation.wazuh.com/current/user-manual/capabilities/file-integrity/index.html
+#   wazuh_win_security_4688_hex_pid.json, wazuh_syscheck_registry_short_hive.json:
+#     alerts built from the Windows eventchannel and registry FIM field sets
+#     (newProcessId as hex, a short-hive HKLM\ path with syscheck_registry)
+#     https://documentation.wazuh.com/current/user-manual/capabilities/file-integrity/windows-registry-monitoring.html
+#     https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4688
 #   junk.json: a wazuh-analysisd log line, Base Event fallback
 #   severity normalization: https://github.com/wazuh/wazuh-indexer/blob/4.10.6/integrations/amazon-security-lake/src/wazuh_ocsf_converter.py
 samples:
@@ -788,6 +840,23 @@ samples:
       class_uid: 2004
       severity_id: 4
       evidences.0.src_endpoint.port: 55348
+  - raw: '{"timestamp":"2024-02-12T09:14:22.318+0000","rule":{"level":3,"description":"A process was created.","id":"67027","groups":["windows","windows_security"]},"agent":{"id":"005","name":"WIN-SRV-01"},"id":"1707729262.4482211","data":{"win":{"eventdata":{"subjectUserName":"alice","newProcessId":"0x2d0","newProcessName":"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe","commandLine":"powershell.exe -NoProfile"}}},"location":"EventChannel"}'
+    expect:
+      class_uid: 2004
+      evidences.0.process.pid: 720
+      evidences.0.process.name: powershell.exe
+      evidences.0.process.user.name: alice
+      evidences.0.process.parent_process: <missing>
+  - raw: '{"timestamp":"2024-02-12T09:20:01.004+0000","rule":{"level":5,"description":"Registry Value Integrity Checksum Changed","id":"750","groups":["ossec","syscheck","syscheck_registry"]},"agent":{"id":"005","name":"WIN-SRV-01"},"id":"1707729601.4490102","syscheck":{"path":"HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run","value_name":"Updater","event":"modified"},"location":"syscheck"}'
+    expect:
+      class_uid: 2004
+      evidences.0.reg_key.path: HKLM\Software\Microsoft\Windows\CurrentVersion\Run
+  - raw: '{"timestamp":"2024-03-04T11:02:44.006+0000","rule":{"description":"File deleted.","id":"553","groups":["ossec","syscheck"]},"agent":{"id":"001","name":"web-01"},"id":"1709550164.118831","syscheck":{"path":"/tmp/x.bin","event":"deleted","sha256_before":"E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"},"location":"syscheck"}'
+    expect:
+      class_uid: 1001
+      status_id: 1
+      severity_id: 0
+      file.hashes.0.value: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
   - raw: "2024/03/04 10:21:07 wazuh-analysisd: INFO: not an alert"
     expect:
       class_uid: 0

@@ -1,4 +1,16 @@
-source: json
+# The parser scrubs credentials from the line BEFORE parsing it, so the source
+# it maps (and spills) is the scrubbed record, not the raw JSON. It is
+# therefore declared as a text source: the JSON source-equality assertion
+# would demand the live token back. The text probe below injects an unknown
+# key and a password into a JSON sample to keep the residual and redaction
+# probes running.
+source: text
+probe:
+  mode: before
+  anchor: '}'
+  require: '"type":"response"'
+  text: ',"ResidualProbe":"nan2421-text-unknown","password":"nan2421-secret"'
+  source: ResidualProbe
 transforms:
 - source: time
   kind: epoch_ms

@@ -1,6 +1,6 @@
 name: hashicorp_vault_ocsf
 display_name: HashiCorp Vault Audit (OCSF)
-version: "1.0.0"
+version: "1.1.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -23,10 +23,16 @@ description: >
   entry with its response), the entry type as metadata.type and the error as
   status_detail. A response is Success, an entry with an error is Failure
   (permission denied and invalid credentials are Medium severity) and a
-  request entry without one is Unknown. HMAC'd values (hmac-sha256:...) are
-  kept exactly as Vault wrote them and never decoded; a client token is only
-  copied into a column when it is hashed. Anything else falls back to Base
-  Event with the raw record kept.
+  request entry without one is Unknown. A namespace prefix on the path (HCP
+  Vault admin/, Enterprise child namespaces) is stripped before login
+  matching. HMAC'd values (hmac-sha256:...) are kept exactly as Vault wrote
+  them and never decoded. Credentials are never stored: with log_raw=true (or
+  non-HMAC request keys) every Vault token and JWT anywhere in the line, each
+  non-HMAC client / wrap token and X-Vault-Token header, credential fields of
+  request.data / response.data and, in raw mode, all data strings and token
+  accessors are replaced with "<redacted>" before mapping, and raw_data keeps
+  the scrubbed record (re-encoded only when something was scrubbed).
+  Anything else falls back to Base Event with the (scrubbed) raw record kept.
 match_values:
   - hashicorp_vault
 category: security
@@ -37,20 +43,95 @@ parser_vrl: |
   # API Activity (6003), Authentication (3002) for login paths, Base Event (0)
   # HMAC'd values ("hmac-sha256:...") are kept exactly as Vault wrote them;
   # the parser never attempts to reverse them.
-  raw_log = to_string(.message) ?? ""
-  __raw_body = raw_log
+  #
+  # Credentials are never stored. An audit device with log_raw=true (or an
+  # operator's audit_non_hmac_request_keys) writes live tokens, passwords and
+  # secret payloads in clear. Before anything is mapped, and before the record
+  # is kept in raw_data, the parser:
+  #   1. replaces every Vault token (hvs. / hvb. / hvr. / legacy s. b. r.)
+  #      and every JWT anywhere in the line with "<redacted>";
+  #   2. replaces each non-HMAC client_token / token / wrap token and the
+  #      X-Vault-Token header with "<redacted>";
+  #   3. replaces non-HMAC credential fields of request.data / response.data
+  #      (password, token, jwt, secret_id, passcode, private_key, ...) and, when
+  #      the entry is in raw mode, every request.data / response.data string;
+  # and then parses, maps, spills and keeps raw_data from the scrubbed record.
+  raw_in = to_string(.message) ?? ""
+  raw_log = replace(raw_in, r'\b(?:hv[sbr]|[sbr])\.[A-Za-z0-9_\-]{20,}', "<redacted>")
+  raw_log = replace(raw_log, r'eyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]*', "<redacted>")
   __source_kv = {}
   ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
 
   # A syslog audit device prefixes the JSON with a syslog header.
   body = raw_log
+  header = ""
   if !match(body, r'^\s*\x7B') {
-      jm, jerr = parse_regex(body, r'^[^\x7B]*?(?P<json>\x7B.*)$')
-      if jerr == null { body = string!(jm.json) }
+      jm, jerr = parse_regex(body, r'^(?P<header>[^\x7B]*?)(?P<json>\x7B.*)$')
+      if jerr == null { body = string!(jm.json); header = string!(jm.header) }
   }
   parsed, err = parse_json(body)
-  __source_kv = object(parsed) ?? {}
   e = object(parsed) ?? {}
+
+  # ---- credential scrub (see above) ----
+  # A token or JWT found in clear means the device logs raw values.
+  scrubbed = raw_log != raw_in
+  raw_mode = scrubbed
+  for_each([["auth", "client_token"], ["request", "client_token"], ["response", "auth", "client_token"], ["response", "wrap_info", "token"], ["response", "auth", "accessor_token"]]) -> |_i, tp| {
+      tv = get(e, array!(tp)) ?? null
+      if is_string(tv) && tv != "" && !starts_with(string!(tv), "hmac-") {
+          if string!(tv) != "<redacted>" { raw_mode = true }
+          e = set(e, array!(tp), "<redacted>") ?? e
+          scrubbed = true
+      }
+  }
+  # In raw mode token accessors are in clear too; Vault HMACs them otherwise.
+  if raw_mode {
+      for_each([["auth", "accessor"], ["request", "client_token_accessor"], ["response", "auth", "accessor"], ["response", "wrap_info", "accessor"], ["response", "wrap_info", "wrapped_accessor"], ["response", "data", "accessor"]]) -> |_i, ap| {
+          av = get(e, array!(ap)) ?? null
+          if is_string(av) && av != "" && !starts_with(string!(av), "hmac-") {
+              e = set(e, array!(ap), "<redacted>") ?? e
+          }
+      }
+  }
+  for_each(["request", "response"]) -> |_i, side| {
+      hdrs = object(get(e, [side, "headers"]) ?? {}) ?? {}
+      for_each(hdrs) -> |hk, hv| {
+          if match(downcase(hk), r'^(?:x-vault-token|authorization|cookie|set-cookie|x-vault-wrap-token)$') {
+              clean = true
+              for_each(array(hv) ?? [hv]) -> |_j, one| { if !starts_with(to_string(one) ?? "", "hmac-") { clean = false } }
+              if !clean {
+                  e = set(e, [side, "headers", hk], ["<redacted>"]) ?? e
+                  scrubbed = true
+              }
+          }
+      }
+      d = get(e, [side, "data"]) ?? null
+      if raw_mode && d != null {
+          if is_object(d) {
+              d = map_values(object!(d), recursive: true) -> |dv| {
+                  if is_string(dv) && !starts_with(string!(dv), "hmac-") { "<redacted>" } else { dv }
+              }
+          } else if is_array(d) {
+              d = map_values(array!(d), recursive: true) -> |dv| {
+                  if is_string(dv) && !starts_with(string!(dv), "hmac-") { "<redacted>" } else { dv }
+              }
+          } else if is_string(d) && !starts_with(string!(d), "hmac-") {
+              d = "<redacted>"
+          }
+          e = set(e, [side, "data"], d) ?? e
+          scrubbed = true
+      } else if is_object(d) {
+          for_each(object(d) ?? {}) -> |dk, dv| {
+              if match(downcase(dk), r'^(?:password|passcode|token|jwt|id_token|secret|secret_id|client_secret|private_key|key|otp|totp|role_id|signature)$') && dv != null && !starts_with(to_string(dv) ?? "", "hmac-") && dv != "<redacted>" {
+                  e = set(e, [side, "data", dk], "<redacted>") ?? e
+                  scrubbed = true
+              }
+          }
+      }
+  }
+  if scrubbed && is_object(parsed) { raw_log = header + encode_json(e) }
+  __raw_body = raw_log
+  __source_kv = e
   req = object(e.request) ?? {}
   entry_type = downcase(to_string(e.type) ?? "")
   path = to_string(req.path) ?? ""
@@ -92,7 +173,13 @@ parser_vrl: |
       if mount_type == "" { mount_type = to_string(resp.mount_type) ?? "" }
       mount_point = to_string(req.mount_point) ?? ""
       if mount_point == "" { mount_point = to_string(resp.mount_point) ?? "" }
-      is_login = match(path, r'^auth/.+/(?:login|callback)(?:/|$)')
+      # Vault Enterprise / HCP prefix request.path with the namespace path
+      # (admin/auth/userpass/login/alice), so strip it before matching.
+      ns_path = to_string(get(req, ["namespace", "path"]) ?? "") ?? ""
+      rel_path = path
+      if ns_path != "" && starts_with(path, ns_path) { rel_path = slice!(path, strlen(ns_path)) }
+      rel_path = replace(rel_path, r'^/+', "")
+      is_login = match(rel_path, r'^auth/.+/(?:login|callback)(?:/|$)') || (!starts_with(rel_path, "sys/") && match(rel_path, r'/auth/.+/(?:login|callback)(?:/|$)'))
 
       time_ms = 0
       ts = to_string(e.time) ?? ""
@@ -139,7 +226,7 @@ parser_vrl: |
       if umail != "" && !starts_with(umail, "hmac-") { user.email_addr = umail }
       if is_login && !exists(user.name) {
           # The login path names the user for userpass / ldap / okta / radius.
-          lm, lerr = parse_regex(path, r'^auth/.+/login/(?P<name>[^/]+)$')
+          lm, lerr = parse_regex(rel_path, r'(?:^|/)auth/.+/login/(?P<name>[^/]+)$')
           if lerr == null { user.name = string!(lm.name) }
       }
       if !exists(user.name) && !exists(user.uid) { user.name = "unauthenticated" }
@@ -701,6 +788,16 @@ parser_vrl: |
 #     response objects) and its userpass-alice example identity
 #     https://github.com/hashicorp/web-unified-docs/blob/main/content/vault/v2.x/content/docs/audit/schema.mdx
 #     https://developer.hashicorp.com/vault/api-docs/auth/userpass#login
+#   vault_lograw_token_lookup_self.json, vault_lograw_jwt_login.json,
+#   vault_lograw_userpass_password.json: the same entries as an audit device
+#     with log_raw=true writes them (live-looking but fake hvs. / s. tokens, a
+#     JWT and a plaintext password), built from the schema above and
+#     https://developer.hashicorp.com/vault/docs/audit#sensitive-information;
+#     every credential must come out as "<redacted>"
+#     (scripts/test_vault_token_redaction.py asserts none survives anywhere)
+#   vault_hcp_namespace_userpass_login.json: an HCP Vault / Enterprise child
+#     namespace login, whose request.path carries the namespace prefix
+#     https://developer.hashicorp.com/vault/docs/enterprise/namespaces
 #   junk.json: a Vault server banner line, Base Event fallback
 samples:
   - raw: '{"auth":{"accessor":"hmac-sha256:3348fe9b24b078f97d747363dda2d55bb0445e90b512e9f68f48d289fed798b3","client_token":"hmac-sha256:c39c69748f0894cb4cd0333c779e72343ba45af287649d0fbcc37e9b079abe5d","display_name":"userpass-alice","entity_id":"62ff123b-7609-1ed9-5707-ea621da72de7","metadata":{"username":"alice"},"policies":["default"],"policy_results":{"allowed":true,"granting_policies":[{"type":""},{"name":"default","namespace_id":"root","type":"acl"}]},"token_policies":["default"],"token_issue_time":"2025-06-04T16:01:31-04:00","token_ttl":2764800,"token_type":"service"},"request":{"id":"79cc9b26-488f-eabf-2a97-303ed3bef0d6","mount_point":"auth/token/","mount_type":"token","namespace":{"id":"root"},"operation":"read","path":"auth/token/lookup-self","remote_address":"127.0.0.1","remote_port":64199},"time":"2025-06-04T20:02:46.117181Z","type":"request"}'
@@ -747,6 +844,19 @@ samples:
       user.name: mallory
       auth_protocol_id: 12
       status_detail: invalid username or password
+  - raw: '{"time":"2025-06-04T20:20:31.010000Z","type":"response","request":{"id":"aa11bb22-0000-4000-8000-000000000004","operation":"update","mount_type":"userpass","namespace":{"id":"Xb7sq","path":"admin/"},"path":"admin/auth/userpass/login/alice","remote_address":"203.0.113.40"},"response":{"auth":{"display_name":"userpass-alice","entity_id":"62ff123b-7609-1ed9-5707-ea621da72de7","policies":["default"]},"mount_type":"userpass"}}'
+    expect:
+      class_uid: 3002
+      activity_id: 1
+      status_id: 1
+      user.name: userpass-alice
+      metadata.tenant_uid: admin/
+  - raw: '{"time":"2025-06-04T20:14:02.100000Z","type":"response","auth":{"client_token":"s.FAKElegacyTOKEN0000doc1","accessor":"FAKEaccessorDOC0003","display_name":"userpass-bob"},"request":{"id":"aa11bb22-0000-4000-8000-000000000003","operation":"update","mount_type":"userpass","path":"auth/userpass/login/bob","data":{"password":"Sup3rS3cretDocPassw0rd"},"remote_address":"198.51.100.20"},"response":{"auth":{"client_token":"s.FAKElegacyTOKEN0000doc1","display_name":"userpass-bob"},"mount_type":"userpass"}}'
+    expect:
+      class_uid: 3002
+      user.name: userpass-bob
+      session.credential_uid: <missing>
+      raw_data: '{"auth":{"accessor":"<redacted>","client_token":"<redacted>","display_name":"userpass-bob"},"request":{"data":{"password":"<redacted>"},"id":"aa11bb22-0000-4000-8000-000000000003","mount_type":"userpass","operation":"update","path":"auth/userpass/login/bob","remote_address":"198.51.100.20"},"response":{"auth":{"client_token":"<redacted>","display_name":"userpass-bob"},"mount_type":"userpass"},"time":"2025-06-04T20:14:02.100000Z","type":"response"}'
   - raw: "==> Vault server started! Log data will stream in below:"
     expect:
       class_uid: 0

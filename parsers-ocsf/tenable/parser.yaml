@@ -1,6 +1,6 @@
 name: tenable_ocsf
 display_name: Tenable Vulnerability Findings (OCSF)
-version: "1.0.0"
+version: "1.1.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -15,11 +15,14 @@ description: >
   export or Nessus response array must be split one finding per event
   upstream (the parser does not fan out). Severity (info / low / medium /
   high / critical, or 0-4) maps to severity_id 1-5. The state maps to the
-  lifecycle: OPEN is Create / New, REOPENED (or Security Center
-  hasBeenMitigated) is Update / New with status_detail, FIXED is Close /
-  Resolved, and an accepted risk is Suppressed. Every CVE becomes its own
-  vulnerabilities[] entry carrying the CVSS v2 / v3 / v4 base scores and
-  vectors; a plugin without a CVE is an advisory keyed by its plugin id.
+  lifecycle: OPEN is Create / New, REOPENED (or a Security Center cumulative
+  record with hasBeenMitigated) is Update / New with status_detail, FIXED (or
+  a Security Center patched record: mitigateTime / lastMitigated set, or
+  sourceType patched) is Close / Resolved, and an accepted risk is
+  Suppressed. Every CVE id becomes its own vulnerabilities[] entry carrying
+  the CVSS v2 / v3 / v4 base scores and vectors (N/A and other non-CVE
+  tokens are dropped); a plugin without a CVE is an advisory keyed by its
+  plugin id. An IPv6-only asset uses its IPv6 address as the IP.
   The plugin is finding_info.analytic (uid = plugin id, category = family),
   the asset is resource / resources[] / device (IP, FQDN, NetBIOS, MAC, OS),
   and port / protocol / service sit in resource.data with a Port observable.
@@ -131,8 +134,8 @@ parser_vrl: |
           solution = to_string(p.solution) ?? ""
           refs = array(p.see_also) ?? []
           for_each(array(p.cve) ?? []) -> |_i, c| {
-              cs = to_string(c) ?? ""
-              if cs != "" { cves = push(cves, cs) }
+              cs = upcase(to_string(c) ?? "")
+              if match(cs, r'^CVE-\d{4}-\d+$') { cves = push(cves, cs) }
           }
           sev_key = downcase(to_string(e.severity) ?? "")
           state = upcase(to_string(e.state) ?? "OPEN")
@@ -184,12 +187,21 @@ parser_vrl: |
           see = to_string(e.seeAlso) ?? ""
           if see != "" { refs = split(see, r'\s+') }
           for_each(split(to_string(e.cve) ?? "", ",")) -> |_i, c| {
-              cs = strip_whitespace(c)
-              if cs != "" { cves = push(cves, cs) }
+              # Tenable.sc writes N/A or other references here too; only CVE ids
+              # become vulnerabilities[].cve.
+              cs = upcase(strip_whitespace(c))
+              if match(cs, r'^CVE-\d{4}-\d+$') { cves = push(cves, cs) }
           }
           sev_key = to_string(get(e, ["severity", "id"]) ?? "") ?? ""
           if sev_key == "" { sev_key = downcase(to_string(get(e, ["severity", "name"]) ?? "") ?? "") }
-          if (to_string(e.hasBeenMitigated) ?? "") == "1" {
+          # hasBeenMitigated is "1" both on a cumulative record that resurfaced
+          # (reopened) and on a patched record that is currently fixed; the
+          # patched one carries a positive mitigation time (or sourceType patched).
+          mitigated_at = 0
+          if e.mitigateTime != null { mitigated_at = to_int(e.mitigateTime) ?? 0 } else if e.lastMitigated != null { mitigated_at = to_int(e.lastMitigated) ?? 0 }
+          if mitigated_at > 0 || downcase(to_string(e.sourceType) ?? "") == "patched" {
+              state = "FIXED"
+          } else if (to_string(e.hasBeenMitigated) ?? "") == "1" {
               state = "REOPENED"
               status_detail = "Previously mitigated"
           }
@@ -224,7 +236,7 @@ parser_vrl: |
           plugin_id = to_string(e.plugin_id) ?? ""
           plugin_name = to_string(e.plugin_name) ?? ""
           family = to_string(e.plugin_family) ?? ""
-          sev_key = to_string(e.severity) ?? ""
+          sev_key = downcase(to_string(e.severity) ?? "")
           hn = to_string(e.hostname) ?? ""
           if match(hn, ip_re) { host_ip = hn } else { host_fqdn = hn }
           hid = to_string(e.host_id) ?? ""
@@ -327,6 +339,7 @@ parser_vrl: |
       # ---- the scanned asset ----
       res = {}
       if host_uid != "" { res.uid = host_uid }
+      if !match(host_ip, ip_re) && match(host_ip6, ip_re) { host_ip = downcase(host_ip6) }
       if match(host_ip, ip_re) { res.ip = host_ip }
       if host_fqdn != "" { res.hostname = downcase(host_fqdn) }
       rname = host_fqdn
@@ -362,7 +375,7 @@ parser_vrl: |
       obs = []
       for_each(cves) -> |_i, c| { obs = push(obs, { "name": "vulnerabilities.cve.uid", "type": "CVE Object: uid", "type_id": 18, "value": upcase(to_string(c) ?? "") }) }
       if match(host_ip, ip_re) { obs = push(obs, { "name": "resource.ip", "type": "IP Address", "type_id": 2, "value": host_ip }) }
-      if host_ip6 != "" { obs = push(obs, { "name": "device.ipv6", "type": "IP Address", "type_id": 2, "value": downcase(host_ip6) }) }
+      if host_ip6 != "" && downcase(host_ip6) != host_ip { obs = push(obs, { "name": "device.ipv6", "type": "IP Address", "type_id": 2, "value": downcase(host_ip6) }) }
       if host_fqdn != "" { obs = push(obs, { "name": "resource.hostname", "type": "Hostname", "type_id": 1, "value": downcase(host_fqdn) }) }
       if port > 0 { obs = push(obs, { "name": "resource.data.port", "type": "Port", "type_id": 11, "value": to_string(port) }) }
 
@@ -637,6 +650,9 @@ parser_vrl: |
   | hostname
   | ip
   | macAddress
+  | mitigateTime
+  | lastMitigated
+  | sourceType
   | netbiosName
   | operatingSystem
   | plugin\.cpe
@@ -913,6 +929,11 @@ parser_vrl: |
 #     https://avleonov.com/2016/06/03/retrieving-scan-results-with-nessus-api/
 #   nessus_host_vuln_high.json: Nessus API host details vulnerabilities[] row,
 #     field set per https://docs.rs/nessus/0.3.0/src/nessus/structs.rs.html
+#   tsc_patched_mitigated.json, tio_ipv6_only_asset.json,
+#   nessus_host_vuln_named_severity.json: variants of the fixtures above (a
+#     Security Center patched record with hasBeenMitigated and mitigateTime and
+#     an N/A token in cve, an IPv6-only asset, a Nessus row whose severity is a
+#     name rather than a 0-4 level)
 #   junk.json: not JSON, Base Event fallback
 samples:
   - raw: '{"asset":{"fqdn":"app-12.example.com","hostname":"app-12","uuid":"00000000-0000-4000-8000-000000000012","ipv4":"192.0.2.12","operating_system":["CentOS Linux 7.9.2009"],"tracked":true},"plugin":{"id":9062,"name":"Google Chrome < 48.0.2564.82 Multiple Vulnerabilities","cve":["CVE-2016-1620","CVE-2016-1614"],"cvss_base_score":9.3,"cvss_vector":{"raw":"AV:N/AC:M/Au:N/C:C/I:C/A:C"},"family":"Web Clients","has_patch":false,"risk_factor":"HIGH","solution":"Update the Chrome browser to 48.0.2564.82 or later."},"port":{"port":"0","protocol":"TCP"},"severity":"high","finding_id":"84f45a4f-2277-52e0-b84f-2bb96a853124","first_found":"2018-12-31T20:59:47Z","last_found":"2019-01-31T20:59:47Z","state":"REOPENED"}'
@@ -957,6 +978,21 @@ samples:
       vulnerabilities.0.advisory.uid: "57608"
       resource.ip: 192.0.2.44
       metadata.product.name: Nessus
+  - raw: '{"pluginID":"171860","severity":{"id":"4","name":"Critical"},"hasBeenMitigated":"1","mitigateTime":"1675900800","ip":"192.0.2.30","port":"445","protocol":"TCP","pluginName":"Oracle Java SE Multiple Vulnerabilities (January 2023 CPU)","firstSeen":"1674518400","lastSeen":"1675123200","cve":"CVE-2023-21830,N/A"}'
+    expect:
+      activity_id: 3
+      status_id: 4
+      is_alert: false
+      vulnerabilities.0.cve.uid: CVE-2023-21830
+      vulnerabilities.1: <missing>
+  - raw: '{"asset":{"fqdn":"v6-host.example.com","uuid":"00000000-0000-4000-8000-000000000060","ipv6":"2001:db8::60"},"plugin":{"id":156641,"name":"Security Updates for Microsoft SharePoint Server 2016 (January 2022)","cve":["CVE-2022-21837"]},"port":{"port":445,"protocol":"TCP"},"severity":"high","finding_id":"02716af9-1adb-4057-b4d5-dcb0c36b2999","last_found":"2023-05-04T05:03:13.737Z","state":"OPEN"}'
+    expect:
+      resource.ip: 2001:db8::60
+      device.ip: 2001:db8::60
+  - raw: '{"host_id":3,"hostname":"192.0.2.45","plugin_id":97833,"plugin_name":"MS17-010: Security Update for Microsoft Windows SMB Server","plugin_family":"Windows","severity":"Critical"}'
+    expect:
+      severity_id: 5
+      is_alert: true
   - raw: "not a tenable record"
     expect:
       class_uid: 0

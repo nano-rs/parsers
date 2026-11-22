@@ -1,6 +1,6 @@
 name: wiz_ocsf
 display_name: Wiz Issues, Detections and Findings (OCSF)
-version: "1.0.0"
+version: "1.1.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -18,7 +18,9 @@ description: >
   MITRE tactics and techniques as attacks, the primary actor as actor.user (or
   a network address as the evidence source IP) and the triggering events'
   process tree and source IP as evidences. Severity (INFORMATIONAL / LOW /
-  MEDIUM / HIGH / CRITICAL) maps to severity_id 1-5; status OPEN is New,
+  MEDIUM / HIGH / CRITICAL) maps to severity_id 1-5 (for a vulnerability the
+  higher of vendorSeverity and CVSSSeverity, since vendorSeverity is often
+  NONE); a High / Critical finding alerts until it is Resolved or Suppressed; status OPEN is New,
   IN_PROGRESS In Progress, REJECTED / IGNORED Suppressed and RESOLVED
   Resolved (activity Close); a webhook trigger type of Updated is an Update.
   The affected cloud resource (entitySnapshot, resource, primaryResource or
@@ -264,8 +266,14 @@ parser_vrl: |
       } else if shape == "vulnerability" {
           title = to_string(e.name) ?? ""
           desc = to_string(e.description) ?? ""
+          # Take the higher of the vendor and CVSS ratings: vendorSeverity is
+          # often NONE / UNKNOWN when the package vendor assigned no rating.
           sev_raw = upcase(to_string(e.vendorSeverity) ?? "")
-          if sev_raw == "" { sev_raw = upcase(to_string(e.CVSSSeverity) ?? "") }
+          cvss_sev = upcase(to_string(e.CVSSSeverity) ?? "")
+          sev_rank = { "INFORMATIONAL": 1, "INFO": 1, "NONE": 0, "LOW": 2, "MEDIUM": 3, "HIGH": 4, "CRITICAL": 5 }
+          vr = to_int(get(sev_rank, [sev_raw]) ?? 0) ?? 0
+          cr = to_int(get(sev_rank, [cvss_sev]) ?? 0) ?? 0
+          if cr > vr { sev_raw = cvss_sev }
           first_str = to_string(e.firstDetectedAt) ?? ""
           last_str = to_string(e.lastDetectedAt) ?? ""
           src_url = to_string(e.portalUrl) ?? ""
@@ -393,7 +401,9 @@ parser_vrl: |
       rips = array(rsrc.ipAddresses) ?? []
       rip = to_string(get(rips, [0]) ?? "") ?? ""
       if match(rip, ip_re) { res.ip = rip }
-      if length(res) > 0 && !exists(res.uid) && !exists(res.name) { res.uid = ralt }
+      if length(res) > 0 && !exists(res.uid) && !exists(res.name) {
+          if ralt != "" { res.uid = ralt } else { res.uid = uid }
+      }
 
       cloud = {}
       if provider != "" {
@@ -418,10 +428,18 @@ parser_vrl: |
           if aid != "" { au.uid = aid }
           amail = to_string(actor_src.email) ?? ""
           if amail != "" { au.email_addr = amail }
-          if atype != "" { au.type = to_string(actor_src.nativeType) ?? atype }
-          if atype == "USER_ACCOUNT" { au.type_id = 1 } else if atype == "SERVICE_ACCOUNT" { au.type_id = 3 } else { au.type_id = 99 }
-          if au.type_id != 99 { del(au.type) }
-          if au.type_id == 99 && !exists(au.type) { au.type = atype }
+          # actor.user.type is the promoted column, so it always carries a caption.
+          if atype == "USER_ACCOUNT" {
+              au.type_id = 1
+              au.type = "User"
+          } else if atype == "SERVICE_ACCOUNT" {
+              au.type_id = 3
+              au.type = "System"
+          } else if atype != "" {
+              au.type_id = 99
+              au.type = to_string(actor_src.nativeType) ?? atype
+              if au.type == "" { au.type = atype }
+          }
           actor.user = au
       }
 
@@ -450,8 +468,13 @@ parser_vrl: |
           if pcmd == "" { pcmd = to_string(get(ev, ["commandLine"]) ?? "") ?? "" }
           if ppath == "" { ppath = to_string(get(ev, ["runtimeProgram", "name"]) ?? "") ?? "" }
           if pcmd != "" || ppath != "" {
-              # A Wiz sensor process carries no pid in these records; pid 0 marks it unknown.
-              proc = { "pid": to_int(pt.id) ?? 0 }
+              # The process tree id is the pid. A runtime program from a threat
+              # node carries none, so it gets an event-scoped uid instead of a
+              # fabricated pid 0 (a real kernel pid).
+              proc = {}
+              if pt.id != null && match(to_string(pt.id) ?? "", r'^\d+$') { proc.pid = to_int(pt.id) ?? 0 }
+              evid = to_string(get(ev, ["id"]) ?? "") ?? ""
+              if !exists(proc.pid) { proc.uid = "wiz|" + evid + "|" + ppath + "|" + pcmd }
               if pcmd != "" { proc.cmd_line = pcmd }
               if ppath != "" {
                   pparts = split(ppath, "/")
@@ -469,7 +492,7 @@ parser_vrl: |
                   if puid != "" { proc.user.uid = puid }
               }
               parent = to_string(get(ev, ["parentRuntimeProgram", "name"]) ?? "") ?? ""
-              if parent != "" { proc.parent_process = { "pid": 0, "file": { "path": parent, "name": to_string(get(split(parent, "/"), [-1]) ?? parent) ?? parent, "type_id": 1, "type": "Regular File" } } }
+              if parent != "" { proc.parent_process = { "uid": "wiz|" + evid + "|parent|" + parent, "file": { "path": parent, "name": to_string(get(split(parent, "/"), [-1]) ?? parent) ?? parent, "type_id": 1, "type": "Regular File" } } }
               evo.process = proc
           }
           if length(evo) > 0 {
@@ -585,7 +608,7 @@ parser_vrl: |
               }
               ocsf.device = dev
           }
-          ocsf.is_alert = severity_id >= 4 && status_id == 1
+          ocsf.is_alert = severity_id >= 4 && status_id != 4 && status_id != 3
       } else if class_uid == 2003 {
           result = upcase(to_string(e.result) ?? "")
           comp = { "status": result, "status_id": 99 }
@@ -1137,6 +1160,9 @@ parser_vrl: |
 #   wiz_vuln_vm_open.json, wiz_vuln_container_image_resolved.json (status set
 #   to RESOLVED): Elastic integrations Wiz vulnerability fixture
 #     https://github.com/elastic/integrations/blob/main/packages/wiz/data_stream/vulnerability/_dev/test/pipeline/test-vulnerability.log
+#   wiz_vuln_vendor_none_cvss_critical.json: the VM vulnerability fixture with
+#     vendorSeverity NONE, CVSSSeverity CRITICAL and status IN_PROGRESS (the
+#     shape Wiz returns when the package vendor assigned no rating)
 #   wiz_ccf_fail_pod.json, wiz_ccf_pass_root_user.json: Elastic integrations
 #     Wiz cloud configuration finding fixture
 #     https://github.com/elastic/integrations/blob/main/packages/wiz/data_stream/cloud_configuration_finding/_dev/test/pipeline/test-cloud-configuration-finding.log
@@ -1183,6 +1209,7 @@ samples:
       finding_info.attacks.0.tactic.uid: TA0005
       actor.user.name: test-actor
       actor.user.type_id: 3
+      actor.user.type: System
       evidences.0.src_endpoint.ip: 198.51.100.192
       evidences.0.process.cmd_line: touch -r /usr/bin /tmp/uga
       evidences.0.process.pid: 1560
@@ -1195,6 +1222,20 @@ samples:
       finding_info.analytic.uid: wc-id-1335
       resources.0.name: system:aggregate-to-edit
       is_alert: false
+  - raw: '{"id":"6fa60061-0000-5000-8000-000000000010","name":"CVE-2024-3094","CVSSSeverity":"CRITICAL","score":10.0,"status":"IN_PROGRESS","vendorSeverity":"NONE","lastDetectedAt":"2024-04-01T10:00:00Z","vulnerableAsset":{"type":"CONTAINER_IMAGE","region":"us-east-1","cloudPlatform":"AWS"}}'
+    expect:
+      class_uid: 2002
+      severity_id: 5
+      status_id: 2
+      is_alert: true
+      resources.0.uid: 6fa60061-0000-5000-8000-000000000010
+  - raw: '{"type":"GENERATED_THREAT","origins":["WIZ_SENSOR"],"createdAt":"2026-07-01T08:13:40.878Z","updatedAt":"2026-07-01T08:18:21.326Z","id":"1456bbb9-19ef-4847-a80c-a2b400ba3db7","severity":"MEDIUM","primaryResource":{"type":"VIRTUAL_MACHINE","name":"example-vm-2","id":"44fa8d41-8cf2-4032-afbf-098cade5d5ab"},"primaryActor":{"type":"UNKNOWN"},"triggeringEvents":{"nodes":[{"id":"38d4c457-8310-4286-9b15-4dca6d102f46","actorIP":"192.0.2.13","commandLine":"sshd: /usr/sbin/sshd -D","runtimeProgram":{"name":"/usr/sbin/sshd"},"parentRuntimeProgram":{"name":"/usr/lib/systemd/systemd"}}]},"ruleMatch":{"rule":{"id":"49ed0540-4dff-4193-87cc-c4b5d6d9c305","name":"Service account token was accessed"}}}'
+    expect:
+      class_uid: 2004
+      evidences.0.process.pid: <missing>
+      evidences.0.process.uid: "wiz|38d4c457-8310-4286-9b15-4dca6d102f46|/usr/sbin/sshd|sshd: /usr/sbin/sshd -D"
+      evidences.0.process.parent_process.pid: <missing>
+      evidences.0.src_endpoint.ip: 192.0.2.13
   - raw: '{"hello":"world"}'
     expect:
       class_uid: 0

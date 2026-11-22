@@ -1,6 +1,6 @@
 name: teleport_ocsf
 display_name: Teleport Audit Events (OCSF)
-version: "1.0.0"
+version: "1.1.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
@@ -14,15 +14,18 @@ description: >
   the user, the Teleport user is the actor and sid is the session. exec and
   session.command (enhanced session recording) are "Process Activity" (1007)
   Launch with the command line, program, path, pid / ppid, login and exit
-  code on the Teleport node as device. scp and sftp are "File System
+  code (only when the event carries one) on the Teleport node as device. scp and sftp are "File System
   Activity" (1001), the transfer direction or SFTP operation choosing Read /
   Create / Update / Delete / Rename / Open / Set or Get Attributes. user.create
   / update / delete / password_change and access requests are "User
   Management" (3007), an approved request as Assign Roles with the requested
   roles as privileges (Account Change 3001 is deprecated in OCSF 1.9);
+  an access_request.update that names the requester and is APPROVED is
+  Assign Roles, and a DENIED one is a Failure that grants no privileges.
   role.created / updated / deleted are "Entity Management" (3004). Every other
-  event (cert.create, kube.request, resource CRUD, locks, connectors, access
-  request reviews without a requester) is "API Activity" (6003) with the
+  event (cert.create, kube.request, resource CRUD, locks, connectors, and an
+  access request review that carries only the reviewer in updated_by, since
+  User Management requires the subject user) is "API Activity" (6003) with the
   event name as api.operation and the create / update / delete suffix or the
   Kubernetes verb as the activity. addr.remote is src_endpoint and addr.local
   / server_addr, server_hostname and server_id the Teleport node; the code
@@ -102,13 +105,16 @@ parser_vrl: |
       cluster = to_string(e.cluster_name) ?? ""
 
       # ---- endpoints: addr.remote is the client, addr.local the Teleport node ----
+      # host:port, [v6]:port, or a bare address without a port
       src = {}
-      rm, rerr = parse_regex(to_string(get(e, ["addr.remote"]) ?? "") ?? "", r'^\x5B?(?P<ip>.+?)\x5D?:(?P<port>\d+)$')
-      if rerr == null && match(string!(rm.ip), ip_re) { src.ip = string!(rm.ip); src.port = to_int(rm.port) ?? 0 }
+      remote = to_string(get(e, ["addr.remote"]) ?? "") ?? ""
+      rm, rerr = parse_regex(remote, r'^\x5B?(?P<ip>.+?)\x5D?:(?P<port>\d+)$')
+      if rerr == null && match(string!(rm.ip), ip_re) { src.ip = string!(rm.ip); src.port = to_int(rm.port) ?? 0 } else if match(remote, ip_re) { src.ip = remote }
       dst = {}
-      lm, lerr = parse_regex(to_string(get(e, ["addr.local"]) ?? "") ?? "", r'^\x5B?(?P<ip>.+?)\x5D?:(?P<port>\d+)$')
-      if lerr != null { lm, lerr = parse_regex(to_string(e.server_addr) ?? "", r'^\x5B?(?P<ip>.+?)\x5D?:(?P<port>\d+)$') }
-      if lerr == null && match(string!(lm.ip), ip_re) { dst.ip = string!(lm.ip); dst.port = to_int(lm.port) ?? 0 }
+      local = to_string(get(e, ["addr.local"]) ?? "") ?? ""
+      if local == "" { local = to_string(e.server_addr) ?? "" }
+      lm, lerr = parse_regex(local, r'^\x5B?(?P<ip>.+?)\x5D?:(?P<port>\d+)$')
+      if lerr == null && match(string!(lm.ip), ip_re) { dst.ip = string!(lm.ip); dst.port = to_int(lm.port) ?? 0 } else if match(local, ip_re) { dst.ip = local }
       shost = to_string(e.server_hostname) ?? ""
       if shost != "" { dst.hostname = shost }
       suid = to_string(e.server_id) ?? ""
@@ -143,6 +149,11 @@ parser_vrl: |
       if event == "scp" || event == "sftp" { kind = "file" }
       if starts_with(event, "user.") && event != "user.login" { kind = "user" }
       if event == "access_request.create" || (starts_with(event, "access_request.") && tp_user != "" && event != "access_request.search") { kind = "user" }
+      # A denied access request is a failed privilege change.
+      if starts_with(event, "access_request.") && upcase(to_string(e.state) ?? "") == "DENIED" {
+          status_id = 2
+          status_str = "Failure"
+      }
       if starts_with(event, "role.") { kind = "entity" }
 
       dev = { "type_id": 0, "type": "Unknown" }
@@ -177,7 +188,9 @@ parser_vrl: |
           user = { "name": subject }
           if subject == "" { user.name = "unknown" }
           attrs = object(e.attributes) ?? {}
+          # SSO traits are map[string][]string, so email may be a list
           umail = to_string(attrs.email) ?? ""
+          if is_array(attrs.email) { umail = to_string(get(array!(attrs.email), [0]) ?? "") ?? "" }
           if umail != "" { user.email_addr = umail }
           ugroups = []
           for_each(array(attrs.groups) ?? []) -> |_i, g| {
@@ -264,8 +277,10 @@ parser_vrl: |
               "device": dev,
               "process": proc
           })
-          rc = to_int(e.return_code) ?? null
-          if rc == null { rc = to_int(e.exitCode) ?? null }
+          # to_int(null) is 0, so test presence first: an event with no exit
+          # code must not claim a clean exit.
+          rc = null
+          if e.return_code != null { rc = to_int(e.return_code) ?? null } else if e.exitCode != null { rc = to_int(e.exitCode) ?? null }
           if rc != null { ocsf.exit_code = rc }
           . = ocsf
       } else if kind == "file" {
@@ -329,9 +344,12 @@ parser_vrl: |
           }
           if subject == "" { subject = "unknown" }
           privs = []
-          for_each(array(e.roles) ?? []) -> |_i, r| {
-              rs = to_string(r) ?? ""
-              if rs != "" { privs = push(privs, rs) }
+          # Denied roles were never granted, so they are not privileges.
+          if state != "DENIED" {
+              for_each(array(e.roles) ?? []) -> |_i, r| {
+                  rs = to_string(r) ?? ""
+                  if rs != "" { privs = push(privs, rs) }
+              }
           }
           ocsf = merge(base, {
               "class_uid": 3007,
@@ -872,6 +890,12 @@ parser_vrl: |
 #     https://github.com/gravitational/teleport/blob/master/api/proto/teleport/legacy/types/events/events.proto
 #   tp_db_session_start_denied.json uses the {"message": ...} wrapper because
 #     the event has its own message key
+#   tp_exec_failed_exit_code.json, tp_access_request_approved_with_requester.json,
+#   tp_access_request_denied.json, tp_user_login_saml_email_list.json:
+#     variants of the fixture events above (failed exec with exitCode, an
+#     access_request.update that names the requester, a DENIED review, an SSO
+#     login whose email trait is a list and whose addr.remote has no port),
+#     field shapes per the event reference and events.proto
 #   junk.json: a Teleport service log line, Base Event fallback
 samples:
   - raw: '{"code":"T1000W","error":"user(name=\"fsdfsdf\") not found","event":"user.login","method":"local","success":false,"time":"2019-04-22T18:06:32Z","uid":"597bf08b-75b2-4dda-a578-e387c5ce9b76","user":"fsdfsdf"}'
@@ -919,6 +943,38 @@ samples:
       file.path: /tmp/file
       file.name: file
       device.hostname: im-a-server-hostname
+  - raw: '{"code":"T3002E","event":"exec","addr.local":"192.0.2.130:3022","command":"nonexistent-cmd --version","exitCode":"127","exitError":"exit status 127","login":"root","server_id":"de3800ea-69d9-4d72-a108-97e57f8eb393","time":"2020-10-30T17:29:02.115Z","uid":"9ab1c2d3-07b1-4308-8e0d-2d2ec57cbb21","user":"alex"}'
+    expect:
+      class_uid: 1007
+      status_id: 2
+      exit_code: 127
+      status_detail: exit status 127
+  - raw: '{"code":"T3002I","event":"exec","addr.local":"192.0.2.130:3022","login":"root","time":"2020-10-30T17:28:14.705Z","uid":"8ea5be3d-07b1-4308-8e0d-2d2ec57cbb20","user":"alex"}'
+    expect:
+      class_uid: 1007
+      exit_code: <missing>
+  - raw: '{"id":"66b827b2-1b0b-512b-965d-6c789388d3c9","code":"T5001I","event":"access_request.update","time":"2020-06-05T19:30:12Z","uid":"68a83a99-73ce-4bd7-bbf7-99103c2ba6a1","user":"carol","state":"APPROVED","updated_by":"sam","roles":["admin"]}'
+    expect:
+      class_uid: 3007
+      activity_id: 16
+      type_uid: 300716
+      status_id: 1
+      user.name: carol
+      actor.user.name: sam
+      privileges.0: admin
+  - raw: '{"id":"77c938c3-2c1c-512b-965d-6c789388d3d0","code":"T5001I","event":"access_request.update","time":"2020-06-05T19:41:03Z","uid":"68a83a99-73ce-4bd7-bbf7-99103c2ba6a2","user":"carol","state":"DENIED","updated_by":"sam","roles":["admin"]}'
+    expect:
+      class_uid: 3007
+      activity_id: 99
+      status_id: 2
+      privileges: <missing>
+      status_code: DENIED
+  - raw: '{"code":"T1001I","event":"user.login","method":"saml","success":true,"addr.remote":"203.0.113.25","attributes":{"email":["ops@example.com"]},"time":"2022-05-23T09:02:11.400Z","uid":"8e551ff2-15f6-4b56-9391-344e8984fd98","user":"ops@example.com"}'
+    expect:
+      class_uid: 3002
+      auth_protocol_id: 5
+      user.email_addr: ops@example.com
+      src_endpoint.ip: 203.0.113.25
   - raw: "INFO [AUTH:1] Auth service is starting on 0.0.0.0:3025."
     expect:
       class_uid: 0
