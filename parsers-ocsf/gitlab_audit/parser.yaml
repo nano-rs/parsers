@@ -423,11 +423,27 @@ parser_vrl: |
       }
   }
   __consumed = ""
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
   # BEGIN parser-specific transformations
   # created_at: ISO created_at converted to the event clock in milliseconds.
   # time: audit_json.log write clock, used only when created_at is absent.
   # with: Known GitLab sign-in methods normalize to the OCSF auth_protocol caption.
-  for_each(flatten(__source_kv)) -> |key, value| {
+  for_each(__flat) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
         created_at
@@ -454,31 +470,16 @@ parser_vrl: |
       }
   }
   # Declared source -> target mappings (field-coverage.yaml `mappings`).
-  __decl = "\n\"author_id\"\t[\"actor.user.uid\",\"user.uid\"]\n\"author_name\"\t[\"actor.user.name\",\"user.display_name\",\"user.name\"]\n\"correlation_id\"\t[\"metadata.correlation_uid\"]\n\"entity_id\"\t[\"group.uid\"]\n\"entity_type\"\t[\"group.type\"]\n\"meta.caller_id\"\t[\"api.operation\"]\n\"meta.remote_ip\"\t[\"src_endpoint.ip\"]\n\"meta.user\"\t[\"user.name\"]\n\"severity\"\t[\"metadata.log_level\"]\n\"target_details\"\t[\"resources.name\",\"user.name\"]\n\"target_id\"\t[\"user.uid\"]\n\"with\"\t[\"auth_protocol\"]\n\"details.custom_message\"\t[\"message\"]\n\"failed_login\"\t[\"auth_protocol\"]\n\"ip_address\"\t[\"src_endpoint.ip\"]\n\"details.author_name\"\t[\"actor.user.name\"]\n\"details.ip_address\"\t[\"src_endpoint.ip\"]\n\"details.target_details\"\t[\"user.name\"]\n\"details.target_id\"\t[\"resources.uid\",\"user.uid\"]\n\"entity_path\"\t[\"group.name\",\"resources.name\"]\n\"event_type\"\t[\"api.operation\",\"message\",\"metadata.event_code\"]\n\"id\"\t[\"metadata.uid\"]\n\"details.as\"\t[\"privileges\"]\n\"details.author_email\"\t[\"actor.user.email_addr\"]\n"
+  __decl = "\n\"author_id\"\t[\"actor.user.uid\",\"user.uid\"]\n\"author_name\"\t[\"actor.user.name\",\"user.display_name\",\"user.name\"]\n\"correlation_id\"\t[\"metadata.correlation_uid\"]\n\"entity_id\"\t[\"group.uid\",\"resources.uid\"]\n\"entity_type\"\t[\"group.type\",\"resources.type\"]\n\"meta~1caller_id\"\t[\"api.operation\"]\n\"meta~1remote_ip\"\t[\"src_endpoint.ip\"]\n\"meta~1user\"\t[\"user.name\"]\n\"severity\"\t[\"metadata.log_level\"]\n\"target_details\"\t[\"resources.name\",\"user.name\"]\n\"target_id\"\t[\"resources.uid\",\"user.uid\"]\n\"target_type\"\t[\"resources.type\"]\n\"with\"\t[\"auth_protocol\"]\n\"details.custom_message\"\t[\"message\"]\n\"failed_login\"\t[\"auth_protocol\"]\n\"ip_address\"\t[\"src_endpoint.ip\"]\n\"details.author_name\"\t[\"actor.user.name\"]\n\"details.entity_path\"\t[\"resources.name\"]\n\"details.ip_address\"\t[\"src_endpoint.ip\"]\n\"details.target_details\"\t[\"resources.name\",\"user.name\"]\n\"details.target_id\"\t[\"resources.uid\",\"user.uid\"]\n\"details.target_type\"\t[\"resources.type\"]\n\"entity_path\"\t[\"group.name\",\"resources.name\"]\n\"event_type\"\t[\"api.operation\",\"message\",\"metadata.event_code\"]\n\"id\"\t[\"metadata.uid\"]\n\"details.as\"\t[\"privileges\"]\n\"details.author_email\"\t[\"actor.user.email_addr\"]\n"
   __preserve = []
   # END parser-specific transformations
-  # Escape literal dots before flattening so dotted source keys cannot overwrite
-  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
-  # In compact JSON only an object key is followed by ':', so a source whose text
-  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
-  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
-  __escaped = object!(__copy.source)
-  __tilde = false
-  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
-      __escaped = map_keys(__escaped, recursive: true) -> |key| {
-          replace(replace(key, "~", "~0"), ".", "~1")
-      }
-      # Keys without a "~" decode to themselves, including the object keys inside
-      # an array that flatten leaves escaped; encode_json never escapes a "~".
-      __tilde = contains(encode_json(__escaped), "~")
-  }
-  __flat = flatten(__escaped)
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
   # target paths + "\n" per mapped source key (a raw newline never occurs in
   # compact JSON). A key is consumed when its value, or every element of a scalar
-  # array, is at one of its own targets.
+  # array, is at one of its own targets. Keys stay ESCAPED here and in __consumed:
+  # a literal dotted key ("a~1b") and the nested path ("a.b") are different
+  # fields, and mapping one never consumes the other.
   for_each(__flat) -> |key, value| {
-      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
       # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
       __kt = encode_json(key)
       if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
@@ -516,7 +517,6 @@ parser_vrl: |
   __names = {}
   if __distinct {
       __kept = filter(__flat) -> |key, value| {
-          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
           # A key is kept unless an explicit mapping or transformation consumed it.
           # Do not spill a copy of the raw body.
           value != __raw_body && !contains(__consumed, "," + encode_json(key))
@@ -550,13 +550,13 @@ parser_vrl: |
       # Slow path, in source key order: a name already taken gets the next free
       # _2, _3, ... suffix.
       for_each(__flat) -> |key, value| {
+          __token = "," + encode_json(key)
           key = replace(replace(key, "~1", "."), "~0", "~")
           if is_array(value) || is_object(value) {
               value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
                   replace(replace(inner, "~1", "."), "~0", "~")
               }, ["v"])
           }
-          __token = "," + encode_json(key)
           if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")
