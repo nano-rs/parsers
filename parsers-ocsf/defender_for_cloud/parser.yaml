@@ -548,13 +548,107 @@ parser_vrl: |
       }
   }
   __consumed = ""
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
   # BEGIN parser-specific transformations
+  # TimeGenerated: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # TimeGenerated: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # StartTimeUtc: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # EndTimeUtc: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # StartTime: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # EndTime: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # Properties.TimeGenerated: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # properties.timeGeneratedUtc: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # properties.timeGeneratedUtc: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # properties.startTimeUtc: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # properties.endTimeUtc: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # properties.status.statusChangeDate: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # properties.status.statusChangeDate: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
+  # properties.status.firstEvaluationDate: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created or modified).
   # Severity: Defender severity normalized to the OCSF severity_id; consume only when that ID is emitted.
   # AlertSeverity: Defender severity normalized to the OCSF severity_id; consume only when that ID is emitted.
   # properties.severity: Defender severity normalized to the OCSF severity_id; consume only when that ID is emitted.
   # properties.metadata.severity: Defender severity normalized to the OCSF severity_id; consume only when that ID is emitted.
   # Properties.Status.Severity: Defender severity normalized to the OCSF severity_id; consume only when that ID is emitted.
-  for_each(flatten(__source_kv)) -> |key, value| {
+  for_each(__flat) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        TimeGenerated
+      | properties\.timeGeneratedUtc
+      | properties\.status\.firstEvaluationDate
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__repr, "," + "\"finding_info.created_time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        TimeGenerated
+      | Properties\.TimeGenerated
+      | properties\.timeGeneratedUtc
+      | properties\.status\.statusChangeDate
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        StartTimeUtc
+      | StartTime
+      | properties\.startTimeUtc
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__repr, "," + "\"finding_info.first_seen_time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        EndTimeUtc
+      | EndTime
+      | properties\.endTimeUtc
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__repr, "," + "\"finding_info.last_seen_time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        properties\.status\.statusChangeDate
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__repr, "," + "\"finding_info.modified_time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
       if match(key, r'(?x)
       \A(?:
         Severity
@@ -576,28 +670,13 @@ parser_vrl: |
   __decl = "\n\"AlertDisplayName\"\t[\"finding_info.analytic.name\",\"finding_info.title\",\"message\"]\n\"AlertName\"\t[\"finding_info.analytic.name\",\"finding_info.title\",\"message\"]\n\"AlertType\"\t[\"finding_info.analytic.uid\",\"finding_info.types\"]\n\"AlertUri\"\t[\"finding_info.src_url\"]\n\"AzureResourceId\"\t[\"resources.uid\"]\n\"CompromisedEntity\"\t[\"resources.name\"]\n\"Description\"\t[\"finding_info.desc\"]\n\"Id\"\t[\"finding_info.uid\"]\n\"Name\"\t[\"compliance.control\"]\n\"ProductComponentName\"\t[\"finding_info.product.name\"]\n\"ProductName\"\t[\"metadata.product.name\"]\n\"Properties.Description\"\t[\"finding_info.desc\"]\n\"Properties.DisplayName\"\t[\"finding_info.title\",\"message\"]\n\"Properties.Remediation\"\t[\"remediation.desc\"]\n\"Properties.ResourceDetails.Id\"\t[\"resources.uid\"]\n\"Properties.Status.Code\"\t[\"compliance.status_code\"]\n\"RemediationSteps\"\t[\"remediation.desc\"]\n\"ResourceId\"\t[\"resources.uid\"]\n\"SystemAlertId\"\t[\"finding_info.uid\",\"metadata.original_event_uid\",\"metadata.uid\"]\n\"Tactics\"\t[\"finding_info.attacks.tactic.name\"]\n\"Techniques\"\t[\"finding_info.attacks.technique.uid\"]\n\"TenantId\"\t[\"cloud.org.uid\"]\n\"VendorName\"\t[\"metadata.product.vendor_name\"]\n\"id\"\t[\"finding_info.uid\"]\n\"name\"\t[\"compliance.control\"]\n\"properties.alertDisplayName\"\t[\"finding_info.analytic.name\",\"finding_info.title\",\"message\"]\n\"properties.alertType\"\t[\"finding_info.analytic.uid\",\"finding_info.types\"]\n\"properties.alertUri\"\t[\"finding_info.src_url\"]\n\"properties.assessmentDetailsLink\"\t[\"finding_info.src_url\"]\n\"properties.compromisedEntity\"\t[\"resources.name\"]\n\"properties.description\"\t[\"finding_info.desc\",\"finding_info.title\",\"message\"]\n\"properties.displayName\"\t[\"finding_info.analytic.name\",\"finding_info.title\",\"message\"]\n\"properties.intent\"\t[\"finding_info.attacks.tactic.name\"]\n\"properties.links.azurePortal\"\t[\"finding_info.src_url\"]\n\"properties.metadata.categories\"\t[\"compliance.category\"]\n\"properties.metadata.description\"\t[\"finding_info.desc\"]\n\"properties.metadata.policyDefinitionId\"\t[\"finding_info.analytic.uid\"]\n\"properties.metadata.remediationDescription\"\t[\"remediation.desc\"]\n\"properties.productComponentName\"\t[\"finding_info.product.name\"]\n\"properties.productName\"\t[\"metadata.product.name\"]\n\"properties.resourceDetails.Id\"\t[\"resources.uid\"]\n\"properties.resourceDetails.ResourceName\"\t[\"resources.name\"]\n\"properties.resourceDetails.ResourceType\"\t[\"resources.type\"]\n\"properties.resourceDetails.id\"\t[\"resources.uid\"]\n\"properties.state\"\t[\"compliance.status_code\"]\n\"properties.status.code\"\t[\"compliance.status_code\"]\n\"properties.status.description\"\t[\"compliance.status_detail\"]\n\"properties.systemAlertId\"\t[\"finding_info.uid\",\"metadata.original_event_uid\",\"metadata.uid\"]\n\"properties.techniques\"\t[\"finding_info.attacks.technique.uid\"]\n\"properties.vendorName\"\t[\"metadata.product.vendor_name\"]\n\"tenantId\"\t[\"cloud.org.uid\"]\n"
   __preserve = []
   # END parser-specific transformations
-  # Escape literal dots before flattening so dotted source keys cannot overwrite
-  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
-  # In compact JSON only an object key is followed by ':', so a source whose text
-  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
-  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
-  __escaped = object!(__copy.source)
-  __tilde = false
-  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
-      __escaped = map_keys(__escaped, recursive: true) -> |key| {
-          replace(replace(key, "~", "~0"), ".", "~1")
-      }
-      # Keys without a "~" decode to themselves, including the object keys inside
-      # an array that flatten leaves escaped; encode_json never escapes a "~".
-      __tilde = contains(encode_json(__escaped), "~")
-  }
-  __flat = flatten(__escaped)
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
   # target paths + "\n" per mapped source key (a raw newline never occurs in
   # compact JSON). A key is consumed when its value, or every element of a scalar
-  # array, is at one of its own targets.
+  # array, is at one of its own targets. Keys stay ESCAPED here and in __consumed:
+  # a literal dotted key ("a~1b") and the nested path ("a.b") are different
+  # fields, and mapping one never consumes the other.
   for_each(__flat) -> |key, value| {
-      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
       # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
       __kt = encode_json(key)
       if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
@@ -635,7 +714,6 @@ parser_vrl: |
   __names = {}
   if __distinct {
       __kept = filter(__flat) -> |key, value| {
-          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
           # A key is kept unless an explicit mapping or transformation consumed it.
           # Do not spill a copy of the raw body.
           value != __raw_body && !contains(__consumed, "," + encode_json(key))
@@ -669,13 +747,13 @@ parser_vrl: |
       # Slow path, in source key order: a name already taken gets the next free
       # _2, _3, ... suffix.
       for_each(__flat) -> |key, value| {
+          __token = "," + encode_json(key)
           key = replace(replace(key, "~1", "."), "~0", "~")
           if is_array(value) || is_object(value) {
               value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
                   replace(replace(inner, "~1", "."), "~0", "~")
               }, ["v"])
           }
-          __token = "," + encode_json(key)
           if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")

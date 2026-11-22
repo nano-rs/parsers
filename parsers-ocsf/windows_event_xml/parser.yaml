@@ -635,6 +635,22 @@ parser_vrl: |
       }
   }
   __consumed = ""
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
   # BEGIN parser-specific transformations
   # event_data.SubjectUserName: Parser lowercases this Windows identity field when emitted.
   # event_data.SubjectUserName: Parser lowercases this Windows identity field when emitted.
@@ -644,6 +660,7 @@ parser_vrl: |
   # event_data.TargetUserName: Parser lowercases this Windows identity field when emitted.
   # event_data.TargetDomainName: Parser lowercases this Windows identity field when emitted.
   # event_data.TargetDomainName: Parser lowercases this Windows identity field when emitted.
+  # system.TimeCreated.@SystemTime: XML system clock converted to event milliseconds.
   # system.Computer: Case normalization already performed by the parser; observed at device.hostname, and checked against the emitted branch.
   # system.Computer: Case normalization already performed by the parser; observed at device.hostname, and checked against the emitted branch.
   # event_data.WorkstationName: Case normalization already performed by the parser; observed at src_endpoint.hostname, and checked against the emitted branch.
@@ -651,7 +668,7 @@ parser_vrl: |
   # event_data.NewProcessId: Parsed hexadecimal process ID or access mask is represented as an integer at this destination.
   # event_data.ProcessId: Parsed hexadecimal process ID or access mask is represented as an integer at this destination.
   # event_data.MemberName: Case normalization already performed by the parser; observed at user.name, and checked against the emitted branch.
-  for_each(flatten(__source_kv)) -> |key, value| {
+  for_each(__flat) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
         event_data\.SubjectUserName
@@ -717,6 +734,17 @@ parser_vrl: |
       }
       if match(key, r'(?x)
       \A(?:
+        system\.TimeCreated\.@SystemTime
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
         system\.Computer
       )\z') {
           __value = value
@@ -775,28 +803,13 @@ parser_vrl: |
   __decl = "\n\"event_data.AccountName\"\t[\"win_service.service_start_name\"]\n\"event_data.AuthenticationPackageName\"\t[\"auth_protocol\"]\n\"event_data.CommandLine\"\t[\"process.cmd_line\"]\n\"event_data.FailureReason\"\t[\"status_detail\"]\n\"event_data.ImagePath\"\t[\"win_service.cmd_line\"]\n\"event_data.IpAddress\"\t[\"src_endpoint.ip\"]\n\"event_data.MemberSid\"\t[\"user.uid\"]\n\"event_data.NewProcessName\"\t[\"process.file.path\"]\n\"event_data.NewValue\"\t[\"reg_value.data.string\"]\n\"event_data.ObjectName\"\t[\"file.path\"]\n\"event_data.ObjectValueName\"\t[\"reg_value.name\"]\n\"event_data.ParentProcessName\"\t[\"actor.process.file.path\"]\n\"event_data.Path\"\t[\"script.file.path\"]\n\"event_data.ProcessName\"\t[\"actor.process.name\",\"process.file.path\"]\n\"event_data.ScriptBlockId\"\t[\"script.uid\"]\n\"event_data.ScriptBlockText\"\t[\"message\",\"script.script_content.value\"]\n\"event_data.ServiceAccount\"\t[\"win_service.service_start_name\"]\n\"event_data.ServiceFileName\"\t[\"win_service.cmd_line\"]\n\"event_data.ServiceName\"\t[\"win_service.name\"]\n\"event_data.ShareLocalPath\"\t[\"file.name\",\"file.path\"]\n\"event_data.Status\"\t[\"status_code\"]\n\"event_data.SubjectLogonId\"\t[\"session.uid\"]\n\"event_data.SubjectUserName\"\t[\"actor.user.name\",\"user.name\"]\n\"event_data.SubjectUserSid\"\t[\"actor.user.uid\",\"user.uid\"]\n\"event_data.TargetLogonId\"\t[\"session.uid\"]\n\"event_data.TargetSid\"\t[\"group.uid\",\"user.uid\"]\n\"event_data.TargetUserName\"\t[\"user.name\"]\n\"event_data.TargetUserSid\"\t[\"user.uid\"]\n\"event_data.TaskName\"\t[\"job.file.path\"]\n\"system.Channel\"\t[\"log_name\",\"metadata.log_name\"]\n\"system.EventID\"\t[\"metadata.event_code\"]\n\"system.EventRecordID\"\t[\"metadata.original_event_uid\"]\n\"system.Provider.@Name\"\t[\"log_provider\",\"metadata.log_provider\"]\n"
   __preserve = []
   # END parser-specific transformations
-  # Escape literal dots before flattening so dotted source keys cannot overwrite
-  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
-  # In compact JSON only an object key is followed by ':', so a source whose text
-  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
-  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
-  __escaped = object!(__copy.source)
-  __tilde = false
-  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
-      __escaped = map_keys(__escaped, recursive: true) -> |key| {
-          replace(replace(key, "~", "~0"), ".", "~1")
-      }
-      # Keys without a "~" decode to themselves, including the object keys inside
-      # an array that flatten leaves escaped; encode_json never escapes a "~".
-      __tilde = contains(encode_json(__escaped), "~")
-  }
-  __flat = flatten(__escaped)
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
   # target paths + "\n" per mapped source key (a raw newline never occurs in
   # compact JSON). A key is consumed when its value, or every element of a scalar
-  # array, is at one of its own targets.
+  # array, is at one of its own targets. Keys stay ESCAPED here and in __consumed:
+  # a literal dotted key ("a~1b") and the nested path ("a.b") are different
+  # fields, and mapping one never consumes the other.
   for_each(__flat) -> |key, value| {
-      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
       # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
       __kt = encode_json(key)
       if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
@@ -834,7 +847,6 @@ parser_vrl: |
   __names = {}
   if __distinct {
       __kept = filter(__flat) -> |key, value| {
-          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
           # A key is kept unless an explicit mapping or transformation consumed it.
           # Do not spill a copy of the raw body.
           value != __raw_body && !contains(__consumed, "," + encode_json(key))
@@ -868,13 +880,13 @@ parser_vrl: |
       # Slow path, in source key order: a name already taken gets the next free
       # _2, _3, ... suffix.
       for_each(__flat) -> |key, value| {
+          __token = "," + encode_json(key)
           key = replace(replace(key, "~1", "."), "~0", "~")
           if is_array(value) || is_object(value) {
               value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
                   replace(replace(inner, "~1", "."), "~0", "~")
               }, ["v"])
           }
-          __token = "," + encode_json(key)
           if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")

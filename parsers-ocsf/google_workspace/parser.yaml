@@ -472,25 +472,6 @@ parser_vrl: |
       }
   }
   __consumed = ""
-  # BEGIN parser-specific transformations
-  # id.time: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-  for_each(flatten(__source_kv)) -> |key, value| {
-      if match(key, r'(?x)
-      \A(?:
-        id\.time
-      )\z') {
-          __value = value
-          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
-          if __clock_err == null {
-              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-              if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
-          }
-      }
-  }
-  # Declared source -> target mappings (field-coverage.yaml `mappings`).
-  __decl = "\n\"actor.applicationInfo.applicationName\"\t[\"resources.name\"]\n\"actor.applicationInfo.oauthClientId\"\t[\"resources.uid\"]\n\"actor.email\"\t[\"actor.user.email_addr\",\"actor.user.name\",\"user.email_addr\",\"user.name\"]\n\"actor.profileId\"\t[\"actor.user.uid\",\"user.uid\"]\n\"id.customerId\"\t[\"metadata.tenant_uid\"]\n\"id.uniqueQualifier\"\t[\"metadata.original_event_uid\"]\n\"ipAddress\"\t[\"src_endpoint.ip\"]\n\"networkInfo.regionCode\"\t[\"src_endpoint.location.country\"]\n"
-  __preserve = ["event_names"]
-  # END parser-specific transformations
   # Escape literal dots before flattening so dotted source keys cannot overwrite
   # nested paths. Decode for naming, and disambiguate collisions with suffixes.
   # In compact JSON only an object key is followed by ':', so a source whose text
@@ -507,12 +488,32 @@ parser_vrl: |
       __tilde = contains(encode_json(__escaped), "~")
   }
   __flat = flatten(__escaped)
+  # BEGIN parser-specific transformations
+  # id.time: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  for_each(__flat) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        id\.time
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
+  # Declared source -> target mappings (field-coverage.yaml `mappings`).
+  __decl = "\n\"actor.applicationInfo.applicationName\"\t[\"resources.name\"]\n\"actor.applicationInfo.oauthClientId\"\t[\"resources.uid\"]\n\"actor.email\"\t[\"actor.user.email_addr\",\"actor.user.name\",\"user.email_addr\",\"user.name\"]\n\"actor.profileId\"\t[\"actor.user.uid\",\"user.uid\"]\n\"id.customerId\"\t[\"metadata.tenant_uid\"]\n\"id.uniqueQualifier\"\t[\"metadata.original_event_uid\"]\n\"ipAddress\"\t[\"src_endpoint.ip\"]\n\"networkInfo.regionCode\"\t[\"src_endpoint.location.country\"]\n"
+  __preserve = ["event_names"]
+  # END parser-specific transformations
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
   # target paths + "\n" per mapped source key (a raw newline never occurs in
   # compact JSON). A key is consumed when its value, or every element of a scalar
-  # array, is at one of its own targets.
+  # array, is at one of its own targets. Keys stay ESCAPED here and in __consumed:
+  # a literal dotted key ("a~1b") and the nested path ("a.b") are different
+  # fields, and mapping one never consumes the other.
   for_each(__flat) -> |key, value| {
-      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
       # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
       __kt = encode_json(key)
       if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
@@ -550,7 +551,6 @@ parser_vrl: |
   __names = {}
   if __distinct {
       __kept = filter(__flat) -> |key, value| {
-          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
           # A key is kept unless an explicit mapping or transformation consumed it.
           # Do not spill a copy of the raw body.
           value != __raw_body && !contains(__consumed, "," + encode_json(key))
@@ -584,13 +584,13 @@ parser_vrl: |
       # Slow path, in source key order: a name already taken gets the next free
       # _2, _3, ... suffix.
       for_each(__flat) -> |key, value| {
+          __token = "," + encode_json(key)
           key = replace(replace(key, "~1", "."), "~0", "~")
           if is_array(value) || is_object(value) {
               value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
                   replace(replace(inner, "~1", "."), "~0", "~")
               }, ["v"])
           }
-          __token = "," + encode_json(key)
           if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")

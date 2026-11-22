@@ -34,11 +34,21 @@ def infer(path, all_keys=False):
     runs = provenance.run_vrl(doc['parser_vrl'], [e for _, e in samples])
     outputs = [o for o, _ in runs]
     sources = [s for _, s in runs]
+    seen = list(dict.fromkeys(k for s in sources for k, _ in provenance.esc_flatten(s)))
+    # A key named with plain dots (a legacy candidate list) means whichever
+    # escaped field it spells: the nested path, or a literal dotted key.
+    spelled = {}
+    for k in seen:
+        spelled.setdefault('.'.join(provenance.unesc(p) for p in k.split('.')), []).append(k)
+    resolve = lambda k: [k] if k in seen else spelled.get(k, [k])
     if all_keys:
-        keys = list(dict.fromkeys(k for s in sources for k, _ in provenance.obj_flatten(s)))
+        keys = seen
     else:
-        keys = list(config.get('mappings') or {}) or list(config.get('consumed_candidates') or [])
-    rules = config.get('transforms') or []
+        keys = list(dict.fromkeys(e for k in (list(config.get('mappings') or {}) or list(config.get('consumed_candidates') or [])) for e in resolve(k)))
+    rules = []
+    for rule in config.get('transforms') or []:
+        for source in resolve(rule['source']):
+            rules.append({**rule, 'source': source})
     items = [(k, None) for k in keys] + [(r['source'], r) for r in rules]
     found = provenance.probe(doc['parser_vrl'], samples, sources, outputs, items, per_key=12)
     mappings = {}
