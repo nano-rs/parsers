@@ -275,6 +275,13 @@ and after a large rewrite. CI runs the check on every PR (job "Parser load budge
 
 ### Writing an OCSF parser
 
+- **A parser never masks, redacts or withholds anything.** It converts raw to
+  real: map every source field faithfully into OCSF or let it spill to
+  `unmapped` as-is, keep `raw_data` as the untouched original line, and keep
+  fallback text as-is. Do not drop, hash, trim or replace a value because it
+  might hold a credential (a password, token, header, URL query or error
+  text). Masking is an opt-in Nano Pipe step, a pipeline concern, never a
+  parser concern. Review rejects parser-level redaction.
 - Emit the **complete OCSF object on the root** (`. = ocsf`) so it lands in
   the lake and every canonical path is stored as its own queryable column.
 - UDM names do not exist in OCSF. `src_ip` is `src_endpoint.ip`, `user` is

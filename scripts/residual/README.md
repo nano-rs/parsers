@@ -1,5 +1,12 @@
 # Residual source preservation
 
+**Parsers never mask, redact or withhold anything.** A parser converts raw to
+real: every source field is mapped faithfully into OCSF or spilled into
+`unmapped` exactly as parsed, `raw_data` is the untouched original, and
+fallback text is kept as-is. Masking is an opt-in Nano Pipe step, a pipeline
+concern, never a parser concern. Do not add redaction to this template, to a
+parser, or to the checker.
+
 `residual_spill.py` generates the shared spill block in each enabled OCSF parser.
 Edit `spill.vrl`, `transforms.vrl`, or the parser's `field-coverage.yaml`, then run:
 
@@ -38,18 +45,15 @@ Residual objects flatten into dotted snake_case paths. Literal dots are escaped
 before flattening, then decoded for naming. Collisions receive `_2`, `_3`, etc.
 Scalar arrays retain their type/order; arrays containing objects or arrays use
 JSON strings. Fully represented scalar arrays are consumed. Partially mapped arrays remain
-intact to preserve their order and repeated elements. Secret-bearing keys
-(`password`, `secret`, `authorization`, `token`, case-insensitive) are redacted
-recursively before encoding; a sensitive object key redacts its whole value.
-Name/value and Key/Value header or parameter objects redact the payload when
-the name identifies a sensitive field.
-This is spill redaction; the existing untouched `raw_data` retention is unchanged.
-An empty residual is omitted. Existing derived scalar evidence is retained when
+intact to preserve their order and repeated elements. Every value spills
+as-is, whatever its key is called (a `password` or `token` key is no
+different from any other). An empty residual is omitted. Existing derived scalar evidence is retained when
 it is not a duplicate of source or mapped values; source aliases are replaced
 by canonical source paths.
 
 The checker runs inline and sidecar samples, and adds JSON probes for unknown
-keys, nested objects, scalar/object arrays, secret redaction, and collisions.
+keys, nested objects, scalar/object arrays, credential-named keys (which must
+spill unaltered like any other), and collisions.
 `--output-dir` optionally retains emitted production events for review.
 `--all` fails for any parser lacking source capture or a coverage manifest;
 it never silently treats unsupported text input as covered.
@@ -71,8 +75,8 @@ size. The generated block therefore:
 - decides each source key with one `filter` and builds the residual with one
   rename, falling back to the original in-order loop only when two keys decode
   or snake-case to the same name;
-- skips work its input makes unnecessary (no secret word: no redaction walk;
-  no dotted key: no escaping; no array or brace-led string: scalar members only).
+- skips work its input makes unnecessary (no dotted key: no escaping; no
+  array or brace-led string: scalar members only).
 
 Compile cost matters as much as per-event cost: Vector compiles every remap
 program in the tree on every reload, and nano rolls back a deploy whose reload
@@ -91,12 +95,15 @@ branch-specific assertions, not weaken them.
 
 Some existing derived evidence has meaning beyond source-value equality.
 `preserve_unmapped` explicitly documents these exceptions (currently Moat DNS
-context). Those objects retain their existing shape and are recursively redacted.
+context). Those objects retain their existing shape and values.
 The flat dotted-key requirement applies to the new source residuals.
 
 Configured text probes inject unseen fields and password values through KV,
 CEF, XML, rendered Windows text, and multi-element syslog structured data. They
-assert both successful capture and redacted preservation. Probes are temporary
+assert successful capture and unaltered preservation: the probe's password
+value must reach the parsed source exactly, and check() then requires it
+mapped or spilled with that value. For every sample, an emitted `raw_data`
+must equal the original input byte for byte. Probes are temporary
 in-memory inputs; supplied samples remain unchanged.
 
 When adding a mapped field, update its consumed candidate and any transformation

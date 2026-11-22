@@ -1,15 +1,8 @@
 # Vault writes one JSON entry per line, bare (file / socket device) or behind
-# a syslog header (syslog device). The parser scrubs credentials fail-closed
-# BEFORE mapping: every string outside the known Vault envelope (unknown
-# top-level keys included) is "<redacted>" unless HMAC'd, so the mapped and
-# spilled source is the scrubbed record and cannot equal the input JSON. It is
-# therefore declared as a text source, without the shared probes, whose
-# unknown string leaves this parser redacts by design.
-# scripts/test_vault_token_redaction.py runs the strict replacement for every
-# sample instead: the captured source must equal the input JSON (syslog header
-# removed) except at "<redacted>" leaves, with the same keys, and the shared
-# no-loss check() and the shared residual probe object run on the result.
-source: text
+# a syslog header (syslog device). The parser captures the parsed entry as
+# its source unchanged, so a bare JSON line runs the shared source-equality
+# check and residual probes; a syslog line adds its header as syslog_header.
+source: mixed
 transforms:
 - source: time
   kind: epoch_ms
@@ -48,7 +41,6 @@ consumed_candidates:
 - auth.metadata.username
 - auth.policies
 - auth.policy_results.granting_policies
-- auth.token_ttl
 - error
 - forwarded_from
 - request.headers.user-agent
@@ -70,7 +62,6 @@ consumed_candidates:
 - response.auth.metadata.email
 - response.auth.metadata.username
 - response.auth.policies
-- response.auth.token_ttl
 - response.mount_accessor
 - response.mount_point
 - response.mount_type
