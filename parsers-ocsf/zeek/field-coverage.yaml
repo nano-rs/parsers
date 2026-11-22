@@ -2,24 +2,24 @@ source: json
 transforms:
 - source: _path
   kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
+  target: metadata.event_code
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
+- source: _path
+  kind: lowercase
+  target: metadata.log_name
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
 - source: proto
   kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
+  target: connection_info.protocol_name
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
 - source: service
   kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: msg_types
+  target: app_protocol_name
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
+- source: service
   kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: action
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
+  target: dst_endpoint.svc_name
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
 - source: ts
   target: time
   kind: scale
@@ -30,92 +30,140 @@ transforms:
   kind: scale
   factor: 1000
   reason: Source seconds converted to the emitted millisecond value.
-consumed_candidates:
-- '@path'
-- TTLs
-- _path
-- _system_name
-- action
-- answers
-- arg
-- assigned_addr
-- auth_success
-- certificate.subject
-- cipher
-- client
-- command
-- community_id
-- conn_state
-- cookie
-- desktop_height
-- desktop_width
-- domainname
-- duration
-- filename
-- from
-- helo
-- host
-- host_key
-- host_key_alg
-- host_name
-- id.orig_h
-- id.orig_p
-- id.resp_h
-- id.resp_p
-- ja3
-- keyboard_layout
-- lease_time
-- mac
-- mailfrom
-- method
-- mime_type
-- msg
-- msg_id
-- msg_types
-- name
-- node
-- note
-- orig_bytes
-- orig_ip_bytes
-- orig_pkts
-- path
-- proto
-- qclass_name
-- qtype_name
-- query
-- rcode_name
-- rcptto
-- referrer
-- reply_code
-- reply_msg
-- request_body_len
-- request_type
-- resp_bytes
-- resp_ip_bytes
-- resp_mime_types
-- resp_pkts
-- response_body_len
-- result
-- seen.indicator
-- server
-- server_name
-- service
-- sha256
-- share_type
-- sources
-- status_code
-- subject
-- success
-- to
-- trans_id
-- ts
-- tunnel_type
-- uid
-- uri
-- user
-- user_agent
-- username
-- version
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  TTLs:
+  - answers.ttl
+  _path:
+  - metadata.event_code
+  - metadata.log_name
+  answers:
+  - answers.rdata
+  arg:
+  - file.name
+  - file.path
+  assigned_addr:
+  - src_endpoint.ip
+  client:
+  - observables.value
+  - user.name
+  command:
+  - command
+  community_id:
+  - connection_info.community_uid
+  cookie:
+  - identifier_cookie
+  desktop_height:
+  - remote_display.physical_height
+  desktop_width:
+  - remote_display.physical_width
+  domainname:
+  - user.domain
+  from:
+  - email.from
+  host:
+  - http_request.url.hostname
+  host_name:
+  - src_endpoint.hostname
+  id.orig_h:
+  - evidences.src_endpoint.ip
+  - observables.value
+  - src_endpoint.ip
+  id.orig_p:
+  - evidences.src_endpoint.port
+  - src_endpoint.port
+  id.resp_h:
+  - dst_endpoint.ip
+  - evidences.dst_endpoint.ip
+  - observables.value
+  id.resp_p:
+  - dst_endpoint.port
+  - evidences.dst_endpoint.port
+  lease_time:
+  - lease_dur
+  mac:
+  - src_endpoint.mac
+  msg:
+  - finding_info.desc
+  - status_detail
+  msg_id:
+  - email.message_uid
+  name:
+  - file.name
+  - file.path
+  - finding_info.analytic.name
+  - finding_info.analytic.uid
+  - finding_info.title
+  - finding_info.uid
+  node:
+  - device.hostname
+  - src_endpoint.hostname
+  note:
+  - finding_info.analytic.name
+  - finding_info.analytic.uid
+  - finding_info.title
+  - finding_info.uid
+  orig_ip_bytes:
+  - traffic.bytes_out
+  orig_pkts:
+  - traffic.packets_out
+  path:
+  - share
+  proto:
+  - connection_info.protocol_name
+  qclass_name:
+  - query.class
+  qtype_name:
+  - query.type
+  query:
+  - observables.value
+  - query.hostname
+  rcode_name:
+  - rcode
+  rcptto:
+  - email.to
+  referrer:
+  - http_request.referrer
+  reply_code:
+  - codes
+  reply_msg:
+  - status_detail
+  resp_ip_bytes:
+  - traffic.bytes_in
+  resp_pkts:
+  - traffic.packets_in
+  response_body_len:
+  - http_response.length
+  - traffic.bytes_in
+  result:
+  - status_detail
+  service:
+  - app_protocol_name
+  - dst_endpoint.svc_name
+  sha256:
+  - observables.value
+  share_type:
+  - share_type
+  status_code:
+  - http_response.code
+  subject:
+  - email.subject
+  trans_id:
+  - transaction_id
+  uid:
+  - connection_info.uid
+  - metadata.correlation_uid
+  uri:
+  - http_request.url.path
+  user:
+  - actor.user.name
+  user_agent:
+  - http_request.user_agent
+  - observables.value
+  username:
+  - observables.value
+  - user.name
+  version:
+  - protocol_ver

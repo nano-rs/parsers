@@ -1,0 +1,714 @@
+name: azure_nsg_flow_ocsf
+display_name: Azure NSG / VNet Flow Logs (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Azure Network Watcher flow logs into OCSF 1.9.0 "Network Activity"
+  (class_uid 4001) records with the cloud and security_control profiles:
+  NSG flow logs (category NetworkSecurityGroupFlowEvent, properties.Version 1
+  and 2, tuple ts,src,dst,sport,dport,T/U,I/O,A/D[,B/C/E,pkts,bytes,pkts,bytes])
+  and virtual network flow logs (category FlowLogFlowEvent, flowLogVersion 4
+  and 5, flowRecords.flows[].flowGroups[].flowTuples with IANA protocol
+  numbers, B/C/E/D flow state, encryption status and the version 5 Private
+  Link fields). Accepted inputs, in order of preference: one record carrying
+  one tuple (the shape an upstream exploder produces), a pre-flattened record
+  with a top-level `flowTuple` string plus `rule` / `mac` / `aclID`, a bare
+  tuple CSV line, and the `{"records": [...]}` storage-blob envelope. VRL
+  cannot fan one input out into several events, so when a record carries
+  several tuples the FIRST tuple is mapped and the complete flows array (every
+  other tuple included) is kept in `unmapped` as JSON; nothing is dropped.
+  Explode records to one tuple per event upstream for full per-flow
+  fidelity. A denied tuple (NSG decision D, or VNet state D) is action Denied
+  / disposition Blocked / activity Refuse; otherwise B is Open, C is Traffic
+  and E is Close. Flow state, encryption and Private Link fields land in
+  `unmapped.flow_*`. Anything that is not a flow record becomes a Base Event
+  with the raw body kept and `unmapped.parse_fallback` set.
+match_values:
+  - azure_nsg_flow
+category: cloud
+vendor: "Microsoft"
+product: "Azure Network Watcher"
+parser_vrl: |
+  # Azure NSG / VNet flow log -> OCSF 1.9.0 Network Activity (4001) / Base Event (0)
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+
+  rec = {}
+  is_json = false
+  parsed, jerr = parse_json(raw_log)
+  if jerr == null && is_object(parsed) {
+      __source_kv = object!(parsed)
+      is_json = true
+      rec = object!(parsed)
+      recs = array(rec.records) ?? []
+      if length(recs) > 0 { rec = object(recs[0]) ?? {} }
+  }
+
+  tuple = ""
+  rule = ""
+  mac = ""
+  acl_id = ""
+  fmt = ""
+  log_ver = ""
+  category = ""
+  op_name = ""
+  res_id = ""
+  rec_time = ""
+
+  if is_json {
+      category = string(rec.category) ?? ""
+      op_name = string(rec.operationName) ?? ""
+      rec_time = string(rec.time) ?? ""
+      res_id = string(rec.resourceId) ?? string(rec.resourceid) ?? string(rec.flowLogResourceID) ?? ""
+      mac = string(rec.macAddress) ?? ""
+      props = object(rec.properties) ?? {}
+      nsg_groups = array(props.flows) ?? []
+      vnet_records = object(rec.flowRecords) ?? {}
+      vnet_flows = array(vnet_records.flows) ?? []
+      if length(nsg_groups) > 0 {
+          # NSG: properties.flows[].{rule, flows[].{mac, flowTuples[]}}
+          fmt = "nsg"
+          log_ver = to_string(props.Version) ?? ""
+          for_each(nsg_groups) -> |_gi, group| {
+              if tuple == "" {
+                  grp = object(group) ?? {}
+                  inner = array(grp.flows) ?? []
+                  for_each(inner) -> |_fi, flow| {
+                      if tuple == "" {
+                          fl = object(flow) ?? {}
+                          tl = array(fl.flowTuples) ?? []
+                          if length(tl) > 0 {
+                              tuple = string(tl[0]) ?? ""
+                              rule = string(grp.rule) ?? ""
+                              fm = string(fl.mac) ?? ""
+                              if fm != "" { mac = fm }
+                          }
+                      }
+                  }
+              }
+          }
+      } else if length(vnet_flows) > 0 {
+          # VNet: flowRecords.flows[].{aclID, flowGroups[].{rule, flowTuples[]}}
+          fmt = "vnet"
+          log_ver = to_string(rec.flowLogVersion) ?? ""
+          for_each(vnet_flows) -> |_ai, acl| {
+              if tuple == "" {
+                  ac = object(acl) ?? {}
+                  groups = array(ac.flowGroups) ?? []
+                  for_each(groups) -> |_gi, group| {
+                      if tuple == "" {
+                          grp = object(group) ?? {}
+                          tl = array(grp.flowTuples) ?? []
+                          if length(tl) > 0 {
+                              tuple = string(tl[0]) ?? ""
+                              rule = string(grp.rule) ?? ""
+                              acl_id = string(ac.aclID) ?? ""
+                          }
+                      }
+                  }
+              }
+          }
+      } else {
+          # Pre-flattened: one tuple string beside its rule / mac / aclID.
+          tuple = string(rec.flowTuple) ?? ""
+          rule = string(rec.rule) ?? ""
+          fm = string(rec.mac) ?? ""
+          if fm != "" { mac = fm }
+          acl_id = string(rec.aclID) ?? ""
+          log_ver = to_string(rec.flowLogVersion) ?? ""
+          if log_ver == "" { log_ver = to_string(rec.Version) ?? "" }
+          if category == "FlowLogFlowEvent" || acl_id != "" { fmt = "vnet" }
+          if category == "NetworkSecurityGroupFlowEvent" { fmt = "nsg" }
+      }
+  } else if match(raw_log, r'^\s*\d{9,13},') {
+      tuple = strip_whitespace(raw_log)
+  }
+
+  f = split(tuple, ",")
+  n = length(f)
+  if n < 8 {
+      # Not a flow record (or a record with no tuples): Base Event, body kept.
+      fb_time = to_unix_timestamp(now(), unit: "milliseconds")
+      fb_log_name = "AzureFlowLog"
+      if category != "" { fb_log_name = category }
+      if rec_time != "" {
+          rt, rterr = parse_timestamp(rec_time, "%+")
+          if rterr == null { fb_time = to_unix_timestamp(rt, unit: "milliseconds") }
+      }
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": fb_time,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud"],
+              "uid": sha2("azure_nsg_flow|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": fb_log_name,
+              "log_provider": "Azure Network Watcher",
+              "product": { "name": "Azure Network Watcher", "vendor_name": "Microsoft" }
+          },
+          "cloud": { "provider": "Azure" }
+      }
+      reason = "unparsable input"
+      if is_json { reason = "no flow tuple in record" }
+      . = set!(., ["unmapped", "parse_fallback"], reason)
+  } else {
+      f0 = string(f[0]) ?? ""
+      f7 = upcase(string(f[7]) ?? "")
+      f8 = upcase(string(f[8]) ?? "")
+      # The envelope (flowLogVersion >= 4, FlowLogFlowEvent, flowRecords) is
+      # authoritative; the encryption column only decides for a bare tuple.
+      vnet_style = fmt == "vnet" || f8 == "X" || starts_with(f8, "NX")
+      if fmt == "" { fmt = if vnet_style { "vnet" } else { "nsg" } }
+
+      decision = ""
+      state = ""
+      encryption = ""
+      if vnet_style {
+          state = f7
+          encryption = string(f[8]) ?? ""
+          decision = if state == "D" { "D" } else { "A" }
+      } else {
+          decision = f7
+          state = f8
+      }
+
+      # ---- bare tuple text: capture named columns as the parsed source ----
+      if !is_json {
+          cols = ["time", "src_ip", "dst_ip", "src_port", "dst_port", "protocol", "direction", "decision", "flow_state", "packets_out", "bytes_out", "packets_in", "bytes_in"]
+          if vnet_style {
+              cols = ["time", "src_ip", "dst_ip", "src_port", "dst_port", "protocol", "direction", "flow_state", "flow_encryption", "packets_out", "bytes_out", "packets_in", "bytes_in", "flow_pls_link_id", "flow_src_nat_ip", "flow_src_nat_port"]
+          }
+          for_each(f) -> |index, value| {
+              if value != "" {
+                  col = string(get(cols, [index]) ?? null) ?? ("column_" + to_string(index))
+                  __source_kv = set!(__source_kv, [col], value)
+              }
+          }
+      }
+
+      # ---- time: NSG tuples carry epoch seconds, VNet tuples epoch milliseconds ----
+      ts = to_int(f0) ?? 0
+      if ts < 0 { ts = 0 }
+      time_ms = ts
+      if ts > 0 && ts < 100000000000 { time_ms = ts * 1000 }
+      if time_ms == 0 && rec_time != "" {
+          rt, rterr = parse_timestamp(rec_time, "%+")
+          if rterr == null { time_ms = to_unix_timestamp(rt, unit: "milliseconds") }
+      }
+      # Never emit 1970: an absent or unreadable clock falls back to ingest time.
+      if time_ms <= 0 { time_ms = to_unix_timestamp(now(), unit: "milliseconds") }
+
+      src_ip = downcase(string(f[1]) ?? "")
+      dst_ip = downcase(string(f[2]) ?? "")
+      src_port = to_int(string(f[3]) ?? "") ?? 0
+      dst_port = to_int(string(f[4]) ?? "") ?? 0
+
+      proto_raw = upcase(string(f[5]) ?? "")
+      proto_num = to_int(proto_raw) ?? -1
+      if proto_raw == "T" { proto_num = 6 }
+      if proto_raw == "U" { proto_num = 17 }
+      proto_name = ""
+      if proto_num == 6 { proto_name = "tcp" }
+      if proto_num == 17 { proto_name = "udp" }
+      if proto_num == 1 { proto_name = "icmp" }
+      if proto_num == 58 { proto_name = "ipv6-icmp" }
+
+      dir_raw = upcase(string(f[6]) ?? "")
+      connection_info = { "direction_id": 0, "direction": "Unknown" }
+      if dir_raw == "I" { connection_info = { "direction_id": 1, "direction": "Inbound" } }
+      if dir_raw == "O" { connection_info = { "direction_id": 2, "direction": "Outbound" } }
+      if proto_num >= 0 { connection_info.protocol_num = proto_num }
+      if proto_name != "" { connection_info.protocol_name = proto_name }
+
+      # ---- verdict ----
+      action_id = 0
+      action_str = "Unknown"
+      disposition_id = 0
+      disposition = "Unknown"
+      status_id = 0
+      status_str = "Unknown"
+      if decision == "A" {
+          action_id = 1; action_str = "Allowed"; disposition_id = 1; disposition = "Allowed"
+          status_id = 1; status_str = "Success"
+      }
+      if decision == "D" {
+          action_id = 2; action_str = "Denied"; disposition_id = 2; disposition = "Blocked"
+          status_id = 2; status_str = "Failure"
+      }
+
+      # ---- flow state -> activity ----
+      activity_id = 6
+      activity_name = "Traffic"
+      if state == "B" { activity_id = 1; activity_name = "Open" }
+      if state == "E" { activity_id = 2; activity_name = "Close" }
+      if decision == "D" { activity_id = 5; activity_name = "Refuse" }
+
+      # ---- traffic counters (absent on B tuples and NSG version 1) ----
+      traffic = {}
+      p_out = to_int(string(f[9]) ?? "") ?? -1
+      b_out = to_int(string(f[10]) ?? "") ?? -1
+      p_in = to_int(string(f[11]) ?? "") ?? -1
+      b_in = to_int(string(f[12]) ?? "") ?? -1
+      if p_out >= 0 { traffic.packets_out = p_out }
+      if b_out >= 0 { traffic.bytes_out = b_out }
+      if p_in >= 0 { traffic.packets_in = p_in }
+      if b_in >= 0 { traffic.bytes_in = b_in }
+      if p_out >= 0 && p_in >= 0 { traffic.packets = p_out + p_in }
+      if b_out >= 0 && b_in >= 0 { traffic.bytes = b_out + b_in }
+
+      # ---- endpoints; the NIC MAC belongs to the VM side of the flow ----
+      src_endpoint = {}
+      dst_endpoint = {}
+      if src_ip != "" { src_endpoint.ip = src_ip }
+      if src_port > 0 { src_endpoint.port = src_port }
+      if dst_ip != "" { dst_endpoint.ip = dst_ip }
+      if dst_port > 0 { dst_endpoint.port = dst_port }
+      mac_fmt = ""
+      mm, mmerr = parse_regex(mac, r'^(?P<a>[0-9A-Fa-f]{2})-?(?P<b>[0-9A-Fa-f]{2})-?(?P<c>[0-9A-Fa-f]{2})-?(?P<d>[0-9A-Fa-f]{2})-?(?P<e>[0-9A-Fa-f]{2})-?(?P<f>[0-9A-Fa-f]{2})$')
+      if mmerr == null {
+          mac_fmt = upcase(to_string(mm.a) + ":" + to_string(mm.b) + ":" + to_string(mm.c) + ":" + to_string(mm.d) + ":" + to_string(mm.e) + ":" + to_string(mm.f))
+      }
+      if mac_fmt != "" {
+          if dir_raw == "I" { dst_endpoint.mac = mac_fmt } else { src_endpoint.mac = mac_fmt }
+      }
+      if length(keys(src_endpoint)) == 0 { src_endpoint.ip = "0.0.0.0" }
+
+      # ---- cloud account out of the ARM resource id ----
+      cloud = { "provider": "Azure" }
+      sm, smerr = parse_regex(res_id, r'(?i)/SUBSCRIPTIONS/(?P<sub>[^/]+)/')
+      if smerr == null { cloud.account = { "uid": downcase(to_string(sm.sub)) } }
+
+      # ---- firewall_rule: NSG rule name, VNet ACL (NSG or AVNM) id ----
+      fw = {}
+      if rule != "" { fw.name = rule }
+      if acl_id != "" { fw.uid = acl_id }
+      if rule == "" && acl_id != "" { fw.name = acl_id }
+      if fmt == "vnet" { fw.type = "VNet flow log ACL" } else { fw.type = "Network Security Group" }
+
+      log_name = category
+      if log_name == "" { log_name = if fmt == "vnet" { "FlowLogFlowEvent" } else { "NetworkSecurityGroupFlowEvent" } }
+      metadata = {
+          "version": "1.9.0",
+          "profiles": ["cloud", "security_control"],
+          "uid": sha2("azure_nsg_flow|raw|" + raw_log, variant: "SHA-256"),
+          "log_name": log_name,
+          "log_provider": "Azure Network Watcher",
+          "product": { "name": "Azure Network Watcher", "vendor_name": "Microsoft" }
+      }
+      if op_name != "" { metadata.event_code = op_name }
+      if log_ver != "" { metadata.log_version = log_ver }
+
+      unmapped = { "flow_log_type": fmt }
+      if state != "" { unmapped.flow_state = state }
+      if encryption != "" { unmapped.flow_encryption = encryption }
+      if vnet_style {
+          pls = string(f[13]) ?? ""
+          if pls != "" { unmapped.flow_pls_link_id = pls }
+          nat_ip = string(f[14]) ?? ""
+          if nat_ip != "" { unmapped.flow_src_nat_ip = nat_ip }
+          nat_port = string(f[15]) ?? ""
+          if nat_port != "" { unmapped.flow_src_nat_port = nat_port }
+      }
+
+      ocsf = {
+          "class_uid": 4001,
+          "class_name": "Network Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": 400100 + activity_id,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": status_id,
+          "status": status_str,
+          "action_id": action_id,
+          "action": action_str,
+          "disposition_id": disposition_id,
+          "disposition": disposition,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "cloud": cloud,
+          "src_endpoint": src_endpoint,
+          "connection_info": connection_info,
+          "unmapped": unmapped
+      }
+      if length(keys(dst_endpoint)) > 0 { ocsf.dst_endpoint = dst_endpoint }
+      if length(keys(traffic)) > 0 { ocsf.traffic = traffic }
+      if exists(fw.name) { ocsf.firewall_rule = fw }
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # Values spill exactly as parsed: a parser never masks, redacts or withholds
+  # anything (masking is an opt-in pipeline step, never a parser concern).
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # A source field is consumed ONLY by an explicit mapping: a field-coverage.yaml
+  # `mappings` entry (source key -> target paths) or a `transforms` rule with a
+  # target, whose value is found AT THAT TARGET PATH of the selected branch. A
+  # value that merely appears somewhere else in the event never consumes a field
+  # (no coincidental consumption); everything else spills.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The sets below are strings instead
+  # (a read shares the buffer). __repr holds one member per mapped leaf:
+  # "," + encode_json(path) + "=" + encode_json(encode_json(value)), plus the
+  # to_string form for a string or a float, so a numeric string is represented by
+  # its typed scalar. Every part is a JSON text, inside which a '"' is always
+  # escaped, so a member is matched exactly. Paths drop array indices
+  # (resources.0.uid is resources.uid); arrays are walked two levels deep, and a
+  # leaf deeper than that is simply not mapping evidence (it can only spill more).
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped = object!(parse_json!(encode_json(__mapped)))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __copy = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __repr = ""
+  for_each(flatten(__mapped)) -> |path, value| {
+      __p = encode_json(path)
+      if is_array(value) {
+          for_each(array!(value)) -> |_i, item| {
+              if is_object(item) {
+                  for_each(flatten(object!(item))) -> |sub, leaf| {
+                      __q = encode_json(path + "." + sub)
+                      if is_array(leaf) {
+                          for_each(array!(leaf)) -> |_j, x| {
+                              if !is_object(x) && !is_array(x) {
+                                  __repr = __repr + ("," + __q + "=" + encode_json(encode_json(x)))
+                                  if is_string(x) || is_float(x) { __repr = __repr + ("," + __q + "=" + encode_json(to_string!(x))) }
+                              }
+                          }
+                      } else {
+                          __repr = __repr + ("," + __q + "=" + encode_json(encode_json(leaf)))
+                          if is_string(leaf) || is_float(leaf) { __repr = __repr + ("," + __q + "=" + encode_json(to_string!(leaf))) }
+                      }
+                  }
+              } else if !is_array(item) {
+                  __repr = __repr + ("," + __p + "=" + encode_json(encode_json(item)))
+                  if is_string(item) || is_float(item) { __repr = __repr + ("," + __p + "=" + encode_json(to_string!(item))) }
+              }
+          }
+      } else {
+          __repr = __repr + ("," + __p + "=" + encode_json(encode_json(value)))
+          if is_string(value) || is_float(value) { __repr = __repr + ("," + __p + "=" + encode_json(to_string!(value))) }
+      }
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # time: Bare NSG tuple clock in epoch seconds converted to the emitted millisecond value.
+  # src_ip: Bare tuple IPv6 source address is lowercased in the emitted endpoint.
+  # dst_ip: Bare tuple IPv6 destination address is lowercased in the emitted endpoint.
+  # protocol: NSG protocol letter normalized to the IANA protocol number; consume only when the expected number is emitted.
+  # direction: Flow direction letter normalized to the OCSF direction id; consume only when the expected id is emitted.
+  # decision: NSG traffic decision letter normalized to the OCSF action id; consume only when the expected id is emitted.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        time
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        src_ip
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__repr, "," + "\"src_endpoint.ip\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        dst_ip
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__repr, "," + "\"dst_endpoint.ip\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        protocol
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"t": 6, "u": 17}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if contains(__repr, "," + "\"connection_info.protocol_num\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        direction
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"i": 1, "o": 2}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if contains(__repr, "," + "\"connection_info.direction_id\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        decision
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"a": 1, "d": 2}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if contains(__repr, "," + "\"action_id\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+  }
+  # Declared source -> target mappings (field-coverage.yaml `mappings`).
+  __decl = "\n\"aclID\"\t[\"firewall_rule.uid\"]\n\"bytes_in\"\t[\"traffic.bytes_in\"]\n\"bytes_out\"\t[\"traffic.bytes\",\"traffic.bytes_out\"]\n\"category\"\t[\"metadata.log_name\"]\n\"dst_ip\"\t[\"dst_endpoint.ip\"]\n\"dst_port\"\t[\"dst_endpoint.port\"]\n\"flowLogVersion\"\t[\"metadata.log_version\"]\n\"operationName\"\t[\"metadata.event_code\"]\n\"packets_in\"\t[\"traffic.packets\",\"traffic.packets_in\"]\n\"packets_out\"\t[\"traffic.packets\",\"traffic.packets_out\"]\n\"properties.Version\"\t[\"metadata.log_version\"]\n\"protocol\"\t[\"connection_info.protocol_num\"]\n\"rule\"\t[\"firewall_rule.name\"]\n\"src_ip\"\t[\"src_endpoint.ip\"]\n\"src_port\"\t[\"src_endpoint.port\"]\n\"time\"\t[\"time\"]\n"
+  __preserve = []
+  # END parser-specific transformations
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
+  # target paths + "\n" per mapped source key (a raw newline never occurs in
+  # compact JSON). A key is consumed when its value, or every element of a scalar
+  # array, is at one of its own targets.
+  for_each(__flat) -> |key, value| {
+      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+      # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
+      __kt = encode_json(key)
+      if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
+          __kt = replace(replace(replace(replace(replace(replace(__kt, r'\x28', "\\u0028"), r'\x29', "\\u0029"), r'\x5B', "\\u005b"), r'\x5D', "\\u005d"), r'\x7B', "\\u007b"), r'\x7D', "\\u007d")
+      }
+      __at = find(__decl, "\n" + __kt + "\t")
+      if is_integer(__at) && !is_object(value) {
+          __rest = slice!(__decl, int!(__at) + strlen(__kt) + 2)
+          __hit = false
+          for_each(array!(parse_json!(slice!(__rest, 0, int!(find(__rest, "\n")))))) -> |_i, target| {
+              __tok = "," + encode_json(target) + "="
+              if !__hit && is_array(value) {
+                  __all = !is_empty(array!(value))
+                  for_each(array!(value)) -> |_j, item| {
+                      if __all {
+                          __all = !is_object(item) && !is_array(item) && (contains(__repr, __tok + encode_json(encode_json(item))) || ((is_string(item) || is_float(item)) && contains(__repr, __tok + encode_json(to_string!(item)))))
+                      }
+                  }
+                  __hit = __all
+              } else if !__hit {
+                  __hit = contains(__repr, __tok + encode_json(encode_json(value))) || ((is_string(value) || is_float(value)) && contains(__repr, __tok + encode_json(to_string!(value))))
+              }
+          }
+          if __hit { __consumed = __consumed + ("," + encode_json(key)) }
+      }
+  }
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless an explicit mapping or transformation consumed it.
+          # Do not spill a copy of the raw body.
+          value != __raw_body && !contains(__consumed, "," + encode_json(key))
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a name already taken gets the next free
+      # _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __token = "," + encode_json(key)
+          if !contains(__consumed, __token) && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and copies of a
+  # source value (that value is mapped or spilled above under its source path).
+  # A value merely equal to some mapped attribute is kept: equality with an
+  # unrelated attribute is no evidence that it is represented.
+  # The canonical source spill above is the authoritative representation of
+  # containers. The cheap conditions run first; the source value set is built on
+  # first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, as-is. These
+  # entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__copy.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # Sources (tuple shapes and field order):
+  #   https://learn.microsoft.com/en-us/azure/network-watcher/nsg-flow-logs-overview
+  #   https://learn.microsoft.com/en-us/azure/network-watcher/vnet-flow-logs-overview
+  # NSG v2 outbound allowed, end of flow with counters (doc sample tuple).
+  - raw: "1542110379,10.5.16.4,203.0.113.117,59932,443,T,O,A,E,1,66,1,66"
+    expect:
+      class_uid: 4001
+      activity_id: 2
+      action_id: 1
+      connection_info.direction_id: 2
+      connection_info.protocol_num: 6
+      traffic.bytes: 132
+      time: 1542110379000
+  # NSG v2 inbound UDP denied at flow begin (doc sample tuple).
+  - raw: "1542110402,192.0.2.190,10.5.16.4,28746,443,U,I,D,B,,,,"
+    expect:
+      activity_id: 5
+      action_id: 2
+      disposition_id: 2
+      connection_info.protocol_num: 17
+      unmapped.flow_state: B
+  # VNet v4 inbound deny (doc sample tuple, millisecond clock).
+  - raw: "1663145989563,192.0.2.10,10.0.0.6,50557,44357,6,I,D,NX,0,0,0,0"
+    expect:
+      time: 1663145989563
+      activity_id: 5
+      action_id: 2
+      unmapped.flow_encryption: NX
+  # Not a flow record: Base Event with the fallback marker.
+  - raw: "not an azure flow log line"
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: unparsable input
+  # Review fix: a VNet record whose encryption column is empty keeps VNet column
+  # positions (the envelope decides), so C is Traffic and the flow is allowed.
+  - raw: "{\"time\":\"2022-09-14T09:00:52.5625085Z\",\"flowLogVersion\":4,\"flowLogGUID\":\"00000000-0000-0000-0000-000000000000\",\"macAddress\":\"112233445566\",\"category\":\"FlowLogFlowEvent\",\"flowLogResourceID\":\"/SUBSCRIPTIONS/00000000-0000-0000-0000-000000000000/RESOURCEGROUPS/NETWORKWATCHERRG/PROVIDERS/MICROSOFT.NETWORK/NETWORKWATCHERS/NETWORKWATCHER_EASTUS2/FLOWLOGS/VNETFLOWLOG\",\"targetResourceID\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/myResourceGroup/providers/Microsoft.Network/virtualNetworks/myVNet\",\"operationName\":\"FlowLogFlowEvent\",\"flowRecords\":{\"flows\":[{\"aclID\":\"00aa00aa-bb11-cc22-dd33-44ee44ee44ee\",\"flowGroups\":[{\"rule\":\"DefaultRule_AllowInternetOutBound\",\"flowTuples\":[\"1663146003606,10.0.0.6,192.0.2.180,23956,443,6,O,C,,3,767,2,1580\"]}]}]}}"
+    expect:
+      class_uid: 4001
+      activity_id: 6
+      disposition_id: 1
+      action_id: 1

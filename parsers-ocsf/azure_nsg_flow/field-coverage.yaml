@@ -1,0 +1,78 @@
+source: mixed
+transforms:
+- source: time
+  kind: scale
+  factor: 1000
+  target: time
+  reason: Bare NSG tuple clock in epoch seconds converted to the emitted millisecond value.
+- source: src_ip
+  kind: lowercase
+  target: src_endpoint.ip
+  reason: Bare tuple IPv6 source address is lowercased in the emitted endpoint.
+- source: dst_ip
+  kind: lowercase
+  target: dst_endpoint.ip
+  reason: Bare tuple IPv6 destination address is lowercased in the emitted endpoint.
+- source: protocol
+  kind: enum
+  target: connection_info.protocol_num
+  values:
+    t: 6
+    u: 17
+  reason: NSG protocol letter normalized to the IANA protocol number; consume only when the expected number
+    is emitted.
+- source: direction
+  kind: enum
+  target: connection_info.direction_id
+  values:
+    i: 1
+    o: 2
+  reason: Flow direction letter normalized to the OCSF direction id; consume only when the expected id
+    is emitted.
+- source: decision
+  kind: enum
+  target: action_id
+  values:
+    a: 1
+    d: 2
+  reason: NSG traffic decision letter normalized to the OCSF action id; consume only when the expected
+    id is emitted.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  aclID:
+  - firewall_rule.uid
+  bytes_in:
+  - traffic.bytes_in
+  bytes_out:
+  - traffic.bytes
+  - traffic.bytes_out
+  category:
+  - metadata.log_name
+  dst_ip:
+  - dst_endpoint.ip
+  dst_port:
+  - dst_endpoint.port
+  flowLogVersion:
+  - metadata.log_version
+  operationName:
+  - metadata.event_code
+  packets_in:
+  - traffic.packets
+  - traffic.packets_in
+  packets_out:
+  - traffic.packets
+  - traffic.packets_out
+  properties.Version:
+  - metadata.log_version
+  protocol:
+  - connection_info.protocol_num
+  rule:
+  - firewall_rule.name
+  src_ip:
+  - src_endpoint.ip
+  src_port:
+  - src_endpoint.port
+  time:
+  - time

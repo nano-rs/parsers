@@ -4,9 +4,11 @@ transforms:
   kind: epoch_ms
   target: time
   format: '%+'
-  reason: RFC 5424 timestamp converted to event milliseconds; RFC 3164 clocks carry no year and remain residual.
+  reason: RFC 5424 timestamp converted to event milliseconds; RFC 3164 clocks carry no year and remain
+    residual.
 - source: filter.protocol
   kind: lowercase
+  target: connection_info.protocol_name
   reason: filterlog protocol names (UDP on IPv6) are lowercased into connection_info.protocol_name.
 - source: filter.action
   kind: enum
@@ -18,6 +20,11 @@ transforms:
   reason: filterlog verdict normalized to the OCSF action; consume only when the expected ID is emitted.
 - source: dhcp.mac
   kind: lowercase
+  target: src_endpoint.mac
+  reason: Client MAC lowercased into src_endpoint.mac.
+- source: dhcp.mac
+  kind: lowercase
+  target: src_endpoint.uid
   reason: Client MAC lowercased into src_endpoint.mac.
 - source: filter.direction
   kind: enum
@@ -26,33 +33,56 @@ transforms:
     in: 1
     out: 2
   reason: filterlog packet direction normalized to the OCSF direction id.
-consumed_candidates:
-- header.host
-- header.prog
-- filter.tracker
-- filter.rule_number
-- filter.interface
-- filter.protocol
-- filter.protocol_id
-- filter.src_ip
-- filter.dst_ip
-- filter.src_port
-- filter.dst_port
-- filter.length
-- dns.client
-- dns.qtype
-- dns.qclass
-- dns.rcode
-- dhcp.type
-- dhcp.ip
-- dhcp.server
-- dhcp.mac
-- dhcp.hostname
-- dhcp.via
-- openvpn.user
-- openvpn.client
-- openvpn.client_port
-- message
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  header.host:
+  - device.hostname
+  - dst_endpoint.hostname
+  filter.tracker:
+  - firewall_rule.uid
+  filter.interface:
+  - dst_endpoint.interface_name
+  - src_endpoint.interface_name
+  filter.protocol:
+  - connection_info.protocol_name
+  filter.src_ip:
+  - src_endpoint.ip
+  filter.dst_ip:
+  - dst_endpoint.ip
+  filter.src_port:
+  - src_endpoint.port
+  filter.dst_port:
+  - dst_endpoint.port
+  filter.length:
+  - traffic.bytes_out
+  dns.client:
+  - src_endpoint.ip
+  dns.qtype:
+  - query.type
+  dns.qclass:
+  - query.class
+  dns.rcode:
+  - rcode
+  dhcp.type:
+  - metadata.event_code
+  dhcp.ip:
+  - src_endpoint.ip
+  dhcp.server:
+  - dst_endpoint.ip
+  dhcp.mac:
+  - src_endpoint.mac
+  - src_endpoint.uid
+  dhcp.hostname:
+  - src_endpoint.hostname
+  dhcp.via:
+  - dst_endpoint.interface_name
+  openvpn.user:
+  - user.name
+  openvpn.client:
+  - src_endpoint.ip
+  openvpn.client_port:
+  - src_endpoint.port
+  message:
+  - message

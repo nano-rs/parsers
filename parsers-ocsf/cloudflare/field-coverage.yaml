@@ -2,29 +2,17 @@ source: json
 transforms:
 - source: QueryName
   kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
+  target: query.hostname
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
 - source: ClientRequestScheme
   kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: Action
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: WAFAction
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
+  target: http_request.url.scheme
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
 - source: Timestamp
   kind: epoch_ms
   target: time
   reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
 - source: Datetime
-  kind: epoch_ms
-  target: time
-  reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-- source: EdgeStartTimestamp
   kind: epoch_ms
   target: time
   reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
@@ -50,74 +38,58 @@ transforms:
     dropped: 2
     log: 3
     observed: 3
-  reason: Named vendor outcome/protocol/severity normalized by the existing mapping;
-    consume only when the expected ID is emitted.
-- source: ClientCountry
-  kind: enum
-  target: src_endpoint.location.country
-  values:
-    ru: RU
-  reason: Parser normalizes the caption case; verify the emitted caption.
-- source: ClientCountry
-  kind: enum
-  target: src_endpoint.location.country
-  values:
-    de: DE
-  reason: Parser normalizes the caption case; verify the emitted caption.
-- source: EdgeStartTimestamp
-  kind: scale
-  factor: 1.0e-06
-  target: time
-  reason: Existing unit conversion by 1e-06 verified against time; unused clock fallbacks
-    remain residual.
-- source: WAFAction
-  kind: enum
-  target: action
-  values:
-    unknown: Unknown
-  reason: Parser normalizes the caption case; verify the emitted caption.
-consumed_candidates:
-- Action
-- BotScore
-- ClientASN
-- ClientASNDescription
-- ClientCountry
-- ClientIP
-- ClientRequestBytes
-- ClientRequestHost
-- ClientRequestMethod
-- ClientRequestPath
-- ClientRequestProtocol
-- ClientRequestQuery
-- ClientRequestReferer
-- ClientRequestScheme
-- ClientRequestURI
-- ClientRequestUserAgent
-- ClientSrcPort
-- ColoCode
-- Datetime
-- Description
-- EDNSSubnet
-- EdgeResponseBytes
-- EdgeResponseContentType
-- EdgeResponseStatus
-- EdgeServerIP
-- EdgeStartTimestamp
-- FirewallMatchesActions
-- FirewallMatchesRuleIDs
-- Kind
-- OriginIP
-- OriginResponseTime
-- QueryName
-- QueryType
-- RayID
-- ResponseCode
-- RuleID
-- SourceIP
-- Timestamp
-- WAFAction
-- WAFRuleID
-- WAFRuleMessage
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+  reason: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when
+    the expected ID is emitted.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  BotScore:
+  - risk_score
+  ClientASN:
+  - src_endpoint.autonomous_system.number
+  ClientASNDescription:
+  - src_endpoint.autonomous_system.name
+  ClientIP:
+  - src_endpoint.ip
+  ClientRequestBytes:
+  - http_request.length
+  - traffic.bytes_out
+  ClientRequestHost:
+  - dst_endpoint.hostname
+  - http_request.url.hostname
+  ClientRequestMethod:
+  - http_request.http_method
+  ClientRequestPath:
+  - http_request.url.path
+  ClientRequestProtocol:
+  - http_request.version
+  ClientRequestReferer:
+  - http_request.referrer
+  ClientRequestScheme:
+  - http_request.url.scheme
+  ClientRequestUserAgent:
+  - http_request.user_agent
+  ClientSrcPort:
+  - src_endpoint.port
+  Description:
+  - firewall_rule.name
+  EdgeResponseBytes:
+  - http_response.length
+  - traffic.bytes_in
+  EdgeResponseStatus:
+  - http_response.code
+  EdgeServerIP:
+  - proxy.ip
+  OriginIP:
+  - dst_endpoint.ip
+  QueryName:
+  - query.hostname
+  RayID:
+  - metadata.correlation_uid
+  ResponseCode:
+  - rcode_id
+  RuleID:
+  - firewall_rule.uid
+  SourceIP:
+  - src_endpoint.ip
