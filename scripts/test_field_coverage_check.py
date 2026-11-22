@@ -9,6 +9,7 @@ import tempfile
 import unittest
 import field_coverage_check as fcc
 from field_coverage_check import check, inject_probe, normalize_probes, normalized_source, validate_config
+import residual_spill
 from residual_spill import generated
 
 
@@ -55,7 +56,7 @@ class ResidualTests(unittest.TestCase):
         rules = [{'source': 'Name', 'kind': 'lowercase', 'target': 'user.name', 'reason': 'Test normalization must exist in emitted branch.'}]
         mappings = {'Known': ['message'], 'KnownList': ['a'], 'Res': ['resources.uid'], 'cs(Host)': ['http_request.url.hostname'],
                     'x.y': ['nested_target'], 'x~1y': ['literal_target']}
-        program = '__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'transforms': rules, 'mappings': mappings})
+        program = residual_spill.prelude() + '\n__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'transforms': rules, 'mappings': mappings})
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             (tmp/'p.vrl').write_text(program)
@@ -91,7 +92,7 @@ class TargetEvidenceTests(unittest.TestCase):
         rules = [{'source': 'Name', 'kind': 'lowercase', 'target': 'message', 'reason': 'r'}]
         cases = [({'Name': 'RAW INPUT'}, {'message': 'raw input'}, {'name': 'RAW INPUT'}),
                  ({'Name': 'HELLO'}, {'message': 'hello'}, {})]
-        program = '__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'transforms': rules})
+        program = residual_spill.prelude() + '\n__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'transforms': rules})
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             (tmp/'p.vrl').write_text(program)
@@ -180,6 +181,14 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(len(naive('t = parse_timestamp!(replace(s, r\' Z$\', ""), "%Y (x)")')), 1)
         self.assertEqual(naive('t, e = parse_timestamp(s, "%+", timezone: "UTC")'), [])
         self.assertEqual(naive('t = parse_timestamp!(replace(s, r\')\', ""), "%Y", timezone: "UTC")'), [])
+        # Comments never count, either way; a timezone variable is fine; a
+        # word "timezone" elsewhere in the call is not the argument.
+        self.assertEqual(naive('# t = parse_timestamp(s, "%Y")\nx = 1'), [])
+        self.assertEqual(naive('t = parse_timestamp(s, "%Y", timezone: tz) # local'), [])
+        self.assertEqual(naive('t = parse_timestamp(p.timezone, "%+")'), [])
+        self.assertEqual(naive('t = parse_timestamp(s, "%d/%b/%Y:%H:%M:%S %z")'), [])
+        self.assertEqual(len(naive('t = parse_timestamp(timezone, fmt)')), 1)
+        self.assertEqual(len(naive('t = parse_timestamp(s, "%Y") # timezone: "UTC"')), 1)
 
     def test_json_envelope_retired(self):
         with self.assertRaises(AssertionError):
@@ -454,6 +463,35 @@ class ProvenanceTests(unittest.TestCase):
             residual_spill.update(path)
             with self.assertRaisesRegex(AssertionError, 'without provenance'):
                 fcc.run_parser(path)
+
+    def test_small_identity_lookup_fails(self):
+        # 0->0, 1->1, 2->2, else 99 is a lookup: draws come from outside the
+        # values the field takes in the samples, so it never echoes them.
+        program = JSON_PARSER.replace('"tags": STATIC', '"tags": [], "category_uid": 99') + 'if includes([0, 1, 2], __source_kv.code) { .category_uid = __source_kv.code }\n'
+        import residual_spill
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'probe'/'parser.yaml'
+            path.parent.mkdir()
+            (path.parent/'field-coverage.yaml').write_text(json.dumps({'source': 'json', 'mappings': {'msg': 'message', 'code': 'category_uid'}}))
+            body = ''.join('  ' + line + '\n' for line in program.strip().splitlines())
+            path.write_text('parser_vrl: |\n' + body + 'samples: ' + json.dumps([{'raw': json.dumps({'msg': m, 'code': c})} for m, c in (('a', 0), ('b', 1), ('c', 2))]) + '\n')
+            residual_spill.update(path)
+            with self.assertRaisesRegex(AssertionError, 'without provenance.*PROVENANCE_SEED='):
+                fcc.run_parser(path)
+
+    def test_draws_are_deterministic(self):
+        import provenance
+        draws = []
+        for _ in range(2):
+            provenance.seed_draw('parser', 'sample', 'key', '', 0)
+            draws.append((provenance.sentinels('10.4.5.6'), provenance.sentinels(4812), provenance.sentinels('vty0')))
+        self.assertEqual(draws[0], draws[1])
+        provenance.seed_draw('parser', 'sample', 'other', '', 0)
+        self.assertNotEqual(provenance.sentinels('10.4.5.6'), draws[0][0])
+        # A lone digit always changes.
+        for draw in range(20):
+            provenance.seed_draw('p', 's', 'by', '', draw)
+            self.assertTrue(all(v != 'vty0' and v[:3] == 'vty' or not v.startswith('vty') for v in provenance.sentinels('vty0')))
 
     def test_real_mapping_passes(self):
         self.run_json({'msg': 'message'}, [{'msg': 'hello', 'flags': [0, 1]}])

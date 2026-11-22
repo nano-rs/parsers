@@ -10,6 +10,7 @@ field_coverage_check.py uses this to verify every declared mapping and every
 `transforms` rule; infer_mappings.py uses it to write the declarations.
 """
 import copy
+import hashlib
 import json
 import math
 import os
@@ -102,10 +103,21 @@ def at(index, target, value):
     return any(same(value, v) for v in found)
 
 
-# A per-run seed: every perturbation is a fresh random value, so a target that
-# merely happens to hold some fixed value can never follow it (set
-# PROVENANCE_SEED to reproduce a run).
-RNG = random.Random(os.environ.get('PROVENANCE_SEED') or secrets.randbits(64))
+# Deterministic, unguessable perturbations: every draw is seeded with SHA-256 of
+# (base seed, parser, sample, field, draw), so each run is reproducible and no
+# check flakes, while a parser cannot depend on the values. PROVENANCE_SEED
+# overrides the base seed ("random" draws a fresh one, for fuzzing); a failure
+# prints the seed it used.
+BASE_SEED = os.environ.get('PROVENANCE_SEED') or 'nano-provenance-v1'
+if BASE_SEED == 'random':
+    BASE_SEED = secrets.token_hex(8)
+RNG = random.Random(0)
+
+
+def seed_draw(*parts):
+    """Seed RNG for one draw from (BASE_SEED, *parts)."""
+    digest = hashlib.sha256(json.dumps([BASE_SEED, *[str(p) for p in parts]]).encode()).digest()
+    RNG.seed(int.from_bytes(digest[:16], 'big'))
 IPV4 = re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}$')
 IPV6 = re.compile(r'^[0-9A-Fa-f:]{2,}$')
 NUMBER = re.compile(r'^-?\d+(?:\.(\d+))?$')
@@ -121,13 +133,15 @@ def _rand_like(text):
     (case kept); punctuation and separators stay."""
     out = []
     for c in text:
+        # Each character always changes (a lone "vty0" digit never stays "0").
         if c.isascii() and c.isdigit():
-            out.append(RNG.choice('0123456789'))
+            out.append(RNG.choice([d for d in '0123456789' if d != c]))
         elif c in HEX:
-            out.append(RNG.choice('abcdef' if c.islower() else 'ABCDEF'))
+            pool = 'abcdef' if c.islower() else 'ABCDEF'
+            out.append(RNG.choice([h for h in pool if h != c]))
         elif c.isascii() and c.isalpha():
-            letters = 'ghijklmnopqrstuvwxyz'
-            out.append(RNG.choice(letters if c.islower() else letters.upper()))
+            letters = 'ghijklmnopqrstuvwxyz' if c.islower() else 'GHIJKLMNOPQRSTUVWXYZ'
+            out.append(RNG.choice([l for l in letters if l != c]))
         else:
             out.append(c)
     return ''.join(out)
@@ -150,7 +164,14 @@ def _number(value, factor=None):
     return value + delta if value >= 0 else value - delta
 
 
-def sentinels(value, kind=None, factor=None):
+def _code(value, exclude):
+    """A small code from 0..31 that the field never takes in any sample (so a
+    short lookup table keyed by the observed values cannot echo it back)."""
+    pool = [v for v in range(32) if v != value and v not in exclude]
+    return RNG.choice(pool) if pool else None
+
+
+def sentinels(value, kind=None, factor=None, exclude=()):
     """Fresh, type-correct perturbations of a scalar, most specific first. Each
     is random per run, so it cannot coincide with a value the parser holds."""
     if isinstance(value, bool):
@@ -158,10 +179,10 @@ def sentinels(value, kind=None, factor=None):
     if isinstance(value, int):
         if kind is None and 0 <= value < 32:
             # Enum-like codes (severity, rcode, logon type) are range-checked.
-            # A neighbor first (a short code table may accept only a few), then
-            # random codes; the multiset check, not the value, rules out a
-            # coincidence (a static target never moves).
-            return list(dict.fromkeys(v for v in (value + 1, value - 1, RNG.randint(0, 31), RNG.randint(0, 15), RNG.randint(1, 65535)) if v != value and v >= 0))
+            # Enum-like codes: drawn from outside the values the field takes in
+            # any sample, so a lookup keyed by those values cannot pass.
+            code = _code(value, exclude)
+            return [code] if code is not None else []
         if kind is None and 0 <= value < 65536:
             # Ports and small ids are range-checked too.
             return list(dict.fromkeys(v for v in (RNG.randint(1, 65535), RNG.randint(1, 65535)) if v != value))
@@ -174,7 +195,9 @@ def sentinels(value, kind=None, factor=None):
     num = NUMBER.match(value)
     if num and kind is None and not num.group(1) and 0 <= int(value) < 32:
         # An enum-like code written as text ("3", "10").
-        out += [str(int(value) + 1), str(int(value) - 1) if int(value) > 0 else str(int(value) + 2), str(RNG.randint(0, 15)), str(RNG.randint(0, 31))]
+        code = _code(int(value), {int(x) for x in exclude if isinstance(x, str) and x.isdigit()} | {x for x in exclude if type(x) is int})
+        if code is not None:
+            out.append(str(code))
     if num and kind == 'scale':
         decimals = len(num.group(1) or '')
         new = _number(float(value) if decimals else int(value), factor)
@@ -212,12 +235,12 @@ def mutations(value):
     return sentinels(value)
 
 
-def array_mutations(value):
+def array_mutations(value, exclude=()):
     """A fresh sentinel for every element of a scalar array (variant j uses
     each element's j-th sentinel)."""
     if not value or any(isinstance(x, (dict, list)) for x in value):
         return []
-    per = [sentinels(x) for x in value]
+    per = [sentinels(x, exclude=exclude) for x in value]
     if not all(per):
         return []
     return [[m[min(j, len(m) - 1)] for m in per] for j in range(max(len(m) for m in per))]
@@ -369,7 +392,7 @@ def transform_want(rule, value):
     raise AssertionError(f'unknown transform {rule.get("kind")}')
 
 
-def rule_mutations(rule, value):
+def rule_mutations(rule, value, exclude=()):
     if rule['kind'] == 'enum':
         # One alternative per distinct target value (every one, not the first few).
         here = rule['values'].get(str(value).lower(), MISSING)
@@ -391,7 +414,7 @@ def rule_mutations(rule, value):
                 out.append(alt.upper() if value.isupper() else (alt.capitalize() if value[:1].isupper() else alt))
                 seen.add(key)
         return out
-    return sentinels(value, rule['kind'], rule.get('factor'))
+    return sentinels(value, rule['kind'], rule.get('factor'), exclude)
 
 
 def _count(index, target, value):
@@ -418,7 +441,7 @@ def followed(before, after, target, want_old, want_new):
     return moved
 
 
-def probe(program, samples, sources, outputs, items, per_key=40, declared=None):
+def probe(program, samples, sources, outputs, items, per_key=40, declared=None, scope=''):
     """Perturbation runs for `items`: (key, rule or None) pairs.
 
     Returns {(key, rule_id): {target: True}} for every normalized target path
@@ -429,8 +452,15 @@ def probe(program, samples, sources, outputs, items, per_key=40, declared=None):
     branches that ignore the field do not use up the budget.
     """
     plans, messages = [], []
+    flats = [dict(esc_flatten(source)) for source in sources]
     for key, rule in items:
         used = 0
+        # Every value the field takes in any sample: a draw avoids them.
+        observed = set()
+        for flat in flats:
+            v = flat.get(key)
+            if v is not None and not isinstance(v, (dict, list)):
+                observed.add(v)
         for (name, event), source, output in zip(samples, sources, outputs):
             if used >= per_key:
                 break
@@ -451,8 +481,9 @@ def probe(program, samples, sources, outputs, items, per_key=40, declared=None):
             # Several fresh draws: a parser that accepts only some values (an
             # enum code, a range) still sees one it maps.
             variants = []
-            for _ in range(DRAWS):
-                variants += array_mutations(old) if isinstance(old, list) else (rule_mutations(rule, old) if rule else sentinels(old))
+            for draw in range(DRAWS):
+                seed_draw(scope, name, key, rule['kind'] + '>' + rule.get('target', '') if rule else '', draw)
+                variants += array_mutations(old, observed) if isinstance(old, list) else (rule_mutations(rule, old, observed) if rule else sentinels(old, exclude=observed))
             variants = [v for i, v in enumerate(variants) if v not in variants[:i]]
             planned = False
             for new in variants:
