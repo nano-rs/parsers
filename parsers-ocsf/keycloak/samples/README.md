@@ -14,6 +14,9 @@ Sources:
   https://github.com/keycloak/keycloak/tree/main/core/src/main/java/org/keycloak/representations/idm
   (every other `json_*` sample); event type names from
   https://github.com/keycloak/keycloak/blob/main/server-spi-private/src/main/java/org/keycloak/events/EventType.java.
+- `json_log_native_login_error_redaction` is Keycloak's native Quarkus JSON
+  log layout (`timestamp`, `level`, `loggerName`) around a quoted event line. Its
+  `client_secret` detail is a synthetic redaction probe, not a Keycloak field.
 - `junk.json` is truncated JSON; `text_non_event_line` and `json_log_non_event`
   are Keycloak log lines that are not events (fallback branch).
 

@@ -7,12 +7,15 @@ Sources:
   (`group_deleted`, `member_of_group_created`, `password_check_failed`,
   `password_check_succeeded`, `password_reset`, `policy_created`,
   `role_assignment_created`, `secret_read`, `user_access_allowed`,
-  `user_created`, `user_deleted`, `user_updated`).
+  `user_created`, `user_deleted`, `user_updated`, and
+  `role_assignment_deleted_gateway`, a role removed from a GATEWAY principal).
 - PingOne Platform API audit reporting events reference (the activity data
   model and the action.type list), https://developer.pingidentity.com/pingone-api/platform/reference/audit-reporting-events.html.
   `user_access_denied`, `otp_check_failed` and `user_locked` are built on that
   data model for action types the fixture does not carry (`USER.ACCESS_DENIED`,
   `OTP.CHECK_FAILED`, `PASSWORD.LOCKED`), with `result.status` `FAILED`.
+- `group_updated_partial_resource` is a GROUP resource without name or id
+  (the group falls back to "unknown" rather than empty strings).
 - `junk.json` is a non-JSON line for the fallback branch.
 
 Identifiers are replaced: environment ids with the zero UUID, other UUIDs with

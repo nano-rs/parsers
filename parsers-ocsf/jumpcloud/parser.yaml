@@ -138,11 +138,14 @@ parser_vrl: |
       if cc != "" { loc.country = cc }
       rn = string(geo.region_name) ?? ""
       if rn != "" { loc.region = rn }
-      la = float(geo.latitude) ?? null
+      la = null
+      if is_integer(geo.latitude) || is_float(geo.latitude) { la = to_float(geo.latitude) ?? null }
       if la != null { loc.lat = la }
-      lo = float(geo.longitude) ?? null
+      lo = null
+      if is_integer(geo.longitude) || is_float(geo.longitude) { lo = to_float(geo.longitude) ?? null }
       if lo != null { loc.long = lo }
-      if length(loc) > 0 { src_ep.location = loc }
+      # location needs a country or region beside any coordinates.
+      if cc != "" || rn != "" { src_ep.location = loc }
 
       # ---- class routing ----
       class_uid = 0
@@ -706,3 +709,14 @@ samples:
       "activity_id": "0"
       "status_id": "0"
       "metadata.uid": "a5e4d6ba14c9372b2c405ccd54cd9f18ddaff61547042e606126143e5c7eb029"
+  # Review fix regression: user_login_attempt_failed_coords_only.json
+  - raw: "{\"@version\":\"1\",\"version\":\"2\",\"client_ip\":\"198.51.100.14\",\"event_type\":\"user_login_attempt\",\"id\":\"63c264c6c1bd55c1b7e901b0\",\"initiated_by\":{\"email\":\"jane.doe@example.com\",\"id\":\"5c86b7149fdce00001d38014\",\"type\":\"user\"},\"mfa\":false,\"organization\":\"000000000000000000000000\",\"service\":\"directory\",\"success\":false,\"timestamp\":\"2026-10-04T18:30:00.000Z\",\"username\":\"jane.doe\",\"geoip\":{\"latitude\":45,\"longitude\":-122,\"timezone\":\"America/Los_Angeles\"},\"error_message\":\"invalid credentials\"}"
+    expect:
+      "class_uid": "3002"
+      "status_id": "2"
+      "src_endpoint.ip": "198.51.100.14"
+  # Review fix regression: admin_login_attempt.json
+  - raw: "{\"@version\":\"1\",\"client_ip\":\"198.51.100.14\",\"event_type\":\"admin_login_attempt\",\"geoip\":{\"continent_code\":\"OC\",\"country_code\":\"AU\",\"latitude\":-27.658,\"longitude\":152.8915,\"region_code\":\"QLD\",\"region_name\":\"Queensland\",\"timezone\":\"Australia/Brisbane\"},\"id\":\"63c264c6c1bd55c1b7e901a4\",\"initiated_by\":{\"email\":\"admin@example.com\",\"id\":\"5c86b6cf9fdce00001d3800c\",\"type\":\"admin\"},\"mfa\":true,\"organization\":\"000000000000000000000000\",\"provider\":null,\"service\":\"directory\",\"success\":true,\"timestamp\":\"2023-01-14T08:16:06.495Z\",\"useragent\":{\"device\":\"Mac\",\"major\":\"109\",\"minor\":\"0\",\"name\":\"Chrome\",\"os\":\"Mac OS X\",\"os_full\":\"Mac OS X 10.15.7\",\"os_major\":\"10\",\"os_minor\":\"15\",\"os_name\":\"Mac OS X\",\"os_patch\":\"7\",\"os_version\":\"10.15.7\",\"patch\":\"0\",\"version\":\"109.0.0.0\"}}"
+    expect:
+      "src_endpoint.location.lat": "-27.658"
+      "src_endpoint.location.country": "AU"

@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from field_coverage_check import check
+from field_coverage_check import check, unpacked_envelope
 from residual_spill import generated
 
 
@@ -51,6 +51,25 @@ class ResidualTests(unittest.TestCase):
                         del broken['unmapped'][next(iter(expected))]
                         with self.assertRaises(AssertionError):
                             check(source, broken, 'raw input', rules, candidates=['Known', 'KnownList', 'Name'])
+
+
+class EnvelopeTests(unittest.TestCase):
+    def test_declared_envelope_unpacked(self):
+        original = {'@timestamp': 't', 'message': 'type="LOGIN", username="a"'}
+        self.assertTrue(unpacked_envelope({'@timestamp': 't', 'type': 'LOGIN', 'username': 'a'}, original, 'message'))
+
+    def test_envelope_must_be_declared(self):
+        original = {'@timestamp': 't', 'message': 'type="LOGIN"'}
+        self.assertFalse(unpacked_envelope({'@timestamp': 't', 'type': 'LOGIN'}, original, None))
+
+    def test_envelope_keeps_every_other_key(self):
+        original = {'@timestamp': 't', 'host': 'h', 'message': 'type="LOGIN"'}
+        self.assertFalse(unpacked_envelope({'@timestamp': 't', 'type': 'LOGIN'}, original, 'message'))
+        self.assertFalse(unpacked_envelope({'@timestamp': 'changed', 'host': 'h', 'type': 'LOGIN'}, original, 'message'))
+
+    def test_envelope_key_removed(self):
+        original = {'@timestamp': 't', 'message': 'type="LOGIN"'}
+        self.assertFalse(unpacked_envelope({'@timestamp': 't', 'message': 'type="LOGIN"', 'type': 'LOGIN'}, original, 'message'))
 
 
 if __name__ == '__main__':

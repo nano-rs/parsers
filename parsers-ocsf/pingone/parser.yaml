@@ -10,8 +10,8 @@ description: >
     USER.ACCESS_ALLOWED / USER.ACCESS_DENIED, PASSWORD.CHECK_*, OTP.CHECK_*,
     USER.KERBEROS_*, SESSION.CREATED       -> Authentication 3002 (Logon)
     SESSION.DELETED, USER.SLO_*            -> Authentication 3002 (Logoff)
-    USER.*, PASSWORD.* (set/reset/lock), ROLE_ASSIGNMENT.*, DEVICE.* (MFA
-    devices)                               -> User Management 3007
+    USER.*, PASSWORD.* (set/reset/lock), DEVICE.* (MFA devices),
+    ROLE_ASSIGNMENT.* on a USER            -> User Management 3007
     GROUP.*, MEMBER_OF_GROUP.*             -> Group Management 3006
     every other action type (configuration of applications, policies,
     populations, flows, keys, ...)         -> API Activity 6003
@@ -19,7 +19,9 @@ description: >
   comes from result.status, overridden to Failure when the action type itself
   names a failure (PASSWORD.CHECK_FAILED is logged with status SUCCESS: the
   audit write succeeded, the password check did not). actors.user is the actor
-  (admin) and the USER entry in resources[] is the subject. One activity per
+  (admin) and the USER entry in resources[] is the subject; on group
+  membership events the member is read from the MEMBER_OF_GROUP resource
+  (its id and href) and the group id from its href. One activity per
   input event: split a paged `_embedded.activities` response upstream.
   PingFederate audit logs (pipe-delimited / CEF) are a different source and are
   not handled here.
@@ -135,9 +137,28 @@ parser_vrl: |
               subj = su
               have_subj = true
           }
-          if (rtype == "GROUP" || rtype == "MEMBER_OF_GROUP") && !have_grp {
-              grp = { "name": rname, "uid": rid }
-              have_grp = true
+          if rtype == "GROUP" && !have_grp {
+              g = {}
+              if rname != "" { g.name = rname }
+              if rid != "" { g.uid = rid }
+              if length(g) > 0 { grp = g; have_grp = true }
+          }
+          # A membership resource names the GROUP but carries the USER's id;
+          # its href is .../users/{user id}/memberOfGroups/{group id}.
+          if rtype == "MEMBER_OF_GROUP" && !have_grp {
+              g = {}
+              if rname != "" { g.name = rname }
+              member_uid = rid
+              hm, hmerr = parse_regex(string(r.href) ?? "", r'/users/(?P<uid>[^/?#]+)/memberOfGroups/(?P<gid>[^/?#]+)')
+              if hmerr == null {
+                  member_uid = string!(hm.uid)
+                  g.uid = string!(hm.gid)
+              }
+              if length(g) > 0 { grp = g; have_grp = true }
+              if member_uid != "" && !have_subj {
+                  subj = { "type_id": 1, "type": "User", "uid": member_uid }
+                  have_subj = true
+              }
           }
       }
 
@@ -159,7 +180,10 @@ parser_vrl: |
       class_uid = 6003
       if includes(["USER.ACCESS_ALLOWED", "USER.ACCESS_DENIED", "SESSION.CREATED", "SESSION.DELETED", "USER.KERBEROS_SUCCEEDED", "USER.KERBEROS_FAILED"], action_type) || starts_with(action_type, "PASSWORD.CHECK_") || starts_with(action_type, "OTP.CHECK_") || starts_with(action_type, "USER.SLO_") {
           class_uid = 3002
-      } else if prefix == "USER" || prefix == "PASSWORD" || prefix == "ROLE_ASSIGNMENT" || prefix == "DEVICE" {
+      } else if prefix == "USER" || prefix == "PASSWORD" || prefix == "DEVICE" || (prefix == "ROLE_ASSIGNMENT" && have_subj) {
+          # A role assigned to a non-USER principal (GATEWAY, APPLICATION) is
+          # not a user change: it stays API Activity with the principal in
+          # resources[], so the admin is never recorded as the subject.
           class_uid = 3007
       } else if prefix == "GROUP" || prefix == "MEMBER_OF_GROUP" {
           class_uid = 3006
@@ -690,3 +714,23 @@ samples:
       "activity_id": "0"
       "status_id": "0"
       "metadata.uid": "b39701d96c41bd0a995541900c99d4207f29c1aebb3530562fa96a13d17aea57"
+  # Review fix regression: member_of_group_created.json
+  - raw: "{\"_links\":{\"self\":{\"href\":\"https://api.pingone.com/v1/environments/00000000-0000-4000-8000-000000000002/activities/00000000-0000-4000-8000-000000000002\"}},\"id\":\"00000000-0000-4000-8000-000000000002\",\"recordedAt\":\"2022-07-28T04:25:41.533Z\",\"createdAt\":\"2022-07-28T04:25:41.546Z\",\"correlationId\":\"00000000-0000-4000-8000-000000000002\",\"actors\":{\"client\":{\"id\":\"adminui\",\"name\":\"adminui\",\"type\":\"CLIENT\"},\"user\":{\"id\":\"00000000-0000-4000-8000-000000000002\",\"name\":\"admin@example.com\",\"environment\":{\"id\":\"00000000-0000-4000-8000-000000000002\"},\"population\":{},\"href\":\"https://api.pingone.com/v1/environments/00000000-0000-4000-8000-000000000002/users/00000000-0000-4000-8000-000000000002\",\"type\":\"USER\"}},\"action\":{\"type\":\"MEMBER_OF_GROUP.CREATED\",\"description\":\"Member Of Group Created\"},\"resources\":[{\"type\":\"MEMBER_OF_GROUP\",\"id\":\"00000000-0000-4000-8000-000000000002\",\"name\":\"new\",\"environment\":{\"id\":\"00000000-0000-4000-8000-000000000002\"},\"href\":\"https://api.pingone.com/v1/environments/00000000-0000-4000-8000-000000000002/users/00000000-0000-4000-8000-000000000002/memberOfGroups/00000000-0000-4000-8000-000000000003\"}],\"result\":{\"status\":\"SUCCESS\",\"description\":\"Created Member Of Group new\"}}"
+    expect:
+      "class_uid": "3006"
+      "activity_id": "3"
+      "user.uid": "00000000-0000-4000-8000-000000000002"
+      "group.uid": "00000000-0000-4000-8000-000000000003"
+      "group.name": "new"
+  # Review fix regression: group_updated_partial_resource.json
+  - raw: "{\"id\":\"00000000-0000-4000-8000-000000000301\",\"recordedAt\":\"2026-11-02T15:00:00.000Z\",\"createdAt\":\"2026-11-02T15:00:00.020Z\",\"correlationId\":\"00000000-0000-4000-8000-000000000302\",\"actors\":{\"client\":{\"id\":\"adminui\",\"name\":\"adminui\",\"type\":\"CLIENT\"},\"user\":{\"id\":\"00000000-0000-4000-8000-000000000303\",\"name\":\"admin@example.com\",\"type\":\"USER\"}},\"action\":{\"type\":\"GROUP.UPDATED\",\"description\":\"Group Updated\"},\"resources\":[{\"type\":\"GROUP\",\"environment\":{\"id\":\"00000000-0000-0000-0000-000000000000\"}}],\"result\":{\"status\":\"SUCCESS\",\"description\":\"Updated group\"}}"
+    expect:
+      "class_uid": "3006"
+      "group.name": "unknown"
+  # Review fix regression: role_assignment_deleted_gateway.json
+  - raw: "{\"_links\":{\"self\":{\"href\":\"https://api.pingone.com/v1/environments/00000000-0000-0000-0000-000000000000/activities/00000000-0000-4000-8000-000000000201\"}},\"id\":\"00000000-0000-4000-8000-000000000201\",\"recordedAt\":\"2022-07-19T17:56:47.122Z\",\"createdAt\":\"2022-07-19T17:56:47.384Z\",\"correlationId\":\"00000000-0000-4000-8000-000000000201\",\"actors\":{\"client\":{\"id\":\"adminui\",\"name\":\"adminui\",\"type\":\"CLIENT\"},\"user\":{\"id\":\"00000000-0000-4000-8000-000000000201\",\"name\":\"admin@example.com\",\"environment\":{\"id\":\"00000000-0000-0000-0000-000000000000\"},\"population\":{},\"href\":\"https://api.pingone.com/v1/environments/00000000-0000-0000-0000-000000000000/users/00000000-0000-4000-8000-000000000201\",\"type\":\"USER\"}},\"action\":{\"type\":\"ROLE_ASSIGNMENT.DELETED\",\"description\":\"Role Assignment Deleted\"},\"resources\":[{\"type\":\"GATEWAY\",\"id\":\"00000000-0000-4000-8000-000000000201\",\"name\":\"00000000-0000-4000-8000-000000000201\",\"environment\":{\"id\":\"00000000-0000-0000-0000-000000000000\"},\"href\":\"https://api.pingone.com/v1/environments/00000000-0000-0000-0000-000000000000/gateways/00000000-0000-4000-8000-000000000201\"}],\"result\":{\"status\":\"SUCCESS\",\"description\":\"Deleted role assignment '00000000-0000-4000-8000-000000000201' scoped for ENVIRONMENT for gateway:'00000000-0000-4000-8000-000000000201'\"}}"
+    expect:
+      "class_uid": "6003"
+      "activity_id": "4"
+      "actor.user.name": "admin@example.com"
+      "user.name": "<missing>"

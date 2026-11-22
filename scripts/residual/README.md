@@ -48,6 +48,12 @@ An empty residual is omitted. Existing derived scalar evidence is retained when
 it is not a duplicate of source or mapped values; source aliases are replaced
 by canonical source paths.
 
+A JSON source normally must be captured exactly. A format that carries the
+event as text inside one key (Keycloak's JSON log `message`) declares
+`json_envelope: <key>`: the parser then replaces that key with the fields it
+parsed from it, every other key must still be captured unchanged, and the
+unpacked fields are held to the same no-loss rule.
+
 The checker runs inline and sidecar samples, and adds JSON probes for unknown
 keys, nested objects, scalar/object arrays, secret redaction, and collisions.
 `--output-dir` optionally retains emitted production events for review.

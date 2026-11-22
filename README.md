@@ -92,7 +92,7 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Auth0](parsers-ocsf/auth0) | `auth0` | Okta | JSON | 20+ event types: login, signup, MFA, token exchange, management API |
 | [PingOne](parsers-ocsf/pingone) | `pingone` | Ping Identity | JSON | Platform audit activities: access allowed / denied, password and OTP checks, sessions, user, password, role and MFA device changes, groups, configuration API activity |
 | [JumpCloud](parsers-ocsf/jumpcloud) | `jumpcloud` | JumpCloud | JSON | Directory Insights: console, SSO, RADIUS, LDAP and system logins, user / admin lifecycle, lockout, password and TOTP events, groups, admin API activity |
-| [OneLogin](parsers-ocsf/onelogin) | `onelogin` | OneLogin | JSON | Events API: 81 event_type_ids mapped (logins, failures, MFA, logouts, user lifecycle, password, role and privilege changes); other ids kept as Base Event |
+| [OneLogin](parsers-ocsf/onelogin) | `onelogin` | OneLogin | JSON | Events API: 82 event_type_ids mapped (logins, failures, MFA, logouts, user lifecycle, password, role and privilege changes); other ids kept as Base Event |
 | [Keycloak](parsers-ocsf/keycloak) | `keycloak` | Keycloak | JSON / jboss-logging text | User events (LOGIN, LOGIN_ERROR, CODE_TO_TOKEN, ...) and admin events (users, roles, groups, clients) from the REST API, event listeners or the server log |
 | [1Password](parsers-ocsf/onepassword) | `onepassword` | 1Password | JSON | Sign-in attempts, item usage, vault access events |
 | [CyberArk PAM](parsers-ocsf/cyberark) | `cyberark` | CyberArk | CEF syslog | Vault audit, PSM sessions, privileged access events |

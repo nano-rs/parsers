@@ -16,6 +16,8 @@ Sources:
   documented example values of each service's attribute table; `user_create`,
   `user_lockout`, `user_admin_granted` and `group_create` use documented
   directory event types with the documented `resource` / `initiated_by` shapes.
+- `user_login_attempt_failed_coords_only` carries integer geoip coordinates
+  without a country or region (no `location` is emitted; the coordinates spill).
 - `junk.json` is a truncated array for the fallback branch.
 
 Identifiers are replaced: the organization with 24 zeros, addresses with

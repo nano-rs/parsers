@@ -13,10 +13,14 @@ description: >
     anything else                                    -> Base Event 0, kept whole
   User Activity: the client is src_endpoint (ClientPublicIP), the application
   server dst_endpoint, the App Connector proxy_endpoint, and InternalReason
-  drives the outcome. BRK_MT_SETUP_FAIL_REJECTED_BY_POLICY / _NO_POLICY_FOUND /
-  _SAML_EXPIRED / _SCIM_INACTIVE / _TOO_MANY_FAILED_ATTEMPTS and policy-approval
-  rejections are Refuse + Denied; any other *_FAIL* or timeout is Fail; closes,
-  terminations and resets are Close / Reset. Traffic is counted from the
+  drives the outcome. Policy and inspection rejections
+  (BRK_MT_SETUP_FAIL_REJECTED_BY_POLICY[_APPROVAL] / _NO_POLICY_FOUND /
+  _SAML_EXPIRED / _SCIM_INACTIVE / _TOO_MANY_FAILED_ATTEMPTS, BRK_MT_AUTH_*,
+  ZIA_MT_BLOCKED_*, BRK_CONN_UPGRADE_REQUEST_FORBIDDEN) are Refuse + Denied /
+  Blocked. Other *_FAIL*, *_ERR*, timeouts and APP_NOT_AVAILABLE /
+  APP_NOT_REACHABLE / NO_CONNECTOR_AVAILABLE are Fail with action Unknown.
+  BRK_MT_CLOSED* / BRK_MT_TERMINATED* are Close and BRK_MT_RESET* is Reset,
+  all successful. Traffic is counted from the
   client's side (ZENTotalBytesRxClient is bytes_out). User / connector status:
   ZPN_STATUS_AUTHENTICATED is a Logon, ZPN_STATUS_DISCONNECTED a Logoff,
   ZPN_STATUS_AUTH_FAILED a failed Logon. Distinct from zscaler_zia (ZIA NSS).
@@ -33,7 +37,13 @@ parser_vrl: |
   parsed, err = parse_json(raw_log)
   __source_kv = object(parsed) ?? {}
 
-  if err != null || !is_object(parsed) {
+  # Only an object carrying an LSS field is a ZPA record; anything else is a
+  # misrouted stream and takes the fallback (counted by source health).
+  is_lss = false
+  if err == null && is_object(parsed) {
+      is_lss = exists(parsed.LogTimestamp) || exists(parsed.ConnectionID) || exists(parsed.ConnectionStatus) || exists(parsed.SessionStatus) || exists(parsed.SessionType)
+  }
+  if !is_lss {
       . = {
           "class_uid": 0,
           "class_name": "Base Event",
@@ -102,21 +112,30 @@ parser_vrl: |
           disposition = "Allowed"
           severity_id = 1
           severity = "Informational"
-          denied = match(reason, r'^BRK_MT_SETUP_FAIL_(REJECTED_BY_POLICY|NO_POLICY_FOUND|SAML_EXPIRED|SCIM_INACTIVE|TOO_MANY_FAILED_ATTEMPTS)')
+          # InternalReason decides the outcome. Policy, inspection and
+          # authentication rejections are a Refuse + Denied; transport and setup
+          # errors are a Fail with an unknown action (the broker did not
+          # decide on the access); closes, terminations and resets keep the
+          # connection's success.
+          denied = match(reason, r'^(BRK_MT_SETUP_FAIL_(REJECTED_BY_POLICY|NO_POLICY_FOUND|SAML_EXPIRED|SCIM_INACTIVE|TOO_MANY_FAILED_ATTEMPTS)|BRK_MT_AUTH_|ZIA_MT_BLOCKED_|BRK_CONN_UPGRADE_REQUEST_FORBIDDEN)')
+          closed = match(reason, r'^BRK_MT_(CLOSED|TERMINATED)')
+          failed_setup = !closed && match(reason, r'(_FAIL|_ERR|TIMEOUT|^APP_NOT_AVAILABLE|^APP_NOT_REACHABLE|^NO_CONNECTOR_AVAILABLE)')
           if denied {
               activity_id = 5; activity_name = "Refuse"
               status_id = 2; status_str = "Failure"
               action_id = 2; action = "Denied"
               disposition_id = 2; disposition = "Blocked"
               severity_id = 2; severity = "Low"
-          } else if contains(reason, "_FAIL") || reason == "BRK_MT_SETUP_TIMEOUT" || reason == "BRK_MT_AUTH_ALREADY_FAILED" {
-              activity_id = 4; activity_name = "Fail"
-              status_id = 2; status_str = "Failure"
-              severity_id = 2; severity = "Low"
           } else if starts_with(reason, "BRK_MT_RESET") {
               activity_id = 3; activity_name = "Reset"
-          } else if starts_with(reason, "BRK_MT_CLOSED") || starts_with(reason, "BRK_MT_TERMINATED") {
+          } else if closed {
               activity_id = 2; activity_name = "Close"
+          } else if failed_setup {
+              activity_id = 4; activity_name = "Fail"
+              status_id = 2; status_str = "Failure"
+              action_id = 0; action = "Unknown"
+              disposition_id = 0; disposition = "Unknown"
+              severity_id = 2; severity = "Low"
           }
 
           src = {}
@@ -125,9 +144,11 @@ parser_vrl: |
           if cpub != "" { src.ip = cpub } else if cpriv != "" { src.ip = cpriv }
           chost = string(p.Hostname) ?? ""
           if chost != "" { src.hostname = chost }
-          clat = float(p.ClientLatitude) ?? null
+          clat = null
+          if is_integer(p.ClientLatitude) || is_float(p.ClientLatitude) { clat = to_float(p.ClientLatitude) ?? null }
           if clat != null { loc.lat = clat }
-          clong = float(p.ClientLongitude) ?? null
+          clong = null
+          if is_integer(p.ClientLongitude) || is_float(p.ClientLongitude) { clong = to_float(p.ClientLongitude) ?? null }
           if clong != null { loc.long = clong }
           ccc = string(p.ClientCountryCode) ?? ""
           if ccc != "" { loc.country = ccc }
@@ -244,9 +265,11 @@ parser_vrl: |
           pub = string(p.PublicIP) ?? ""
           priv = string(p.PrivateIP) ?? ""
           if pub != "" && pub != "0.0.0.0" { src.ip = pub } else if priv != "" { src.ip = priv }
-          lat = float(p.Latitude) ?? null
+          lat = null
+          if is_integer(p.Latitude) || is_float(p.Latitude) { lat = to_float(p.Latitude) ?? null }
           if lat != null { loc.lat = lat }
-          long = float(p.Longitude) ?? null
+          long = null
+          if is_integer(p.Longitude) || is_float(p.Longitude) { long = to_float(p.Longitude) ?? null }
           if long != null { loc.long = long }
           cc = string(p.CountryCode) ?? ""
           if cc != "" { loc.country = cc; src.location = loc }
@@ -735,3 +758,37 @@ samples:
       "activity_id": "0"
       "status_id": "0"
       "metadata.uid": "a26048845552ce35479f6dd618f92ea6b077242a05619a4346f2d714e7544be3"
+  # Review fix regression: user_activity_setup_fail_app_not_found.json
+  - raw: "{\"LogTimestamp\":\"Mon Oct 12 09:35:12 2026\",\"Customer\":\"Example Corp\",\"SessionID\":\"LHJdkjmNDf12nclBsvwA\",\"ConnectionID\":\"SqyZIMkg0JTj7EABsvwA,Q+EjXGdrvbF2lPiBbedm\",\"InternalReason\":\"BRK_MT_SETUP_FAIL_APP_NOT_FOUND\",\"ConnectionStatus\":\"close\",\"IPProtocol\":6,\"DoubleEncryption\":0,\"Username\":\"contractor@example.com\",\"ServicePort\":443,\"ClientPublicIP\":\"192.0.2.10\",\"ClientPrivateIP\":\"192.0.2.10\",\"ClientLatitude\":45.0,\"ClientLongitude\":-119.0,\"ClientCountryCode\":\"US\",\"ClientZEN\":\"broker2b.pdx\",\"Policy\":\"\",\"Connector\":\"\",\"ConnectorZEN\":\"broker2b.pdx\",\"ConnectorIP\":\"\",\"ConnectorPort\":0,\"Host\":\"legacy.example.com\",\"Application\":\"\",\"AppGroup\":\"Finance\",\"Server\":\"0\",\"ServerIP\":\"\",\"ServerPort\":443,\"PolicyProcessingTime\":28,\"CAProcessingTime\":1330,\"ConnectorZENSetupTime\":191017,\"ConnectionSetupTime\":192397,\"ServerSetupTime\":465,\"AppLearnTime\":0,\"TimestampConnectionStart\":\"2026-10-12T09:35:12.010Z\",\"TimestampConnectionEnd\":\"2026-10-12T09:35:12.020Z\",\"TimestampCATx\":\"2019-05-30T08:20:42.230Z\",\"TimestampCARx\":\"2019-05-30T08:20:42.231Z\",\"TimestampAppLearnStart\":\"\",\"TimestampZENFirstRxClient\":\"2019-05-30T08:20:42.424Z\",\"TimestampZENFirstTxClient\":\"\",\"TimestampZENLastRxClient\":\"2019-05-31T17:34:27.348Z\",\"TimestampZENLastTxClient\":\"\",\"TimestampConnectorZENSetupComplete\":\"2019-05-30T08:20:42.422Z\",\"TimestampZENFirstRxConnector\":\"\",\"TimestampZENFirstTxConnector\":\"2019-05-30T08:20:42.424Z\",\"TimestampZENLastRxConnector\":\"\",\"TimestampZENLastTxConnector\":\"2019-05-31T17:34:27.348Z\",\"ZENTotalBytesRxClient\":0,\"ZENBytesRxClient\":0,\"ZENTotalBytesTxClient\":0,\"ZENBytesTxClient\":0,\"ZENTotalBytesRxConnector\":0,\"ZENBytesRxConnector\":0,\"ZENTotalBytesTxConnector\":0,\"ZENBytesTxConnector\":0,\"Idp\":\"Example IDP Config\",\"ClientToClient\":\"0\"}"
+    expect:
+      "class_uid": "4001"
+      "activity_id": "4"
+      "status_id": "2"
+      "action_id": "0"
+      "disposition_id": "0"
+  # Review fix regression: user_activity_zia_blocked_by_inspection.json
+  - raw: "{\"LogTimestamp\":\"Mon Oct 12 09:36:40 2026\",\"Customer\":\"Example Corp\",\"SessionID\":\"LHJdkjmNDf12nclBsvwA\",\"ConnectionID\":\"SqyZIMkg0JTj7EABsvwA,Q+EjXGdrvbF2lPiBbedm\",\"InternalReason\":\"ZIA_MT_BLOCKED_BY_INSPECTION\",\"ConnectionStatus\":\"close\",\"IPProtocol\":6,\"DoubleEncryption\":0,\"Username\":\"contractor@example.com\",\"ServicePort\":443,\"ClientPublicIP\":\"192.0.2.10\",\"ClientPrivateIP\":\"192.0.2.10\",\"ClientLatitude\":45.0,\"ClientLongitude\":-119.0,\"ClientCountryCode\":\"US\",\"ClientZEN\":\"broker2b.pdx\",\"Policy\":\"SIPA Destinations Policy\",\"Connector\":\"\",\"ConnectorZEN\":\"broker2b.pdx\",\"ConnectorIP\":\"\",\"ConnectorPort\":0,\"Host\":\"files.example.net\",\"Application\":\"SIPA - Technology URLs\",\"AppGroup\":\"Finance\",\"Server\":\"0\",\"ServerIP\":\"\",\"ServerPort\":443,\"PolicyProcessingTime\":28,\"CAProcessingTime\":1330,\"ConnectorZENSetupTime\":191017,\"ConnectionSetupTime\":192397,\"ServerSetupTime\":465,\"AppLearnTime\":0,\"TimestampConnectionStart\":\"2026-10-12T09:36:40.300Z\",\"TimestampConnectionEnd\":\"2026-10-12T09:36:40.410Z\",\"TimestampCATx\":\"2019-05-30T08:20:42.230Z\",\"TimestampCARx\":\"2019-05-30T08:20:42.231Z\",\"TimestampAppLearnStart\":\"\",\"TimestampZENFirstRxClient\":\"2019-05-30T08:20:42.424Z\",\"TimestampZENFirstTxClient\":\"\",\"TimestampZENLastRxClient\":\"2019-05-31T17:34:27.348Z\",\"TimestampZENLastTxClient\":\"\",\"TimestampConnectorZENSetupComplete\":\"2019-05-30T08:20:42.422Z\",\"TimestampZENFirstRxConnector\":\"\",\"TimestampZENFirstTxConnector\":\"2019-05-30T08:20:42.424Z\",\"TimestampZENLastRxConnector\":\"\",\"TimestampZENLastTxConnector\":\"2019-05-31T17:34:27.348Z\",\"ZENTotalBytesRxClient\":0,\"ZENBytesRxClient\":0,\"ZENTotalBytesTxClient\":0,\"ZENBytesTxClient\":0,\"ZENTotalBytesRxConnector\":0,\"ZENBytesRxConnector\":0,\"ZENTotalBytesTxConnector\":0,\"ZENBytesTxConnector\":0,\"Idp\":\"Example IDP Config\",\"ClientToClient\":\"0\"}"
+    expect:
+      "class_uid": "4001"
+      "activity_id": "5"
+      "status_id": "2"
+      "action_id": "2"
+      "disposition_id": "2"
+  # Review fix regression: user_activity_terminated_idle_timeout.json
+  - raw: "{\"LogTimestamp\":\"Mon Oct 12 11:00:00 2026\",\"Customer\":\"Example Corp\",\"SessionID\":\"LHJdkjmNDf12nclBsvwA\",\"ConnectionID\":\"SqyZIMkg0JTj7EABsvwA,Q+EjXGdrvbF2lPiBbedm\",\"InternalReason\":\"BRK_MT_TERMINATED_IDLE_TIMEOUT\",\"ConnectionStatus\":\"close\",\"IPProtocol\":6,\"DoubleEncryption\":0,\"Username\":\"john.doe@example.com\",\"ServicePort\":443,\"ClientPublicIP\":\"192.0.2.10\",\"ClientPrivateIP\":\"192.0.2.10\",\"ClientLatitude\":45.0,\"ClientLongitude\":-119.0,\"ClientCountryCode\":\"US\",\"ClientZEN\":\"broker2b.pdx\",\"Policy\":\"ABC Lab Apps\",\"Connector\":\"\",\"ConnectorZEN\":\"broker2b.pdx\",\"ConnectorIP\":\"\",\"ConnectorPort\":0,\"Host\":\"lab.example.com\",\"Application\":\"ABC Lab Apps\",\"AppGroup\":\"Finance\",\"Server\":\"0\",\"ServerIP\":\"\",\"ServerPort\":443,\"PolicyProcessingTime\":28,\"CAProcessingTime\":1330,\"ConnectorZENSetupTime\":191017,\"ConnectionSetupTime\":192397,\"ServerSetupTime\":465,\"AppLearnTime\":0,\"TimestampConnectionStart\":\"2026-10-12T09:40:00.000Z\",\"TimestampConnectionEnd\":\"2026-10-12T11:00:00.000Z\",\"TimestampCATx\":\"2019-05-30T08:20:42.230Z\",\"TimestampCARx\":\"2019-05-30T08:20:42.231Z\",\"TimestampAppLearnStart\":\"\",\"TimestampZENFirstRxClient\":\"2019-05-30T08:20:42.424Z\",\"TimestampZENFirstTxClient\":\"\",\"TimestampZENLastRxClient\":\"2019-05-31T17:34:27.348Z\",\"TimestampZENLastTxClient\":\"\",\"TimestampConnectorZENSetupComplete\":\"2019-05-30T08:20:42.422Z\",\"TimestampZENFirstRxConnector\":\"\",\"TimestampZENFirstTxConnector\":\"2019-05-30T08:20:42.424Z\",\"TimestampZENLastRxConnector\":\"\",\"TimestampZENLastTxConnector\":\"2019-05-31T17:34:27.348Z\",\"ZENTotalBytesRxClient\":48211,\"ZENBytesRxClient\":0,\"ZENTotalBytesTxClient\":990120,\"ZENBytesTxClient\":0,\"ZENTotalBytesRxConnector\":0,\"ZENBytesRxConnector\":0,\"ZENTotalBytesTxConnector\":0,\"ZENBytesTxConnector\":0,\"Idp\":\"Example IDP Config\",\"ClientToClient\":\"0\"}"
+    expect:
+      "class_uid": "4001"
+      "activity_id": "2"
+      "status_id": "1"
+      "action_id": "1"
+      "disposition_id": "1"
+  # Review fix regression: non_zpa_json_object.json
+  - raw: "{\"foo\":\"bar\",\"level\":\"info\"}"
+    expect:
+      "class_uid": "0"
+      "unmapped.parse_fallback": "unparsable input"
+  # Review fix regression: user_status_authenticated.json
+  - raw: "{\"LogTimestamp\":\"Fri May 31 17:34:48 2019\",\"Customer\":\"Example Corp\",\"Username\":\"john.doe@example.com\",\"SessionID\":\"vkczUERSLl88Y+ytH8v5\",\"SessionStatus\":\"ZPN_STATUS_AUTHENTICATED\",\"Version\":\"19.12.0-36-g87dad18\",\"ZEN\":\"broker2b.pdx\",\"CertificateCN\":\"loggerz2x.pde.zpabeta.net\",\"PrivateIP\":\"192.0.2.10\",\"PublicIP\":\"198.51.100.44\",\"Latitude\":45,\"Longitude\":-119,\"CountryCode\":\"US\",\"TimestampAuthentication\":\"2019-05-29T21:18:38.000Z\",\"TimestampUnAuthentication\":\"\",\"TotalBytesRx\":31274866,\"TotalBytesTx\":25424152,\"Idp\":\"IDP Config\",\"Hostname\":\"DESKTOP-99HCSJ1\",\"Platform\":\"windows\",\"ClientType\":\"zpn_client_type_zapp\",\"TrustedNetworks\":\"TN1_stc1\",\"TrustedNetworksNames\":\"145248739466696953\",\"SAMLAttributes\":\"myname:user,myemail:user@example.com\",\"PosturesHit\":[\"sm-posture1\",\"sm-posture2\"],\"PosturesMiss\":[\"sm-posture11\",\"sm-posture12\"],\"ZENLatitude\":47,\"ZENLongitude\":-122,\"ZENCountryCode\":\"\",\"FQDNRegistered\":\"0\",\"FQDNRegisteredError\":\"CUSTOMER_NOT_ENABLED\"}"
+    expect:
+      "src_endpoint.location.lat": "45"
+      "src_endpoint.location.long": "-119"

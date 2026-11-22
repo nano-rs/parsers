@@ -53,8 +53,12 @@ parser_vrl: |
           # Keycloak JSON log handler: the jboss-logging line is in `message`.
           shape = "json_log"
           kv_body = string!(pj.message)
+          # ECS layout (@timestamp, log.level) or Keycloak's native Quarkus
+          # JSON log (timestamp, level).
           envelope_time = string(get(pj, ["@timestamp"]) ?? "") ?? ""
+          if envelope_time == "" { envelope_time = string(pj.timestamp) ?? "" }
           log_level = string(get(pj, ["log.level"]) ?? "") ?? ""
+          if log_level == "" { log_level = string(pj.level) ?? "" }
       }
   } else {
       m, merr = parse_regex(raw_log, r'^(?P<log_time>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}[,.]\d{3})\s+(?P<log_level>[A-Z]+)\s+\x5B(?P<logger>[^\x5D]+)\x5D\s+\x28(?P<thread>[^\x29]*)\x29\s+(?P<body>(?:type|operationType)=.*)$')
@@ -72,7 +76,11 @@ parser_vrl: |
 
   if kv_body != "" {
       kv = parse_key_value(kv_body, key_value_delimiter: "=", field_delimiter: ", ", whitespace: "strict") ?? {}
-      if shape == "text" { __source_kv = merge(__source_kv, kv) }
+      # The event's own fields are the source: for a JSON log envelope the
+      # `message` they were unpacked from is replaced by them, so its details
+      # spill as redacted keys instead of one raw string.
+      if shape == "json_log" { __discard = del(__source_kv.message) }
+      __source_kv = merge(__source_kv, kv)
       top_keys = ["type", "operationType", "realmId", "realmName", "clientId", "userId", "sessionId", "ipAddress", "error", "resourceType", "resourcePath", "representation"]
       details = {}
       for_each(kv) -> |k, v| {
@@ -441,11 +449,13 @@ parser_vrl: |
   __consumed = ""
   # BEGIN parser-specific transformations
   # @timestamp: Successful ISO timestamp conversion of the JSON log envelope clock in milliseconds.
+  # timestamp: Successful ISO timestamp conversion of the native Quarkus JSON log clock in milliseconds.
   # type: Keycloak event type mapped to the OCSF activity caption; consume only when the emitted caption matches.
   for_each(flatten(__source_kv)) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
         @timestamp
+      | timestamp
       )\z') {
           __value = value
           __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
@@ -486,6 +496,7 @@ parser_vrl: |
   | ipAddress
   | log_level
   | log\.level
+  | level
   | message
   | operationType
   | realmId
@@ -745,3 +756,19 @@ samples:
       "activity_id": "0"
       "status_id": "0"
       "metadata.uid": "12312b733b013378f55f14570ddffed84b820c107636ce8e594ca80b61b2a626"
+  # Review fix regression: json_log_native_login_error_redaction.json
+  - raw: "{\"timestamp\":\"2026-10-12T09:50:01.204Z\",\"sequence\":20117,\"loggerClassName\":\"org.jboss.logging.Logger\",\"loggerName\":\"org.keycloak.events\",\"level\":\"WARN\",\"message\":\"type=\\\"LOGIN_ERROR\\\", realmId=\\\"00000000-0000-0000-0000-000000000000\\\", realmName=\\\"acme\\\", clientId=\\\"web-portal\\\", userId=\\\"null\\\", ipAddress=\\\"203.0.113.45\\\", error=\\\"user_not_found\\\", auth_method=\\\"openid-connect\\\", auth_type=\\\"code\\\", redirect_uri=\\\"https://portal.example.com/callback\\\", code_id=\\\"00000000-0000-4000-8000-000000000e01\\\", username=\\\"mallory@example.com\\\", client_secret=\\\"nan-redaction-probe\\\", authSessionParentId=\\\"00000000-0000-4000-8000-000000000e01\\\", authSessionTabId=\\\"Zr4k2Lq9pVs\\\"\",\"threadName\":\"executor-thread-7\",\"threadId\":88,\"mdc\":{},\"ndc\":\"\",\"hostName\":\"kc-1\",\"processName\":\"QuarkusEntryPoint\",\"processId\":1}"
+    expect:
+      "class_uid": "3002"
+      "status_id": "2"
+      "time": "1791798601204"
+      "metadata.log_level": "WARN"
+      "unmapped.client_secret": "<redacted>"
+      "user.name": "mallory@example.com"
+  # Review fix regression: json_log_login_ecs.json
+  - raw: "{\"@timestamp\":\"2025-05-01T01:20:11.418Z\",\"event.sequence\":10233,\"log.logger\":\"org.keycloak.events\",\"log.level\":\"DEBUG\",\"message\":\"type=\\\"LOGIN\\\", realmId=\\\"00000000-0000-0000-0000-000000000000\\\", realmName=\\\"acme\\\", clientId=\\\"web-portal\\\", userId=\\\"00000000-0000-4000-8000-000000000a01\\\", sessionId=\\\"00000000-0000-4000-8000-000000000d01\\\", ipAddress=\\\"198.51.100.156\\\", auth_method=\\\"openid-connect\\\", auth_type=\\\"code\\\", response_type=\\\"code\\\", redirect_uri=\\\"https://portal.example.com/callback\\\", consent=\\\"no_consent_required\\\", code_id=\\\"00000000-0000-4000-8000-000000000d01\\\", username=\\\"alice@example.com\\\", response_mode=\\\"query\\\", authSessionParentId=\\\"00000000-0000-4000-8000-000000000d01\\\", authSessionTabId=\\\"q0U8nVZ1cXc\\\"\",\"process.thread.name\":\"executor-thread-2\",\"process.thread.id\":71,\"mdc\":{},\"ndc\":\"\",\"host.hostname\":\"kc-0\",\"process.name\":\"java\",\"process.pid\":1,\"ecs.version\":\"1.12.2\",\"data_stream.type\":\"logs\",\"service.name\":\"Keycloak\",\"service.version\":\"26.2.2\",\"service.environment\":\"prod\"}"
+    expect:
+      "class_uid": "3002"
+      "status_id": "1"
+      "time": "1746062411418"
+      "unmapped.response_type": "code"

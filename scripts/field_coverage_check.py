@@ -164,6 +164,21 @@ def reference_consumed(source, output):
     return consumed
 
 
+def unpacked_envelope(source, original, key):
+    """A declared JSON envelope (`json_envelope: <key>` in field-coverage.yaml).
+
+    Some JSON log formats carry the event itself as text in one key (Keycloak's
+    JSON log puts the event line in `message`). A parser that unpacks it replaces
+    that key with the parsed fields, so the captured source is every other key
+    of the record unchanged, without `key`, plus the unpacked fields (which the
+    check below then holds to the same no-loss rule). Without the declaration,
+    or when the parser did not unpack the key, the capture must be exact.
+    """
+    if not key or not isinstance(original.get(key), str) or key in source:
+        return False
+    return all(k in source and source[k] == v for k, v in original.items() if k != key)
+
+
 def envelope(raw):
     try:
         obj = json.loads(raw)
@@ -249,7 +264,7 @@ def run_parser(path, supplied=None, output_dir=None):
                 except json.JSONDecodeError: original = {}
                 if not isinstance(original, dict): original = {}
                 if isinstance(original, dict) and original:
-                    assert source == original, f'{name}: JSON source capture changed fields'
+                    assert source == original or unpacked_envelope(source, original, config.get('json_envelope')), f'{name}: JSON source capture changed fields'
             try:
                 consumed = []
                 if config.get('reference') == 'windows_sysmon':

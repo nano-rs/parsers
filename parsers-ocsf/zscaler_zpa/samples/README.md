@@ -16,6 +16,12 @@ Sources:
   `user_status_disconnected` (`ZPN_STATUS_DISCONNECTED`) and
   `user_status_auth_failed` (`ZPN_STATUS_AUTH_FAILED`) are the fixture records
   with those documented codes.
+- `user_activity_setup_fail_app_not_found` (`BRK_MT_SETUP_FAIL_APP_NOT_FOUND`),
+  `user_activity_zia_blocked_by_inspection` (`ZIA_MT_BLOCKED_BY_INSPECTION`) and
+  `user_activity_terminated_idle_timeout` (`BRK_MT_TERMINATED_IDLE_TIMEOUT`) are
+  the same fixture record with those codes: Fail with an unknown action,
+  Refuse + Denied, and a successful Close.
+- `non_zpa_json_object` is a JSON object with no LSS field (fallback branch).
 - `junk.json` is a non-JSON line for the fallback branch.
 
 Addresses are replaced with documentation ranges, users with example.com, the
