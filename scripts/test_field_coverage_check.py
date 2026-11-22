@@ -53,5 +53,31 @@ class ResidualTests(unittest.TestCase):
                             check(source, broken, 'raw input', rules, candidates=['Known', 'KnownList', 'Name'])
 
 
+    def test_truncate_kind(self):
+        # A bounded copy consumes its source only when it is the character
+        # prefix and, for an over-bound value, the event sets is_truncated.
+        cases = [
+            ({'Query': 'abcdefgh'}, {'query_info': {'query_string': 'abcde'}, 'metadata': {'is_truncated': True}}, {}),
+            ({'Query': 'abcdefgh'}, {'query_info': {'query_string': 'abcde'}}, {'query': 'abcdefgh'}),
+            ({'Query': 'abc'}, {'query_info': {'query_string': 'abc'}}, {}),
+            ({'Query': 'h\u00e9llo w\u00f6rld'}, {'query_info': {'query_string': 'h\u00e9llo'}, 'metadata': {'is_truncated': True}}, {}),
+            ({'Query': 'abcdefgh'}, {'query_info': {'query_string': 'abcdX'}, 'metadata': {'is_truncated': True}}, {'query': 'abcdefgh'}),
+        ]
+        rules = [{'source': 'Query', 'kind': 'truncate', 'target': 'query_info.query_string', 'length': 5, 'reason': 'Bounded query text.'}]
+        program = '__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'transforms': rules, 'consumed_candidates': ['Query']})
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp/'p.vrl').write_text(program)
+            (tmp/'events.json').write_text(''.join(json.dumps({'source': s, 'output': o})+'\n' for s,o,_ in cases))
+            run = subprocess.run(['vector', 'vrl', '--program', str(tmp/'p.vrl'), '--input', str(tmp/'events.json')], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            outputs = [json.loads(l) for l in run.stdout.splitlines() if l.startswith('{')]
+            self.assertEqual(len(outputs), len(cases), run.stdout + run.stderr)
+            for (source, mapped, expected), output in zip(cases, outputs):
+                with self.subTest(source=source, mapped=mapped):
+                    self.assertEqual(output.get('unmapped', {}), expected)
+                    check(source, output, 'raw input', rules, candidates=['Query'])
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -29,6 +29,10 @@ not consumed unless its value actually appears in the selected branch.
 
 Every additional normalization has a per-parser `field-coverage.yaml` entry:
 source path, transform kind, optional destination path, and a one-line reason.
+The `truncate` kind (with `length`) covers a bounded copy: the source counts
+as consumed when the destination holds its first `length` characters and,
+for a longer value, the event sets `metadata.is_truncated`, so an over-long
+value is kept once in `raw_data` rather than repeated in `unmapped`.
 Rules are conditional: the transformed value must actually match emitted
 output. Malformed timestamps, unsupported enums, and unused fallback values
 remain residual. These are executable expectations, not unconditional waivers.

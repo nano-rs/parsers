@@ -135,12 +135,14 @@ parser_vrl: |
           if it_type != "" { res.type = it_type }
           if exists(res.uid) || exists(res.name) { resources = push(resources, res) }
       }
+      setting_name = ""
       for_each(containers) -> |_i, item| {
           it = object(item) ?? {}
           it_attrs = object(it.attributes) ?? {}
           it_type = string(it.type) ?? ""
           it_id = string(it.id) ?? ""
           it_name = string(it_attrs.siteName) ?? string(it_attrs.name) ?? string(it_attrs.cloudUrl) ?? ""
+          if setting_name == "" { setting_name = string(it_attrs.settingName) ?? "" }
           res = {}
           if it_id != "" { res.uid = it_id }
           if it_name != "" { res.name = it_name }
@@ -183,6 +185,13 @@ parser_vrl: |
       severity = "Informational"
       if is_failed { status_id = 2; status_str = "Failure"; severity_id = 2; severity = "Low" }
       if is_switch || action == "api_token_created" { severity_id = 3; severity = "Medium" }
+      # Privilege grants (into an admin group, or an admin role), changes to the
+      # authentication policy, and data exports are Medium.
+      grp_name = string(grp.name) ?? ""
+      if is_group && contains(action, "_to_group") && match(grp_name, r'(?i)admin') { severity_id = 3; severity = "Medium" }
+      if contains(action, "admin") && (contains(action, "grant") || contains(action, "added") || contains(action, "assign")) { severity_id = 3; severity = "Medium" }
+      if contains(action, "authentication_policy") || starts_with(setting_name, "Authentication") { severity_id = 3; severity = "Medium" }
+      if contains(action, "export") { severity_id = 3; severity = "Medium" }
 
       ocsf = {}
       if class_uid == 3002 {
@@ -693,11 +702,12 @@ samples:
       "class_uid": 6003
       "activity_id": 1
       "metadata.version": "1.9.0"
-  # org authentication policy changed, source: https://github.com/elastic/integrations/blob/main/packages/atlassian_cloud/data_stream/audit/_dev/test/pipeline/test-org-policy-update.log
+  # org authentication policy changed (Medium), source: https://github.com/elastic/integrations/blob/main/packages/atlassian_cloud/data_stream/audit/_dev/test/pipeline/test-org-policy-update.log
   - raw: "{\"type\":\"events\",\"id\":\"f5000005-0000-4000-8000-000000000005\",\"attributes\":{\"time\":\"2026-05-19T13:50:44.742Z\",\"processedAt\":\"2026-05-19T13:50:45.198Z\",\"action\":\"org_settings_update\",\"actor\":{\"id\":\"712020:cccccccc-cccc-cccc-cccc-cccccccccccc\",\"name\":\"Carol Davis\",\"email\":\"carol.davis@example.com\"},\"context\":[],\"container\":[{\"id\":\"00000000-0000-0000-0000-000000000001\",\"type\":\"orgs\",\"attributes\":{\"name\":\"Example Corp\",\"settingName\":\"AuthenticationPolicy\",\"settingValues\":\"samlEnabled\"}}],\"location\":{\"ip\":\"192.0.2.10\",\"geo\":\"EU\",\"countryName\":\"Example Country\",\"city\":\"Example City\"}},\"message\":{\"content\":\"Carol Davis updated AuthenticationPolicy setting values samlEnabled\",\"format\":\"simple\"}}"
     expect:
       "class_uid": 6003
       "activity_id": 3
+      "severity_id": 3
       "metadata.version": "1.9.0"
   # organization users viewed, source: https://github.com/elastic/integrations/blob/main/packages/atlassian_cloud/data_stream/audit/_dev/test/pipeline/test-organization-users-viewed.log
   - raw: "{\"type\":\"events\",\"id\":\"a1000002-0000-4000-8000-000000000002\",\"attributes\":{\"time\":\"2026-05-19T10:01:00.000Z\",\"processedAt\":\"2026-05-19T10:01:01.000Z\",\"action\":\"organization_users_viewed\",\"actor\":{\"id\":\"712020:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb\",\"name\":\"Bob Smith\",\"email\":\"bob.smith@example.com\"},\"location\":{\"ip\":\"198.51.100.11\",\"geo\":\"NA\",\"countryName\":\"Example Country\",\"city\":\"Example City\"}},\"message\":{\"content\":\"Bob Smith viewed organization users\",\"format\":\"simple\"}}"
@@ -705,11 +715,12 @@ samples:
       "class_uid": 6003
       "activity_id": 2
       "metadata.version": "1.9.0"
-  # data classification policy update, source: https://github.com/elastic/integrations/blob/main/packages/atlassian_cloud/data_stream/audit/_dev/test/pipeline/test-policy-suffix-update.log
+  # data classification policy update (stays Informational), source: https://github.com/elastic/integrations/blob/main/packages/atlassian_cloud/data_stream/audit/_dev/test/pipeline/test-policy-suffix-update.log
   - raw: "{\"type\":\"events\",\"id\":\"g8000008-0000-4000-8000-000000000008\",\"attributes\":{\"time\":\"2026-05-19T14:00:00.000Z\",\"processedAt\":\"2026-05-19T14:00:01.000Z\",\"action\":\"data_classification_policy_update\",\"actor\":{\"id\":\"712020:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\",\"name\":\"Grace Park\",\"email\":\"grace.park@example.com\"},\"context\":[],\"container\":[{\"id\":\"00000000-0000-0000-0000-000000000001\",\"type\":\"orgs\",\"attributes\":{\"name\":\"Example Corp\"}}],\"location\":{\"ip\":\"192.0.2.20\",\"geo\":\"NA\",\"countryName\":\"Example Country\",\"city\":\"Example City\"}},\"message\":{\"content\":\"Grace Park updated data classification policy\",\"format\":\"simple\"}}"
     expect:
       "class_uid": 6003
       "activity_id": 3
+      "severity_id": 1
       "metadata.version": "1.9.0"
   # Atlassian system actor, no IP, source: https://github.com/elastic/integrations/blob/main/packages/atlassian_cloud/data_stream/audit/_dev/test/pipeline/test-system-app-actor.log
   - raw: "{\"type\":\"events\",\"id\":\"e6000006-0000-4000-8000-000000000006\",\"attributes\":{\"time\":\"2026-05-19T10:23:46.830Z\",\"processedAt\":\"2026-05-19T10:23:47.000Z\",\"action\":\"confluence_audit_record_removed_content_restriction\",\"actor\":{\"id\":\"confluence\",\"name\":\"Confluence\",\"email\":\"Atlassian app\",\"picture\":null,\"links\":{}},\"context\":[{\"id\":\"88888888-8888-8888-8888-888888888888\",\"type\":\"sites\",\"attributes\":{\"siteName\":\"example-corp\"}}],\"container\":[],\"location\":{\"geo\":\"EU\"}},\"message\":{\"content\":\"Confluence removed content restriction on example-corp\",\"format\":\"simple\"}}"
@@ -731,6 +742,7 @@ samples:
       "activity_id": 3
       "group.name": "site-admins"
       "user.name": "Carol Davis"
+      "severity_id": 3
       "metadata.version": "1.9.0"
   # whole response page (data[] not split upstream): Base Event fallback, shape per https://developer.atlassian.com/cloud/admin/organization/rest/api-group-events/
   - raw: "{\"data\":[{\"type\":\"events\",\"id\":\"a1000001-0000-4000-8000-000000000001\",\"attributes\":{\"time\":\"2026-05-19T10:00:00.000Z\",\"processedAt\":\"2026-05-19T10:00:01.000Z\",\"action\":\"user_login\",\"actor\":{\"id\":\"712020:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\",\"name\":\"Alice Johnson\",\"email\":\"alice.johnson@example.com\"},\"location\":{\"ip\":\"198.51.100.10\",\"geo\":\"NA\",\"countryName\":\"Example Country\",\"regionName\":\"Example Region\",\"city\":\"Example City\"}},\"message\":{\"content\":\"Alice Johnson logged in\",\"format\":\"simple\"}}],\"meta\":{\"next\":null,\"page_size\":25},\"links\":{\"self\":\"https://api.atlassian.com/admin/v1/orgs/00000000-0000-0000-0000-000000000001/events\"}}"
@@ -743,3 +755,21 @@ samples:
     expect:
       "class_uid": 0
       "metadata.uid": "666f5a9e1b55b93f4fb4905cf960b94839ac59e086b0b781407c6f493229150a"
+  # review: user added to a non-admin group stays Informational; shape per https://developer.atlassian.com/cloud/admin/organization/rest/api-group-events/
+  - raw: "{\"type\":\"events\",\"id\":\"c1000021-0000-4000-8000-000000000021\",\"attributes\":{\"time\":\"2026-05-19T12:00:00.000Z\",\"action\":\"user_added_to_group\",\"actor\":{\"id\":\"712020:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb\",\"name\":\"Bob Smith\",\"email\":\"bob.smith@example.com\"},\"context\":[{\"id\":\"712020:cccccccc-cccc-cccc-cccc-cccccccccccc\",\"type\":\"users\",\"attributes\":{\"name\":\"Carol Davis\",\"email\":\"carol.davis@example.com\"}},{\"id\":\"00000000-0000-0000-0000-0000000000aa\",\"type\":\"groups\",\"attributes\":{\"name\":\"jira-software-users\"}}],\"container\":[{\"id\":\"00000000-0000-0000-0000-000000000001\",\"type\":\"orgs\",\"attributes\":{\"name\":\"Example Corp\"}}],\"location\":{\"ip\":\"203.0.113.10\",\"city\":\"Example City\"}},\"message\":{\"content\":\"Bob Smith added Carol Davis to group site-admins\",\"format\":\"simple\"}}"
+    expect:
+      "class_uid": 3006
+      "activity_id": 3
+      "severity_id": 1
+      "metadata.version": "1.9.0"
+  # review: a Confluence space export is Medium; shape from https://github.com/elastic/integrations/blob/main/packages/atlassian_cloud/data_stream/audit/_dev/test/pipeline/test-confluence-permission-added.log
+  - raw: "{\"type\":\"events\",\"id\":\"d4000030-0000-4000-8000-000000000030\",\"attributes\":{\"time\":\"2026-05-19T15:00:00.000Z\",\"action\":\"confluence_space_exported\",\"actor\":{\"id\":\"712020:dddddddd-dddd-dddd-dddd-dddddddddddd\",\"name\":\"Dana Wilson\",\"email\":\"dana.wilson@example.com\"},\"context\":[{\"id\":\"22222222-2222-2222-2222-222222222222\",\"type\":\"space\",\"attributes\":{\"name\":\"Example Space\",\"key\":\"EX\"}}],\"location\":{\"ip\":\"203.0.113.21\"}},\"message\":{\"content\":\"Dana Wilson exported space Example Space\",\"format\":\"simple\"}}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 2
+      "severity_id": 3
+      "metadata.version": "1.9.0"
+  # review: a null message never aborts
+  - raw: "{\"message\":null}"
+    expect:
+      "class_uid": 0

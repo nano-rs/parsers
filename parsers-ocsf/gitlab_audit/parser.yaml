@@ -29,13 +29,35 @@ vendor: "GitLab"
 product: "GitLab"
 parser_vrl: |
   # GitLab audit events (streaming, REST API, audit_json.log) -> OCSF 1.9.0.
-  raw_log = string!(.message)
+  # A string body is the usual wire form. A source that already decoded the
+  # JSON hands over an object (or array) instead, and a record without any
+  # `message` is the decoded event itself; never abort on either.
+  raw_log = ""
+  if is_string(.message) {
+      raw_log = string!(.message)
+  } else if is_object(.message) || is_array(.message) {
+      raw_log = encode_json(.message)
+  } else if exists(.message) && !is_null(.message) {
+      raw_log = to_string(.message) ?? ""
+  } else {
+      raw_log = encode_json(.)
+  }
   __raw_body = raw_log
   __source_kv = {}
   parsed, err = parse_json(raw_log)
   __source_kv = object(parsed) ?? {}
 
-  if err != null || !is_object(parsed) {
+  # A JSON object only counts as a GitLab audit event when it carries at least
+  # one GitLab audit field; anything else is a misrouted record.
+  is_gitlab = false
+  if err == null && is_object(parsed) {
+      is_gitlab = exists(parsed.event_type) || exists(parsed.event_name) || exists(parsed.entity_type) ||
+                  exists(parsed.author_id) || exists(parsed.target_type) || exists(parsed."meta.caller_id")
+  }
+  reason = "not a JSON object"
+  if err == null && is_object(parsed) { reason = "JSON object without GitLab audit fields" }
+
+  if !is_gitlab {
       # Unparseable input (or a batched JSON array that was not split upstream)
       # is emitted as an OCSF Base Event with the raw line kept, never guessed
       # into a security class.
@@ -61,7 +83,7 @@ parser_vrl: |
               "log_provider": "GitLab",
               "product": { "name": "GitLab", "vendor_name": "GitLab" }
           },
-          "unmapped": { "parse_error": "not a JSON object" }
+          "unmapped": { "parse_error": reason }
       }
       # NAN-5264: explicit fallback marker; nano parser health counts it.
       . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
@@ -142,7 +164,9 @@ parser_vrl: |
 
       # ---- class routing ----
       is_failed = starts_with(event, "login_failed_with_") || event == "omniauth_login_failed" || failed_login != ""
-      is_auth = starts_with(event, "authenticated_with_") || is_failed ||
+      # An administrator impersonating a user (GitLab 14.8+ `user_impersonation`).
+      is_switch = event == "user_impersonation" || starts_with(event, "user_impersonation_")
+      is_auth = starts_with(event, "authenticated_with_") || is_failed || is_switch ||
                 event == "user_signed_in_from_unseen_ip" || event == "user_email_changed_and_user_signed_in" ||
                 event == "smartcard_authentication_created" ||
                 (event == "" && with != "" && entity_type == "User" && change == "" && add == "" && remove == "")
@@ -165,9 +189,13 @@ parser_vrl: |
       if is_failed {
           status_id = 2; status_str = "Failure"; severity_id = 2; severity = "Low"
       }
-      if event == "user_disable_two_factor" || event == "user_admin_status_updated" || event == "user_signed_in_from_unseen_ip" {
+      if event == "user_disable_two_factor" || event == "user_admin_status_updated" || event == "user_signed_in_from_unseen_ip" || is_switch {
           severity_id = 3; severity = "Medium"
       }
+      # Owner / Maintainer grants and group or project exports.
+      access_level = downcase(access_as)
+      if is_member && (access_level == "owner" || access_level == "maintainer") { severity_id = 3; severity = "Medium" }
+      if contains(event, "export") { severity_id = 3; severity = "Medium" }
 
       ocsf = {}
       if class_uid == 3002 {
@@ -183,6 +211,20 @@ parser_vrl: |
           auth_user = actor_user
           if is_failed && have_subject { auth_user = subject }
           ocsf.user = auth_user
+          if is_switch {
+              # The administrator (author) acts AS the target user.
+              if have_subject { ocsf.user = subject }
+              ocsf.actor = { "user": actor_user }
+              if contains(downcase(custom_message), "stop") {
+                  ocsf.activity_id = 2
+                  ocsf.activity_name = "Logoff"
+              } else {
+                  ocsf.activity_id = 7
+                  ocsf.activity_name = "Account Switch"
+                  ocsf.account_switch_type_id = 2
+                  ocsf.account_switch_type = "Impersonate"
+              }
+          }
           ocsf.service = { "name": "GitLab" }
           ocsf.is_remote = true
           method = with
@@ -757,6 +799,7 @@ samples:
       "activity_id": 3
       "user.name": "bsmith"
       "group.name": "example-group"
+      "severity_id": 3
       "metadata.version": "1.9.0"
   # streaming event, member removed from a project; schema: https://docs.gitlab.com/user/compliance/audit_event_schema/
   # event type: https://docs.gitlab.com/user/compliance/audit_event_types/
@@ -825,6 +868,55 @@ samples:
       "metadata.uid": "b8a106b5e3be298ff879cd70c4bf28c7cb17321a762958890b507c3a049385c6"
   # batched streaming request (JSON array) not split upstream: Base Event fallback
   - raw: "[{\"id\": 111, \"author_id\": 42, \"entity_id\": 8, \"entity_type\": \"Project\", \"details\": {\"author_name\": \"jdoe\", \"author_class\": \"User\", \"target_id\": 8, \"target_type\": \"Project\", \"target_details\": \"g/p\", \"ip_address\": \"192.0.2.40\", \"entity_path\": \"g/p\", \"custom_message\": \"Project created\"}, \"ip_address\": \"192.0.2.40\", \"author_name\": \"jdoe\", \"entity_path\": \"g/p\", \"target_details\": \"g/p\", \"created_at\": \"2026-08-18T20:00:00.000Z\", \"target_type\": \"Project\", \"target_id\": 8, \"event_type\": \"project_created\"}]"
+    expect:
+      "class_uid": 0
+      "metadata.version": "1.9.0"
+  # review: user_impersonation started (admin acts as a user): Account Switch / Impersonate, Medium; event type: https://docs.gitlab.com/user/compliance/audit_event_types/
+  - raw: "{\"id\":112,\"author_id\":1,\"entity_id\":77,\"entity_type\":\"User\",\"details\":{\"author_name\":\"Administrator\",\"author_class\":\"User\",\"target_id\":77,\"target_type\":\"User\",\"target_details\":\"bsmith\",\"ip_address\":\"192.0.2.40\",\"entity_path\":\"bsmith\",\"custom_message\":\"Started Impersonation\"},\"ip_address\":\"192.0.2.40\",\"author_name\":\"Administrator\",\"entity_path\":\"bsmith\",\"target_details\":\"bsmith\",\"created_at\":\"2026-08-18T20:00:00.000Z\",\"target_type\":\"User\",\"target_id\":77,\"event_type\":\"user_impersonation\"}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 7
+      "account_switch_type_id": 2
+      "user.name": "bsmith"
+      "actor.user.name": "Administrator"
+      "severity_id": 3
+      "metadata.version": "1.9.0"
+  # review: user_impersonation stopped: Logoff with the admin as actor; event type: https://docs.gitlab.com/user/compliance/audit_event_types/
+  - raw: "{\"id\":113,\"author_id\":1,\"entity_id\":77,\"entity_type\":\"User\",\"details\":{\"author_name\":\"Administrator\",\"author_class\":\"User\",\"target_id\":77,\"target_type\":\"User\",\"target_details\":\"bsmith\",\"ip_address\":\"192.0.2.40\",\"entity_path\":\"bsmith\",\"custom_message\":\"Stopped Impersonation\"},\"ip_address\":\"192.0.2.40\",\"author_name\":\"Administrator\",\"entity_path\":\"bsmith\",\"target_details\":\"bsmith\",\"created_at\":\"2026-08-18T20:00:00.000Z\",\"target_type\":\"User\",\"target_id\":77,\"event_type\":\"user_impersonation\"}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 2
+      "actor.user.name": "Administrator"
+      "metadata.version": "1.9.0"
+  # review: project export requested (Medium); event type: https://docs.gitlab.com/user/compliance/audit_event_types/
+  - raw: "{\"id\":114,\"author_id\":42,\"entity_id\":7,\"entity_type\":\"Project\",\"details\":{\"author_name\":\"jdoe\",\"author_class\":\"User\",\"target_id\":7,\"target_type\":\"Project\",\"target_details\":\"example-group/example-project\",\"ip_address\":\"192.0.2.40\",\"entity_path\":\"example-group/example-project\",\"custom_message\":\"Project export created\"},\"ip_address\":\"192.0.2.40\",\"author_name\":\"jdoe\",\"entity_path\":\"example-group/example-project\",\"target_details\":\"example-group/example-project\",\"created_at\":\"2026-08-18T20:00:00.000Z\",\"target_type\":\"Project\",\"target_id\":7,\"event_type\":\"project_export_created\"}"
+    expect:
+      "class_uid": 6003
+      "activity_id": 1
+      "severity_id": 3
+      "metadata.version": "1.9.0"
+  # review: a JSON object without any GitLab audit field is a Base Event fallback, not API Activity
+  - raw: "{\"foo\":\"bar\"}"
+    expect:
+      "class_uid": 0
+      "unmapped.parse_fallback": "unparsable input"
+      "metadata.version": "1.9.0"
+  # review: an empty JSON object is a Base Event fallback
+  - raw: "{}"
+    expect:
+      "class_uid": 0
+      "metadata.version": "1.9.0"
+  # review: a null message (validate-ocsf feeds this envelope as the event itself) never aborts
+  - raw: "{\"message\":null}"
+    expect:
+      "class_uid": 0
+      "metadata.version": "1.9.0"
+  # review: a pre-decoded message object never aborts; validate-ocsf feeds it as an object message (3002), validate-vrl as a string (fallback)
+  - raw: "{\"message\":{\"id\":115,\"author_id\":42,\"entity_id\":42,\"entity_type\":\"User\",\"details\":{\"author_name\":\"jdoe\",\"author_class\":\"User\",\"target_id\":42,\"target_type\":\"User\",\"target_details\":\"jdoe\",\"ip_address\":\"192.0.2.40\",\"entity_path\":\"jdoe\",\"custom_message\":\"Signed in with STANDARD authentication\"},\"ip_address\":\"192.0.2.40\",\"author_name\":\"jdoe\",\"entity_path\":\"jdoe\",\"target_details\":\"jdoe\",\"created_at\":\"2026-08-18T20:00:00.000Z\",\"target_type\":\"User\",\"target_id\":42,\"event_type\":\"authenticated_with_password\"}}"
+    expect:
+      "metadata.version": "1.9.0"
+  # review: a numeric message never aborts
+  - raw: "{\"message\":123}"
     expect:
       "class_uid": 0
       "metadata.version": "1.9.0"

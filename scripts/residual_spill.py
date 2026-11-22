@@ -12,7 +12,7 @@ START = '# NAN-2421 residual spill.'
 END = '# END NAN-2421 residual spill'
 
 
-KINDS = ('lowercase', 'epoch_ms', 'scale', 'enum', 'hex')
+KINDS = ('lowercase', 'epoch_ms', 'scale', 'enum', 'hex', 'truncate')
 SENSITIVE = re.compile(r'[\x00-\x1f"\\\'{}]')
 
 
@@ -66,6 +66,10 @@ def rule_body(rule, templates):
         text = text.replace('__FORMAT__', vrl_string(fmt if isinstance(fmt, str) else '%+'))
     elif rule['kind'] == 'scale':
         text = text.replace('__FACTOR__', vrl_number(float(rule['factor'])))
+    elif rule['kind'] == 'truncate':
+        length = rule['length']
+        assert type(length) is int and length > 0, rule
+        text = text.replace('__LENGTH__', str(length))
     elif rule['kind'] == 'enum':
         values = rule['values']
         # The template skips an absent source, which the old loop looked up as "".

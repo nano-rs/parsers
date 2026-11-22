@@ -7,7 +7,8 @@
 # Unrolling every rule into straight-line VRL was as fast per event, but each
 # `if` in a large program makes Vector's VRL type checker clone and merge the
 # whole type state, which doubled compile (reload) time for the parsers with
-# the most rules. Placeholders: __FORMAT__, __FACTOR__, __VALUES__, and
+# the most rules. Placeholders: __FORMAT__, __FACTOR__, __VALUES__, __LENGTH__
+# (the truncate kind's character bound), and
 # __MATCH__ (the emitted target equals __expected, or __expected is a
 # represented value when the rule names no target).
 # A rule consumes its source only when the source is valid for the kind AND
@@ -51,4 +52,16 @@ if __value != null {
     if __expected != null {
         if __MATCH__ { __consumed = __consumed + ("," + encode_json(key)) }
     }
+}
+# kind: truncate
+# A bounded copy (the first __LENGTH__ characters, as truncate() counts them)
+# consumes its source, so an over-long value is not stored a second time in
+# unmapped: raw_data stays its one lossless copy. An over-bound value counts
+# only when the event says so in metadata.is_truncated.
+__value = value
+if is_string(__value) {
+    __expected = string!(__value)
+    __over = strlen(__expected) > __LENGTH__
+    if __over { __expected = truncate(__expected, __LENGTH__) }
+    if (!__over || .metadata.is_truncated == true) && __MATCH__ { __consumed = __consumed + ("," + encode_json(key)) }
 }

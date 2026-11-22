@@ -101,6 +101,12 @@ def transformed(rule, value, output, mapped):
             want = int(value, 16)
         elif kind == 'enum':
             want = rule['values'].get(str(value).lower(), MISSING)
+        elif kind == 'truncate':
+            # A bounded copy: the first `length` characters. An over-bound value
+            # counts only when the event flags itself metadata.is_truncated.
+            if not isinstance(value, str): return False
+            want = value[:rule['length']]
+            if len(value) > rule['length'] and (output.get('metadata') or {}).get('is_truncated') is not True: return False
         else:
             raise AssertionError(f'unknown transform {kind}')
     except (ValueError, TypeError, AttributeError, OverflowError):

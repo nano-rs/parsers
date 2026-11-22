@@ -18,8 +18,8 @@ description: >
                    when the DDL creates, alters or drops a USER
   The SQL text goes to query_info.query_string, bounded to 4096 characters;
   a longer statement sets metadata.is_truncated and metadata.untruncated_size
-  (the full text stays in raw_data and in the residual spill, as the repo's
-  no-lost-field rule requires). ACCESS_HISTORY joins QUERY_HISTORY on
+  (bytes). The full text stays in raw_data only: the residual spill's
+  truncate rule keeps it out of unmapped. ACCESS_HISTORY joins QUERY_HISTORY on
   metadata.correlation_uid (the QUERY_ID). CLIENT_IP values that are not IPs
   (INTERNAL_SNOWFLAKE_IP/...) are kept in unmapped, never written to an IP
   column. Rows of any other view, and unparseable input, become a Base Event
@@ -31,7 +31,19 @@ vendor: "Snowflake"
 product: "Snowflake"
 parser_vrl: |
   # Snowflake ACCOUNT_USAGE rows (LOGIN_HISTORY, QUERY_HISTORY, ACCESS_HISTORY) -> OCSF 1.9.0.
-  raw_log = string!(.message)
+  # A string body is the usual wire form. A source that already decoded the
+  # JSON hands over an object (or array) instead, and a record without any
+  # `message` is the decoded event itself; never abort on either.
+  raw_log = ""
+  if is_string(.message) {
+      raw_log = string!(.message)
+  } else if is_object(.message) || is_array(.message) {
+      raw_log = encode_json(.message)
+  } else if exists(.message) && !is_null(.message) {
+      raw_log = to_string(.message) ?? ""
+  } else {
+      raw_log = encode_json(.)
+  }
   __raw_body = raw_log
   __source_kv = {}
   parsed, err = parse_json(raw_log)
@@ -125,7 +137,10 @@ parser_vrl: |
           ocsf.user = user
           ocsf.service = { "name": "Snowflake" }
           ocsf.is_remote = true
-          if upcase(string(p.IS_SUCCESS) ?? "") == "NO" {
+          # IS_SUCCESS is "YES"/"NO" in the view, but typed exports send a JSON
+          # boolean or 0/1; every false spelling is a failure.
+          ok_flag = downcase(to_string(p.IS_SUCCESS) ?? "")
+          if includes(["no", "false", "0", "f", "n"], ok_flag) {
               status_id = 2; status_str = "Failure"; severity_id = 2; severity = "Low"
           }
           src_ip = string(p.CLIENT_IP) ?? ""
@@ -192,8 +207,10 @@ parser_vrl: |
           ocsf.database = { "name": db_name, "type_id": 1, "type": "Relational" }
           qtext = string(p.QUERY_TEXT) ?? ""
           qinfo = { "uid": to_string(p.QUERY_ID) ?? "", "query_string": qtext }
-          if length(qtext) > 4096 {
-              qinfo.query_string = slice!(qtext, 0, 4096)
+          # Bounded to 4096 characters; the residual spill's truncate rule keeps
+          # the full statement out of unmapped (raw_data is its one copy).
+          if strlen(qtext) > 4096 {
+              qinfo.query_string = truncate(qtext, 4096)
               ocsf.metadata_truncated = length(qtext)
           }
           ocsf.query_info = qinfo
@@ -201,8 +218,13 @@ parser_vrl: |
           if exec == "fail" || exec == "incident" { status_id = 2; status_str = "Failure" }
           if err_code != "" { ocsf.status_code = err_code }
           if err_msg != "" { ocsf.status_detail = err_msg }
-          dur = to_int(p.TOTAL_ELAPSED_TIME) ?? null
-          if dur != null { ocsf.duration = dur }
+          # to_int(null) is 0: only a present elapsed time is a duration.
+          if p.TOTAL_ELAPSED_TIME != null {
+              dur, dur_err = to_int(p.TOTAL_ELAPSED_TIME)
+              if dur_err == null { ocsf.duration = dur }
+          }
+          # Privilege changes and bulk unloads (COPY INTO @stage) are Medium.
+          if qtype == "GRANT" || qtype == "REVOKE" || qtype == "UNLOAD" { severity_id = 3; severity = "Medium" }
           evt_uid = to_string(p.QUERY_ID) ?? ""
           event_code = string(p.QUERY_TYPE) ?? ""
       } else {
@@ -390,6 +412,7 @@ parser_vrl: |
   __consumed = ""
   # BEGIN parser-specific transformations
   # FIRST_AUTHENTICATION_FACTOR: SAML and OAuth first factors are the authentication protocol.
+  # QUERY_TEXT: SQL text is bounded to 4096 characters in query_info.query_string (metadata.is_truncated marks a cut); raw_data keeps the one full copy, so unmapped never repeats it.
   for_each(flatten(__source_kv)) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
@@ -401,6 +424,22 @@ parser_vrl: |
               if __expected != null {
                   if ."auth_protocol" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
               }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        QUERY_TEXT
+      )\z') {
+          # A bounded copy (the first 4096 characters, as truncate() counts them)
+          # consumes its source, so an over-long value is not stored a second time in
+          # unmapped: raw_data stays its one lossless copy. An over-bound value counts
+          # only when the event says so in metadata.is_truncated.
+          __value = value
+          if is_string(__value) {
+              __expected = string!(__value)
+              __over = strlen(__expected) > 4096
+              if __over { __expected = truncate(__expected, 4096) }
+              if (!__over || .metadata.is_truncated == true) && ."query_info"."query_string" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
           }
       }
   }
@@ -694,6 +733,7 @@ samples:
       "class_uid": 3002
       "status_id": 2
       "status_detail": "JWT_TOKEN_INVALID_PUBLIC_KEY_FINGERPRINT_MISMATCH"
+      "is_mfa": false
       "metadata.version": "1.9.0"
   # QUERY_HISTORY successful SELECT, source: https://github.com/elastic/integrations/blob/main/packages/snowflake/data_stream/query_history/_dev/test/pipeline/, columns per https://docs.snowflake.com/en/sql-reference/account-usage/query_historytest-query-history-success-select.log
   - raw: "{\"QUERY_ID\":\"01b2c3d4-e5f6-7890-abcd-ef1234567890\",\"QUERY_TEXT\":\"SELECT id, email FROM example_db.public.customers WHERE created_on > '2026-01-01' LIMIT 100\",\"DATABASE_NAME\":\"EXAMPLE_DB\",\"SCHEMA_NAME\":\"PUBLIC\",\"QUERY_TYPE\":\"SELECT\",\"SESSION_ID\":\"9876543210001\",\"AUTHN_EVENT_ID\":\"1234567890001\",\"USER_NAME\":\"john.doe\",\"ROLE_NAME\":\"ANALYST\",\"WAREHOUSE_NAME\":\"EXAMPLE_WH\",\"EXECUTION_STATUS\":\"success\",\"ERROR_CODE\":null,\"ERROR_MESSAGE\":null,\"START_TIME\":\"2020-06-15 07:59:58.873 +0000\",\"END_TIME\":\"2020-06-15 08:00:00.123 +0000\",\"TOTAL_ELAPSED_TIME\":\"1250\",\"BYTES_SCANNED\":\"65536\",\"ROWS_UNLOADED\":\"10\",\"OUTBOUND_DATA_TRANSFER_BYTES\":\"2048\",\"INBOUND_DATA_TRANSFER_BYTES\":\"4096\",\"QUERY_HASH\":\"abcdef0123456789abcdef0123456789\",\"USER_TYPE\":\"PERSON\",\"AGENT_TYPE\":null}"
@@ -711,11 +751,12 @@ samples:
       "status_id": 2
       "status_code": "002003"
       "metadata.version": "1.9.0"
-  # QUERY_HISTORY GRANT by SECURITYADMIN, source: https://github.com/elastic/integrations/blob/main/packages/snowflake/data_stream/query_history/_dev/test/pipeline/, columns per https://docs.snowflake.com/en/sql-reference/account-usage/query_historytest-query-history-grant.log
+  # QUERY_HISTORY GRANT by SECURITYADMIN (Medium), source: https://github.com/elastic/integrations/blob/main/packages/snowflake/data_stream/query_history/_dev/test/pipeline/, columns per https://docs.snowflake.com/en/sql-reference/account-usage/query_historytest-query-history-grant.log
   - raw: "{\"QUERY_ID\":\"01b2c3d4-e5f6-7890-abcd-ef1234567894\",\"QUERY_TEXT\":\"GRANT SELECT ON example_db.public.customers TO ROLE ANALYST\",\"DATABASE_NAME\":\"EXAMPLE_DB\",\"SCHEMA_NAME\":\"PUBLIC\",\"QUERY_TYPE\":\"GRANT\",\"SESSION_ID\":\"9876543210005\",\"AUTHN_EVENT_ID\":\"1234567890005\",\"USER_NAME\":\"john.doe\",\"ROLE_NAME\":\"SECURITYADMIN\",\"WAREHOUSE_NAME\":\"EXAMPLE_WH\",\"EXECUTION_STATUS\":\"success\",\"ERROR_CODE\":null,\"ERROR_MESSAGE\":null,\"START_TIME\":\"2020-06-15 11:59:59.000 +0000\",\"END_TIME\":\"2020-06-15 12:00:00.000 +0000\",\"TOTAL_ELAPSED_TIME\":\"95\",\"BYTES_SCANNED\":\"0\",\"ROWS_UNLOADED\":\"0\",\"OUTBOUND_DATA_TRANSFER_BYTES\":\"0\",\"INBOUND_DATA_TRANSFER_BYTES\":\"0\",\"QUERY_HASH\":\"44444444444444444444444444444444\",\"USER_TYPE\":\"PERSON\",\"AGENT_TYPE\":null}"
     expect:
       "class_uid": 6005
       "activity_id": 2
+      "severity_id": 3
       "metadata.version": "1.9.0"
   # QUERY_HISTORY CREATE USER, source: https://github.com/elastic/integrations/blob/main/packages/snowflake/data_stream/query_history/_dev/test/pipeline/, columns per https://docs.snowflake.com/en/sql-reference/account-usage/query_historytest-query-history-grant.log
   - raw: "{\"QUERY_ID\":\"01b2c3d4-e5f6-7890-abcd-ef1234567895\",\"QUERY_TEXT\":\"CREATE USER example_user\",\"DATABASE_NAME\":\"EXAMPLE_DB\",\"SCHEMA_NAME\":\"PUBLIC\",\"QUERY_TYPE\":\"CREATE_USER\",\"SESSION_ID\":\"9876543210006\",\"AUTHN_EVENT_ID\":\"1234567890006\",\"USER_NAME\":\"john.doe\",\"ROLE_NAME\":\"SECURITYADMIN\",\"WAREHOUSE_NAME\":\"EXAMPLE_WH\",\"EXECUTION_STATUS\":\"success\",\"ERROR_CODE\":null,\"ERROR_MESSAGE\":null,\"START_TIME\":\"2020-06-15 12:00:01.000 +0000\",\"END_TIME\":\"2020-06-15 12:00:02.000 +0000\",\"TOTAL_ELAPSED_TIME\":\"80\",\"BYTES_SCANNED\":\"0\",\"ROWS_UNLOADED\":\"0\",\"OUTBOUND_DATA_TRANSFER_BYTES\":\"0\",\"INBOUND_DATA_TRANSFER_BYTES\":\"0\",\"QUERY_HASH\":\"55555555555555555555555555555555\",\"USER_TYPE\":\"PERSON\",\"AGENT_TYPE\":null}"
@@ -735,6 +776,7 @@ samples:
       "class_uid": 6005
       "metadata.is_truncated": true
       "metadata.untruncated_size": 5039
+      "unmapped.query_text": "<missing>"
       "metadata.version": "1.9.0"
   # ACCESS_HISTORY read of a table through a function, source: https://github.com/elastic/integrations/blob/main/packages/snowflake/data_stream/access_history/_dev/test/pipeline/test-snowflake-access-history-sample.log, columns per https://docs.snowflake.com/en/sql-reference/account-usage/access_history
   - raw: "{\"QUERY_ID\":\"01b5a1c2-0000-1a2b-0000-000100000001\",\"QUERY_START_TIME\":\"2020-06-15 08:00:00.123 +0000\",\"USER_NAME\":\"alice.johnson\",\"DIRECT_OBJECTS_ACCESSED\":\"[\\n  {\\n    \\\"argumentSignature\\\": \\\"(NUM1 NUMBER, NUM2 NUMBER)\\\",\\n    \\\"dataType\\\": \\\"NUMBER(38,0)\\\",\\n    \\\"objectDomain\\\": \\\"Function\\\",\\n    \\\"objectId\\\": 2,\\n    \\\"objectName\\\": \\\"EXAMPLE_DB.FUNCTIONS.RETURN_SUM\\\"\\n  },\\n  {\\n    \\\"columns\\\": [\\n      {\\n        \\\"columnId\\\": 68610,\\n        \\\"columnName\\\": \\\"CONTENT\\\"\\n      },\\n      {\\n        \\\"columnId\\\": 68611,\\n        \\\"columnName\\\": \\\"CREATED_AT\\\"\\n      }\\n    ],\\n    \\\"objectDomain\\\": \\\"Table\\\",\\n    \\\"objectId\\\": 66564,\\n    \\\"objectName\\\": \\\"EXAMPLE_DB.PUBLIC.ORDERS\\\"\\n  }\\n]\",\"BASE_OBJECTS_ACCESSED\":\"[\\n  {\\n    \\\"columns\\\": [\\n      {\\n        \\\"columnId\\\": 68610,\\n        \\\"columnName\\\": \\\"CONTENT\\\"\\n      },\\n      {\\n        \\\"columnId\\\": 68611,\\n        \\\"columnName\\\": \\\"CREATED_AT\\\"\\n      }\\n    ],\\n    \\\"objectDomain\\\": \\\"Table\\\",\\n    \\\"objectId\\\": 66564,\\n    \\\"objectName\\\": \\\"EXAMPLE_DB.PUBLIC.ORDERS\\\"\\n  }\\n]\",\"OBJECTS_MODIFIED\":\"[]\",\"OBJECT_MODIFIED_BY_DDL\":null,\"POLICIES_REFERENCED\":\"[]\",\"PARENT_QUERY_ID\":null,\"ROOT_QUERY_ID\":null,\"EVENT_SOURCE\":\"snowflake_sql\",\"ADDITIONAL_PROPERTIES\":null,\"INVOKER_IDENTITY\":null,\"AGENTS_INFO\":null}"
@@ -798,3 +840,57 @@ samples:
     expect:
       "class_uid": 0
       "metadata.uid": "c971c16bcb3378755a03e10bd149d81a439175fd6cc9398d6bb1ed001f07988f"
+  # review: typed export with IS_SUCCESS as JSON false is a failure; built from source: https://github.com/elastic/integrations/blob/main/packages/snowflake/data_stream/login_history/_dev/test/pipeline/test-log.log, columns per https://docs.snowflake.com/en/sql-reference/account-usage/login_history
+  - raw: "{\"EVENT_ID\":\"1101\",\"EVENT_TIMESTAMP\":\"2020-06-15 12:00:00.000 +0000\",\"EVENT_TYPE\":\"LOGIN\",\"USER_NAME\":\"dave.wilson\",\"CLIENT_IP\":\"203.0.113.50\",\"REPORTED_CLIENT_TYPE\":\"JDBC_DRIVER\",\"REPORTED_CLIENT_VERSION\":\"3.14.4\",\"FIRST_AUTHENTICATION_FACTOR\":\"PASSWORD\",\"SECOND_AUTHENTICATION_FACTOR\":null,\"IS_SUCCESS\":false,\"ERROR_CODE\":\"390100\",\"ERROR_MESSAGE\":\"INCORRECT_USERNAME_PASSWORD\",\"CONNECTION\":\"EXAMPLE_CONNECTION\",\"CLIENT_PRIVATE_LINK_ID\":null,\"LOGIN_DETAILS\":null,\"AUTHORIZING_INTEGRATION_NAME\":null}"
+    expect:
+      "class_uid": 3002
+      "status_id": 2
+      "severity_id": 2
+      "metadata.version": "1.9.0"
+  # review: IS_SUCCESS "FALSE" is a failure; built from source: https://github.com/elastic/integrations/blob/main/packages/snowflake/data_stream/login_history/_dev/test/pipeline/test-log.log, columns per https://docs.snowflake.com/en/sql-reference/account-usage/login_history
+  - raw: "{\"EVENT_ID\":\"1102\",\"EVENT_TIMESTAMP\":\"2020-06-15 12:00:00.000 +0000\",\"EVENT_TYPE\":\"LOGIN\",\"USER_NAME\":\"dave.wilson\",\"CLIENT_IP\":\"203.0.113.50\",\"REPORTED_CLIENT_TYPE\":\"JDBC_DRIVER\",\"REPORTED_CLIENT_VERSION\":\"3.14.4\",\"FIRST_AUTHENTICATION_FACTOR\":\"PASSWORD\",\"SECOND_AUTHENTICATION_FACTOR\":null,\"IS_SUCCESS\":\"FALSE\",\"ERROR_CODE\":\"390100\",\"ERROR_MESSAGE\":\"INCORRECT_USERNAME_PASSWORD\",\"CONNECTION\":\"EXAMPLE_CONNECTION\",\"CLIENT_PRIVATE_LINK_ID\":null,\"LOGIN_DETAILS\":null,\"AUTHORIZING_INTEGRATION_NAME\":null}"
+    expect:
+      "class_uid": 3002
+      "status_id": 2
+      "metadata.version": "1.9.0"
+  # review: IS_SUCCESS 0 is a failure; built from source: https://github.com/elastic/integrations/blob/main/packages/snowflake/data_stream/login_history/_dev/test/pipeline/test-log.log, columns per https://docs.snowflake.com/en/sql-reference/account-usage/login_history
+  - raw: "{\"EVENT_ID\":\"1103\",\"EVENT_TIMESTAMP\":\"2020-06-15 12:00:00.000 +0000\",\"EVENT_TYPE\":\"LOGIN\",\"USER_NAME\":\"dave.wilson\",\"CLIENT_IP\":\"203.0.113.50\",\"REPORTED_CLIENT_TYPE\":\"JDBC_DRIVER\",\"REPORTED_CLIENT_VERSION\":\"3.14.4\",\"FIRST_AUTHENTICATION_FACTOR\":\"PASSWORD\",\"SECOND_AUTHENTICATION_FACTOR\":null,\"IS_SUCCESS\":0,\"ERROR_CODE\":\"390100\",\"ERROR_MESSAGE\":\"INCORRECT_USERNAME_PASSWORD\",\"CONNECTION\":\"EXAMPLE_CONNECTION\",\"CLIENT_PRIVATE_LINK_ID\":null,\"LOGIN_DETAILS\":null,\"AUTHORIZING_INTEGRATION_NAME\":null}"
+    expect:
+      "class_uid": 3002
+      "status_id": 2
+      "metadata.version": "1.9.0"
+  # review: IS_SUCCESS true is a success; built from source: https://github.com/elastic/integrations/blob/main/packages/snowflake/data_stream/login_history/_dev/test/pipeline/test-log.log, columns per https://docs.snowflake.com/en/sql-reference/account-usage/login_history
+  - raw: "{\"EVENT_ID\":\"1104\",\"EVENT_TIMESTAMP\":\"2020-06-15 12:00:00.000 +0000\",\"EVENT_TYPE\":\"LOGIN\",\"USER_NAME\":\"dave.wilson\",\"CLIENT_IP\":\"203.0.113.50\",\"REPORTED_CLIENT_TYPE\":\"JDBC_DRIVER\",\"REPORTED_CLIENT_VERSION\":\"3.14.4\",\"FIRST_AUTHENTICATION_FACTOR\":\"PASSWORD\",\"SECOND_AUTHENTICATION_FACTOR\":null,\"IS_SUCCESS\":true,\"ERROR_CODE\":null,\"ERROR_MESSAGE\":null,\"CONNECTION\":\"EXAMPLE_CONNECTION\",\"CLIENT_PRIVATE_LINK_ID\":null,\"LOGIN_DETAILS\":null,\"AUTHORIZING_INTEGRATION_NAME\":null}"
+    expect:
+      "class_uid": 3002
+      "status_id": 1
+      "metadata.version": "1.9.0"
+  # review: UNLOAD (COPY INTO @stage, bulk export) is Medium; built from source: https://github.com/elastic/integrations/blob/main/packages/snowflake/data_stream/query_history/_dev/test/pipeline/, columns per https://docs.snowflake.com/en/sql-reference/account-usage/query_historytest-query-history-success-select.log, QUERY_TYPE per https://docs.snowflake.com/en/sql-reference/account-usage/query_history
+  - raw: "{\"QUERY_ID\":\"01b2c3d4-e5f6-7890-abcd-ef12345678aa\",\"QUERY_TEXT\":\"COPY INTO @example_db.public.export_stage FROM example_db.public.customers\",\"DATABASE_NAME\":\"EXAMPLE_DB\",\"SCHEMA_NAME\":\"PUBLIC\",\"QUERY_TYPE\":\"UNLOAD\",\"SESSION_ID\":\"9876543210001\",\"AUTHN_EVENT_ID\":\"1234567890001\",\"USER_NAME\":\"john.doe\",\"ROLE_NAME\":\"ANALYST\",\"WAREHOUSE_NAME\":\"EXAMPLE_WH\",\"EXECUTION_STATUS\":\"success\",\"ERROR_CODE\":null,\"ERROR_MESSAGE\":null,\"START_TIME\":\"2020-06-15 07:59:58.873 +0000\",\"END_TIME\":\"2020-06-15 08:00:00.123 +0000\",\"TOTAL_ELAPSED_TIME\":\"1250\",\"BYTES_SCANNED\":\"65536\",\"ROWS_UNLOADED\":\"250000\",\"OUTBOUND_DATA_TRANSFER_BYTES\":\"2048\",\"INBOUND_DATA_TRANSFER_BYTES\":\"4096\",\"QUERY_HASH\":\"abcdef0123456789abcdef0123456789\",\"USER_TYPE\":\"PERSON\",\"AGENT_TYPE\":null}"
+    expect:
+      "class_uid": 6005
+      "activity_id": 4
+      "severity_id": 3
+      "metadata.version": "1.9.0"
+  # review: a null TOTAL_ELAPSED_TIME emits no duration (never a fabricated 0); built from source: https://github.com/elastic/integrations/blob/main/packages/snowflake/data_stream/query_history/_dev/test/pipeline/, columns per https://docs.snowflake.com/en/sql-reference/account-usage/query_historytest-query-history-fail.log
+  - raw: "{\"QUERY_ID\":\"01b2c3d4-e5f6-7890-abcd-ef12345678bb\",\"QUERY_TEXT\":\"SELECT * FROM example_db.public.missing_table\",\"DATABASE_NAME\":\"EXAMPLE_DB\",\"SCHEMA_NAME\":\"PUBLIC\",\"QUERY_TYPE\":\"SELECT\",\"SESSION_ID\":\"9876543210002\",\"AUTHN_EVENT_ID\":\"1234567890002\",\"USER_NAME\":\"john.doe\",\"ROLE_NAME\":\"ANALYST\",\"WAREHOUSE_NAME\":\"EXAMPLE_WH\",\"EXECUTION_STATUS\":\"fail\",\"ERROR_CODE\":\"002003\",\"ERROR_MESSAGE\":\"SQL compilation error: Object does not exist or not authorized.\",\"START_TIME\":\"2020-06-15 08:59:59.500 +0000\",\"END_TIME\":\"2020-06-15 09:00:00.000 +0000\",\"TOTAL_ELAPSED_TIME\":null,\"BYTES_SCANNED\":\"0\",\"ROWS_UNLOADED\":\"0\",\"OUTBOUND_DATA_TRANSFER_BYTES\":\"0\",\"INBOUND_DATA_TRANSFER_BYTES\":\"0\",\"QUERY_HASH\":\"11111111111111111111111111111111\",\"USER_TYPE\":\"PERSON\",\"AGENT_TYPE\":null}"
+    expect:
+      "class_uid": 6005
+      "duration": "<missing>"
+      "metadata.version": "1.9.0"
+  # review: a missing TOTAL_ELAPSED_TIME emits no duration; built from source: https://github.com/elastic/integrations/blob/main/packages/snowflake/data_stream/query_history/_dev/test/pipeline/, columns per https://docs.snowflake.com/en/sql-reference/account-usage/query_historytest-query-history-fail.log
+  - raw: "{\"QUERY_ID\":\"01b2c3d4-e5f6-7890-abcd-ef12345678cc\",\"QUERY_TEXT\":\"SELECT * FROM example_db.public.missing_table\",\"DATABASE_NAME\":\"EXAMPLE_DB\",\"SCHEMA_NAME\":\"PUBLIC\",\"QUERY_TYPE\":\"SELECT\",\"SESSION_ID\":\"9876543210002\",\"AUTHN_EVENT_ID\":\"1234567890002\",\"USER_NAME\":\"john.doe\",\"ROLE_NAME\":\"ANALYST\",\"WAREHOUSE_NAME\":\"EXAMPLE_WH\",\"EXECUTION_STATUS\":\"fail\",\"ERROR_CODE\":\"002003\",\"ERROR_MESSAGE\":\"SQL compilation error: Object does not exist or not authorized.\",\"START_TIME\":\"2020-06-15 08:59:59.500 +0000\",\"END_TIME\":\"2020-06-15 09:00:00.000 +0000\",\"BYTES_SCANNED\":\"0\",\"ROWS_UNLOADED\":\"0\",\"OUTBOUND_DATA_TRANSFER_BYTES\":\"0\",\"INBOUND_DATA_TRANSFER_BYTES\":\"0\",\"QUERY_HASH\":\"11111111111111111111111111111111\",\"USER_TYPE\":\"PERSON\",\"AGENT_TYPE\":null}"
+    expect:
+      "class_uid": 6005
+      "duration": "<missing>"
+      "metadata.version": "1.9.0"
+  # review: a null message never aborts
+  - raw: "{\"message\":null}"
+    expect:
+      "class_uid": 0
+      "metadata.version": "1.9.0"
+  # review: a numeric message never aborts
+  - raw: "{\"message\":42}"
+    expect:
+      "class_uid": 0
+      "metadata.version": "1.9.0"

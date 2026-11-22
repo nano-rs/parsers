@@ -28,7 +28,19 @@ vendor: "Zoom"
 product: "Zoom"
 parser_vrl: |
   # Zoom sign-in activity, admin operation logs and webhooks -> OCSF 1.9.0.
-  raw_log = string!(.message)
+  # A string body is the usual wire form. A source that already decoded the
+  # JSON hands over an object (or array) instead, and a record without any
+  # `message` is the decoded event itself; never abort on either.
+  raw_log = ""
+  if is_string(.message) {
+      raw_log = string!(.message)
+  } else if is_object(.message) || is_array(.message) {
+      raw_log = encode_json(.message)
+  } else if exists(.message) && !is_null(.message) {
+      raw_log = to_string(.message) ?? ""
+  } else {
+      raw_log = encode_json(.)
+  }
   __raw_body = raw_log
   __source_kv = {}
   parsed, err = parse_json(raw_log)
@@ -82,12 +94,25 @@ parser_vrl: |
       event = string(p.event) ?? ""
       email_re = r'^[^@\s]+@[^@\s]+\.[^@\s]+$'
 
-      # ---- time: webhook event_ts (epoch ms), else the record's ISO clock ----
+      # ---- time: webhook event_ts (epoch ms), then payload.time_stamp (epoch
+      # ms, settings and older webhooks), then the record's own ISO clock: the
+      # activity / operation-log time, the object's date_time, the participant
+      # join / leave or share time, the recording segment start, and for
+      # meeting.started / meeting.ended the meeting's own start / end. ----
       time_ms = 0
       if kind == "webhook" { time_ms = to_int(p.event_ts) ?? 0 }
+      if time_ms == 0 && kind == "webhook" { time_ms = to_int(payload.time_stamp) ?? 0 }
       if time_ms == 0 {
+          rec_file = object(obj.recording_file) ?? {}
+          share = object(participant.sharing_details) ?? {}
           ts = string(p.time) ?? ""
           if ts == "" { ts = string(obj.date_time) ?? "" }
+          if ts == "" { ts = string(participant.join_time) ?? "" }
+          if ts == "" { ts = string(participant.leave_time) ?? "" }
+          if ts == "" { ts = string(share.date_time) ?? "" }
+          if ts == "" { ts = string(rec_file.recording_start) ?? "" }
+          if ts == "" && event == "meeting.ended" { ts = string(obj.end_time) ?? "" }
+          if ts == "" && event == "meeting.started" { ts = string(obj.start_time) ?? "" }
           clock, clock_err = parse_timestamp(ts, "%+")
           if clock_err == null {
               time_ms = to_unix_timestamp(clock, unit: "milliseconds")
@@ -341,11 +366,23 @@ parser_vrl: |
   # BEGIN parser-specific transformations
   # time: ISO activity / operation-log time converted to the event clock in milliseconds.
   # payload.object.date_time: Webhook object time, used only when event_ts is absent.
+  # payload.object.participant.join_time: Participant join time, used when the webhook has no event_ts.
+  # payload.object.participant.leave_time: Participant leave time, used when the webhook has no event_ts.
+  # payload.object.participant.sharing_details.date_time: Screen-share time, used when the webhook has no event_ts.
+  # payload.object.recording_file.recording_start: Recording segment start, used when the webhook has no event_ts.
+  # payload.object.end_time: meeting.ended end time, used when the webhook has no event_ts.
+  # payload.object.start_time: meeting.started start time, used when the webhook has no event_ts.
   for_each(flatten(__source_kv)) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
         time
       | payload\.object\.date_time
+      | payload\.object\.participant\.join_time
+      | payload\.object\.participant\.leave_time
+      | payload\.object\.participant\.sharing_details\.date_time
+      | payload\.object\.recording_file\.recording_start
+      | payload\.object\.end_time
+      | payload\.object\.start_time
       )\z') {
           __value = value
           __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
@@ -377,6 +414,7 @@ parser_vrl: |
   | payload\.object\.uuid
   | payload\.operator
   | payload\.operator_id
+  | payload\.time_stamp
   | time
   | type
   )\z'
@@ -679,23 +717,24 @@ samples:
       "activity_id": 2
       "metadata.version": "1.9.0"
   # user.created webhook, source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/webhook/_dev/test/pipeline/test-user.json
-  - raw: "{\"event\":\"user.created\",\"payload\":{\"account_id\":\"AAAAAA\",\"creation_type\":\"create\",\"object\":{\"email\":\"henrysemail@example.com\",\"first_name\":\"Henry\",\"id\":\"abcD3ojfdbjfg\",\"last_name\":\"Phan\",\"type\":\"3\"},\"operator\":\"anawesomeuse@example.com\"}}"
+  - raw: "{\"event\":\"user.created\",\"payload\":{\"account_id\":\"AAAAAA\",\"creation_type\":\"create\",\"object\":{\"email\":\"henrysemail@example.com\",\"first_name\":\"Henry\",\"id\":\"abcD3ojfdbjfg\",\"last_name\":\"Phan\",\"type\":\"3\"},\"operator\":\"anawesomeuse@example.com\"},\"event_ts\":1787083200000}"
     expect:
       "class_uid": 3007
       "activity_id": 1
       "user.email_addr": "henrysemail@example.com"
       "metadata.version": "1.9.0"
   # user.deactivated webhook, source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/webhook/_dev/test/pipeline/test-user.json
-  - raw: "{\"event\":\"user.deactivated\",\"payload\":{\"account_id\":\"AAAAAABBBB\",\"object\":{\"email\":\"henrysemail@example.com\",\"first_name\":\"Henry\",\"id\":\"abcD3ojfdbjfg\",\"last_name\":\"Phan\",\"type\":1},\"operator\":\"anawesomeuse@example.com\",\"operator_id\":\"z8yCxjabcdEFGHfp8uQ\"}}"
+  - raw: "{\"event\":\"user.deactivated\",\"payload\":{\"account_id\":\"AAAAAABBBB\",\"object\":{\"email\":\"henrysemail@example.com\",\"first_name\":\"Henry\",\"id\":\"abcD3ojfdbjfg\",\"last_name\":\"Phan\",\"type\":1},\"operator\":\"anawesomeuse@example.com\",\"operator_id\":\"z8yCxjabcdEFGHfp8uQ\"},\"event_ts\":1787083260000}"
     expect:
       "class_uid": 3007
       "activity_id": 5
       "metadata.version": "1.9.0"
-  # user.settings_updated webhook (old_object diff), source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/webhook/_dev/test/pipeline/test-user.json
+  # user.settings_updated webhook (old_object diff), time from payload.time_stamp, source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/webhook/_dev/test/pipeline/test-user.json
   - raw: "{\"event\":\"user.settings_updated\",\"payload\":{\"account_id\":\"CAl6ByEyAq8KK_CCCCCC\",\"object\":{\"id\":\"uL34AAbbbbAAAAAAQsQ\",\"settings\":{\"in_meeting\":{\"private_chat\":false}}},\"old_object\":{\"id\":\"uL34AAbbbbAAAAAAQsQ\",\"settings\":{\"in_meeting\":{\"private_chat\":true}}},\"operator\":\"iamtheoperat@example.com\",\"operator_id\":\"uLoRgfbbTayCX6r2Q_qQsQ\",\"time_stamp\":1563572826929}}"
     expect:
       "class_uid": 3007
       "activity_id": 2
+      "time": 1563572826929
       "metadata.version": "1.9.0"
   # user.presence_status_updated (not an admin change), source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/webhook/_dev/test/pipeline/test-user.json
   - raw: "{\"event\":\"user.presence_status_updated\",\"payload\":{\"account_id\":\"EPjfyjxHMA\",\"object\":{\"date_time\":\"2019-11-26T20:13:57Z\",\"email\":\"sfdhfghfgh@example.com\",\"id\":\"z8ycx1223fq\",\"presence_status\":\"Available\"}}}"
@@ -704,17 +743,18 @@ samples:
       "activity_id": 3
       "metadata.version": "1.9.0"
   # meeting.created webhook with operator, source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/webhook/_dev/test/pipeline/test-meeting.json
-  - raw: "{\"event\":\"meeting.created\",\"payload\":{\"account_id\":\"o8KK_AAACq6BBEyA70CA\",\"object\":{\"duration\":60,\"host_id\":\"uLoRgfbbTayCX6r2Q_qQsQ\",\"id\":111111111,\"start_time\":\"2019-07-09T17:00:00Z\",\"timezone\":\"America/Los_Angeles\",\"topic\":\"My Meeting\",\"type\":2,\"uuid\":\"czLF6FFFoQOKgAB99DlDb9g==\"},\"operator\":\"someemail@example.com\",\"operator_id\":\"uLoRgfbbTayCX6r2Q_qQsQ\"}}"
+  - raw: "{\"event\":\"meeting.created\",\"payload\":{\"account_id\":\"o8KK_AAACq6BBEyA70CA\",\"object\":{\"duration\":60,\"host_id\":\"uLoRgfbbTayCX6r2Q_qQsQ\",\"id\":111111111,\"start_time\":\"2019-07-09T17:00:00Z\",\"timezone\":\"America/Los_Angeles\",\"topic\":\"My Meeting\",\"type\":2,\"uuid\":\"czLF6FFFoQOKgAB99DlDb9g==\"},\"operator\":\"someemail@example.com\",\"operator_id\":\"uLoRgfbbTayCX6r2Q_qQsQ\"},\"event_ts\":1787083320000}"
     expect:
       "class_uid": 6003
       "activity_id": 1
       "metadata.version": "1.9.0"
-  # meeting.started webhook (host as actor), source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/webhook/_dev/test/pipeline/test-meeting.json
+  # meeting.started webhook (host as actor; no event_ts, so time is the meeting start), source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/webhook/_dev/test/pipeline/test-meeting.json
   - raw: "{\"event\":\"meeting.started\",\"payload\":{\"account_id\":\"o8KK_AAACq6BBEyA70CA\",\"object\":{\"duration\":60,\"host_id\":\"uLoRgfbbTayCX6r2Q_qQsQ\",\"id\":\"111111111\",\"start_time\":\"2019-07-09T17:00:00Z\",\"timezone\":\"America/Los_Angeles\",\"topic\":\"My Meeting\",\"type\":2,\"uuid\":\"czLF6FFFoQOKgAB99DlDb9g==\"}}}"
     expect:
       "class_uid": 6003
       "activity_id": 99
       "actor.user.uid": "uLoRgfbbTayCX6r2Q_qQsQ"
+      "time": 1562691600000
       "metadata.version": "1.9.0"
   # meeting.participant_joined with the participant public IP, source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/webhook/_dev/test/pipeline/test-meeting.json
   - raw: "{\"event\":\"meeting.participant_joined\",\"event_ts\":1752127174016,\"payload\":{\"account_id\":\"HzozXXXXXXXX\",\"object\":{\"duration\":60,\"host_id\":\"dNvWUbXXXXXXXXXXXXXX\",\"id\":\"986XXXXXXXX\",\"participant\":{\"email\":\"user@example.com\",\"id\":\"8XjrxbGtXXXXXXXXXX\",\"join_time\":\"2025-07-10T05:59:30Z\",\"participant_user_id\":\"8XjrxbGtXXXXXXXXXX\",\"participant_uuid\":\"0E699901-3B16-3698-3388-XXXXXXXXXX\",\"public_ip\":\"192.0.2.144\",\"user_id\":\"123456789\",\"user_name\":\"Display Name of User\"},\"start_time\":\"2025-07-10T05:57:47Z\",\"timezone\":\"Asia/Seoul\",\"topic\":\"Team Meeting\",\"type\":2,\"uuid\":\"pU/13Hdsdfsdfsdf7xZZzpUg==\"}}}"
@@ -723,13 +763,13 @@ samples:
       "src_endpoint.ip": "192.0.2.144"
       "metadata.version": "1.9.0"
   # recording.completed webhook, source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/webhook/_dev/test/pipeline/test-recording.json
-  - raw: "{\"event\":\"recording.completed\",\"payload\":{\"account_id\":\"lAAAAAAAAAAAAA\",\"object\":{\"duration\":1,\"host_email\":\"somemeail@example.com\",\"host_id\":\"uLobbbbbbbbbb_qQsQ\",\"id\":150000008,\"recording_count\":4,\"recording_files\":[{\"download_url\":\"https://zoom.us/recording/download/80ebRwsfjskf2H3vlSigX0gNlBBBBBBBBBBBBBB\",\"file_size\":282825,\"file_type\":\"MP4\",\"id\":\"8f88599d-19ca-4d2b-a965-1196e777cb3c\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"play_url\":\"https://zoom.us/recording/play/80ebRwsfjskf2H3vlSigX0gNlBBBBBBBBBBBBBB\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\",\"recording_type\":\"shared_screen_with_speaker_view\",\"status\":\"completed\"},{\"download_url\":\"https://zoom.us/recording/download/Oaevut8LSACCCCCCCCnnnnnnnnbbbb\",\"file_size\":246560,\"file_type\":\"M4A\",\"id\":\"a6b332f9-2246-49e5-913e-588adc7f0f5f\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"play_url\":\"https://zoom.us/recording/play/Oaevut8LSACCCCCCCCnnnnnnnnbbbb\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\",\"recording_type\":\"audio_only\",\"status\":\"completed\"},{\"download_url\":\"https://zoom.us/recording/download/2dBBBBBccccDDDDeeee\",\"file_type\":\"TIMELINE\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\"},{\"download_url\":\"https://zoom.us/recording/play/7h0BBBBBBBchfhfhffh_0AAAAbbbbbeeSFcf209m\",\"file_size\":373,\"file_type\":\"TRANSCRIPT\",\"id\":\"97a4f7ca-e7e8-4e3b-b28a-27b42cd33c09\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"play_url\":\"https://zoom.us/recording/play/7h0BBBBBBBchfhfhffh_0AAAAbbbbbeeSFcf209m\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\",\"recording_type\":\"audio_transcript\",\"status\":\"completed\"}],\"share_url\":\"https://zoom.us/recording/share/aaaaaannnnnldglrkgmrmhh\",\"start_time\":\"2019-07-11T20:00:00Z\",\"timezone\":\"America/Los_Angeles\",\"topic\":\"A test meeting\",\"total_size\":529758,\"type\":2,\"uuid\":\"dj12vck6sdTn6yy7qdy3dQg==\"}}}"
+  - raw: "{\"event\":\"recording.completed\",\"payload\":{\"account_id\":\"lAAAAAAAAAAAAA\",\"object\":{\"duration\":1,\"host_email\":\"somemeail@example.com\",\"host_id\":\"uLobbbbbbbbbb_qQsQ\",\"id\":150000008,\"recording_count\":4,\"recording_files\":[{\"download_url\":\"https://zoom.us/recording/download/80ebRwsfjskf2H3vlSigX0gNlBBBBBBBBBBBBBB\",\"file_size\":282825,\"file_type\":\"MP4\",\"id\":\"8f88599d-19ca-4d2b-a965-1196e777cb3c\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"play_url\":\"https://zoom.us/recording/play/80ebRwsfjskf2H3vlSigX0gNlBBBBBBBBBBBBBB\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\",\"recording_type\":\"shared_screen_with_speaker_view\",\"status\":\"completed\"},{\"download_url\":\"https://zoom.us/recording/download/Oaevut8LSACCCCCCCCnnnnnnnnbbbb\",\"file_size\":246560,\"file_type\":\"M4A\",\"id\":\"a6b332f9-2246-49e5-913e-588adc7f0f5f\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"play_url\":\"https://zoom.us/recording/play/Oaevut8LSACCCCCCCCnnnnnnnnbbbb\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\",\"recording_type\":\"audio_only\",\"status\":\"completed\"},{\"download_url\":\"https://zoom.us/recording/download/2dBBBBBccccDDDDeeee\",\"file_type\":\"TIMELINE\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\"},{\"download_url\":\"https://zoom.us/recording/play/7h0BBBBBBBchfhfhffh_0AAAAbbbbbeeSFcf209m\",\"file_size\":373,\"file_type\":\"TRANSCRIPT\",\"id\":\"97a4f7ca-e7e8-4e3b-b28a-27b42cd33c09\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"play_url\":\"https://zoom.us/recording/play/7h0BBBBBBBchfhfhffh_0AAAAbbbbbeeSFcf209m\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\",\"recording_type\":\"audio_transcript\",\"status\":\"completed\"}],\"share_url\":\"https://zoom.us/recording/share/aaaaaannnnnldglrkgmrmhh\",\"start_time\":\"2019-07-11T20:00:00Z\",\"timezone\":\"America/Los_Angeles\",\"topic\":\"A test meeting\",\"total_size\":529758,\"type\":2,\"uuid\":\"dj12vck6sdTn6yy7qdy3dQg==\"}},\"event_ts\":1787083380000}"
     expect:
       "class_uid": 6003
       "activity_id": 1
       "metadata.version": "1.9.0"
   # recording.deleted webhook, source: https://github.com/elastic/integrations/blob/main/packages/zoom/data_stream/webhook/_dev/test/pipeline/test-recording.json
-  - raw: "{\"event\":\"recording.deleted\",\"payload\":{\"account_id\":\"lAAAAAAAAAAAAA\",\"object\":{\"duration\":1,\"host_id\":\"uLobbbbbbbbbb_qQsQ\",\"id\":150000008,\"recording_count\":4,\"recording_files\":[{\"download_url\":\"https://zoom.us/recording/download/80ebRwsfjskf2H3vlSigX0gNlBBBBBBBBBBBBBB\",\"file_size\":282825,\"file_type\":\"MP4\",\"id\":\"8f88599d-19ca-4d2b-a965-1196e777cb3c\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"play_url\":\"https://zoom.us/recording/play/80ebRwsfjskf2H3vlSigX0gNlBBBBBBBBBBBBBB\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\",\"recording_type\":\"shared_screen_with_speaker_view\",\"status\":\"completed\"},{\"download_url\":\"https://zoom.us/recording/download/Oaevut8LSACCCCCCCCnnnnnnnnbbbb\",\"file_size\":246560,\"file_type\":\"M4A\",\"id\":\"a6b332f9-2246-49e5-913e-588adc7f0f5f\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"play_url\":\"https://zoom.us/recording/play/Oaevut8LSACCCCCCCCnnnnnnnnbbbb\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\",\"recording_type\":\"audio_only\",\"status\":\"completed\"},{\"download_url\":\"https://zoom.us/recording/download/2dBBBBBccccDDDDeeee\",\"file_type\":\"TIMELINE\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\"},{\"download_url\":\"https://zoom.us/recording/play/7h0BBBBBBBchfhfhffh_0AAAAbbbbbeeSFcf209m\",\"file_size\":373,\"file_type\":\"TRANSCRIPT\",\"id\":\"97a4f7ca-e7e8-4e3b-b28a-27b42cd33c09\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"play_url\":\"https://zoom.us/recording/play/7h0BBBBBBBchfhfhffh_0AAAAbbbbbeeSFcf209m\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\",\"recording_type\":\"audio_transcript\",\"status\":\"completed\"}],\"share_url\":\"https://zoom.us/recording/share/aaaaaannnnnldglrkgmrmhh\",\"start_time\":\"2019-07-11T20:00:00Z\",\"timezone\":\"America/Los_Angeles\",\"topic\":\"A test meeting\",\"total_size\":529758,\"type\":2,\"uuid\":\"dj12vck6sdTn6yy7qdy3dQg==\"}}}"
+  - raw: "{\"event\":\"recording.deleted\",\"payload\":{\"account_id\":\"lAAAAAAAAAAAAA\",\"object\":{\"duration\":1,\"host_id\":\"uLobbbbbbbbbb_qQsQ\",\"id\":150000008,\"recording_count\":4,\"recording_files\":[{\"download_url\":\"https://zoom.us/recording/download/80ebRwsfjskf2H3vlSigX0gNlBBBBBBBBBBBBBB\",\"file_size\":282825,\"file_type\":\"MP4\",\"id\":\"8f88599d-19ca-4d2b-a965-1196e777cb3c\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"play_url\":\"https://zoom.us/recording/play/80ebRwsfjskf2H3vlSigX0gNlBBBBBBBBBBBBBB\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\",\"recording_type\":\"shared_screen_with_speaker_view\",\"status\":\"completed\"},{\"download_url\":\"https://zoom.us/recording/download/Oaevut8LSACCCCCCCCnnnnnnnnbbbb\",\"file_size\":246560,\"file_type\":\"M4A\",\"id\":\"a6b332f9-2246-49e5-913e-588adc7f0f5f\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"play_url\":\"https://zoom.us/recording/play/Oaevut8LSACCCCCCCCnnnnnnnnbbbb\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\",\"recording_type\":\"audio_only\",\"status\":\"completed\"},{\"download_url\":\"https://zoom.us/recording/download/2dBBBBBccccDDDDeeee\",\"file_type\":\"TIMELINE\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\"},{\"download_url\":\"https://zoom.us/recording/play/7h0BBBBBBBchfhfhffh_0AAAAbbbbbeeSFcf209m\",\"file_size\":373,\"file_type\":\"TRANSCRIPT\",\"id\":\"97a4f7ca-e7e8-4e3b-b28a-27b42cd33c09\",\"meeting_id\":\"bpKUheqtRLifLBcIYVJLZw==\",\"play_url\":\"https://zoom.us/recording/play/7h0BBBBBBBchfhfhffh_0AAAAbbbbbeeSFcf209m\",\"recording_end\":\"2019-07-23T22:15:41Z\",\"recording_start\":\"2019-07-23T22:14:57Z\",\"recording_type\":\"audio_transcript\",\"status\":\"completed\"}],\"share_url\":\"https://zoom.us/recording/share/aaaaaannnnnldglrkgmrmhh\",\"start_time\":\"2019-07-11T20:00:00Z\",\"timezone\":\"America/Los_Angeles\",\"topic\":\"A test meeting\",\"total_size\":529758,\"type\":2,\"uuid\":\"dj12vck6sdTn6yy7qdy3dQg==\"}},\"event_ts\":1787083440000}"
     expect:
       "class_uid": 6003
       "activity_id": 4
@@ -739,6 +779,16 @@ samples:
     expect:
       "class_uid": 0
       "activity_id": 99
+      "metadata.version": "1.9.0"
+  # review: a null message never aborts
+  - raw: "{\"message\":null}"
+    expect:
+      "class_uid": 0
+      "metadata.version": "1.9.0"
+  # review: a numeric message never aborts
+  - raw: "{\"message\":7}"
+    expect:
+      "class_uid": 0
       "metadata.version": "1.9.0"
   # malformed line: Base Event with the raw line kept; deterministic uid
   - raw: "zoom: not json"

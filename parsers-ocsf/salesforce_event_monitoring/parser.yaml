@@ -10,12 +10,17 @@ description: >
     the ELF column names (a collector applied the header), or the CSV header
     line plus ONE data row in the same message. The CSV column order is
     header-driven (LogFileFieldNames): it differs by event type and API
-    version, so a bare CSV row without its header is not guessed at and is
-    kept as a Base Event. A message carrying more rows is parsed for the
-    first row only and marked with unmapped.parse_fallback.
+    version, so EVENT_TYPE may sit in any column, a leading UTF-8 BOM is
+    ignored, and a quoted value may span lines (the record ends at a newline
+    outside quotes). A bare CSV row without its header is not guessed at and
+    is kept as a Base Event, as is a row with an unclosed quote. A message
+    carrying more rows is parsed for the first row only and marked with
+    unmapped.parse_fallback.
     Real-Time Event Monitoring objects (LoginEvent, LoginAsEvent, LogoutEvent,
     ApiEvent, ReportEvent, LightningUriEvent) and LoginHistory, typed by
-    attributes.type when the export carries it, else by their fields.
+    attributes.type when the export carries it, else by their fields
+    (streamed Pub/Sub events have no attributes: DelegatedUsername marks a
+    LoginAsEvent, a bare session record a LogoutEvent).
   Routing:
     Login, LoginEvent, LoginHistory       -> Authentication 3002 (Logon)
     LoginAs, LoginAsEvent                 -> Authentication 3002 (Account Switch, Impersonate; Medium)
@@ -23,7 +28,8 @@ description: >
     Report, ReportExport, ReportEvent     -> Datastore Activity 6005 (Read; exports Medium)
     ApiEvent with a SOQL Query            -> Datastore Activity 6005 (Query); the
                                              query is bounded to 4096 characters in
-                                             query_info.query_string
+                                             query_info.query_string (raw_data
+                                             keeps the one full copy)
     API, RestApi, Apex*, URI, LightningUriEvent
     and every other event type            -> API Activity 6003
   ORGANIZATION_ID is metadata.tenant_uid; REQUEST_ID (ELF) or EventIdentifier
@@ -35,10 +41,25 @@ vendor: "Salesforce"
 product: "Salesforce"
 parser_vrl: |
   # Salesforce Event Monitoring (EventLogFile rows, Real-Time Event Monitoring) -> OCSF 1.9.0.
-  raw_log = string!(.message)
+  # A string body is the usual wire form. A source that already decoded the
+  # JSON hands over an object (or array) instead, and a record without any
+  # `message` is the decoded event itself; never abort on either.
+  raw_log = ""
+  if is_string(.message) {
+      raw_log = string!(.message)
+  } else if is_object(.message) || is_array(.message) {
+      raw_log = encode_json(.message)
+  } else if exists(.message) && !is_null(.message) {
+      raw_log = to_string(.message) ?? ""
+  } else {
+      raw_log = encode_json(.)
+  }
   __raw_body = raw_log
   __source_kv = {}
-  parsed, err = parse_json(raw_log)
+  # A UTF-8 byte order mark (written by spreadsheet tools and some exporters)
+  # is not part of the data.
+  body = replace(raw_log, r'^\x{FEFF}', "")
+  parsed, err = parse_json(body)
   r = {}
   fmt = ""
   fallback = ""
@@ -57,26 +78,46 @@ parser_vrl: |
   } else {
       # EventLogFile CSV is header-driven: the column order is the file's own
       # header (LogFileFieldNames) and differs by event type and API version,
-      # so a row is only decoded together with its header line.
-      lines = split(replace(raw_log, "\r", ""), "\n")
-      first = ""
-      if length(lines) > 0 { first = string!(lines[0]) }
-      if !match(first, r'^"?EVENT_TYPE"?,') {
+      # so a row is only decoded together with its header line, and EVENT_TYPE
+      # may sit in any column.
+      lines = split(replace(body, "\r\n", "\n"), "\n")
+      header = parse_csv(string!(lines[0])) ?? []
+      if !includes(header, "EVENT_TYPE") {
           fallback = "EventLogFile CSV row without its header line (column layout unknown)"
-      } else if length(lines) < 2 || string!(lines[1]) == "" {
-          fallback = "EventLogFile CSV header line without a data row"
       } else {
-          header = parse_csv(first) ?? []
-          row = parse_csv(string!(lines[1])) ?? []
-          if length(header) == 0 || length(header) != length(row) {
-              fallback = "EventLogFile CSV row does not match its header"
-          } else {
-              for_each(header) -> |i, name| {
-                  r = set!(r, [string!(name)], get!(row, [i]))
+          # One RFC 4180 record ends at a newline OUTSIDE quotes: a quoted
+          # QUERY or STACK_TRACE value may span lines, so lines are joined
+          # until the record's quotes balance.
+          rec_text = ""
+          complete = false
+          more = false
+          for_each(slice!(lines, 1)) -> |_i, line| {
+              l = string!(line)
+              if !complete {
+                  if rec_text != "" || l != "" {
+                      if rec_text == "" { rec_text = l } else { rec_text = rec_text + "\n" + l }
+                      if mod(length(split(rec_text, "\"")) - 1, 2) == 0 { complete = true }
+                  }
+              } else if l != "" {
+                  more = true
               }
-              fmt = "elf"
-              __source_kv = r
-              if length(lines) > 2 && string!(lines[2]) != "" { fallback = "multi-row EventLogFile CSV: only the first row is parsed" }
+          }
+          if rec_text == "" {
+              fallback = "EventLogFile CSV header line without a data row"
+          } else if !complete {
+              fallback = "EventLogFile CSV data row has an unclosed quote"
+          } else {
+              row = parse_csv(rec_text) ?? []
+              if length(header) != length(row) {
+                  fallback = "EventLogFile CSV row does not match its header"
+              } else {
+                  for_each(header) -> |i, name| {
+                      r = set!(r, [string!(name)], get!(row, [i]))
+                  }
+                  fmt = "elf"
+                  __source_kv = r
+                  if more { fallback = "multi-row EventLogFile CSV: only the first row is parsed" }
+              }
           }
       }
   }
@@ -166,8 +207,9 @@ parser_vrl: |
           login_status = string(r.LOGIN_STATUS) ?? ""
           req_status = string(r.REQUEST_STATUS) ?? ""
           if login_status != "" && login_status != "LOGIN_NO_ERROR" { failed = true; status_text = login_status }
-          if req_status == "F" || req_status == "f" || req_status == "Failed" { failed = true }
-          if (string(r.SUCCESS) ?? "") == "0" { failed = true }
+          if includes(["f", "failed", "failure"], downcase(req_status)) { failed = true }
+          # SUCCESS is "1"/"0" in the CSV but may arrive typed (0, false) in JSON.
+          if includes(["0", "false", "f", "no", "n"], downcase(to_string(r.SUCCESS) ?? "")) { failed = true }
           status_code = to_int(r.STATUS_CODE) ?? 0
           if status_code >= 400 { failed = true }
       } else {
@@ -178,6 +220,11 @@ parser_vrl: |
               if exists(r.PageUrl) { rtype = "LightningUriEvent" }
               if exists(r.Query) || (exists(r.QueriedEntities) && exists(r.ApiType)) { rtype = "ApiEvent" }
               if rtype == "" && (exists(r.LoginType) || exists(r.LoginUrl)) { rtype = "LoginEvent" }
+              # Streamed (Pub/Sub) deliveries carry no attributes.type: an admin
+              # login-as carries DelegatedUsername, and a logout is a session
+              # record with no operation, query, page or login details.
+              if exists(r.DelegatedUsername) { rtype = "LoginAsEvent" }
+              if rtype == "" && exists(r.SessionKey) && !exists(r.Operation) && !exists(r.ApiType) && !exists(r.Status) { rtype = "LogoutEvent" }
           }
           et = rtype
           ts = string(r.EventDate) ?? ""
@@ -312,8 +359,10 @@ parser_vrl: |
           ocsf.table = tbl
           if family == "query" {
               qinfo = { "uid": evt_uid, "query_string": query }
-              if length(query) > 4096 {
-                  qinfo.query_string = slice!(query, 0, 4096)
+              # Bounded to 4096 characters; the residual spill's truncate rule
+              # keeps the full query out of unmapped (raw_data is its one copy).
+              if strlen(query) > 4096 {
+                  qinfo.query_string = truncate(query, 4096)
                   ocsf.metadata_truncated = length(query)
               }
               ocsf.query_info = qinfo
@@ -459,6 +508,7 @@ parser_vrl: |
   # TIMESTAMP_DERIVED: EventLogFile ISO TIMESTAMP_DERIVED converted to the event clock in milliseconds.
   # EventDate: Real-time event ISO EventDate converted to the event clock in milliseconds.
   # CreatedDate: Record CreatedDate, used only when EventDate is absent.
+  # Query: SOQL text is bounded to 4096 characters in query_info.query_string (metadata.is_truncated marks a cut); raw_data keeps the one full copy, so unmapped never repeats it.
   for_each(flatten(__source_kv)) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
@@ -471,6 +521,22 @@ parser_vrl: |
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
               if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        Query
+      )\z') {
+          # A bounded copy (the first 4096 characters, as truncate() counts them)
+          # consumes its source, so an over-long value is not stored a second time in
+          # unmapped: raw_data stays its one lossless copy. An over-bound value counts
+          # only when the event says so in metadata.is_truncated.
+          __value = value
+          if is_string(__value) {
+              __expected = string!(__value)
+              __over = strlen(__expected) > 4096
+              if __over { __expected = truncate(__expected, 4096) }
+              if (!__over || .metadata.is_truncated == true) && ."query_info"."query_string" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
           }
       }
   }
@@ -486,6 +552,7 @@ parser_vrl: |
   | DELEGATED_USER_ID
   | DELEGATED_USER_ID_DERIVED
   | DELEGATED_USER_NAME
+  | DelegatedUsername
   | ENTITY
   | ENTITY_NAME
   | EVENT_TYPE
@@ -904,3 +971,87 @@ samples:
     expect:
       "class_uid": 0
       "metadata.uid": "9bd8e70dc5991b62712de91541d3289bb88940caf46327fefb751a15dc9db4a3"
+  # review: CSV with a leading UTF-8 byte order mark; values from https://github.com/elastic/integrations/blob/main/packages/salesforce/data_stream/login/_dev/test/pipeline/test-login-eventlogfile.log
+  - raw: "\ufeff\"EVENT_TYPE\",\"TIMESTAMP\",\"REQUEST_ID\",\"ORGANIZATION_ID\",\"USER_ID\",\"RUN_TIME\",\"CPU_TIME\",\"URI\",\"SESSION_KEY\",\"LOGIN_KEY\",\"USER_TYPE\",\"REQUEST_STATUS\",\"DB_TOTAL_TIME\",\"LOGIN_STATUS\",\"BROWSER_TYPE\",\"API_TYPE\",\"API_VERSION\",\"USER_NAME\",\"TLS_PROTOCOL\",\"CIPHER_SUITE\",\"AUTHENTICATION_METHOD_REFERENCE\",\"TIMESTAMP_DERIVED\",\"USER_ID_DERIVED\",\"CLIENT_IP\",\"URI_ID_DERIVED\"\n\"Login\",\"20220913052243.429\",\"4lGJ1R0ZSWVXwFl1cJIRH-\",\"00D5j000000VI3n\",\"0056j000000utlQAAR\",\"156\",\"63\",\"/index.jsp\",\"\",\"NK2oPJrJze8tH+vC\",\"Standard\",\"Success\",\"93531912\",\"LOGIN_NO_ERROR\",\"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.12; rv%3A50.0) Gecko/20100101 Firefox/50.0\",\"f\",\"9998.0\",\"user.name@example.com\",\"TLSv1.2\",\"ECDHE-RSA-AES256-GCM-SHA384\",\"\",\"2022-09-13T05:22:43.429Z\",\"0056j000000utlQAAR\",\"192.0.2.10\",\"s4heK3WbH-lcJIL3-n\""
+    expect:
+      "class_uid": 3002
+      "metadata.uid": "4lGJ1R0ZSWVXwFl1cJIRH-"
+      "metadata.version": "1.9.0"
+  # review: CSV whose header puts EVENT_TYPE in the fourth column (header-driven layout); values from the Login row above
+  - raw: "\"TIMESTAMP\",\"REQUEST_ID\",\"ORGANIZATION_ID\",\"EVENT_TYPE\",\"USER_ID\",\"RUN_TIME\",\"CPU_TIME\",\"URI\",\"SESSION_KEY\",\"LOGIN_KEY\",\"USER_TYPE\",\"REQUEST_STATUS\",\"DB_TOTAL_TIME\",\"LOGIN_STATUS\",\"BROWSER_TYPE\",\"API_TYPE\",\"API_VERSION\",\"USER_NAME\",\"TLS_PROTOCOL\",\"CIPHER_SUITE\",\"AUTHENTICATION_METHOD_REFERENCE\",\"TIMESTAMP_DERIVED\",\"USER_ID_DERIVED\",\"CLIENT_IP\",\"URI_ID_DERIVED\"\n\"20220913052243.429\",\"4lGJ1R0ZSWVXwFl1cJIRH-\",\"00D5j000000VI3n\",\"Login\",\"0056j000000utlQAAR\",\"156\",\"63\",\"/index.jsp\",\"\",\"NK2oPJrJze8tH+vC\",\"Standard\",\"Success\",\"93531912\",\"LOGIN_NO_ERROR\",\"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.12; rv%3A50.0) Gecko/20100101 Firefox/50.0\",\"f\",\"9998.0\",\"user.name@example.com\",\"TLSv1.2\",\"ECDHE-RSA-AES256-GCM-SHA384\",\"\",\"2022-09-13T05:22:43.429Z\",\"0056j000000utlQAAR\",\"192.0.2.10\",\"s4heK3WbH-lcJIL3-n\""
+    expect:
+      "class_uid": 3002
+      "metadata.uid": "4lGJ1R0ZSWVXwFl1cJIRH-"
+      "metadata.version": "1.9.0"
+  # review: ELF CSV ApexSoap-style row with a QUERY spanning lines in a middle column; field names per https://developer.salesforce.com/docs/atlas.en-us.object_reference.meta/object_reference/sforce_api_objects_eventlogfile_apexsoap.htm
+  - raw: "\"EVENT_TYPE\",\"TIMESTAMP_DERIVED\",\"QUERY\",\"USER_ID_DERIVED\",\"CLIENT_IP\",\"REQUEST_ID\"\n\"ApexSoap\",\"2026-08-18T10:00:00.000Z\",\"SELECT Id\nFROM Account\",\"005000000000123AAA\",\"198.51.100.25\",\"4nR74Q97128rIbdV2ampDD-\""
+    expect:
+      "class_uid": 6003
+      "metadata.uid": "4nR74Q97128rIbdV2ampDD-"
+      "unmapped.query": "SELECT Id\nFROM Account"
+      "metadata.version": "1.9.0"
+  # review: ELF CSV row whose LAST column spans lines: the whole value is kept, no false multi-row marker
+  - raw: "\"EVENT_TYPE\",\"TIMESTAMP_DERIVED\",\"USER_ID_DERIVED\",\"CLIENT_IP\",\"REQUEST_ID\",\"QUERY\"\n\"ApexSoap\",\"2026-08-18T10:01:00.000Z\",\"005000000000123AAA\",\"198.51.100.25\",\"4nR74Q97128rIbdV2ampEE-\",\"SELECT Id\nFROM Account\""
+    expect:
+      "class_uid": 6003
+      "unmapped.query": "SELECT Id\nFROM Account"
+      "unmapped.parse_fallback": "<missing>"
+      "metadata.version": "1.9.0"
+  # review: ELF CSV row with an unclosed quote: Base Event fallback, never a silently cut field
+  - raw: "\"EVENT_TYPE\",\"TIMESTAMP_DERIVED\",\"USER_ID_DERIVED\",\"CLIENT_IP\",\"REQUEST_ID\",\"QUERY\"\n\"ApexSoap\",\"2026-08-18T10:02:00.000Z\",\"005000000000123AAA\",\"198.51.100.25\",\"4nR74Q97128rIbdV2ampFF-\",\"SELECT Id"
+    expect:
+      "class_uid": 0
+      "unmapped.parse_fallback": "unparsable input"
+      "metadata.version": "1.9.0"
+  # review: streamed LoginAsEvent without attributes.type: Account Switch / Impersonate (Medium), admin as actor; fields per https://developer.salesforce.com/docs/atlas.en-us.platform_events.meta/platform_events/sforce_api_objects_loginasevent.htm
+  - raw: "{\"EventDate\":\"2026-08-18T12:30:00.000Z\",\"EventIdentifier\":\"7c5b3d3e-0000-4000-8000-000000000004\",\"Username\":\"jdoe@example.com\",\"UserId\":\"005000000000789AAA\",\"DelegatedUsername\":\"admin.user@example.com\",\"DelegatedOrganizationId\":\"00D000000000123\",\"LoginType\":\"Application\",\"LoginKey\":\"Qv1P3iAGDrGQxSmN\",\"SessionKey\":\"vMASKIU6AxEr+Op6\",\"SourceIp\":\"203.0.113.12\",\"Application\":\"Browser\",\"TargetUrl\":\"/home/home.jsp\"}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 7
+      "account_switch_type_id": 2
+      "severity_id": 3
+      "actor.user.name": "admin.user@example.com"
+      "user.name": "jdoe@example.com"
+      "metadata.version": "1.9.0"
+  # review: streamed LogoutEvent without attributes.type: Logoff; fields per https://developer.salesforce.com/docs/atlas.en-us.platform_events.meta/platform_events/sforce_api_objects_logoutevent.htm
+  - raw: "{\"EventDate\":\"2026-08-18T13:00:00.000Z\",\"EventIdentifier\":\"7c5b3d3e-0000-4000-8000-000000000005\",\"Username\":\"jdoe@example.com\",\"UserId\":\"005000000000789AAA\",\"SessionKey\":\"vMASKIU6AxEr+Op6\",\"LoginKey\":\"Qv1P3iAGDrGQxSmN\",\"SessionLevel\":\"STANDARD\",\"SourceIp\":\"203.0.113.12\",\"RelatedEventIdentifier\":\"7c5b3d3e-0000-4000-8000-000000000004\"}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 2
+      "metadata.version": "1.9.0"
+  # review: typed ELF JSON with SUCCESS 0 is a failure; built from source: https://github.com/elastic/integrations/blob/main/packages/salesforce/data_stream/apex/_dev/test/pipeline/test-apex.log
+  - raw: "{\"CLIENT_IP\":\"192.0.2.30\",\"CPU_TIME\":\"10\",\"EVENT_TYPE\":\"ApexCallout\",\"LOGIN_KEY\":\"QfNecrLXSII6fsBq\",\"METHOD\":\"GET\",\"ORGANIZATION_ID\":\"00D5j000000XY0P\",\"REQUEST_ID\":\"00D5j00XYZBDT\",\"REQUEST_SIZE\":\"10\",\"RESPONSE_SIZE\":\"61\",\"RUN_TIME\":\"237\",\"SESSION_KEY\":\"DDKHdl+8yn/LIXzz\",\"SUCCESS\":0,\"TIME\":\"227\",\"TIMESTAMP\":\"20230101055317.461\",\"TIMESTAMP_DERIVED\":\"2023-01-01T05:53:17.461Z\",\"TYPE\":\"OData\",\"URI\":\"CALLOUT-LOG\",\"URI_ID_DERIVED\":\"AQB00530000009M943\",\"URL\":\"https://odata.example.com/odata/Random\",\"USER_ID\":\"0055j000000PQ01\",\"USER_ID_DERIVED\":\"0055j000000utll12\"}"
+    expect:
+      "class_uid": 6003
+      "status_id": 2
+      "metadata.version": "1.9.0"
+  # review: typed ELF JSON with SUCCESS false is a failure; built from source: https://github.com/elastic/integrations/blob/main/packages/salesforce/data_stream/apex/_dev/test/pipeline/test-apex.log
+  - raw: "{\"CLIENT_IP\":\"192.0.2.30\",\"CPU_TIME\":\"10\",\"EVENT_TYPE\":\"ApexCallout\",\"LOGIN_KEY\":\"QfNecrLXSII6fsBq\",\"METHOD\":\"GET\",\"ORGANIZATION_ID\":\"00D5j000000XY0P\",\"REQUEST_ID\":\"00D5j00XYZBDU\",\"REQUEST_SIZE\":\"10\",\"RESPONSE_SIZE\":\"61\",\"RUN_TIME\":\"237\",\"SESSION_KEY\":\"DDKHdl+8yn/LIXzz\",\"SUCCESS\":false,\"TIME\":\"227\",\"TIMESTAMP\":\"20230101055317.461\",\"TIMESTAMP_DERIVED\":\"2023-01-01T05:53:17.461Z\",\"TYPE\":\"OData\",\"URI\":\"CALLOUT-LOG\",\"URI_ID_DERIVED\":\"AQB00530000009M943\",\"URL\":\"https://odata.example.com/odata/Random\",\"USER_ID\":\"0055j000000PQ01\",\"USER_ID_DERIVED\":\"0055j000000utll12\"}"
+    expect:
+      "class_uid": 6003
+      "status_id": 2
+      "metadata.version": "1.9.0"
+  # review: SUCCESS "1" stays a success; built from source: https://github.com/elastic/integrations/blob/main/packages/salesforce/data_stream/apex/_dev/test/pipeline/test-apex.log
+  - raw: "{\"CLIENT_IP\":\"192.0.2.30\",\"CPU_TIME\":\"10\",\"EVENT_TYPE\":\"ApexCallout\",\"LOGIN_KEY\":\"QfNecrLXSII6fsBq\",\"METHOD\":\"GET\",\"ORGANIZATION_ID\":\"00D5j000000XY0P\",\"REQUEST_ID\":\"00D5j00XYZBDV\",\"REQUEST_SIZE\":\"10\",\"RESPONSE_SIZE\":\"61\",\"RUN_TIME\":\"237\",\"SESSION_KEY\":\"DDKHdl+8yn/LIXzz\",\"SUCCESS\":\"1\",\"TIME\":\"227\",\"TIMESTAMP\":\"20230101055317.461\",\"TIMESTAMP_DERIVED\":\"2023-01-01T05:53:17.461Z\",\"TYPE\":\"OData\",\"URI\":\"CALLOUT-LOG\",\"URI_ID_DERIVED\":\"AQB00530000009M943\",\"URL\":\"https://odata.example.com/odata/Random\",\"USER_ID\":\"0055j000000PQ01\",\"USER_ID_DERIVED\":\"0055j000000utll12\"}"
+    expect:
+      "class_uid": 6003
+      "status_id": 1
+      "metadata.version": "1.9.0"
+  # review: a SOQL query over the 4096-character bound is truncated and NOT repeated in unmapped (raw_data is the one full copy); built from the ApiEvent above
+  - raw: "{\"attributes\":{\"type\":\"ApiEvent\",\"url\":\"/services/data/v59.0/sobjects/ApiEvent/0Ya000000000001\"},\"EventDate\":\"2026-08-18T12:00:00.000+0000\",\"EventIdentifier\":\"7c5b3d3e-0000-4000-8000-000000000006\",\"Username\":\"analyst@example.com\",\"UserId\":\"005000000000456AAA\",\"SourceIp\":\"198.51.100.40\",\"SessionKey\":\"vMASKIU6AxEr+Op5\",\"LoginKey\":\"QfNecrLXSII6fsBq\",\"ApiType\":\"REST\",\"ApiVersion\":\"59.0\",\"Application\":\"Workbench\",\"Client\":\"Workbench/\",\"Operation\":\"Query\",\"Query\":\"SELECT Id FROM Contact WHERE Id IN ('003000000000000AAA', '003000000000001AAA', '003000000000002AAA', '003000000000003AAA', '003000000000004AAA', '003000000000005AAA', '003000000000006AAA', '003000000000007AAA', '003000000000008AAA', '003000000000009AAA', '003000000000010AAA', '003000000000011AAA', '003000000000012AAA', '003000000000013AAA', '003000000000014AAA', '003000000000015AAA', '003000000000016AAA', '003000000000017AAA', '003000000000018AAA', '003000000000019AAA', '003000000000020AAA', '003000000000021AAA', '003000000000022AAA', '003000000000023AAA', '003000000000024AAA', '003000000000025AAA', '003000000000026AAA', '003000000000027AAA', '003000000000028AAA', '003000000000029AAA', '003000000000030AAA', '003000000000031AAA', '003000000000032AAA', '003000000000033AAA', '003000000000034AAA', '003000000000035AAA', '003000000000036AAA', '003000000000037AAA', '003000000000038AAA', '003000000000039AAA', '003000000000040AAA', '003000000000041AAA', '003000000000042AAA', '003000000000043AAA', '003000000000044AAA', '003000000000045AAA', '003000000000046AAA', '003000000000047AAA', '003000000000048AAA', '003000000000049AAA', '003000000000050AAA', '003000000000051AAA', '003000000000052AAA', '003000000000053AAA', '003000000000054AAA', '003000000000055AAA', '003000000000056AAA', '003000000000057AAA', '003000000000058AAA', '003000000000059AAA', '003000000000060AAA', '003000000000061AAA', '003000000000062AAA', '003000000000063AAA', '003000000000064AAA', '003000000000065AAA', '003000000000066AAA', '003000000000067AAA', '003000000000068AAA', '003000000000069AAA', '003000000000070AAA', '003000000000071AAA', '003000000000072AAA', '003000000000073AAA', '003000000000074AAA', '003000000000075AAA', '003000000000076AAA', '003000000000077AAA', '003000000000078AAA', '003000000000079AAA', '003000000000080AAA', '003000000000081AAA', '003000000000082AAA', '003000000000083AAA', '003000000000084AAA', '003000000000085AAA', '003000000000086AAA', '003000000000087AAA', '003000000000088AAA', '003000000000089AAA', '003000000000090AAA', '003000000000091AAA', '003000000000092AAA', '003000000000093AAA', '003000000000094AAA', '003000000000095AAA', '003000000000096AAA', '003000000000097AAA', '003000000000098AAA', '003000000000099AAA', '003000000000100AAA', '003000000000101AAA', '003000000000102AAA', '003000000000103AAA', '003000000000104AAA', '003000000000105AAA', '003000000000106AAA', '003000000000107AAA', '003000000000108AAA', '003000000000109AAA', '003000000000110AAA', '003000000000111AAA', '003000000000112AAA', '003000000000113AAA', '003000000000114AAA', '003000000000115AAA', '003000000000116AAA', '003000000000117AAA', '003000000000118AAA', '003000000000119AAA', '003000000000120AAA', '003000000000121AAA', '003000000000122AAA', '003000000000123AAA', '003000000000124AAA', '003000000000125AAA', '003000000000126AAA', '003000000000127AAA', '003000000000128AAA', '003000000000129AAA', '003000000000130AAA', '003000000000131AAA', '003000000000132AAA', '003000000000133AAA', '003000000000134AAA', '003000000000135AAA', '003000000000136AAA', '003000000000137AAA', '003000000000138AAA', '003000000000139AAA', '003000000000140AAA', '003000000000141AAA', '003000000000142AAA', '003000000000143AAA', '003000000000144AAA', '003000000000145AAA', '003000000000146AAA', '003000000000147AAA', '003000000000148AAA', '003000000000149AAA', '003000000000150AAA', '003000000000151AAA', '003000000000152AAA', '003000000000153AAA', '003000000000154AAA', '003000000000155AAA', '003000000000156AAA', '003000000000157AAA', '003000000000158AAA', '003000000000159AAA', '003000000000160AAA', '003000000000161AAA', '003000000000162AAA', '003000000000163AAA', '003000000000164AAA', '003000000000165AAA', '003000000000166AAA', '003000000000167AAA', '003000000000168AAA', '003000000000169AAA', '003000000000170AAA', '003000000000171AAA', '003000000000172AAA', '003000000000173AAA', '003000000000174AAA', '003000000000175AAA', '003000000000176AAA', '003000000000177AAA', '003000000000178AAA', '003000000000179AAA', '003000000000180AAA', '003000000000181AAA', '003000000000182AAA', '003000000000183AAA', '003000000000184AAA', '003000000000185AAA', '003000000000186AAA', '003000000000187AAA', '003000000000188AAA', '003000000000189AAA', '003000000000190AAA', '003000000000191AAA', '003000000000192AAA', '003000000000193AAA', '003000000000194AAA', '003000000000195AAA', '003000000000196AAA', '003000000000197AAA', '003000000000198AAA', '003000000000199AAA', '003000000000200AAA', '003000000000201AAA', '003000000000202AAA', '003000000000203AAA', '003000000000204AAA', '003000000000205AAA', '003000000000206AAA', '003000000000207AAA', '003000000000208AAA', '003000000000209AAA', '003000000000210AAA', '003000000000211AAA', '003000000000212AAA', '003000000000213AAA', '003000000000214AAA', '003000000000215AAA', '003000000000216AAA', '003000000000217AAA', '003000000000218AAA', '003000000000219AAA', '003000000000220AAA', '003000000000221AAA', '003000000000222AAA', '003000000000223AAA', '003000000000224AAA', '003000000000225AAA', '003000000000226AAA', '003000000000227AAA', '003000000000228AAA', '003000000000229AAA', '003000000000230AAA', '003000000000231AAA', '003000000000232AAA', '003000000000233AAA', '003000000000234AAA', '003000000000235AAA', '003000000000236AAA', '003000000000237AAA', '003000000000238AAA', '003000000000239AAA', '003000000000240AAA', '003000000000241AAA', '003000000000242AAA', '003000000000243AAA', '003000000000244AAA', '003000000000245AAA', '003000000000246AAA', '003000000000247AAA', '003000000000248AAA', '003000000000249AAA')\",\"QueriedEntities\":\"Contact\",\"RowsProcessed\":4200,\"ElapsedTime\":312,\"Platform\":\"Mac OSX\",\"SessionLevel\":\"STANDARD\",\"UserAgent\":\"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)\"}"
+    expect:
+      "class_uid": 6005
+      "metadata.is_truncated": true
+      "metadata.untruncated_size": 5535
+      "unmapped.query": "<missing>"
+      "metadata.version": "1.9.0"
+  # review: a null message never aborts
+  - raw: "{\"message\":null}"
+    expect:
+      "class_uid": 0
+      "metadata.version": "1.9.0"
+  # review: an object message never aborts
+  - raw: "{\"message\":{\"foo\":\"bar\"}}"
+    expect:
+      "class_uid": 0
+      "metadata.version": "1.9.0"
