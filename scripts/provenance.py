@@ -151,7 +151,10 @@ def sentinels(value, kind=None, factor=None):
     if isinstance(value, int):
         if kind is None and 0 <= value < 32:
             # Enum-like codes (severity, rcode, logon type) are range-checked.
-            return list(dict.fromkeys(v for v in (RNG.randint(0, 31), RNG.randint(0, 15), RNG.randint(1, 65535)) if v != value))
+            # A neighbor first (a short code table may accept only a few), then
+            # random codes; the multiset check, not the value, rules out a
+            # coincidence (a static target never moves).
+            return list(dict.fromkeys(v for v in (value + 1, value - 1, RNG.randint(0, 31), RNG.randint(0, 15), RNG.randint(1, 65535)) if v != value and v >= 0))
         if kind is None and 0 <= value < 65536:
             # Ports and small ids are range-checked too.
             return list(dict.fromkeys(v for v in (RNG.randint(1, 65535), RNG.randint(1, 65535)) if v != value))
@@ -164,7 +167,7 @@ def sentinels(value, kind=None, factor=None):
     num = NUMBER.match(value)
     if num and kind is None and not num.group(1) and 0 <= int(value) < 32:
         # An enum-like code written as text ("3", "10").
-        out += [str(RNG.randint(0, 15)), str(RNG.randint(0, 31))]
+        out += [str(int(value) + 1), str(int(value) - 1) if int(value) > 0 else str(int(value) + 2), str(RNG.randint(0, 15)), str(RNG.randint(0, 31))]
     if num and kind == 'scale':
         decimals = len(num.group(1) or '')
         new = _number(float(value) if decimals else int(value), factor)
@@ -452,7 +455,7 @@ def probe(program, samples, sources, outputs, items, per_key=40, declared=None):
                     messages.append(mutated_event)
                     planned = True
             used += planned
-    found = {}
+    found, hits, single = {}, {}, set()
     if not messages:
         return found
     for (key, rule, old, new, event, output, flat), mutated_event, result in zip(plans, messages, run_vrl(program, messages, tolerant=True)):
@@ -475,7 +478,19 @@ def probe(program, samples, sources, outputs, items, per_key=40, declared=None):
                 continue
         for target in set(after) | set(before):
             if followed(before, after, target, want_old, want_new):
-                found.setdefault((key, id(rule) if rule else None), {})[target] = True
+                hits.setdefault((key, id(rule) if rule else None), {}).setdefault(target, set()).add(json.dumps(want_new, sort_keys=True))
+                # A boolean has one other value; an enum rule's own table fixes the
+                # expected value, so one arrival of a different outcome proves it.
+                lone = isinstance(old, bool) or (rule is not None and rule['kind'] == 'enum')
+                single.add((key, id(rule) if rule else None, lone))
+    # Two distinct sentinels must arrive: one could be a lookup (an id mapped
+    # to a class) that happens to output the new value. A boolean, or an enum
+    # rule (its table names the expected value), needs one.
+    for item, targets in hits.items():
+        boolean = (item[0], item[1], True) in single
+        for target, seen in targets.items():
+            if len(seen) >= 2 or boolean:
+                found.setdefault(item, {})[target] = True
     return found
 
 
