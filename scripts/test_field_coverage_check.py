@@ -173,6 +173,56 @@ class RunParserTests(unittest.TestCase):
             self.run_parser(message='raw_log')
 
 
+def emitted(parser):
+    """The events a tree parser emits for its own inline and sidecar samples."""
+    path = residual_spill.ROOT/'parsers-ocsf'/parser/'parser.yaml'
+    import yaml
+    doc = yaml.safe_load(path.read_text())
+    samples = fcc.samples_for(path, doc, None)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp/'p.vrl').write_text(doc['parser_vrl'])
+        (tmp/'i.json').write_text(''.join(json.dumps(event)+'\n' for _, event in samples))
+        run = subprocess.run(['vector', 'vrl', '--program', str(tmp/'p.vrl'), '--input', str(tmp/'i.json'), '--print-object'], capture_output=True, text=True, timeout=300)
+    assert run.returncode == 0, run.stderr
+    outputs = [json.loads(l, strict=False) for l in run.stdout.splitlines() if l.startswith('{')]
+    return {name: output for (name, _), output in zip(samples, outputs)}
+
+
+class DescriptiveCredentialKeyTests(unittest.TestCase):
+    """Credential VALUE keys are redacted; descriptive credential telemetry is not
+    (round 5: a bare `credential` match had redacted these in main parsers)."""
+
+    KEPT = {
+        'moat_edr': {'inline_002': {'credential_reads': '~/.aws/credentials', 'moat.receipt.credential_reads': ['~/.aws/credentials']}},
+        'azure_monitor': {'inline_011': {'properties.client_credential_type': 'federatedIdentityCredential'}},
+        'windows_event_text': {'inline_004': {'event_data.account_whose_credentials_were_used.logon_guid': '{0}'}},
+    }
+
+    def test_key_classification(self):
+        for key in ('credentials', 'credentialData', 'credential_value', 'client_credential', 'clientCredential', 'credential', 'secretData', 'a.credentials', 'credentials.hash'):
+            self.assertTrue(fcc.SECRET.search(key), key)
+        for key in ('credential_type', 'credential_id', 'credential_name', 'credential_provider', 'credential_reads', 'client_credential_type', 'Account Whose Credentials Were Used', 'credential_key_id'):
+            self.assertFalse(fcc.SECRET.search(key), key)
+
+    def test_main_parsers_keep_descriptive_credential_fields(self):
+        for parser in ('moat_edr', 'azure_monitor', 'windows_event_text', 'okta'):
+            outputs = emitted(parser)
+            for sample, kept in self.KEPT.get(parser, {}).items():
+                unmapped = outputs[sample].get('unmapped', {})
+                for key, value in kept.items():
+                    with self.subTest(parser=parser, sample=sample, key=key):
+                        self.assertEqual(unmapped.get(key), value)
+            # Every redaction left is a real secret-value key.
+            for sample, output in outputs.items():
+                for key, value in (output.get('unmapped') or {}).items():
+                    if value == '<redacted>':
+                        with self.subTest(parser=parser, sample=sample, key=key):
+                            self.assertTrue(any(fcc.SECRET.search(part) for part in key.split('.')), key)
+                    if 'credential' in key and ('type' in key or 'provider' in key or 'reads' in key):
+                        self.assertNotEqual(value, '<redacted>', (parser, sample, key))
+
+
 class TargetEvidenceTests(unittest.TestCase):
     """A targeted rule is satisfied only by the mapped event (spill.vrl __mapped)."""
 
@@ -220,7 +270,7 @@ class ConfigTests(unittest.TestCase):
             {'kind': 'base64_json_merge', 'path': 'message.data', 'reason': 'r'},
             {'kind': 'parse_json_object', 'paths': ['message'], 'target': 'message_json', 'reason': 'r'},
             {'kind': 'parse_kv_merge', 'path': 'message', 'match': '^type=', 'key_value_delimiter': '=', 'field_delimiter': ', ', 'reason': 'r'},
-            {'kind': 'withhold', 'paths': ['message', 'a.b'], 'match': '^type=', 'reason': 'r'},
+            {'kind': 'withhold', 'paths': ['message'], 'match': '^type=', 'reason': 'r'},
         ]})
 
     def test_truncate_guardrails(self):
@@ -278,6 +328,10 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             validate_config({'source_normalize': [withhold]})
         validate_config({'source_normalize': [{'kind': 'parse_json_object', 'paths': ['details'], 'target': 'details_json', 'reason': 'r'}, withhold]})
+        # Bound to the unpack step's own paths: an unrelated field cannot be withheld.
+        for paths in (['command_line'], ['details', 'audit_items']):
+            with self.subTest(paths=paths), self.assertRaises(AssertionError):
+                validate_config({'source_normalize': [{'kind': 'parse_json_object', 'paths': ['details'], 'target': 'details_json', 'reason': 'r'}, dict(withhold, paths=paths)]})
 
     def test_json_envelope_retired(self):
         with self.assertRaises(AssertionError):
@@ -357,6 +411,33 @@ class SourceNormalizeTests(unittest.TestCase):
         self.assertEqual(normalized_source(listed, [dict(rules[0], arrays=False)]), listed)
         with self.assertRaises(AssertionError):
             validate_config({'source_normalize': [dict(rules[0], arrays='yes', reason='r')]})
+
+    def test_parse_json_object_keep(self):
+        import hashlib
+        keep = ['id', 'username', 'type']
+        rules = [{'kind': 'parse_json_object', 'paths': ['representation'], 'target': 'representation_json', 'keep': keep}]
+        rep = {'username': 'u', 'type': 'password', 'value': 'nan2421-secret', 'privateKey': 'k', 'attributes': {'a': 1}}
+        out = normalized_source({'representation': json.dumps(rep)}, rules)
+        rest = '{"attributes":{"a":1},"privateKey":"k","value":"nan2421-secret"}'
+        self.assertEqual(out, {'representation_json': {'username': 'u', 'type': 'password', 'withheld_fields': {
+            'withheld': True, 'bytes': len(rest), 'sha256': hashlib.sha256(rest.encode()).hexdigest()}}})
+        # An already-decoded object is filtered too; an array is not moved.
+        self.assertNotIn('nan2421-secret', json.dumps(normalized_source({'representation': rep}, rules)))
+        arr = {'representation': '[{"type": "password", "value": "x"}]'}
+        self.assertEqual(normalized_source(arr, rules), arr)
+        self.assertEqual(normalized_source({'representation': '{"id": "1"}'}, rules), {'representation_json': {'id': '1'}})
+        for bad in ({'keep': []}, {'keep': ['withheld_fields']}, {'keep': ['id'], 'arrays': True}):
+            with self.subTest(bad=bad), self.assertRaises(AssertionError):
+                validate_config({'source_normalize': [dict(rules[0], reason='r', **bad)]})
+
+    def test_parse_kv_merge_tail_key(self):
+        step = dict(KV, tail_key='representation')
+        line = 'operationType=CREATE, realmId=r1, representation={"attributes":{"dn":"cn=a, dc=corp"},"credentials":[{"value":"x"}]}'
+        out = normalized_source({'message': line}, [step])
+        self.assertEqual(out, {'operationType': 'CREATE', 'realmId': 'r1', 'representation': '{"attributes":{"dn":"cn=a, dc=corp"},"credentials":[{"value":"x"}]}'})
+        quoted = 'operationType="CREATE", representation="{\\"a\\":\\"b, c\\"}"'
+        self.assertEqual(normalized_source({'message': quoted}, [step])['representation'], '{"a":"b, c"}')
+        self.assertEqual(normalized_source({'message': 'type=LOGIN, realmId=r1'}, [step]), {'type': 'LOGIN', 'realmId': 'r1'})
 
     def test_parse_json_object_never_overwrites_target(self):
         rules = [{'kind': 'parse_json_object', 'paths': ['message'], 'target': 'message_json'}]
