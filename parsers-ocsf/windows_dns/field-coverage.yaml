@@ -1,0 +1,210 @@
+source: mixed
+transforms:
+- source: '@timestamp'
+  kind: epoch_ms
+  target: time
+  reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+- source: remote_ip
+  kind: lowercase
+  target: dst_endpoint.ip
+  reason: IP addresses are lowercased (IPv6) on the emitted endpoint.
+- source: remote_ip
+  kind: lowercase
+  target: src_endpoint.ip
+  reason: IP addresses are lowercased (IPv6) on the emitted endpoint.
+- source: RemoteIP
+  kind: lowercase
+  target: src_endpoint.ip
+  reason: IP addresses are lowercased (IPv6) on the emitted endpoint.
+- source: winlog.event_data.InterfaceIP
+  kind: lowercase
+  target: dst_endpoint.ip
+  reason: IP addresses are lowercased (IPv6) on the emitted endpoint.
+- source: winlog.event_data.InterfaceIP
+  kind: lowercase
+  target: src_endpoint.ip
+  reason: IP addresses are lowercased (IPv6) on the emitted endpoint.
+- source: winlog.event_data.Source
+  kind: lowercase
+  target: dst_endpoint.ip
+  reason: IP addresses are lowercased (IPv6) on the emitted endpoint.
+- source: winlog.event_data.Source
+  kind: lowercase
+  target: src_endpoint.ip
+  reason: IP addresses are lowercased (IPv6) on the emitted endpoint.
+- source: winlog.event_data.Destination
+  kind: lowercase
+  target: dst_endpoint.ip
+  reason: IP addresses are lowercased (IPv6) on the emitted endpoint.
+- source: winlog.event_data.Destination
+  kind: lowercase
+  target: src_endpoint.ip
+  reason: IP addresses are lowercased (IPv6) on the emitted endpoint.
+- source: InterfaceIP
+  kind: lowercase
+  target: dst_endpoint.ip
+  reason: IP addresses are lowercased (IPv6) on the emitted endpoint.
+- source: Source
+  kind: lowercase
+  target: src_endpoint.ip
+  reason: IP addresses are lowercased (IPv6) on the emitted endpoint.
+- source: Destination
+  kind: lowercase
+  target: src_endpoint.ip
+  reason: IP addresses are lowercased (IPv6) on the emitted endpoint.
+- source: direction
+  kind: enum
+  target: connection_info.direction_id
+  values:
+    rcv: 1
+    snd: 2
+  reason: Debug log Snd/Rcv normalized to the OCSF direction; consume only when the expected ID is emitted.
+- source: SendReceiveIndicator
+  kind: enum
+  target: connection_info.direction_id
+  values:
+    rcv: 1
+    snd: 2
+  reason: Debug log Snd/Rcv normalized to the OCSF direction; consume only when the expected ID is emitted.
+- source: opcode
+  kind: enum
+  target: query.opcode
+  values:
+    q: Query
+    n: Notify
+    u: Update
+  reason: Debug log opcode letter normalized to the OCSF opcode caption.
+- source: Opcode
+  kind: enum
+  target: query.opcode
+  values:
+    standard query: Query
+    notify: Notify
+    update: Update
+  reason: xm_msdns opcode name normalized to the OCSF opcode caption.
+- source: rcode
+  kind: enum
+  target: rcode
+  values:
+    noerror: NoError
+    formerr: FormError
+    servfail: ServError
+    nxdomain: NXDomain
+    notimp: NotImp
+    notimpl: NotImp
+    refused: Refused
+    yxdomain: YXDomain
+    yxrrset: YXRRSet
+    nxrrset: NXRRSet
+    notauth: NotAuth
+    notzone: NotZone
+  reason: Response code mnemonic normalized to the OCSF rcode caption (responses only).
+- source: winlog.event_data.QTYPE
+  kind: enum
+  target: query.type
+  values: &id001
+    '1': A
+    '2': NS
+    '5': CNAME
+    '6': SOA
+    '12': PTR
+    '13': HINFO
+    '15': MX
+    '16': TXT
+    '28': AAAA
+    '33': SRV
+    '35': NAPTR
+    '43': DS
+    '46': RRSIG
+    '47': NSEC
+    '48': DNSKEY
+    '64': SVCB
+    '65': HTTPS
+    '251': IXFR
+    '252': AXFR
+    '255': ANY
+    '257': CAA
+  reason: ETW numeric question type mapped to its mnemonic on query.type.
+- source: winlog.event_data.TCP
+  kind: enum
+  target: connection_info.protocol_name
+  values:
+    '0': udp
+    '1': tcp
+  reason: ETW TCP indicator mapped to the transport name.
+- source: QTYPE
+  kind: enum
+  target: query.type
+  values: *id001
+  reason: ETW numeric question type mapped to its mnemonic on query.type.
+- source: TCP
+  kind: enum
+  target: connection_info.protocol_name
+  values:
+    '0': udp
+    '1': tcp
+  reason: ETW TCP indicator mapped to the transport name.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  Destination:
+  - src_endpoint.ip
+  EventID:
+  - metadata.event_code
+  Hostname:
+  - device.hostname
+  InterfaceIP:
+  - dst_endpoint.ip
+  Port:
+  - src_endpoint.port
+  QuestionName:
+  - query.hostname
+  QuestionType:
+  - query.type
+  RCODE:
+  - rcode_id
+  Reason:
+  - status_detail
+  RemoteIP:
+  - src_endpoint.ip
+  Source:
+  - src_endpoint.ip
+  XID:
+  - transaction_id
+  detail:
+  - message
+  event.code:
+  - metadata.event_code
+  host.name:
+  - device.hostname
+  message:
+  - message
+  qtype:
+  - query.type
+  remote_ip:
+  - dst_endpoint.ip
+  - src_endpoint.ip
+  winlog.computer_name:
+  - device.hostname
+  winlog.event_data.Destination:
+  - dst_endpoint.ip
+  - src_endpoint.ip
+  winlog.event_data.ElapsedTime:
+  - duration
+  winlog.event_data.InterfaceIP:
+  - dst_endpoint.ip
+  - src_endpoint.ip
+  winlog.event_data.Port:
+  - src_endpoint.port
+  winlog.event_data.RCODE:
+  - rcode_id
+  winlog.event_data.Reason:
+  - status_detail
+  winlog.event_data.Source:
+  - dst_endpoint.ip
+  - src_endpoint.ip
+  winlog.event_data.XID:
+  - transaction_id
+  winlog.event_id:
+  - metadata.event_code

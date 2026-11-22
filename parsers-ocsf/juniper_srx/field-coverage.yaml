@@ -1,8 +1,11 @@
 source: text
+probe:
+  mode: before
+  anchor: ']'
+  require: junos@
+  text: ' ResidualProbe="nan2421-text-unknown" password="nan2421-secret"'
+  source: ResidualProbe
 transforms:
-- source: action
-  kind: lowercase
-  reason: Parser case-normalizes this parsed field when represented in output.
 - source: action
   kind: enum
   target: action_id
@@ -25,63 +28,74 @@ transforms:
     dropped: 2
     log: 3
     observed: 3
-  reason: Named vendor outcome/protocol/severity normalized by the existing mapping;
-    consume only when the expected ID is emitted.
-- source: threat-severity
-  kind: enum
-  target: severity
-  values:
-    critical: Critical
-  reason: Parser normalizes the caption case; verify the emitted caption.
-probe:
-  mode: before
-  anchor: ']'
-  require: junos@
-  text: ' ResidualProbe="nan2421-text-unknown" password="nan2421-secret"'
-  source: ResidualProbe
-consumed_candidates:
-- action
-- application
-- application-name
-- attack-name
-- bytes-from-client
-- bytes-from-server
-- category
-- destination-address
-- destination-interface-name
-- destination-port
-- destination-zone-name
-- elapsed-time
-- header.appname
-- header.host
-- header.msgid
-- header.rest
-- header.ts
-- nat-destination-address
-- nat-destination-port
-- nat-source-address
-- nat-source-port
-- object-name
-- packet-incoming-interface
-- packets-from-client
-- packets-from-server
-- policy-name
-- protocol-id
-- protocol-name
-- reason
-- repeat-count
-- rule-name
-- rulebase-name
-- service-name
-- session-id
-- session-id-32
-- source-address
-- source-interface-name
-- source-port
-- source-zone-name
-- threat-severity
-- url
-- username
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+  reason: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when
+    the expected ID is emitted.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  application:
+  - app_name
+  attack-name:
+  - finding_info.analytic.name
+  - finding_info.analytic.uid
+  - finding_info.title
+  - finding_info.uid
+  bytes-from-client:
+  - traffic.bytes_out
+  bytes-from-server:
+  - traffic.bytes_in
+  category:
+  - http_request.url.categories
+  destination-address:
+  - dst_endpoint.ip
+  - evidences.dst_endpoint.ip
+  - observables.value
+  destination-port:
+  - dst_endpoint.port
+  - evidences.dst_endpoint.port
+  destination-zone-name:
+  - dst_endpoint.zone
+  elapsed-time:
+  - duration
+  header.appname:
+  - metadata.log_name
+  header.host:
+  - device.hostname
+  - src_endpoint.hostname
+  header.msgid:
+  - metadata.event_code
+  packet-incoming-interface:
+  - src_endpoint.interface_name
+  packets-from-client:
+  - traffic.packets_out
+  packets-from-server:
+  - traffic.packets_in
+  policy-name:
+  - firewall_rule.name
+  - firewall_rule.uid
+  protocol-id:
+  - connection_info.protocol_num
+  reason:
+  - status_detail
+  repeat-count:
+  - count
+  rulebase-name:
+  - firewall_rule.category
+  service-name:
+  - dst_endpoint.svc_name
+  - evidences.dst_endpoint.svc_name
+  session-id-32:
+  - connection_info.uid
+  source-address:
+  - evidences.src_endpoint.ip
+  - observables.value
+  - src_endpoint.ip
+  source-port:
+  - evidences.src_endpoint.port
+  - src_endpoint.port
+  source-zone-name:
+  - src_endpoint.zone
+  username:
+  - actor.user.name
+  - observables.value

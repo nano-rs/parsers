@@ -1,76 +1,60 @@
 source: json
 transforms:
-- source: Dir
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: Act
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: action
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: scanResult
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: result
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: actionTriggered
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
 - source: datetime
   kind: epoch_ms
   target: time
   reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-consumed_candidates:
-- Act
-- AttCnt
-- AttNames
-- Cphr
-- Dir
-- IP
-- MsgId
-- MsgSz
-- Rcpt
-- Sender
-- SpamInfo
-- SpamLimit
-- SpamProcessingDetail
-- SpamProcessingDetail.dkim.allow
-- SpamProcessingDetail.dmarc.allow
-- SpamProcessingDetail.spf.allow
-- SpamScore
-- Subject
-- TlsVer
-- VirusFound
-- acc
-- action
-- actionTriggered
-- category
-- datetime
-- definition
-- details
-- fileExt
-- fileHash
-- fileName
-- fromUserEmailAddress
-- messageId
-- recipientAddress
-- result
-- route
-- scanResult
-- senderAddress
-- sendingIp
-- subject
-- type
-- url
-- userEmailAddress
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  AttNames:
+  - email.files.name
+  IP:
+  - src_endpoint.ip
+  MsgId:
+  - email.message_uid
+  - metadata.original_event_uid
+  MsgSz:
+  - email.size
+  Rcpt:
+  - email.to
+  Sender:
+  - email.from
+  SpamProcessingDetail.dkim.allow:
+  - email_auth.dkim
+  SpamProcessingDetail.dmarc.allow:
+  - email_auth.dmarc
+  SpamProcessingDetail.spf.allow:
+  - email_auth.spf
+  SpamScore:
+  - risk_score
+  Subject:
+  - email.subject
+  - message
+  VirusFound:
+  - malware.name
+  category:
+  - email.urls.categories
+  fileName:
+  - email.files.name
+  fromUserEmailAddress:
+  - email.from
+  messageId:
+  - email.message_uid
+  - metadata.original_event_uid
+  recipientAddress:
+  - email.to
+  senderAddress:
+  - email.from
+  sendingIp:
+  - src_endpoint.ip
+  subject:
+  - email.subject
+  - message
+  type:
+  - metadata.event_code
+  url:
+  - email.urls.url_string
+  userEmailAddress:
+  - email.to

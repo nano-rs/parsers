@@ -7,29 +7,60 @@ transforms:
   reason: RFC 3339 header clock converted to event milliseconds; device clocks without a year remain residual.
 - source: event.protocol
   kind: lowercase
+  target: connection_info.protocol_name
   reason: ACL protocol keyword lowercased into connection_info.protocol_name.
-consumed_candidates:
-- header.host
-- header.outer_host
-- header.seq
-- tag.facility
-- event.user
-- event.source
-- event.localport
-- event.reason
-- event.acl
-- event.src_ip
-- event.src_port
-- event.dst_ip
-- event.dst_port
-- event.packets
-- event.protocol
-- event.tty
-- event.line
-- event.by
-- event.interface
-- event.command
-- message
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  header.host:
+  - device.hostname
+  - dst_endpoint.hostname
+  - src_endpoint.hostname
+  header.outer_host:
+  - device.hostname
+  - device.ip
+  - dst_endpoint.ip
+  header.seq:
+  - metadata.sequence
+  tag.facility:
+  - metadata.log_provider
+  event.user:
+  - actor.user.name
+  - evidences.user.name
+  - user.name
+  event.source:
+  - evidences.src_endpoint.ip
+  - src_endpoint.ip
+  event.localport:
+  - dst_endpoint.port
+  event.reason:
+  - status_detail
+  event.acl:
+  - firewall_rule.name
+  - firewall_rule.uid
+  event.src_ip:
+  - src_endpoint.ip
+  event.src_port:
+  - src_endpoint.port
+  event.dst_ip:
+  - dst_endpoint.ip
+  event.dst_port:
+  - dst_endpoint.port
+  event.packets:
+  - traffic.packets
+  event.protocol:
+  - connection_info.protocol_name
+  event.tty:
+  - session.terminal
+  event.line:
+  - actor.session.terminal
+  event.by:
+  - actor.session.terminal
+  - actor.user.name
+  event.interface:
+  - device.network_interfaces.name
+  event.command:
+  - api.operation
+  message:
+  - message
