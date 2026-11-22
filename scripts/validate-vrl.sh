@@ -63,12 +63,17 @@ write_probe_program() {
 
 # run_probe <event file> <probe program file>
 # Sets PROBE_RC (vector's exit status: non-zero = compile error), PROBE_OUT
-# (vector's full output, for messages) and PROBE_JSON (the emitted event as
-# JSON, empty if the program aborted). Returns 0 only if the program completed.
+# (vector's full output, for messages), PROBE_JSON (the emitted event as
+# JSON, empty if the program aborted) and PROBE_NONOBJ (1 when the program
+# completed but left `.` as something other than a JSON object). Returns 0
+# only if the program completed AND emitted an object: a log event must be an
+# object (validate-ocsf.sh requires one, and the expect: lookups below index
+# into it), so `. = null`, `false`, a scalar or an array is a failure too.
 run_probe() {
     PROBE_RC=0
     PROBE_OUT=$(vector vrl --input "$1" --program "$2" 2>&1) || PROBE_RC=$?
     PROBE_JSON=""
+    PROBE_NONOBJ=0
     [ "$PROBE_RC" -eq 0 ] || return 1
     local line
     # The marker line is a VRL string literal of base64 chars, so it is also
@@ -76,7 +81,13 @@ run_probe() {
     line=$(printf '%s\n' "$PROBE_OUT" | grep -F "\"${DONE_MARKER}" | tail -1) || true
     [ -n "$line" ] || return 1
     PROBE_JSON=$(printf '%s' "$line" | jq -r --arg m "$DONE_MARKER" 'ltrimstr($m) | @base64d') || return 1
-    [ -n "$PROBE_JSON" ]
+    [ -n "$PROBE_JSON" ] || return 1
+    # PROBE_JSON is kept verbatim (exact numeric formatting); only its type
+    # is checked here.
+    if ! printf '%s' "$PROBE_JSON" | jq -e 'type == "object"' >/dev/null 2>&1; then
+        PROBE_NONOBJ=1
+        return 1
+    fi
 }
 
 # Output for humans: vector's lines minus its INFO log banner.
@@ -207,7 +218,7 @@ EOF
     # and still completes; one that aborts never reaches the marker.
     if [ "$compiled" -eq 1 ] && [ "$is_enrichment" -eq 0 ]; then
         if ! run_probe "$event_file" "$vrl_file"; then
-            echo "  NOTE: aborts on the generic stub event (no event emitted)"
+            echo "  NOTE: aborts or emits a non-object on the generic stub event (no event emitted)"
             echo "        Not blocking — the stub is not a meaningful input for"
             echo "        most parsers. Add samples: to assert real behaviour."
         fi
@@ -238,9 +249,14 @@ EOF
             jq -nc --arg m "$raw" '{message: $m}' > "$sample_event"
 
             if ! run_probe "$sample_event" "$vrl_file"; then
-                echo "  FAIL: sample[$idx] aborted at runtime — the parser would DROP this event"
-                echo "    input:  $raw"
-                vector_messages "$PROBE_OUT" | head -3 | sed 's/^/    output: /'
+                if [ "$PROBE_NONOBJ" -eq 1 ]; then
+                    echo "  FAIL: sample[$idx] left the event as a non-object ($(printf '%s' "$PROBE_JSON" | jq -r 'type' 2>/dev/null || echo unknown)) — the parser would DROP this event"
+                    echo "    input:  $raw"
+                else
+                    echo "  FAIL: sample[$idx] aborted at runtime — the parser would DROP this event"
+                    echo "    input:  $raw"
+                    vector_messages "$PROBE_OUT" | head -3 | sed 's/^/    output: /'
+                fi
                 sample_failed=1
             else
                 s_json="$PROBE_JSON"

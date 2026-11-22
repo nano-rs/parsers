@@ -96,6 +96,55 @@ samples:
       user: admin
 YAML
 
+# A program that completes but leaves `.` as a non-object emits no log event.
+# null and false were rejected before the completion marker existed; a scalar
+# or array root must fail the sample too, and with expect: present the jq
+# lookup must not abort the whole run (the second parser still validates).
+for root in null false '"text"' '[1, 2]'; do
+    case_name="nonobject_root_$(printf '%s' "$root" | tr -c 'a-z0-9' '_')"
+    run_case "$case_name" fail "FAIL: sample\[0\] left the event as a non-object" <<YAML
+name: test_${case_name}
+parser_vrl: |
+  . = parse_json!(string!(.message))
+samples:
+  - raw: '${root}'
+    expect:
+      foo: bar
+YAML
+done
+
+# The run continues past a non-object sample and still validates later parsers.
+mkdir -p "$WORK/nonobject_continue_a" "$WORK/nonobject_continue_b"
+cat > "$WORK/nonobject_continue_a/parser.yaml" <<'YAML'
+name: test_nonobject_continue_a
+parser_vrl: |
+  . = parse_json!(string!(.message))
+samples:
+  - raw: '[1, 2]'
+    expect:
+      foo: bar
+YAML
+cat > "$WORK/nonobject_continue_b/parser.yaml" <<'YAML'
+name: test_nonobject_continue_b
+parser_vrl: |
+  .ok = true
+samples:
+  - raw: "anything"
+    expect:
+      ok: true
+YAML
+printf '%s\n%s\n' "$WORK/nonobject_continue_a/parser.yaml" "$WORK/nonobject_continue_b/parser.yaml" > "$WORK/nonobject_continue.txt"
+cont_rc=0
+cont_out=$(bash "$VALIDATE" "$WORK/nonobject_continue.txt" 2>&1) || cont_rc=$?
+if [ "$cont_rc" -ne 0 ] && printf '%s\n' "$cont_out" | grep -q "Validating: test_nonobject_continue_b" \
+    && printf '%s\n' "$cont_out" | grep -q "OK: 1 sample(s) parsed and matched expectations"; then
+    echo "ok   nonobject_continue"
+else
+    echo "FAIL nonobject_continue (exit $cont_rc)"
+    printf '%s\n' "$cont_out" | sed 's/^/     | /'
+    FAILURES=$((FAILURES + 1))
+fi
+
 # A compile error is still a compile error.
 run_case compile_error fail "FAIL: VRL compilation error" <<'YAML'
 name: test_compile_error
