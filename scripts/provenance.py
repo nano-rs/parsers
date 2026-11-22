@@ -11,11 +11,14 @@ field_coverage_check.py uses this to verify every declared mapping and every
 """
 import copy
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 
 MISSING = object()
+# Vector runs in UTC, so no result depends on the checking host's timezone.
+VECTOR_ENV = {**os.environ, 'TZ': 'UTC'}
 
 
 def obj_flatten(value, prefix=''):
@@ -213,7 +216,7 @@ def run_vrl(program, messages):
         (tmp/'p.vrl').write_text(program + '\n.__coverage_source = __source_kv\n')
         (tmp/'in.json').write_text(''.join(json.dumps(m if isinstance(m, dict) else {'message': m}) + '\n' for m in messages))
         run = subprocess.run(['vector', 'vrl', '--program', str(tmp/'p.vrl'), '--input', str(tmp/'in.json'), '--print-object'],
-                             text=True, capture_output=True, timeout=900)
+                             text=True, capture_output=True, timeout=900, env=VECTOR_ENV)
     assert run.returncode == 0, run.stderr
     outputs = [json.loads(line, strict=False) for line in run.stdout.splitlines() if line.startswith('{')]
     assert len(outputs) == len(messages), f'Vector returned {len(outputs)} events for {len(messages)} inputs'
@@ -242,8 +245,10 @@ def transform_want(rule, value):
                     fmt, value = fmt.replace('%e', '%d'), ' '.join(value.split())
                     fmt = ' '.join(fmt.split())
                 clock = dt.datetime.strptime(value, fmt)
-            # A clock without an offset is local time, as Vector's runtime
-            # timezone reads it (vector vrl runs here, with this TZ).
+            # Every parser passes timezone: "UTC" (field_coverage_check
+            # enforces it), so a clock without an offset is UTC.
+            if clock.tzinfo is None:
+                clock = clock.replace(tzinfo=dt.timezone.utc)
             return int(clock.timestamp() * 1000)
         if kind == 'scale':
             return int(float(value) * rule['factor'])
