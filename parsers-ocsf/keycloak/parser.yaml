@@ -68,7 +68,14 @@ parser_vrl: |
               if log_level == "" { log_level = string(pj.level) ?? "" }
           }
           # A colliding or unparsable event line is never read as a REST event
-          # (those carry no `type=` message): it takes the explicit fallback.
+          # (those carry no `type=` message): it takes the explicit fallback, and
+          # the line itself is withheld (source_normalize withhold): key redaction
+          # cannot reach inside unparsed text, so only its byte length and sha256
+          # stay outside raw_data.
+          if shape != "json_log" {
+              wt = string!(pj.message)
+              __source_kv.message = {"withheld": true, "bytes": length(wt), "sha256": sha2(wt, variant: "SHA-256")}
+          }
       } else if exists(pj.type) || exists(pj.operationType) {
           shape = "json"
           e = pj

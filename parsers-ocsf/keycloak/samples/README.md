@@ -26,6 +26,10 @@ Sources:
   log record a forwarder tagged with its own top-level `type`: the event line
   collides with it, so the record falls back instead of being read as a REST
   event with `status_id` Success.
+- `json_log_collision_secret_withheld` and `json_log_unparsable_secret_withheld`
+  (review regressions) carry a credential in an event line that cannot be
+  unpacked: the line is withheld (byte length + sha256), and the credential
+  appears only in `raw_data` (the checker asserts `nan2421-secret` nowhere else).
 
 UUIDs are replaced with `00000000-0000-…` values, addresses with documentation
 ranges, users with example.com addresses.

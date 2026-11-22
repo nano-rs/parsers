@@ -151,6 +151,7 @@ class ConfigTests(unittest.TestCase):
             {'kind': 'base64_json_merge', 'path': 'message.data', 'reason': 'r'},
             {'kind': 'parse_json_object', 'paths': ['message'], 'target': 'message_json', 'reason': 'r'},
             {'kind': 'parse_kv_merge', 'path': 'message', 'match': '^type=', 'key_value_delimiter': '=', 'field_delimiter': ', ', 'reason': 'r'},
+            {'kind': 'withhold', 'paths': ['message', 'a.b'], 'match': '^type=', 'reason': 'r'},
         ]})
 
     def test_truncate_guardrails(self):
@@ -174,6 +175,9 @@ class ConfigTests(unittest.TestCase):
             {'kind': 'parse_kv_merge', 'path': 'a.b', 'match': '^', 'key_value_delimiter': '=', 'field_delimiter': ' ', 'reason': 'r'},
             {'kind': 'parse_kv_merge', 'path': 'message', 'key_value_delimiter': '=', 'field_delimiter': ' ', 'reason': 'r'},
             {'kind': 'unwrap_single', 'path': 'x', 'reason': 'r', 'extra': 1},
+            {'kind': 'withhold', 'paths': ['message'], 'reason': 'r'},
+            {'kind': 'withhold', 'paths': ['a..b'], 'match': '.', 'reason': 'r'},
+            {'kind': 'withhold', 'paths': ['m'], 'match': '(', 'reason': 'r'},
         ]
         for step in bad:
             with self.subTest(step=step), self.assertRaises(AssertionError):
@@ -295,6 +299,36 @@ class SourceNormalizeTests(unittest.TestCase):
         trailing = {'message': 'type="LOGIN_ERROR", realmId="r1", '}
         self.assertEqual(normalized_source(trailing, [KV]), trailing)
 
+    def test_withhold(self):
+        import hashlib
+        step = {'kind': 'withhold', 'paths': ['logEvents.message', 'message'], 'match': '^type='}
+        text = 'type="LOGIN_ERROR", client_secret="s3cr3t" \u00e9'
+        out = normalized_source({'message': text, 'level': 'WARN'}, [step])
+        self.assertEqual(out, {'level': 'WARN', 'message': {'withheld': True, 'bytes': len(text.encode()), 'sha256': hashlib.sha256(text.encode()).hexdigest()}})
+        self.assertNotIn('s3cr3t', json.dumps(out))
+        # The first existing path decides; no match keeps the value.
+        nested = {'logEvents': {'message': 'plain'}, 'message': 'type=X'}
+        self.assertEqual(normalized_source(nested, [step]), nested)
+        self.assertEqual(normalized_source({'other': 1}, [step]), {'other': 1})
+        # A non-string value is matched and digested as VRL encode_json text.
+        batch = {'logEvents': [{'id': '2', 'message': 'b'}, {'id': '1', 'message': 'a'}]}
+        out = normalized_source(batch, [{'kind': 'withhold', 'paths': ['logEvents'], 'match': r'^\[[^\]]'}])
+        encoded = '[{"id":"2","message":"b"},{"id":"1","message":"a"}]'
+        self.assertEqual(out['logEvents']['sha256'], hashlib.sha256(encoded.encode()).hexdigest())
+        empty = {'logEvents': []}
+        self.assertEqual(normalized_source(empty, [{'kind': 'withhold', 'paths': ['logEvents'], 'match': r'^\[[^\]]'}]), empty)
+
+    def test_withhold_after_failed_unpack(self):
+        # A KV line that cannot be unpacked is withheld instead of kept as text.
+        steps = [KV, {'kind': 'withhold', 'paths': ['message'], 'match': '^(type|operationType)='}]
+        ok = {'@timestamp': 't', 'message': 'type="LOGIN", username="a"'}
+        self.assertEqual(normalized_source(ok, steps, fake_kv), {'@timestamp': 't', 'type': 'LOGIN', 'username': 'a'})
+        collide = {'type': 'forwarder', 'message': 'type="LOGIN", password="s3cr3t"'}
+        out = normalized_source(collide, steps, fake_kv)
+        self.assertEqual(out['type'], 'forwarder')
+        self.assertTrue(out['message']['withheld'])
+        self.assertNotIn('s3cr3t', json.dumps(out))
+
     def test_unknown_kind_fails(self):
         with self.assertRaises(AssertionError):
             normalized_source({}, [{'kind': 'nope'}])
@@ -320,6 +354,17 @@ class NormalizeProbeTests(unittest.TestCase):
         self.assert_probe({'logEvents': [{'message': '{"a": 1}'}]},
                           [{'kind': 'unwrap_single', 'path': 'logEvents'},
                            {'kind': 'parse_json_object', 'paths': ['logEvents.message', 'message'], 'target': 'message_json'}])
+
+    def test_withhold_probe(self):
+        steps = [KV, {'kind': 'withhold', 'paths': ['message'], 'match': '^(type|operationType)='}]
+        samples = [('ok', {'message': json.dumps({'message': 'type="LOGIN"'})}),
+                   ('collide', {'message': json.dumps({'type': 'f', 'message': 'type="LOGIN"'})})]
+        probes = normalize_probes(samples, steps, fake_kv)
+        self.assertEqual([n for n, _ in probes], ['normalize_probe_0', 'withhold_probe_1'])
+        withheld = normalized_source(json.loads(probes[1][1]['message']), steps, fake_kv)
+        self.assertTrue(withheld['message']['withheld'])
+        with self.assertRaises(AssertionError):
+            normalize_probes(samples[:1], steps, fake_kv)
 
     def test_unexercised_step_fails(self):
         with self.assertRaises(AssertionError):
