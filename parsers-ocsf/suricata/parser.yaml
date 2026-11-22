@@ -689,7 +689,7 @@ parser_vrl: |
           __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              if __mapped."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
           }
       }
       if match(key, r'(?x)
@@ -700,7 +700,7 @@ parser_vrl: |
           if __value != null {
               __expected = get!({"blocked": "Blocked"}, [downcase(to_string(__value) ?? "")])
               if __expected != null {
-                  if ."disposition" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+                  if __mapped."disposition" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
               }
           }
       }
@@ -712,7 +712,7 @@ parser_vrl: |
           if __value != null {
               __expected = get!({"allow": 1, "allowed": 1, "accept": 1, "accepted": 1, "permit": 1, "permitted": 1, "pass": 1, "passed": 1, "deny": 2, "denied": 2, "block": 2, "blocked": 2, "reject": 2, "rejected": 2, "drop": 2, "dropped": 2, "log": 3, "observed": 3}, [downcase(to_string(__value) ?? "")])
               if __expected != null {
-                  if ."action_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+                  if __mapped."action_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
               }
           }
       }
@@ -725,7 +725,7 @@ parser_vrl: |
           if __value != null {
               __expected = get!({"request": "Request"}, [downcase(to_string(__value) ?? "")])
               if __expected != null {
-                  if ."activity_name" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+                  if __mapped."activity_name" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
               }
           }
       }
@@ -737,7 +737,7 @@ parser_vrl: |
           if __value != null {
               __expected = get!({"tcp": 6, "udp": 17, "icmp": 1, "icmpv6": 58, "ipv6-icmp": 58}, [downcase(to_string(__value) ?? "")])
               if __expected != null {
-                  if ."connection_info"."protocol_num" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+                  if __mapped."connection_info"."protocol_num" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
               }
           }
       }
@@ -749,7 +749,7 @@ parser_vrl: |
           if __value != null {
               __expected = get!({"query": "Query"}, [downcase(to_string(__value) ?? "")])
               if __expected != null {
-                  if ."activity_name" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+                  if __mapped."activity_name" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
               }
           }
       }
@@ -842,20 +842,26 @@ parser_vrl: |
   # END parser-specific transformations
   # Redact at every depth, including objects inside arrays, before serialization.
   # Redaction needs a sensitive word in a key or a name/key value, and encode_json
-  # never escapes a letter, so text without one of the words needs no walk.
-  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+  # never escapes a letter, so text without one of the words needs no walk (the
+  # test here is a superset of the key list). A key is sensitive when it holds a
+  # secret value: password, secret, authorization, token, or a credential VALUE
+  # key (credential, credentials, client_credential, credential_data / _value /
+  # _hash / _key / _blob, credentialData). Descriptive credential keys such as
+  # credential_type, credential_id, credential_name, credential_provider or
+  # credential_reads are telemetry and never redacted.
+  if match(downcase(__safe_json), r'password|secret|authorization|token|credential') {
       __safe = map_values(__safe, recursive: true) -> |value| {
           if is_object(value) {
               # Header/parameter arrays commonly encode sensitive keys as name/value
               # or Key/Value objects instead of using the secret name as an object key.
               __sensitive_pair = false
               for_each(object!(value)) -> |key, child| {
-                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token|(?:^|[^a-z0-9\s]|client)credentials?(?:$|[^a-z0-9_\s])|credential_?(?:data|value|val|blob|hash|key)(?:$|[^a-z0-9_\s])') {
                       __sensitive_pair = true
                   }
               }
               for_each(object!(value)) -> |key, _child| {
-                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                  if match(downcase(key), r'password|secret|authorization|token|(?:^|[^a-z0-9\s]|client)credentials?(?:$|[^a-z0-9_\s])|credential_?(?:data|value|val|blob|hash|key)(?:$|[^a-z0-9_\s])') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
                       value = set!(value, [key], "<redacted>")
                   }
               }
@@ -1015,7 +1021,7 @@ parser_vrl: |
   # conditions run first; the source value set is built on first use.
   __original_values = null
   for_each(flatten(__existing)) -> |key, value| {
-      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token|(?:^|[^a-z0-9\s]|client)credentials?(?:$|[^a-z0-9_\s])|credential_?(?:data|value|val|blob|hash|key)(?:$|[^a-z0-9_\s])') {
           # Members for the value itself and for to_string(value), as above.
           __json = encode_json(value)
           __as_json = "," + encode_json(__json)
