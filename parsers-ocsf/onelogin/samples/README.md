@@ -11,6 +11,8 @@ Sources:
   documented event object fields with ids from that list: 3, 4, 6, 7, 8, 9, 11,
   19, 22, 69, 551, 950, 1001, 1002, and 41 (`AD_CONNECTOR_STARTED`) as an id the parser
   deliberately leaves unmapped (Base Event, id kept).
+- `05_user_logged_into_onelogin_invalid_ip.json` carries an `ipaddr` that is
+  not an address: no `src_endpoint.ip` (ip_t), the value stays in unmapped.
 - `junk.json` is a non-JSON line for the fallback branch.
 
 Identifiers are documentation values: addresses in 192.0.2.0/24,

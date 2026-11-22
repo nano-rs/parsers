@@ -16,25 +16,43 @@ transforms:
     succeeded: Success
     failed: Failure
     failure: Failure
-  reason: PingOne result.status normalized to the OCSF status caption; consume only
-    when the emitted caption matches (a named-failure override keeps it residual).
-consumed_candidates:
-- action.description
-- action.type
-- actors.client.environment.id
-- actors.client.id
-- actors.client.name
-- actors.user.environment.id
-- actors.user.id
-- actors.user.name
-- correlationId
-- id
-- internalCorrelation.sessionId
-- internalCorrelation.transactionId
-- result.description
-- source.ipAddress
-- source.userAgent
-- tags
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+  reason: PingOne result.status normalized to the OCSF status caption; consume only when the emitted caption
+    matches (a named-failure override keeps it residual).
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  action.description:
+  - message
+  action.type:
+  - api.operation
+  - metadata.event_code
+  actors.client.environment.id:
+  - metadata.tenant_uid
+  actors.client.id:
+  - actor.app_uid
+  - service.uid
+  actors.client.name:
+  - actor.app_name
+  - service.name
+  actors.user.environment.id:
+  - metadata.tenant_uid
+  actors.user.id:
+  - actor.user.uid
+  actors.user.name:
+  - actor.user.email_addr
+  - actor.user.name
+  correlationId:
+  - metadata.correlation_uid
+  id:
+  - metadata.uid
+  internalCorrelation.sessionId:
+  - session.uid
+  result.description:
+  - status_detail
+  source.ipAddress:
+  - src_endpoint.ip
+  source.userAgent:
+  - http_request.user_agent
+  tags:
+  - metadata.labels

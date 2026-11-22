@@ -18,6 +18,14 @@ Sources:
   directory event types with the documented `resource` / `initiated_by` shapes.
 - `user_login_attempt_failed_coords_only` carries integer geoip coordinates
   without a country or region (no `location` is emitted; the coordinates spill).
+- `mdm_command_result_with_client_ip.json` is a Base Event with `client_ip` and
+  `geoip`: Base Event has no `src_endpoint`, so they stay in unmapped.
+- `user_update_display_name_only.json` names its user resource by display name
+  only: no OCSF `user` (it needs a name or uid); the resource spills.
+- `policy_update_type_only.json` is an API Activity whose resource has only a
+  type: no `resources[]` entry (it needs a name or uid); the type spills.
+- `user_login_attempt_invalid_ip.json` carries a `client_ip` that is not an
+  address: no `src_endpoint.ip` (ip_t), the value stays in unmapped.
 - `junk.json` is a truncated array for the fallback branch.
 
 Identifiers are replaced: the organization with 24 zeros, addresses with

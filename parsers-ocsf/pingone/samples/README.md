@@ -16,6 +16,12 @@ Sources:
   `OTP.CHECK_FAILED`, `PASSWORD.LOCKED`), with `result.status` `FAILED`.
 - `group_updated_partial_resource` is a GROUP resource without name or id
   (the group falls back to "unknown" rather than empty strings).
+- `user_updated_partial_user_resource.json` has a USER resource with neither
+  name nor id: no OCSF `user` from it (OCSF needs a name or uid).
+- `policy_created_partial_resource.json` has a resource with neither name nor
+  id: no `resources[]` entry; its fields stay in unmapped.
+- `user_access_allowed_invalid_ip.json` carries a `source.ipAddress` that is
+  not an address: no `src_endpoint.ip` (ip_t), the value stays in unmapped.
 - `junk.json` is a non-JSON line for the fallback branch.
 
 Identifiers are replaced: environment ids with the zero UUID, other UUIDs with

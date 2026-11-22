@@ -7,42 +7,71 @@ transforms:
 - source: event_type
   kind: lowercase
   target: metadata.event_code
-  reason: Parser lowercases the event type; consume only when the normalized value
-    is emitted.
-consumed_candidates:
-- application.display_label
-- application.id
-- application.name
-- client_ip
-- error_message
-- failure_reason
-- geoip.country_code
-- geoip.country_code2
-- geoip.latitude
-- geoip.longitude
-- geoip.region_name
-- id
-- initiated_by.email
-- initiated_by.id
-- initiated_by.name
-- initiated_by.username
-- message
-- mfa
-- organization
-- outer.error_message
-- resource.email
-- resource.id
-- resource.name
-- resource.recipient_email
-- resource.type
-- resource.username
-- service
-- src_ip
-- success
-- system.displayName
-- system.hostname
-- system.id
-- username
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+  reason: Parser lowercases the event type; consume only when the normalized value is emitted.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  application.display_label:
+  - service.name
+  application.id:
+  - service.uid
+  client_ip:
+  - src_endpoint.ip
+  error_message:
+  - status_detail
+  geoip.country_code:
+  - src_endpoint.location.country
+  geoip.country_code2:
+  - src_endpoint.location.country
+  geoip.latitude:
+  - src_endpoint.location.lat
+  geoip.longitude:
+  - src_endpoint.location.long
+  geoip.region_name:
+  - src_endpoint.location.region
+  id:
+  - metadata.uid
+  initiated_by.email:
+  - actor.user.email_addr
+  - actor.user.name
+  - user.email_addr
+  - user.name
+  initiated_by.id:
+  - actor.user.uid
+  - user.uid
+  initiated_by.username:
+  - user.name
+  message:
+  - message
+  mfa:
+  - is_mfa
+  organization:
+  - metadata.tenant_uid
+  resource.email:
+  - user.email_addr
+  - user.name
+  resource.id:
+  - group.uid
+  - user.uid
+  resource.name:
+  - group.name
+  - user.display_name
+  resource.recipient_email:
+  - user.email_addr
+  resource.type:
+  - group.type
+  resource.username:
+  - user.name
+  service:
+  - api.service.name
+  src_ip:
+  - src_endpoint.ip
+  system.displayName:
+  - dst_endpoint.name
+  system.hostname:
+  - dst_endpoint.hostname
+  system.id:
+  - dst_endpoint.uid
+  username:
+  - user.name

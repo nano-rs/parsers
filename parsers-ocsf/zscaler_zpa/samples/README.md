@@ -22,6 +22,10 @@ Sources:
   the same fixture record with those codes: Fail with an unknown action,
   Refuse + Denied, and a successful Close.
 - `non_zpa_json_object` is a JSON object with no LSS field (fallback branch).
+- `user_activity_placeholder_ips` has `ServerIP` and `ConnectorIP` set to "-":
+  neither becomes an `ip_t` attribute (the server address comes from `Host`).
+- `user_status_placeholder_ips` has `PublicIP` 0.0.0.0 and `PrivateIP` "-": no
+  `src_endpoint` (it would have no address); the values stay in unmapped.
 - `junk.json` is a non-JSON line for the fallback branch.
 
 Addresses are replaced with documentation ranges, users with example.com, the
