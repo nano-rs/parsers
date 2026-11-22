@@ -254,8 +254,8 @@ parser_vrl: |
   } else if parsed {
       # connection build
       if msg_id == "302013" || msg_id == "302015" || msg_id == "302020" || msg_id == "302017" {
-          ev, er = parse_regex(body, r'^Built\s+(?P<direction>inbound|outbound)\s+(?P<protocol>\w+)\s+connection\s+(?P<conn_id>\d+)\s+for\s+(?P<src_iface>[^:\s]+):(?P<src_ip>[^/\s]+)/(?P<src_port>\d+)\s*(?:\x28(?P<src_nat_ip>[^/]+)/(?P<src_nat_port>\d+)\x29)?(?:\x28(?P<src_user>[^\x29]*)\x29)?\s+to\s+(?P<dst_iface>[^:\s]+):(?P<dst_ip>[^/\s]+)/(?P<dst_port>\d+)\s*(?:\x28(?P<dst_nat_ip>[^/]+)/(?P<dst_nat_port>\d+)\x29)?')
-          if er == null { route = "network"; activity_id = 1; activity_name = "Open"; action_id = 1 } else { ev = {} }
+          ev, er = parse_regex(body, r'^Built\s+(?P<direction>inbound|outbound)\s+(?P<protocol>\w+)\s+connection\s+(?P<conn_id>\d+)\s+for\s+(?P<src_iface>[^:\s]+):(?P<src_ip>[^/\s]+)/(?P<src_port>\d+)\s*(?:\x28(?P<src_nat_ip>[^/]+)/(?P<src_nat_port>\d+)\x29)?(?:\x28(?P<src_user>[^\x29]*)\x29)?\s+to\s+(?P<dst_iface>[^:\s]+):(?P<dst_ip>[^/\s]+)/(?P<dst_port>\d+)\s*(?:\x28(?P<dst_nat_ip>[^/]+)/(?P<dst_nat_port>\d+)\x29)?(?:\x28(?P<dst_user>[^\x29]*)\x29)?(?:\s+\x28(?P<proxy_user>[^\x29]+)\x29)?')
+          if er == null { ev = compact(ev); route = "network"; activity_id = 1; activity_name = "Open"; action_id = 1 } else { ev = {} }
       } else if msg_id == "302014" || msg_id == "302016" || msg_id == "302021" || msg_id == "302018" {
           ev, er = parse_regex(body, r'^Teardown\s+(?P<protocol>\w+)\s+connection\s+(?P<conn_id>\d+)\s+for\s+(?P<src_iface>[^:\s]+):(?P<src_ip>[^/\s]+)/(?P<src_port>\d+)(?:\s+\x28[^\x29]*\x29)?\s+to\s+(?P<dst_iface>[^:\s]+):(?P<dst_ip>[^/\s]+)/(?P<dst_port>\d+)(?:\s+\x28[^\x29]*\x29)?(?:\s+duration\s+(?P<h>\d+):(?P<m>\d{2}):(?P<s>\d{2}))?(?:\s+bytes\s+(?P<bytes>\d+))?(?:\s+(?P<reason>.+))?$')
           if er == null { route = "network"; activity_id = 2; activity_name = "Close"; action_id = 1 } else { ev = {} }
@@ -337,9 +337,18 @@ parser_vrl: |
           status_detail = string(ev.reason) ?? ""
           srv = string(ev.server) ?? ""
           if is_ipv4(srv) || is_ipv6(srv) { dst.ip = srv } else if srv != "" { dst.hostname = srv }
-          su = string(ev.src_user) ?? ""
-          if su != "" && user_name == "" { user_name = su }
           dirw = string(ev.direction) ?? ""
+          # Identity-firewall users follow each endpoint; a cut-through proxy user
+          # trails the line. The initiator is the "to" side on outbound builds
+          # and the "for" side on inbound builds, so prefer that side's user.
+          su = string(ev.src_user) ?? ""
+          du = string(ev.dst_user) ?? ""
+          pu = string(ev.proxy_user) ?? ""
+          cand = [su, pu, du]
+          if dirw == "outbound" { cand = [du, pu, su] }
+          for_each(cand) -> |_i, c| {
+              if user_name == "" && c != "" && !includes(["No Authentication Required", "Not Found", "Unknown", "Pending"], c) { user_name = c }
+          }
           if dirw == "inbound" { direction_id = 1; direction = "Inbound" }
           if dirw == "outbound" {
               direction_id = 2; direction = "Outbound"
@@ -686,6 +695,8 @@ parser_vrl: |
   | event\.service
   | event\.user
   | event\.src_user
+  | event\.dst_user
+  | event\.proxy_user
   | message
   )\z'
   __preserve = []
@@ -1012,6 +1023,28 @@ samples:
       src_endpoint.ip: 203.0.113.5
       dst_endpoint.ip: 10.1.2.10
       actor.user.name: LOCAL\jdoe
+  # Built outbound: the initiating "to" side carries the identity-firewall user
+  - raw: 'Apr 29 2013 13:00:02: %FTD-6-302013: Built outbound TCP connection 89743301 for outside:192.0.2.43/443 (192.0.2.43/443) to inside:10.123.3.42/4952 (198.51.100.42/12834)(LOCAL\jdoe)'
+    expect:
+      class_uid: 4001
+      connection_info.direction_id: 2
+      src_endpoint.ip: 10.123.3.42
+      dst_endpoint.ip: 192.0.2.43
+      actor.user.name: LOCAL\jdoe
+  # East-west outbound with IDFW users on both sides: the initiator ("to") wins
+  - raw: 'Apr 29 2013 13:00:03: %FTD-6-302013: Built outbound TCP connection 89743302 for dmz:10.1.2.10/443 (10.1.2.10/443)(LOCAL\svc_app) to inside:10.123.3.42/4952 (10.123.3.42/4952)(LOCAL\jdoe)'
+    expect:
+      class_uid: 4001
+      src_endpoint.ip: 10.123.3.42
+      dst_endpoint.ip: 10.1.2.10
+      actor.user.name: LOCAL\jdoe
+  # Trailing cut-through proxy user
+  - raw: 'Apr 29 2013 13:00:04: %FTD-6-302013: Built inbound TCP connection 89743303 for outside:203.0.113.5/51515 (203.0.113.5/51515) to dmz:10.1.2.10/443 (198.51.100.10/443) (jdoe)'
+    expect:
+      class_uid: 4001
+      connection_info.direction_id: 1
+      dst_endpoint.ip: 10.1.2.10
+      actor.user.name: jdoe
   - raw: 'Dec 11 2018 08:01:31 ftd02: %FTD-6-302014: Teardown TCP connection 447236 for outside:192.0.2.222/1234 to dmz:192.168.1.34/5678 duration 0:00:00 bytes 14804 TCP FINs'
     expect:
       class_uid: 4001
