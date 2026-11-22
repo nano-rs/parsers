@@ -10,18 +10,23 @@ source_normalize:
   - requestUri
   - cookies
   - stackTrace
-  reason: A Keycloak JSON log record carries the event line in `message`; the parser replaces
-    that key with the pairs parsed from it. The values a line ends with (representation, and
-    at TRACE requestUri, cookies, stackTrace) are cut off whole first, never split on ', '.
-    Skipped on a parse error, an empty result or a key the record already has.
+  reason: A Keycloak JSON log record carries the event line in `message`; the parser replaces that key
+    with the pairs parsed from it. The values a line ends with (representation, and at TRACE requestUri,
+    cookies, stackTrace) are cut off whole first, never split on ', '. Skipped on a parse error, an empty
+    result or a key the record already has.
 - kind: parse_json_object
   paths:
   - representation
   target: representation_json
   arrays: true
-  reason: An admin event representation is JSON text; parsed (object or array) it moves whole
-    to representation_json so each field maps or spills as-is. Text that is not JSON stays as
-    written; never overwrites an existing representation_json.
+  reason: An admin event representation is JSON text; parsed (object or array) it moves whole to representation_json
+    so each field maps or spills as-is. Text that is not JSON stays as written; never overwrites an existing
+    representation_json.
+probe:
+  mode: suffix
+  require: '[org.keycloak.events] (default task-'
+  text: ', ResidualProbe="nan2421-text-unknown", password="nan2421-secret"'
+  source: ResidualProbe
 transforms:
 - source: '@timestamp'
   kind: epoch_ms
@@ -38,47 +43,73 @@ transforms:
     login: Logon
     login_error: Logon
     logout: Logoff
-  reason: Keycloak event type mapped to the OCSF activity caption; consume only when
-    the emitted caption matches.
-probe:
-  mode: suffix
-  require: '[org.keycloak.events] (default task-'
-  text: ', ResidualProbe="nan2421-text-unknown", password="nan2421-secret"'
-  source: ResidualProbe
-consumed_candidates:
-- representation_json.email
-- representation_json.name
-- representation_json.username
-- representation_json.id
-- representation_json.clientId
-- authDetails.clientId
-- authDetails.ipAddress
-- authDetails.realmId
-- authDetails.userId
-- clientId
-- details.auth_method
-- details.authSessionParentId
-- details.code_id
-- details.impersonator
-- details.impersonator_id
-- details.username
-- error
-- id
-- ipAddress
-- log_level
-- log.level
-- level
-- message
-- operationType
-- realmId
-- resourcePath
-- sessionId
-- time
-- type
-- userId
-- authSessionParentId
-- code_id
-- username
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+  reason: Keycloak event type mapped to the OCSF activity caption; consume only when the emitted caption
+    matches.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  representation_json.email:
+  - user.email_addr
+  - user.name
+  representation_json.name:
+  - group.name
+  representation_json.username:
+  - user.name
+  authDetails.clientId:
+  - actor.app_uid
+  authDetails.ipAddress:
+  - src_endpoint.ip
+  authDetails.userId:
+  - actor.user.uid
+  clientId:
+  - actor.app_uid
+  - service.name
+  details.authSessionParentId:
+  - metadata.correlation_uid
+  details.code_id:
+  - metadata.correlation_uid
+  details.impersonator:
+  - actor.user.name
+  details.impersonator_id:
+  - actor.user.uid
+  details.username:
+  - actor.user.email_addr
+  - actor.user.name
+  - user.email_addr
+  - user.name
+  error:
+  - status_detail
+  id:
+  - metadata.uid
+  ipAddress:
+  - src_endpoint.ip
+  log_level:
+  - metadata.log_level
+  log.level:
+  - metadata.log_level
+  level:
+  - metadata.log_level
+  operationType:
+  - api.operation
+  realmId:
+  - metadata.tenant_uid
+  resourcePath:
+  - resources.uid
+  sessionId:
+  - session.uid
+  time:
+  - time
+  type:
+  - message
+  - metadata.event_code
+  userId:
+  - actor.user.uid
+  - user.uid
+  authSessionParentId:
+  - metadata.correlation_uid
+  code_id:
+  - metadata.correlation_uid
+  username:
+  - user.email_addr
+  - user.name
