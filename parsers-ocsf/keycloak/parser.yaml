@@ -3,7 +3,7 @@ display_name: Keycloak (OCSF)
 version: "1.0.0"
 ocsf_version: "1.9.0"
 description: >
-  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Preserves unconsumed parsed fields, unaltered, in dotted snake_case unmapped keys.
   Parses Keycloak user events and admin events into complete OCSF 1.9.0 records.
   Accepts three shapes of the same event: the JSON representation (Admin REST API
   GET /admin/realms/{realm}/events and /admin-events, and HTTP / webhook event
@@ -50,8 +50,8 @@ parser_vrl: |
           # Keycloak JSON log handler: the jboss-logging line is in `message`. It is
           # unpacked below only when it parses cleanly and none of its pairs is a key
           # the record already has (source_normalize parse_kv_merge); otherwise the
-          # record falls back and its message is withheld with every other
-          # non-allowlisted field. Never read as a REST event.
+          # record falls back with every field, message included, kept as-is.
+          # Never read as a REST event.
           shape = "json_log"
           kv_body = string!(pj.message)
           # ECS layout (@timestamp, log.level) or Keycloak's native Quarkus
@@ -141,92 +141,12 @@ parser_vrl: |
   if shape != "" && kv_body != "" {
       # The event's own fields are the source: for a JSON log envelope the
       # `message` they were unpacked from is replaced by them, so its details
-      # spill as redacted keys instead of one raw string.
+      # map or spill one by one instead of as one raw string.
       if shape == "json_log" { __discard = del(__source_kv.message) }
       __source_kv = merge(__source_kv, kv)
   }
 
 
-  # ---- event-field allowlist (source_normalize allowlist in field-coverage.yaml) ----
-  # Fail closed: only the documented Keycloak event fields (and the JSON log
-  # envelope's own metadata) stay in the source; requestUri / redirect_uri keep
-  # only scheme://host plus the path before its first ';'; an object
-  # representation keeps only its allowlisted scalar fields. Everything else
-  # (cookies, stackTrace, the full request URI, an unparsed or non-string
-  # message, Quarkus exception, mdc, ndc, a pre-existing representation_json,
-  # unknown details) is withheld
-  # together as withheld_fields: only its byte length and sha256 stay outside
-  # raw_data.
-  al_keep = ["id", "time", "type", "operationType", "realmId", "realmName", "clientId", "userId", "ipAddress", "sessionId", "error", "resourceType", "resourcePath", "representation", "requestUri", "authSessionParentId", "authSessionTabId", "auth_method", "auth_type", "client_auth_method", "code_id", "consent", "grant_type", "redirect_uri", "response_mode", "response_type", "scope", "refresh_token_type", "username", "email", "impersonator", "impersonator_id", "impersonator_realm", "reason", "remember_me", "identity_provider", "identity_provider_identity", "register_method", "previous_email", "updated_email", "custom_required_action", "timestamp", "@timestamp", "level", "log.level", "log.logger", "loggerClassName", "loggerName", "threadName", "threadId", "hostName", "processName", "processId", "sequence", "host.hostname", "process.name", "process.pid", "process.thread.id", "process.thread.name", "service.name", "service.version", "service.environment", "ecs.version", "event.sequence", "data_stream.type", "log_time", "log_level", "logger", "thread"]
-  al_details = ["auth_method", "auth_type", "client_auth_method", "code_id", "consent", "grant_type", "redirect_uri", "response_mode", "response_type", "scope", "refresh_token_type", "username", "email", "impersonator", "impersonator_id", "impersonator_realm", "reason", "remember_me", "identity_provider", "identity_provider_identity", "register_method", "previous_email", "updated_email", "custom_required_action", "authSessionParentId", "authSessionTabId"]
-  al_rep = ["id", "username", "email", "firstName", "lastName", "enabled", "clientId", "name", "realm", "type"]
-  al_auth = ["realmId", "clientId", "userId", "ipAddress"]
-  al_urls = ["requestUri", "redirect_uri"]
-  al_kept = {}
-  al_rest = {}
-  for_each(__source_kv) -> |k, v| {
-      if (k == "details" || k == "authDetails" || k == "representation") && is_object(v) {
-          al_allowed = al_auth
-          if k == "details" { al_allowed = al_details }
-          if k == "representation" { al_allowed = al_rep }
-          al_inner = {}
-          al_inner_rest = {}
-          for_each(object!(v)) -> |ik, iv| {
-              if !includes(al_allowed, ik) || is_object(iv) || is_array(iv) {
-                  al_inner_rest = set!(al_inner_rest, [ik], iv)
-              } else if includes(al_urls, ik) {
-                  # Fail closed: a plain http(s) URL only (no whitespace, quotes, backslash,
-                  # braces, brackets, angle brackets or control characters), cut to scheme,
-                  # host and the path before its first ';' (a ;jsessionid= is a session id).
-                  al_short = ""
-                  if is_string(iv) && !match(string!(iv), r'[\s"\\{}\x5B\x5D<>\x00-\x1F\x7F]') {
-                      au, auerr = parse_url(string!(iv))
-                      if auerr == null && includes(["http", "https"], downcase(string(au.scheme) ?? "")) && is_string(au.host) && string!(au.host) != "" {
-                          al_short = downcase(string!(au.scheme)) + "://" + string!(au.host) + (string(split(string(au.path) ?? "", ";")[0]) ?? "")
-                      }
-                  }
-                  if al_short == "" {
-                      al_inner_rest = set!(al_inner_rest, [ik], iv)
-                  } else {
-                      al_inner = set!(al_inner, [ik], al_short)
-                      if al_short != iv { al_inner_rest = set!(al_inner_rest, [ik], iv) }
-                  }
-              } else {
-                  al_inner = set!(al_inner, [ik], iv)
-              }
-          }
-          al_kept = set!(al_kept, [k], al_inner)
-          if length(al_inner_rest) > 0 { al_rest = set!(al_rest, [k], al_inner_rest) }
-      } else if !includes(al_keep, k) || is_object(v) || is_array(v) {
-          al_rest = set!(al_rest, [k], v)
-      } else if includes(al_urls, k) {
-          # Fail closed: a plain http(s) URL only (no whitespace, quotes, backslash,
-          # braces, brackets, angle brackets or control characters), cut to scheme,
-          # host and the path before its first ';' (a ;jsessionid= is a session id).
-          al_short = ""
-          if is_string(v) && !match(string!(v), r'[\s"\\{}\x5B\x5D<>\x00-\x1F\x7F]') {
-              au, auerr = parse_url(string!(v))
-              if auerr == null && includes(["http", "https"], downcase(string(au.scheme) ?? "")) && is_string(au.host) && string!(au.host) != "" {
-                  al_short = downcase(string!(au.scheme)) + "://" + string!(au.host) + (string(split(string(au.path) ?? "", ";")[0]) ?? "")
-              }
-          }
-          if al_short == "" {
-              al_rest = set!(al_rest, [k], v)
-          } else {
-              al_kept = set!(al_kept, [k], al_short)
-              if al_short != v { al_rest = set!(al_rest, [k], v) }
-          }
-      } else {
-          al_kept = set!(al_kept, [k], v)
-      }
-  }
-  if length(al_rest) > 0 {
-      al_text = encode_json(al_rest)
-      al_kept.withheld_fields = {"withheld": true, "bytes": length(al_text), "sha256": sha2(al_text, variant: "SHA-256")}
-  }
-  __source_kv = al_kept
-
-  # Mapping reads only what the allowlist kept: never a withheld field.
   if shape == "json" { e = __source_kv }
   if shape == "json_log" || shape == "text" {
       top_keys = ["type", "operationType", "realmId", "realmName", "clientId", "userId", "sessionId", "ipAddress", "error", "resourceType", "resourcePath", "representation"]
@@ -243,41 +163,16 @@ parser_vrl: |
   }
 
   # ---- admin-event representation (source_normalize in field-coverage.yaml) ----
-  # The representation is JSON (a user with credentials, a client with its secret,
-  # a CredentialRepresentation {type, value}, a key provider's private key, ...).
-  # Fail closed: a parsed object moves to representation_json cut to an allowlist
-  # of non-secret scalar fields; every other field is withheld together as
-  # withheld_fields (byte length and sha256). Anything else left (an array, not
-  # JSON, or an input that already has representation_json) is withheld whole.
-  # Mapping reads only named fields (username, email, name).
-  if exists(__source_kv.representation) && !exists(__source_kv.representation_json) {
-      rv = __source_kv.representation
-      rp = null
-      if is_object(rv) {
-          rp = rv
-      } else if is_string(rv) {
-          rpp, rperr = parse_json(string!(rv))
-          if rperr == null && is_object(rpp) { rp = rpp }
-      }
-      if is_object(rp) {
-          rkeep = ["id", "username", "email", "firstName", "lastName", "enabled", "clientId", "name", "realm", "type"]
-          rkept = {}
-          rrest = {}
-          for_each(object!(rp)) -> |k, v| {
-              if includes(rkeep, k) && !is_object(v) && !is_array(v) { rkept = set!(rkept, [k], v) } else { rrest = set!(rrest, [k], v) }
-          }
-          if length(rrest) > 0 {
-              rrt = encode_json(rrest)
-              rkept.withheld_fields = {"withheld": true, "bytes": length(rrt), "sha256": sha2(rrt, variant: "SHA-256")}
-          }
+  # The representation is JSON text (the created user, client, role, ...). When
+  # it parses to an object or an array it moves, whole and parsed, to
+  # representation_json so its fields spill one by one; text that is not JSON
+  # stays as written. Never overwrites an existing representation_json.
+  if is_string(__source_kv.representation) && !exists(__source_kv.representation_json) {
+      rpp, rperr = parse_json(string!(__source_kv.representation))
+      if rperr == null && (is_object(rpp) || is_array(rpp)) {
           __discard = del(__source_kv.representation)
-          __source_kv.representation_json = rkept
+          __source_kv.representation_json = rpp
       }
-  }
-  if is_string(__source_kv.representation) || is_array(__source_kv.representation) {
-      rw = __source_kv.representation
-      rt = if is_string(rw) { string!(rw) } else { encode_json(rw) }
-      if match(rt, r'^[\s\S]') { __source_kv.representation = {"withheld": true, "bytes": length(rt), "sha256": sha2(rt, variant: "SHA-256")} }
   }
 
   if shape == "" {
@@ -294,6 +189,7 @@ parser_vrl: |
           "status_id": 0,
           "status": "Unknown",
           "time": 0,
+          "message": raw_log,
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
@@ -385,8 +281,8 @@ parser_vrl: |
           op_delete = optype == "DELETE"
           target = {}
           if path_id != "" { target.uid = path_id }
-          # The allowlisted representation fields (never anything withheld).
-          rep = object(__source_kv.representation_json) ?? {}
+          # Named representation fields (username, email, name) are mapped.
+          rep = object(__source_kv.representation_json) ?? object(__source_kv.representation) ?? {}
           rep_user = string(rep.username) ?? ""
           if rep_user != "" { target.name = rep_user }
           rep_email = string(rep.email) ?? ""
@@ -569,6 +465,8 @@ parser_vrl: |
   }
 
   # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # Values spill exactly as parsed: a parser never masks, redacts or withholds
+  # anything (masking is an opt-in pipeline step, never a parser concern).
   # __source_kv is a local variable, never an OCSF attribute. The checker instruments
   # this marker to observe the parsed source without changing production output.
   # Exact value representation is evaluated AFTER branch selection. Numeric strings
@@ -590,8 +488,8 @@ parser_vrl: |
   __mapped_json = encode_json(__mapped)
   __mapped = object!(parse_json!(__mapped_json))
   if __mapped.message == __raw_body { __discard = del(__mapped.message) }
-  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
-  __safe_json = encode_json(__safe)
+  __copy = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __copy_json = encode_json(__copy)
   # Object and array members are encodings: an empty object, an object that
   # opens with a quoted key, or an array. A lookup can ask for one only when some
   # source or existing value is an array, or a string spelling one of those
@@ -604,7 +502,7 @@ parser_vrl: |
   # Their encodings, unwrapped from the array, already are the string members.
   __represented = ""
   __nodes = __mapped
-  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+  if !match(__copy_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
       __leaves = flatten(values(flatten(__mapped)))
       __leaves_json = encode_json(__leaves)
       if match(__leaves_json, r'\x7B') {
@@ -704,41 +602,12 @@ parser_vrl: |
   )\z'
   __preserve = []
   # END parser-specific transformations
-  # Redact at every depth, including objects inside arrays, before serialization.
-  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
-  # never escapes a letter, so text without one of the words needs no walk (the
-  # test here is a superset of the key list). A key is sensitive when it holds a
-  # secret value: password, secret, authorization, token, or a credential VALUE
-  # key (credential, credentials, client_credential, credential_data / _value /
-  # _hash / _key / _blob, credentialData). Descriptive credential keys such as
-  # credential_type, credential_id, credential_name, credential_provider or
-  # credential_reads are telemetry and never redacted.
-  if match(downcase(__safe_json), r'password|secret|authorization|token|credential') {
-      __safe = map_values(__safe, recursive: true) -> |value| {
-          if is_object(value) {
-              # Header/parameter arrays commonly encode sensitive keys as name/value
-              # or Key/Value objects instead of using the secret name as an object key.
-              __sensitive_pair = false
-              for_each(object!(value)) -> |key, child| {
-                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token|(?:^|[^a-z0-9\s]|client)credentials?(?:$|[^a-z0-9_\s])|credential_?(?:data|value|val|blob|hash|key)(?:$|[^a-z0-9_\s])') {
-                      __sensitive_pair = true
-                  }
-              }
-              for_each(object!(value)) -> |key, _child| {
-                  if match(downcase(key), r'password|secret|authorization|token|(?:^|[^a-z0-9\s]|client)credentials?(?:$|[^a-z0-9_\s])|credential_?(?:data|value|val|blob|hash|key)(?:$|[^a-z0-9_\s])') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
-                      value = set!(value, [key], "<redacted>")
-                  }
-              }
-          }
-          value
-      }
-  }
   # Escape literal dots before flattening so dotted source keys cannot overwrite
   # nested paths. Decode for naming, and disambiguate collisions with suffixes.
   # In compact JSON only an object key is followed by ':', so a source whose text
   # has no '.' or '~' followed by the rest of a string and then ':' has no key to
   # escape. ('.' and '~' are never the escaped half of a JSON escape.)
-  __escaped = object!(__safe.source)
+  __escaped = object!(__copy.source)
   __tilde = false
   if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
       __escaped = map_keys(__escaped, recursive: true) -> |key| {
@@ -762,12 +631,9 @@ parser_vrl: |
       __kept = filter(__flat) -> |key, value| {
           if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
           # A key is kept unless it is consumed: by a transformation above, or as a
-          # candidate whose value is represented. Redacted leaves always remain
-          # visible. Do not spill a copy of the raw body.
+          # candidate whose value is represented. Do not spill a copy of the raw body.
           if value == __raw_body {
               false
-          } else if value == "<redacted>" {
-              true
           } else if contains(__consumed, "," + encode_json(key)) {
               false
           } else if !match(key, __candidates) {
@@ -854,7 +720,7 @@ parser_vrl: |
           }
           __token = "," + encode_json(key)
           if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
-          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+          if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")
               __key = __base
@@ -880,12 +746,12 @@ parser_vrl: |
   }
   # Keep existing derived evidence, but remove null placeholders and mapped copies.
   # Source-derived aliases are replaced by canonical dotted source paths above.
-  # Existing aggregates may contain sensitive descendants; the canonical source
-  # spill above is the authoritative representation of containers. The cheap
-  # conditions run first; the source value set is built on first use.
+  # The canonical source spill above is the authoritative representation of
+  # containers. The cheap conditions run first; the source value set is built on
+  # first use.
   __original_values = null
   for_each(flatten(__existing)) -> |key, value| {
-      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token|(?:^|[^a-z0-9\s]|client)credentials?(?:$|[^a-z0-9_\s])|credential_?(?:data|value|val|blob|hash|key)(?:$|[^a-z0-9_\s])') {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body {
           # Members for the value itself and for to_string(value), as above.
           __json = encode_json(value)
           __as_json = "," + encode_json(__json)
@@ -920,10 +786,10 @@ parser_vrl: |
           }
       }
   }
-  # Parser-declared derived evidence is merged after source spill, with recursive
-  # redaction. These entries preserve meaning beyond source scalar value equality.
+  # Parser-declared derived evidence is merged after source spill, as-is. These
+  # entries preserve meaning beyond source scalar value equality.
   for_each(__preserve) -> |_index, key| {
-      __derived = get!(object!(__safe.existing), [string!(key)])
+      __derived = get!(object!(__copy.existing), [string!(key)])
       if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
   }
   __discard = del(.unmapped)
@@ -955,14 +821,14 @@ samples:
       "activity_id": "0"
       "status_id": "0"
       "metadata.uid": "12312b733b013378f55f14570ddffed84b820c107636ce8e594ca80b61b2a626"
-  # Review fix regression: json_log_native_login_error_redaction.json
+  # Review fix regression: json_log_native_login_error_client_secret.json (kept as-is)
   - raw: "{\"timestamp\":\"2026-10-12T09:50:01.204Z\",\"sequence\":20117,\"loggerClassName\":\"org.jboss.logging.Logger\",\"loggerName\":\"org.keycloak.events\",\"level\":\"WARN\",\"message\":\"type=\\\"LOGIN_ERROR\\\", realmId=\\\"00000000-0000-0000-0000-000000000000\\\", realmName=\\\"acme\\\", clientId=\\\"web-portal\\\", userId=\\\"null\\\", ipAddress=\\\"203.0.113.45\\\", error=\\\"user_not_found\\\", auth_method=\\\"openid-connect\\\", auth_type=\\\"code\\\", redirect_uri=\\\"https://portal.example.com/callback\\\", code_id=\\\"00000000-0000-4000-8000-000000000e01\\\", username=\\\"mallory@example.com\\\", client_secret=\\\"nan-redaction-probe\\\", authSessionParentId=\\\"00000000-0000-4000-8000-000000000e01\\\", authSessionTabId=\\\"Zr4k2Lq9pVs\\\"\",\"threadName\":\"executor-thread-7\",\"threadId\":88,\"mdc\":{},\"ndc\":\"\",\"hostName\":\"kc-1\",\"processName\":\"QuarkusEntryPoint\",\"processId\":1}"
     expect:
       "class_uid": "3002"
       "status_id": "2"
       "time": "1791798601204"
       "metadata.log_level": "WARN"
-      "unmapped.client_secret": "<missing>"
+      "unmapped.client_secret": "nan-redaction-probe"
       "user.name": "mallory@example.com"
   # Review fix regression: json_log_login_ecs.json
   - raw: "{\"@timestamp\":\"2025-05-01T01:20:11.418Z\",\"event.sequence\":10233,\"log.logger\":\"org.keycloak.events\",\"log.level\":\"DEBUG\",\"message\":\"type=\\\"LOGIN\\\", realmId=\\\"00000000-0000-0000-0000-000000000000\\\", realmName=\\\"acme\\\", clientId=\\\"web-portal\\\", userId=\\\"00000000-0000-4000-8000-000000000a01\\\", sessionId=\\\"00000000-0000-4000-8000-000000000d01\\\", ipAddress=\\\"198.51.100.156\\\", auth_method=\\\"openid-connect\\\", auth_type=\\\"code\\\", response_type=\\\"code\\\", redirect_uri=\\\"https://portal.example.com/callback\\\", consent=\\\"no_consent_required\\\", code_id=\\\"00000000-0000-4000-8000-000000000d01\\\", username=\\\"alice@example.com\\\", response_mode=\\\"query\\\", authSessionParentId=\\\"00000000-0000-4000-8000-000000000d01\\\", authSessionTabId=\\\"q0U8nVZ1cXc\\\"\",\"process.thread.name\":\"executor-thread-2\",\"process.thread.id\":71,\"mdc\":{},\"ndc\":\"\",\"host.hostname\":\"kc-0\",\"process.name\":\"java\",\"process.pid\":1,\"ecs.version\":\"1.12.2\",\"data_stream.type\":\"logs\",\"service.name\":\"Keycloak\",\"service.version\":\"26.2.2\",\"service.environment\":\"prod\"}"
