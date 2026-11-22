@@ -170,10 +170,13 @@ parser_vrl: |
       status_id = 1; status_str = "Success"
   } else if tag == "LOGIN_FAILED" || tag == "SSHD_LOGIN_FAILED" || tag == "LOGIN_PAM_MAX_RETRIES" {
       route = "auth"
-      fm, fe = parse_regex(msg, r'(?:Login failed for user|authenticating user|attempts exceeded for (?:user)?|authentication failures for (?:user)?)\s*\x27?(?P<user>[^\x27\s]+)\x27?(?:\s+from host\s+\x27?(?P<src>[^\x27\s]+)\x27?)?')
+      # The optional "user" word carries its own leading whitespace, and the
+      # name needs whitespace before it, so "exceeded for user1" keeps "user1".
+      fm, fe = parse_regex(msg, r'(?:Login failed for user|authenticating user|attempts exceeded for(?:\s+user)?|authentication failures for(?:\s+user)?)\s+\x27?(?P<user>[^\x27\s]+)\x27?(?:\s+from host\s+\x27?(?P<src>[^\x27\s]+)\x27?)?')
       if fe == null {
           ev = compact(object!(fm), string: true, null: true)
-          user_name = string!(fm.user)
+          # structured-data username stays authoritative
+          if user_name == "" { user_name = string!(fm.user) }
           s = string(fm.src) ?? ""
           if is_ipv4(s) || is_ipv6(s) { src_ip = s } else if s != "" { ev.src_host = s }
       }
@@ -856,3 +859,14 @@ samples:
     expect:
       class_uid: 0
       unmapped.parse_fallback: unparsable input
+  # neon #80 r2: a username starting with "user" is not truncated
+  - raw: '<36>Mar  4 11:03:10 rtr01 login[4130]: LOGIN_PAM_MAX_RETRIES: Maximum number of authentication attempts exceeded for user1'
+    expect:
+      class_uid: 3002
+      status_id: 2
+      user.name: user1
+  # neon #80 r2: the structured-data username stays authoritative
+  - raw: '<36>1 2023-05-09T15:00:06.756+10:00 rtr01 login 4130 LOGIN_PAM_MAX_RETRIES [junos@2636.1.1.1.2.129 username="user_ops"] Maximum number of authentication attempts exceeded for user_ops'
+    expect:
+      class_uid: 3002
+      user.name: user_ops

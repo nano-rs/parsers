@@ -306,7 +306,9 @@ parser_vrl: |
           if client_pid > 0 { cproc.pid = client_pid }
           actor = { "process": cproc }
           if pid > 0 { .logon_process = proc }
-          if auth_creator != "" { . = set!(., ["unmapped", "authorization_created_by"], auth_creator) }
+          # key must not contain "authorization": the residual spill's secret
+          # filter drops any unmapped key matching it
+          if auth_creator != "" { . = set!(., ["unmapped", "authd_creator_path"], auth_creator) }
       }
   } else if route == "tcc" {
       . = merge(base, {
@@ -864,3 +866,8 @@ samples:
     expect:
       class_uid: 0
       unmapped.parse_fallback: "not a unified log ndjson object"
+  # neon #80 r2: the authorization creator survives the residual spill filter
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%{public}s\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.Authorization\", \"category\": \"authd\", \"threadID\": 871, \"senderImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"backtrace\": {\"frames\": [{\"imageOffset\": 0, \"imageUUID\": \"00000000-0000-0000-0000-000000000000\"}]}, \"bootUUID\": \"00000000-0000-0000-0000-000000000000\", \"processImagePath\": \"/System/Library/Frameworks/Security.framework/Versions/A/XPCServices/authd.xpc/Contents/MacOS/authd\", \"senderImagePath\": \"/System/Library/Frameworks/Security.framework/Versions/A/XPCServices/authd.xpc/Contents/MacOS/authd\", \"timestamp\": \"2026-11-02 08:20:00.000100-0700\", \"machTimestamp\": 0, \"eventMessage\": \"Succeeded authorizing right 'system.preferences.security' by client '/System/Applications/System Settings.app' [811] for authorization created by '/usr/libexec/securityd' [120] (3,0) (engine 412)\", \"processImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"traceID\": 0, \"processID\": 290, \"senderProgramCounter\": 0, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 3002
+      unmapped.authd_creator_path: /usr/libexec/securityd

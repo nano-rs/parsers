@@ -251,7 +251,9 @@ parser_vrl: |
               method = string!(cm.method)
               if match(method, r'^(?i)(?:console|con\d*|vty\d*|aux\d*|tty\d*)$') { terminal = method }
           }
-          if cm.src_ip != null { src.ip = cm.src_ip } else { src.name = terminal }
+          # no address and no line (e.g. "from memory by admin"): leave src
+          # empty so the device-as-source fallback below fills it
+          if cm.src_ip != null { src.ip = cm.src_ip } else if terminal != "" { src.name = terminal }
       }
   } else if tagged && facility == "PARSER" && mnemonic == "CFGLOG_LOGGEDCMD" {
       gm, ge = parse_regex(msg, r'^User:\s*(?P<user>.+?)\s+logged command:\s*(?P<command>.*?)\s*$')
@@ -1007,3 +1009,9 @@ samples:
     expect:
       class_uid: 0
       unmapped.parse_fallback: unparsable input
+  # neon #80 r2: no line and no address leaves the device as the source
+  - raw: '<189>42: rtr01: *Mar  1 00:01:00.000: %SYS-5-CONFIG_I: Configured from memory by admin'
+    expect:
+      class_uid: 6003
+      actor.user.name: admin
+      src_endpoint.hostname: rtr01

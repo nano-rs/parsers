@@ -35,13 +35,25 @@ parser_vrl: |
   level = ""
   msg = raw_log
 
+  # ---- RFC 3339 syslog forwarders (rsyslog) put a hostname after the clock:
+  # `<38>2024-01-15T10:23:45.123Z web-01 fail2ban.actions: ...`. Lift the host
+  # out so the header below sees the plain fail2ban.log shape. A token that is
+  # itself fail2ban's daemon/logger name is never taken as the host.
+  header_input = raw_log
+  im, ie = parse_regex(raw_log, r'^(?P<pre>(?:<\d{1,3}>)?\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[,.]\d{1,9})?(?:Z|[+-]\d{2}:?\d{2})?\s+)(?P<iso_host>[^\s\x5B:]+)\s+(?P<rest>fail2ban.*)$')
+  if ie == null && !starts_with(string!(im.iso_host), "fail2ban") {
+      host = string!(im.iso_host)
+      header_input = string!(im.pre) + string!(im.rest)
+  }
+
   # ---- header: ISO clock (fail2ban.log), BSD syslog or the short journal form ----
-  hm, he = parse_regex(raw_log, r'^(?:<(?P<pri>\d{1,3})>)?(?:(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[,.]\d{1,9})?(?:Z|[+-]\d{2}:?\d{2})?)\s+|(?P<syslog_ts>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(?P<host>[^\s\x5B]+)\s+|(?P<jhost>[A-Za-z0-9._-]+)\s+(?P<jdaemon>fail2ban(?:-server)?)\x5B(?P<jpid>\d+)\x5D:\s+)?(?:(?P<daemon>fail2ban(?:-server)?)(?:\x5B(?P<daemon_pid>\d+)\x5D)?:\s+)?(?:(?P<logger>fail2ban\.[A-Za-z0-9_.]+)\s*(?:\x5B(?P<pid>\d+)\x5D)?:\s+(?P<level>[A-Z]+)\s+)?(?P<msg>.*)$')
+  hm, he = parse_regex(header_input, r'^(?:<(?P<pri>\d{1,3})>)?(?:(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[,.]\d{1,9})?(?:Z|[+-]\d{2}:?\d{2})?)\s+|(?P<syslog_ts>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(?P<host>[^\s\x5B]+)\s+|(?P<jhost>[A-Za-z0-9._-]+)\s+(?P<jdaemon>fail2ban(?:-server)?)\x5B(?P<jpid>\d+)\x5D:\s+)?(?:(?P<daemon>fail2ban(?:-server)?)(?:\x5B(?P<daemon_pid>\d+)\x5D)?:\s+)?(?:(?P<logger>fail2ban\.[A-Za-z0-9_.]+)\s*(?:\x5B(?P<pid>\d+)\x5D)?:\s+(?P<level>[A-Z]+)\s+)?(?P<msg>.*)$')
   if he == null {
       hdr = compact(object!(hm), string: true, null: true)
       __d = del(hdr.msg)
       if hm.ts != null || hm.syslog_ts != null || hm.jdaemon != null || hm.daemon != null || hm.logger != null {
           header_ok = true
+          if host != "" { hdr.host = host }
           __source_kv.header = hdr
           msg = string(hm.msg) ?? ""
           if hm.host != null { host = string!(hm.host) }
@@ -658,3 +670,13 @@ samples:
     expect:
       class_uid: 0
       unmapped.parse_fallback: unparsable input
+  # neon #80 r2: RFC 3339 forwarded syslog keeps the hostname and the finding
+  - raw: '<38>2024-01-15T10:23:45.123Z web-01.example.com fail2ban.actions: NOTICE [sshd] Ban 192.0.2.11'
+    expect:
+      class_uid: 2004
+      device.hostname: web-01.example.com
+      time: 1705314225123
+  - raw: '<38>2024-01-15T10:23:45+00:00 web-01.example.com fail2ban-server[99]: fail2ban.actions [1234]: NOTICE [sshd] Unban 192.0.2.11'
+    expect:
+      class_uid: 2004
+      device.hostname: web-01.example.com
