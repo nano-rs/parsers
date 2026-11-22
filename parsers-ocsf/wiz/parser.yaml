@@ -694,23 +694,44 @@ parser_vrl: |
       }
   }
   __consumed = ""
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
   # BEGIN parser-specific transformations
   # createdAt: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # analyzedAt: Successful ISO timestamp conversion to the emitted millisecond clock.
   # issue.created: Successful ISO timestamp conversion to the emitted millisecond clock.
   # updatedAt: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # firstDetectedAt: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # firstSeenAt: Successful ISO timestamp conversion to the emitted millisecond clock.
   # timeframe.start: Successful ISO timestamp conversion to the emitted millisecond clock.
   # lastDetectedAt: Successful ISO timestamp conversion to the emitted millisecond clock.
   # timeframe.end: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # resolvedAt: A resolved issue's resolution time is its last-seen time; consume only when emitted.
   # severity: The Wiz severity normalized to the OCSF severity; consume only when the expected ID is emitted.
   # issue.severity: The webhook issue severity normalized to the OCSF severity; consume only when the expected ID is emitted.
   # status: The Wiz status normalized to the OCSF finding status; consume only when the expected ID is emitted.
   # issue.status: The webhook issue status normalized to the OCSF finding status; consume only when the expected ID is emitted.
   # trigger.type: The webhook trigger type drives the OCSF activity; consume only when that activity is emitted.
   # result: The configuration check result normalized to the OCSF compliance status; consume only when the expected ID is emitted.
-  for_each(flatten(__source_kv)) -> |key, value| {
+  for_each(__flat) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
         createdAt
+      | analyzedAt
       | issue\.created
       )\z') {
           __value = value
@@ -733,7 +754,9 @@ parser_vrl: |
       }
       if match(key, r'(?x)
       \A(?:
-        timeframe\.start
+        firstDetectedAt
+      | firstSeenAt
+      | timeframe\.start
       )\z') {
           __value = value
           __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
@@ -746,6 +769,7 @@ parser_vrl: |
       \A(?:
         lastDetectedAt
       | timeframe\.end
+      | resolvedAt
       )\z') {
           __value = value
           __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
@@ -809,28 +833,13 @@ parser_vrl: |
   __decl = "\n\"CVEDescription\"\t[\"vulnerabilities.cve.desc\"]\n\"control.description\"\t[\"finding_info.desc\"]\n\"control.id\"\t[\"finding_info.analytic.uid\"]\n\"control.name\"\t[\"finding_info.analytic.name\",\"finding_info.title\",\"message\"]\n\"control.resolutionRecommendation\"\t[\"remediation.desc\"]\n\"dataSourceName\"\t[\"finding_info.data_sources\"]\n\"description\"\t[\"finding_info.desc\",\"vulnerabilities.desc\"]\n\"entitySnapshot.cloudPlatform\"\t[\"cloud.provider\",\"resources.provider\"]\n\"entitySnapshot.id\"\t[\"resources.uid\"]\n\"entitySnapshot.name\"\t[\"resources.name\"]\n\"entitySnapshot.providerId\"\t[\"resources.uid_alt\"]\n\"entitySnapshot.region\"\t[\"cloud.region\",\"resources.region\"]\n\"entitySnapshot.subscriptionExternalId\"\t[\"cloud.account.uid\"]\n\"entitySnapshot.subscriptionName\"\t[\"cloud.account.name\"]\n\"entitySnapshot.type\"\t[\"resources.type\"]\n\"epssPercentile\"\t[\"vulnerabilities.cve.epss.percentile\"]\n\"epssProbability\"\t[\"vulnerabilities.cve.epss.score\"]\n\"hasExploit\"\t[\"vulnerabilities.is_exploit_available\"]\n\"id\"\t[\"finding_info.uid\",\"metadata.original_event_uid\",\"metadata.uid\",\"resource.uid\",\"resources.uid\"]\n\"issue.id\"\t[\"finding_info.uid\",\"metadata.original_event_uid\",\"metadata.uid\"]\n\"link\"\t[\"vulnerabilities.references\"]\n\"mitreTactics\"\t[\"finding_info.attacks.tactic.uid\"]\n\"mitreTechniques\"\t[\"finding_info.attacks.sub_technique.uid\"]\n\"name\"\t[\"finding_info.title\",\"message\",\"vulnerabilities.cve.uid\",\"vulnerabilities.title\"]\n\"origins\"\t[\"finding_info.data_sources\"]\n\"portalUrl\"\t[\"finding_info.src_url\"]\n\"primaryActor.email\"\t[\"actor.user.email_addr\"]\n\"primaryActor.id\"\t[\"actor.user.uid\"]\n\"primaryActor.name\"\t[\"actor.user.name\"]\n\"primaryResource.cloudAccount.cloudPlatform\"\t[\"cloud.provider\",\"resources.provider\"]\n\"primaryResource.cloudAccount.externalId\"\t[\"cloud.account.uid\"]\n\"primaryResource.externalId\"\t[\"resources.uid_alt\"]\n\"primaryResource.id\"\t[\"resources.uid\"]\n\"primaryResource.kubernetesNamespaceName\"\t[\"resources.namespace\"]\n\"primaryResource.name\"\t[\"resources.name\"]\n\"primaryResource.providerUniqueId\"\t[\"resources.uid_alt\"]\n\"primaryResource.region\"\t[\"cloud.region\",\"resources.region\"]\n\"primaryResource.type\"\t[\"resources.type\"]\n\"remediation\"\t[\"remediation.desc\",\"vulnerabilities.remediation.desc\"]\n\"resource.cloudPlatform\"\t[\"cloud.provider\",\"resources.provider\"]\n\"resource.externalId\"\t[\"resources.uid_alt\"]\n\"resource.id\"\t[\"resource.uid\",\"resources.uid\"]\n\"resource.name\"\t[\"resource.name\",\"resources.name\"]\n\"resource.providerId\"\t[\"resource.uid_alt\",\"resources.uid_alt\"]\n\"resource.region\"\t[\"cloud.region\",\"resources.region\"]\n\"resource.subscription.cloudProvider\"\t[\"cloud.provider\",\"resource.provider\",\"resources.provider\"]\n\"resource.subscription.externalId\"\t[\"cloud.account.uid\"]\n\"resource.subscription.name\"\t[\"cloud.account.name\"]\n\"resource.subscriptionId\"\t[\"cloud.account.uid\"]\n\"resource.subscriptionName\"\t[\"cloud.account.name\"]\n\"resource.type\"\t[\"resource.type\",\"resources.type\"]\n\"result\"\t[\"compliance.status\"]\n\"rule.description\"\t[\"finding_info.desc\"]\n\"rule.id\"\t[\"finding_info.analytic.uid\"]\n\"rule.name\"\t[\"finding_info.analytic.name\",\"finding_info.title\",\"message\"]\n\"rule.remediationInstructions\"\t[\"remediation.desc\"]\n\"rule.shortId\"\t[\"compliance.control\"]\n\"ruleMatch.rule.id\"\t[\"finding_info.analytic.uid\"]\n\"ruleMatch.rule.name\"\t[\"finding_info.analytic.name\",\"finding_info.title\",\"message\"]\n\"tdrId\"\t[\"finding_info.analytic.uid\"]\n\"tdrSource\"\t[\"finding_info.data_sources\"]\n\"threatId\"\t[\"finding_info.uid_alt\"]\n\"threatURL\"\t[\"finding_info.src_url\"]\n\"title\"\t[\"finding_info.analytic.name\",\"finding_info.title\",\"message\"]\n\"trigger.ruleName\"\t[\"metadata.product.feature.name\"]\n\"triggeringEvent.actorIP\"\t[\"evidences.src_endpoint.ip\"]\n\"triggeringEvent.actorIPMeta.autonomousSystemNumber\"\t[\"evidences.src_endpoint.autonomous_system.number\"]\n\"triggeringEvent.actorIPMeta.autonomousSystemOrganization\"\t[\"evidences.src_endpoint.autonomous_system.name\"]\n\"triggeringEvent.actorIPMeta.country\"\t[\"evidences.src_endpoint.location.country\"]\n\"triggeringEvent.id\"\t[\"evidences.uid\"]\n\"triggeringEvent.name\"\t[\"evidences.name\"]\n\"type\"\t[\"finding_info.types\"]\n\"vendorSeverity\"\t[\"vulnerabilities.severity\"]\n\"vulnerableAsset.cloudPlatform\"\t[\"cloud.provider\",\"resource.provider\",\"resources.provider\"]\n\"vulnerableAsset.id\"\t[\"device.uid\",\"resource.uid\",\"resources.uid\"]\n\"vulnerableAsset.ipAddresses\"\t[\"device.ip\",\"resource.ip\",\"resources.ip\"]\n\"vulnerableAsset.name\"\t[\"device.name\",\"resource.name\",\"resources.name\"]\n\"vulnerableAsset.operatingSystem\"\t[\"device.os.name\"]\n\"vulnerableAsset.providerUniqueId\"\t[\"resource.uid_alt\",\"resources.uid_alt\"]\n\"vulnerableAsset.region\"\t[\"cloud.region\",\"resource.region\",\"resources.region\"]\n\"vulnerableAsset.subscriptionExternalId\"\t[\"cloud.account.uid\"]\n\"vulnerableAsset.subscriptionName\"\t[\"cloud.account.name\"]\n\"vulnerableAsset.type\"\t[\"resource.type\",\"resources.type\"]\n"
   __preserve = []
   # END parser-specific transformations
-  # Escape literal dots before flattening so dotted source keys cannot overwrite
-  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
-  # In compact JSON only an object key is followed by ':', so a source whose text
-  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
-  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
-  __escaped = object!(__copy.source)
-  __tilde = false
-  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
-      __escaped = map_keys(__escaped, recursive: true) -> |key| {
-          replace(replace(key, "~", "~0"), ".", "~1")
-      }
-      # Keys without a "~" decode to themselves, including the object keys inside
-      # an array that flatten leaves escaped; encode_json never escapes a "~".
-      __tilde = contains(encode_json(__escaped), "~")
-  }
-  __flat = flatten(__escaped)
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
   # target paths + "\n" per mapped source key (a raw newline never occurs in
   # compact JSON). A key is consumed when its value, or every element of a scalar
-  # array, is at one of its own targets.
+  # array, is at one of its own targets. Keys stay ESCAPED here and in __consumed:
+  # a literal dotted key ("a~1b") and the nested path ("a.b") are different
+  # fields, and mapping one never consumes the other.
   for_each(__flat) -> |key, value| {
-      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
       # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
       __kt = encode_json(key)
       if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
@@ -868,7 +877,6 @@ parser_vrl: |
   __names = {}
   if __distinct {
       __kept = filter(__flat) -> |key, value| {
-          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
           # A key is kept unless an explicit mapping or transformation consumed it.
           # Do not spill a copy of the raw body.
           value != __raw_body && !contains(__consumed, "," + encode_json(key))
@@ -902,13 +910,13 @@ parser_vrl: |
       # Slow path, in source key order: a name already taken gets the next free
       # _2, _3, ... suffix.
       for_each(__flat) -> |key, value| {
+          __token = "," + encode_json(key)
           key = replace(replace(key, "~1", "."), "~0", "~")
           if is_array(value) || is_object(value) {
               value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
                   replace(replace(inner, "~1", "."), "~0", "~")
               }, ["v"])
           }
-          __token = "," + encode_json(key)
           if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")

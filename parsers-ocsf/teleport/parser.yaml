@@ -533,13 +533,30 @@ parser_vrl: |
       }
   }
   __consumed = ""
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
   # BEGIN parser-specific transformations
   # time: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # session_start: Successful ISO timestamp conversion of the session start to the emitted millisecond clock.
   # method: The SSO connector type normalized to the OCSF auth protocol; consume only when the expected ID is emitted.
   # verb: The Kubernetes verb drives the API Activity; the method itself also lands in http_request.http_method.
   # action: The scp direction or Teleport SFTPAction number drives the File System Activity; consume only when that activity is emitted.
   # success: The success flag is the OCSF status; consume only when the expected ID is emitted.
-  for_each(flatten(__source_kv)) -> |key, value| {
+  for_each(__flat) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
         time
@@ -549,6 +566,17 @@ parser_vrl: |
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
               if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        session_start
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__repr, "," + "\"session.created_time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
           }
       }
       if match(key, r'(?x)
@@ -601,31 +629,16 @@ parser_vrl: |
       }
   }
   # Declared source -> target mappings (field-coverage.yaml `mappings`).
-  __decl = "\n\"addr.local\"\t[\"dst_endpoint.ip\"]\n\"addr.remote\"\t[\"src_endpoint.ip\"]\n\"attributes.email\"\t[\"user.email_addr\"]\n\"attributes.groups\"\t[\"user.groups.name\"]\n\"cert_type\"\t[\"api.request.flags\"]\n\"cluster_name\"\t[\"metadata.log_provider\",\"service.name\"]\n\"code\"\t[\"metadata.event_code\"]\n\"command\"\t[\"process.cmd_line\"]\n\"connector\"\t[\"user.domain\"]\n\"db_service\"\t[\"service.name\"]\n\"db_user\"\t[\"user.name\"]\n\"error\"\t[\"status_detail\"]\n\"event\"\t[\"message\"]\n\"exitCode\"\t[\"exit_code\"]\n\"exitError\"\t[\"status_detail\"]\n\"id\"\t[\"resources.uid\"]\n\"identity.user\"\t[\"actor.user.name\"]\n\"kubernetes_cluster\"\t[\"device.name\"]\n\"login\"\t[\"actor.user.account.name\",\"process.user.name\",\"user.name\"]\n\"message\"\t[\"message\"]\n\"name\"\t[\"entity.name\",\"user.name\"]\n\"path\"\t[\"file.path\",\"process.file.path\"]\n\"pid\"\t[\"process.pid\"]\n\"ppid\"\t[\"process.parent_process.pid\"]\n\"program\"\t[\"process.name\"]\n\"proto\"\t[\"api.service.name\"]\n\"request_path\"\t[\"http_request.url.path\"]\n\"resource_kind\"\t[\"resources.type\"]\n\"resource_name\"\t[\"resources.name\"]\n\"resource_namespace\"\t[\"resources.namespace\"]\n\"response_code\"\t[\"http_response.code\"]\n\"return_code\"\t[\"exit_code\"]\n\"roles\"\t[\"privileges\"]\n\"server_hostname\"\t[\"device.hostname\",\"dst_endpoint.hostname\"]\n\"server_id\"\t[\"device.uid\",\"dst_endpoint.uid\"]\n\"sid\"\t[\"actor.session.uid\",\"metadata.correlation_uid\",\"process.session.uid\",\"session.uid\"]\n\"state\"\t[\"status_code\"]\n\"uid\"\t[\"metadata.uid\"]\n\"updated_by\"\t[\"actor.user.name\"]\n\"user\"\t[\"actor.user.name\",\"user.name\"]\n"
+  __decl = "\n\"addr~1local\"\t[\"dst_endpoint.ip\"]\n\"addr~1remote\"\t[\"src_endpoint.ip\"]\n\"attributes.email\"\t[\"user.email_addr\"]\n\"attributes.groups\"\t[\"user.groups.name\"]\n\"cert_type\"\t[\"api.request.flags\"]\n\"cluster_name\"\t[\"metadata.log_provider\",\"service.name\"]\n\"code\"\t[\"metadata.event_code\"]\n\"command\"\t[\"process.cmd_line\"]\n\"connector\"\t[\"user.domain\"]\n\"db_service\"\t[\"service.name\"]\n\"db_user\"\t[\"user.name\"]\n\"error\"\t[\"status_detail\"]\n\"event\"\t[\"api.operation\",\"message\"]\n\"exitCode\"\t[\"exit_code\"]\n\"exitError\"\t[\"status_detail\"]\n\"id\"\t[\"resources.uid\"]\n\"identity.user\"\t[\"actor.user.name\"]\n\"kubernetes_cluster\"\t[\"device.name\"]\n\"login\"\t[\"actor.user.account.name\",\"process.user.name\",\"user.name\"]\n\"message\"\t[\"message\"]\n\"name\"\t[\"entity.name\",\"user.name\"]\n\"path\"\t[\"file.path\",\"process.file.path\"]\n\"pid\"\t[\"process.pid\"]\n\"ppid\"\t[\"process.parent_process.pid\"]\n\"program\"\t[\"process.name\"]\n\"proto\"\t[\"api.service.name\"]\n\"request_path\"\t[\"http_request.url.path\"]\n\"resource_kind\"\t[\"resources.type\"]\n\"resource_name\"\t[\"resources.name\"]\n\"resource_namespace\"\t[\"resources.namespace\"]\n\"response_code\"\t[\"http_response.code\"]\n\"return_code\"\t[\"exit_code\"]\n\"roles\"\t[\"privileges\"]\n\"server_hostname\"\t[\"device.hostname\",\"dst_endpoint.hostname\"]\n\"server_id\"\t[\"device.uid\",\"dst_endpoint.uid\"]\n\"sid\"\t[\"actor.session.uid\",\"metadata.correlation_uid\",\"process.session.uid\",\"session.uid\"]\n\"state\"\t[\"status_code\"]\n\"uid\"\t[\"metadata.uid\"]\n\"updated_by\"\t[\"actor.user.name\"]\n\"user\"\t[\"actor.user.name\",\"user.name\"]\n"
   __preserve = []
   # END parser-specific transformations
-  # Escape literal dots before flattening so dotted source keys cannot overwrite
-  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
-  # In compact JSON only an object key is followed by ':', so a source whose text
-  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
-  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
-  __escaped = object!(__copy.source)
-  __tilde = false
-  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
-      __escaped = map_keys(__escaped, recursive: true) -> |key| {
-          replace(replace(key, "~", "~0"), ".", "~1")
-      }
-      # Keys without a "~" decode to themselves, including the object keys inside
-      # an array that flatten leaves escaped; encode_json never escapes a "~".
-      __tilde = contains(encode_json(__escaped), "~")
-  }
-  __flat = flatten(__escaped)
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
   # target paths + "\n" per mapped source key (a raw newline never occurs in
   # compact JSON). A key is consumed when its value, or every element of a scalar
-  # array, is at one of its own targets.
+  # array, is at one of its own targets. Keys stay ESCAPED here and in __consumed:
+  # a literal dotted key ("a~1b") and the nested path ("a.b") are different
+  # fields, and mapping one never consumes the other.
   for_each(__flat) -> |key, value| {
-      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
       # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
       __kt = encode_json(key)
       if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
@@ -663,7 +676,6 @@ parser_vrl: |
   __names = {}
   if __distinct {
       __kept = filter(__flat) -> |key, value| {
-          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
           # A key is kept unless an explicit mapping or transformation consumed it.
           # Do not spill a copy of the raw body.
           value != __raw_body && !contains(__consumed, "," + encode_json(key))
@@ -697,13 +709,13 @@ parser_vrl: |
       # Slow path, in source key order: a name already taken gets the next free
       # _2, _3, ... suffix.
       for_each(__flat) -> |key, value| {
+          __token = "," + encode_json(key)
           key = replace(replace(key, "~1", "."), "~0", "~")
           if is_array(value) || is_object(value) {
               value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
                   replace(replace(inner, "~1", "."), "~0", "~")
               }, ["v"])
           }
-          __token = "," + encode_json(key)
           if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")

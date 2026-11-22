@@ -112,13 +112,15 @@ def check(source, output, raw, rules, consumed=(), mappings=None):
     assert 'unmapped' not in output or residual, 'empty unmapped'
     index = leaf_index(mapped_view(output, raw))
     mappings = mappings or {}
-    fields = list(flatten(source))
+    # Escaped keys: a literal dotted key ("a~1b") and the nested path ("a.b")
+    # are different fields, mapped and spilled independently.
+    fields = list(provenance.esc_flatten(source))
     used = set()
     for key, value in fields:
         if key in consumed or any(at(index, target, value) for target in mappings.get(key, ())) or any(r['source'] == key and transformed(r, value, index) for r in rules):
             continue
         if value == raw: continue
-        base = '.'.join(snake(part) for part in key.split('.'))
+        base = '.'.join(snake(provenance.unesc(part)) for part in key.split('.'))
         matched = False
         for slot, actual in residual.items():
             if slot in used or not (slot == base or re.fullmatch(re.escape(base)+r'_\d+', slot)): continue
@@ -612,7 +614,9 @@ def verify_provenance(path, program, samples, outputs_sources, mappings, rules):
     sources = [s for _, _, _, s in real]
     outputs = [o for _, _, o, _ in real]
     items = [(key, None) for key in mappings] + [(rule['source'], rule) for rule in rules]
-    found = provenance.probe(program, samples, sources, outputs, items, per_key=12)
+    declared = {(key, None): targets for key, targets in mappings.items()}
+    declared.update({(rule['source'], id(rule)): [norm_path(rule['target'])] for rule in rules})
+    found = provenance.probe(program, samples, sources, outputs, items, per_key=40, declared=declared)
     missing = []
     for key, targets in mappings.items():
         for target in targets:

@@ -596,6 +596,22 @@ parser_vrl: |
       }
   }
   __consumed = ""
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
   # BEGIN parser-specific transformations
   # computer: Parser lowercases this source value; consume only when the normalized value is emitted.
   # computer: Parser lowercases this source value; consume only when the normalized value is emitted.
@@ -606,9 +622,11 @@ parser_vrl: |
   # event_data.QueryName: Parser lowercases this source value; consume only when the normalized value is emitted.
   # timestamp: Successful ISO timestamp conversion to the selected event clock in milliseconds.
   # time_created: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # event_data.UtcTime: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # event_data.CreationUtcTime: Successful ISO timestamp conversion to the selected event clock in milliseconds.
   # event_data.Protocol: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
   # event_data.GrantedAccess: Parsed hexadecimal process ID or access mask is represented as an integer at this destination.
-  for_each(flatten(__source_kv)) -> |key, value| {
+  for_each(__flat) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
         computer
@@ -674,12 +692,24 @@ parser_vrl: |
       \A(?:
         timestamp
       | time_created
+      | event_data\.UtcTime
       )\z') {
           __value = value
           __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
               if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        event_data\.CreationUtcTime
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__repr, "," + "\"file.created_time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
           }
       }
       if match(key, r'(?x)
@@ -712,31 +742,16 @@ parser_vrl: |
       __consumed = __consumed + ("," + encode_json(key))
   }
   # Declared source -> target mappings (field-coverage.yaml `mappings`).
-  __decl = "\n\"channel\"\t[\"metadata.log_name\"]\n\"event_data.CommandLine\"\t[\"actor.process.cmd_line\",\"process.cmd_line\"]\n\"event_data.DestinationHostname\"\t[\"dst_endpoint.hostname\"]\n\"event_data.DestinationIp\"\t[\"dst_endpoint.ip\"]\n\"event_data.DestinationPort\"\t[\"dst_endpoint.port\"]\n\"event_data.DestinationPortName\"\t[\"dst_endpoint.svc_name\"]\n\"event_data.Details\"\t[\"reg_value.data\"]\n\"event_data.Image\"\t[\"actor.process.file.path\",\"process.file.path\"]\n\"event_data.ImageLoaded\"\t[\"module.file.path\"]\n\"event_data.IntegrityLevel\"\t[\"process.integrity\"]\n\"event_data.ParentCommandLine\"\t[\"actor.process.cmd_line\",\"actor.process.parent_process.cmd_line\"]\n\"event_data.ParentImage\"\t[\"actor.process.file.path\",\"actor.process.parent_process.file.name\",\"actor.process.parent_process.file.path\",\"actor.process.parent_process.name\"]\n\"event_data.ParentProcessGuid\"\t[\"actor.process.parent_process.uid\",\"actor.process.uid\"]\n\"event_data.ParentProcessId\"\t[\"actor.process.parent_process.pid\",\"actor.process.pid\"]\n\"event_data.ParentUser\"\t[\"actor.process.parent_process.user.name\",\"actor.process.user.name\"]\n\"event_data.ProcessGuid\"\t[\"actor.process.uid\",\"process.uid\"]\n\"event_data.ProcessId\"\t[\"actor.process.pid\",\"process.pid\"]\n\"event_data.QueryName\"\t[\"query.hostname\"]\n\"event_data.QueryResults\"\t[\"answers.rdata\"]\n\"event_data.Signature\"\t[\"module.file.signatures.developer_uid\"]\n\"event_data.SignatureStatus\"\t[\"module.file.signatures.state\"]\n\"event_data.SourceImage\"\t[\"actor.process.file.path\"]\n\"event_data.SourceIp\"\t[\"src_endpoint.ip\"]\n\"event_data.SourcePort\"\t[\"src_endpoint.port\"]\n\"event_data.SourcePortName\"\t[\"src_endpoint.svc_name\"]\n\"event_data.SourceProcessGUID\"\t[\"actor.process.uid\"]\n\"event_data.SourceProcessId\"\t[\"actor.process.pid\"]\n\"event_data.SourceThreadId\"\t[\"actor.process.ptid\"]\n\"event_data.SourceUser\"\t[\"actor.process.user.name\"]\n\"event_data.TargetFilename\"\t[\"file.path\"]\n\"event_data.TargetImage\"\t[\"process.file.path\"]\n\"event_data.TargetObject\"\t[\"reg_key.path\"]\n\"event_data.TargetProcessGUID\"\t[\"process.uid\"]\n\"event_data.TargetProcessId\"\t[\"process.pid\"]\n\"event_data.TargetUser\"\t[\"process.user.name\"]\n\"event_id\"\t[\"metadata.event_code\"]\n\"provider_name\"\t[\"metadata.log_provider\"]\n\"record_id\"\t[\"metadata.original_event_uid\"]\n"
+  __decl = "\n\"channel\"\t[\"metadata.log_name\"]\n\"computer\"\t[\"device.hostname\"]\n\"event_data.CommandLine\"\t[\"actor.process.cmd_line\",\"process.cmd_line\"]\n\"event_data.DestinationHostname\"\t[\"dst_endpoint.hostname\"]\n\"event_data.DestinationIp\"\t[\"dst_endpoint.ip\"]\n\"event_data.DestinationPort\"\t[\"dst_endpoint.port\"]\n\"event_data.DestinationPortName\"\t[\"dst_endpoint.svc_name\"]\n\"event_data.Details\"\t[\"reg_value.data\"]\n\"event_data.Image\"\t[\"actor.process.file.path\",\"process.file.path\"]\n\"event_data.ImageLoaded\"\t[\"module.file.path\"]\n\"event_data.IntegrityLevel\"\t[\"process.integrity\"]\n\"event_data.ParentCommandLine\"\t[\"actor.process.cmd_line\",\"actor.process.parent_process.cmd_line\"]\n\"event_data.ParentImage\"\t[\"actor.process.file.path\",\"actor.process.parent_process.file.path\"]\n\"event_data.ParentProcessGuid\"\t[\"actor.process.parent_process.uid\",\"actor.process.uid\"]\n\"event_data.ParentProcessId\"\t[\"actor.process.parent_process.pid\",\"actor.process.pid\"]\n\"event_data.ParentUser\"\t[\"actor.process.parent_process.user.name\",\"actor.process.user.name\"]\n\"event_data.ProcessGuid\"\t[\"actor.process.uid\",\"process.uid\"]\n\"event_data.ProcessId\"\t[\"actor.process.pid\",\"process.pid\"]\n\"event_data.QueryName\"\t[\"query.hostname\"]\n\"event_data.QueryResults\"\t[\"answers.rdata\"]\n\"event_data.Signature\"\t[\"module.file.signatures.developer_uid\"]\n\"event_data.SignatureStatus\"\t[\"module.file.signatures.state\"]\n\"event_data.SourceImage\"\t[\"actor.process.file.path\"]\n\"event_data.SourceIp\"\t[\"src_endpoint.ip\"]\n\"event_data.SourcePort\"\t[\"src_endpoint.port\"]\n\"event_data.SourcePortName\"\t[\"src_endpoint.svc_name\"]\n\"event_data.SourceProcessGUID\"\t[\"actor.process.uid\"]\n\"event_data.SourceProcessId\"\t[\"actor.process.pid\"]\n\"event_data.SourceThreadId\"\t[\"actor.process.ptid\"]\n\"event_data.SourceUser\"\t[\"actor.process.user.name\"]\n\"event_data.TargetFilename\"\t[\"file.path\"]\n\"event_data.TargetImage\"\t[\"process.file.path\"]\n\"event_data.TargetObject\"\t[\"reg_key.path\"]\n\"event_data.TargetProcessGUID\"\t[\"process.uid\"]\n\"event_data.TargetProcessId\"\t[\"process.pid\"]\n\"event_data.TargetUser\"\t[\"process.user.name\"]\n\"event_data.User\"\t[\"actor.user.name\"]\n\"event_id\"\t[\"metadata.event_code\"]\n\"provider_name\"\t[\"metadata.log_provider\"]\n\"record_id\"\t[\"metadata.original_event_uid\"]\n"
   __preserve = []
   # END parser-specific transformations
-  # Escape literal dots before flattening so dotted source keys cannot overwrite
-  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
-  # In compact JSON only an object key is followed by ':', so a source whose text
-  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
-  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
-  __escaped = object!(__copy.source)
-  __tilde = false
-  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
-      __escaped = map_keys(__escaped, recursive: true) -> |key| {
-          replace(replace(key, "~", "~0"), ".", "~1")
-      }
-      # Keys without a "~" decode to themselves, including the object keys inside
-      # an array that flatten leaves escaped; encode_json never escapes a "~".
-      __tilde = contains(encode_json(__escaped), "~")
-  }
-  __flat = flatten(__escaped)
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
   # target paths + "\n" per mapped source key (a raw newline never occurs in
   # compact JSON). A key is consumed when its value, or every element of a scalar
-  # array, is at one of its own targets.
+  # array, is at one of its own targets. Keys stay ESCAPED here and in __consumed:
+  # a literal dotted key ("a~1b") and the nested path ("a.b") are different
+  # fields, and mapping one never consumes the other.
   for_each(__flat) -> |key, value| {
-      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
       # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
       __kt = encode_json(key)
       if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
@@ -774,7 +789,6 @@ parser_vrl: |
   __names = {}
   if __distinct {
       __kept = filter(__flat) -> |key, value| {
-          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
           # A key is kept unless an explicit mapping or transformation consumed it.
           # Do not spill a copy of the raw body.
           value != __raw_body && !contains(__consumed, "," + encode_json(key))
@@ -808,13 +822,13 @@ parser_vrl: |
       # Slow path, in source key order: a name already taken gets the next free
       # _2, _3, ... suffix.
       for_each(__flat) -> |key, value| {
+          __token = "," + encode_json(key)
           key = replace(replace(key, "~1", "."), "~0", "~")
           if is_array(value) || is_object(value) {
               value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
                   replace(replace(inner, "~1", "."), "~0", "~")
               }, ["v"])
           }
-          __token = "," + encode_json(key)
           if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")

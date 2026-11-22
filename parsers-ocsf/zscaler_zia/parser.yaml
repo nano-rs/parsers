@@ -558,8 +558,23 @@ parser_vrl: |
       }
   }
   __consumed = ""
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
   # BEGIN parser-specific transformations
-  # sourcetype: Parser lowercases this source value; consume only when the normalized value is emitted.
   # event.sha256: Parser lowercases this source value; consume only when the normalized value is emitted.
   # event.sha256: Parser lowercases this source value; consume only when the normalized value is emitted.
   # event.result: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when the expected ID is emitted.
@@ -571,17 +586,7 @@ parser_vrl: |
   # event.proto: Case normalization already performed by the parser; observed at connection_info.protocol_name, and checked against the emitted branch.
   # event.protocol: Case normalization already performed by the parser; observed at connection_info.protocol_name, and checked against the emitted branch.
   # event.epochtime: Existing unit conversion by 1000 verified against time; unused clock fallbacks remain residual.
-  for_each(flatten(__source_kv)) -> |key, value| {
-      if match(key, r'(?x)
-      \A(?:
-        sourcetype
-      )\z') {
-          __value = value
-          if is_string(__value) {
-              __expected = downcase(string!(__value))
-              if contains(__repr, "," + "\"metadata.log_name\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
-          }
-      }
+  for_each(__flat) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
         event\.sha256
@@ -675,28 +680,13 @@ parser_vrl: |
   __decl = "\n\"event.action\"\t[\"api.operation\"]\n\"event.adminid\"\t[\"actor.user.name\"]\n\"event.cdip\"\t[\"dst_endpoint.ip\"]\n\"event.cdport\"\t[\"dst_endpoint.port\"]\n\"event.clientip\"\t[\"src_endpoint.ip\"]\n\"event.clt_sip\"\t[\"src_endpoint.ip\"]\n\"event.cltip\"\t[\"src_endpoint.ip\"]\n\"event.contenttype\"\t[\"http_response.content_type\"]\n\"event.csip\"\t[\"src_endpoint.ip\"]\n\"event.csport\"\t[\"src_endpoint.port\"]\n\"event.destinationip\"\t[\"dst_endpoint.ip\"]\n\"event.destinationport\"\t[\"dst_endpoint.port\"]\n\"event.dlpeng\"\t[\"finding_info.analytic.name\"]\n\"event.dlpidentifier\"\t[\"finding_info.uid\"]\n\"event.dlprulename\"\t[\"finding_info.title\"]\n\"event.dns_req\"\t[\"query.hostname\"]\n\"event.dns_reqtype\"\t[\"query.type\"]\n\"event.dns_resp\"\t[\"answers.rdata\"]\n\"event.duration\"\t[\"duration\"]\n\"event.durationms\"\t[\"duration\"]\n\"event.filename\"\t[\"evidences.file.name\",\"file.name\",\"observables.value\"]\n\"event.host\"\t[\"dst_endpoint.hostname\",\"http_request.url.hostname\"]\n\"event.inbytes\"\t[\"traffic.bytes_in\"]\n\"event.login\"\t[\"actor.user.name\"]\n\"event.outbytes\"\t[\"traffic.bytes_out\"]\n\"event.recordid\"\t[\"metadata.original_event_uid\"]\n\"event.referrer\"\t[\"http_request.referrer\"]\n\"event.reqmethod\"\t[\"http_request.http_method\"]\n\"event.reqsize\"\t[\"traffic.bytes_out\"]\n\"event.resource\"\t[\"resources.name\"]\n\"event.resourcetype\"\t[\"resources.type\"]\n\"event.respcode\"\t[\"http_response.code\"]\n\"event.respsize\"\t[\"http_response.length\",\"traffic.bytes_in\"]\n\"event.riskscore\"\t[\"risk_score\"]\n\"event.rule\"\t[\"firewall_rule.name\"]\n\"event.rxbytes\"\t[\"traffic.bytes_out\"]\n\"event.serverip\"\t[\"dst_endpoint.ip\"]\n\"event.sourceip\"\t[\"src_endpoint.ip\"]\n\"event.sourceport\"\t[\"src_endpoint.port\"]\n\"event.srv_dip\"\t[\"dst_endpoint.ip\"]\n\"event.srv_dport\"\t[\"dst_endpoint.port\"]\n\"event.threatname\"\t[\"malware.name\"]\n\"event.txbytes\"\t[\"traffic.bytes_in\"]\n\"event.urlsupercat\"\t[\"http_request.url.categories\"]\n\"event.user\"\t[\"actor.user.name\",\"evidences.user.name\",\"observables.value\"]\n\"event.useragent\"\t[\"http_request.user_agent\"]\n\"sourcetype\"\t[\"metadata.log_name\"]\n"
   __preserve = []
   # END parser-specific transformations
-  # Escape literal dots before flattening so dotted source keys cannot overwrite
-  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
-  # In compact JSON only an object key is followed by ':', so a source whose text
-  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
-  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
-  __escaped = object!(__copy.source)
-  __tilde = false
-  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
-      __escaped = map_keys(__escaped, recursive: true) -> |key| {
-          replace(replace(key, "~", "~0"), ".", "~1")
-      }
-      # Keys without a "~" decode to themselves, including the object keys inside
-      # an array that flatten leaves escaped; encode_json never escapes a "~".
-      __tilde = contains(encode_json(__escaped), "~")
-  }
-  __flat = flatten(__escaped)
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
   # target paths + "\n" per mapped source key (a raw newline never occurs in
   # compact JSON). A key is consumed when its value, or every element of a scalar
-  # array, is at one of its own targets.
+  # array, is at one of its own targets. Keys stay ESCAPED here and in __consumed:
+  # a literal dotted key ("a~1b") and the nested path ("a.b") are different
+  # fields, and mapping one never consumes the other.
   for_each(__flat) -> |key, value| {
-      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
       # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
       __kt = encode_json(key)
       if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
@@ -734,7 +724,6 @@ parser_vrl: |
   __names = {}
   if __distinct {
       __kept = filter(__flat) -> |key, value| {
-          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
           # A key is kept unless an explicit mapping or transformation consumed it.
           # Do not spill a copy of the raw body.
           value != __raw_body && !contains(__consumed, "," + encode_json(key))
@@ -768,13 +757,13 @@ parser_vrl: |
       # Slow path, in source key order: a name already taken gets the next free
       # _2, _3, ... suffix.
       for_each(__flat) -> |key, value| {
+          __token = "," + encode_json(key)
           key = replace(replace(key, "~1", "."), "~0", "~")
           if is_array(value) || is_object(value) {
               value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
                   replace(replace(inner, "~1", "."), "~0", "~")
               }, ["v"])
           }
-          __token = "," + encode_json(key)
           if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")

@@ -756,10 +756,28 @@ parser_vrl: |
       }
   }
   __consumed = ""
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
   # BEGIN parser-specific transformations
   # severity: Defender severity word normalized to OCSF severity; consume only when the expected ID is emitted.
   # Severity: Defender severity word normalized to OCSF severity; consume only when the expected ID is emitted.
   # properties.Severity: Defender severity word normalized to OCSF severity; consume only when the expected ID is emitted.
+  # createdDateTime: ISO clock converted to an emitted OCSF millisecond timestamp; verified against the output.
+  # createdDateTime: ISO clock converted to an emitted OCSF millisecond timestamp; verified against the output.
   # createdDateTime: ISO clock converted to an emitted OCSF millisecond timestamp; verified against the output.
   # lastUpdateDateTime: ISO clock converted to an emitted OCSF millisecond timestamp; verified against the output.
   # lastUpdateDateTime: ISO clock converted to an emitted OCSF millisecond timestamp; verified against the output.
@@ -770,10 +788,12 @@ parser_vrl: |
   # lastActivityDateTime: ISO clock converted to an emitted OCSF millisecond timestamp; verified against the output.
   # Timestamp: ISO clock converted to an emitted OCSF millisecond timestamp; verified against the output.
   # Timestamp: ISO clock converted to an emitted OCSF millisecond timestamp; verified against the output.
+  # properties.Timestamp: ISO clock converted to an emitted OCSF millisecond timestamp; verified against the output.
+  # properties.Timestamp: ISO clock converted to an emitted OCSF millisecond timestamp; verified against the output.
   # status: Graph alert/incident status normalized to the OCSF finding status; consume only when the expected ID is emitted.
   # classification: Graph classification normalized to OCSF verdict; consume only when the expected ID is emitted.
   # RemoteIP: IP address is lowercased in the emitted endpoint.
-  for_each(flatten(__source_kv)) -> |key, value| {
+  for_each(__flat) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
         severity
@@ -792,12 +812,36 @@ parser_vrl: |
       \A(?:
         createdDateTime
       | Timestamp
+      | properties\.Timestamp
       )\z') {
           __value = value
           __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
               if contains(__repr, "," + "\"finding_info.created_time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        createdDateTime
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__repr, "," + "\"finding_info_list.created_time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        createdDateTime
+      | firstActivityDateTime
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__repr, "," + "\"start_time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
           }
       }
       if match(key, r'(?x)
@@ -826,6 +870,7 @@ parser_vrl: |
       \A(?:
         lastUpdateDateTime
       | Timestamp
+      | properties\.Timestamp
       )\z') {
           __value = value
           __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
@@ -843,17 +888,6 @@ parser_vrl: |
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
               if contains(__repr, "," + "\"finding_info.first_seen_time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
-          }
-      }
-      if match(key, r'(?x)
-      \A(?:
-        firstActivityDateTime
-      )\z') {
-          __value = value
-          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
-          if __clock_err == null {
-              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-              if contains(__repr, "," + "\"start_time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
           }
       }
       if match(key, r'(?x)
@@ -917,28 +951,13 @@ parser_vrl: |
   __decl = "\n\"AccountDomain\"\t[\"actor.user.domain\",\"evidences.user.domain\"]\n\"AccountName\"\t[\"actor.user.name\",\"evidences.user.name\"]\n\"AccountObjectId\"\t[\"actor.user.uid_alt\",\"evidences.user.uid_alt\"]\n\"AccountUpn\"\t[\"actor.user.email_addr\",\"evidences.user.email_addr\"]\n\"AlertId\"\t[\"finding_info.uid\"]\n\"Category\"\t[\"finding_info.types\"]\n\"DetectionSource\"\t[\"finding_info.analytic.name\"]\n\"DeviceId\"\t[\"device.uid\",\"evidences.device.uid\"]\n\"DeviceName\"\t[\"device.hostname\",\"evidences.device.hostname\"]\n\"EntityType\"\t[\"evidences.name\"]\n\"FileName\"\t[\"actor.process.file.name\",\"actor.process.name\",\"evidences.file.name\",\"evidences.process.file.name\",\"evidences.process.name\"]\n\"RemoteIP\"\t[\"evidences.dst_endpoint.ip\"]\n\"ServiceSource\"\t[\"finding_info.data_sources\"]\n\"Title\"\t[\"finding_info.title\",\"message\"]\n\"alertWebUrl\"\t[\"finding_info.src_url\"]\n\"assignedTo\"\t[\"assignee.email_addr\",\"assignee.name\"]\n\"category\"\t[\"finding_info.types\"]\n\"description\"\t[\"desc\",\"finding_info.desc\"]\n\"detectionSource\"\t[\"finding_info.analytic.name\"]\n\"detectorId\"\t[\"finding_info.analytic.uid\"]\n\"displayName\"\t[\"finding_info_list.title\",\"message\"]\n\"id\"\t[\"finding_info.uid\",\"finding_info_list.uid\",\"metadata.correlation_uid\"]\n\"incidentId\"\t[\"metadata.correlation_uid\"]\n\"incidentWebUrl\"\t[\"src_url\"]\n\"mitreTechniques\"\t[\"finding_info.attacks.sub_technique.uid\"]\n\"productName\"\t[\"metadata.product.name\"]\n\"properties.AlertId\"\t[\"finding_info.uid\"]\n\"properties.Category\"\t[\"finding_info.types\"]\n\"properties.CloudResource\"\t[\"evidences.data.name\",\"resources.name\"]\n\"properties.DetectionSource\"\t[\"finding_info.analytic.name\"]\n\"properties.DeviceId\"\t[\"device.uid\",\"evidences.device.uid\"]\n\"properties.DeviceName\"\t[\"device.hostname\",\"evidences.device.hostname\"]\n\"properties.EntityType\"\t[\"evidences.name\"]\n\"properties.FileName\"\t[\"actor.process.file.name\",\"actor.process.name\",\"evidences.file.name\",\"evidences.process.file.name\",\"evidences.process.name\"]\n\"properties.ProcessCommandLine\"\t[\"actor.process.cmd_line\",\"evidences.process.cmd_line\"]\n\"properties.FileSize\"\t[\"actor.process.file.size\",\"evidences.file.size\",\"evidences.process.file.size\"]\n\"properties.FolderPath\"\t[\"actor.process.file.path\",\"evidences.file.path\",\"evidences.process.file.path\"]\n\"properties.ResourceID\"\t[\"evidences.data.uid\",\"resources.uid\"]\n\"properties.ResourceType\"\t[\"evidences.data.type\",\"resources.type\"]\n\"properties.SHA1\"\t[\"actor.process.file.hashes.value\"]\n\"properties.ServiceSource\"\t[\"finding_info.data_sources\"]\n\"properties.Title\"\t[\"finding_info.title\",\"message\"]\n\"providerAlertId\"\t[\"finding_info.uid_alt\"]\n\"recommendedActions\"\t[\"remediation.desc\"]\n\"resolvingComment\"\t[\"comment\"]\n\"serviceSource\"\t[\"finding_info.data_sources\"]\n\"tenantId\"\t[\"metadata.tenant_uid\"]\n\"title\"\t[\"finding_info.title\",\"message\"]\n"
   __preserve = []
   # END parser-specific transformations
-  # Escape literal dots before flattening so dotted source keys cannot overwrite
-  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
-  # In compact JSON only an object key is followed by ':', so a source whose text
-  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
-  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
-  __escaped = object!(__copy.source)
-  __tilde = false
-  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
-      __escaped = map_keys(__escaped, recursive: true) -> |key| {
-          replace(replace(key, "~", "~0"), ".", "~1")
-      }
-      # Keys without a "~" decode to themselves, including the object keys inside
-      # an array that flatten leaves escaped; encode_json never escapes a "~".
-      __tilde = contains(encode_json(__escaped), "~")
-  }
-  __flat = flatten(__escaped)
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
   # target paths + "\n" per mapped source key (a raw newline never occurs in
   # compact JSON). A key is consumed when its value, or every element of a scalar
-  # array, is at one of its own targets.
+  # array, is at one of its own targets. Keys stay ESCAPED here and in __consumed:
+  # a literal dotted key ("a~1b") and the nested path ("a.b") are different
+  # fields, and mapping one never consumes the other.
   for_each(__flat) -> |key, value| {
-      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
       # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
       __kt = encode_json(key)
       if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
@@ -976,7 +995,6 @@ parser_vrl: |
   __names = {}
   if __distinct {
       __kept = filter(__flat) -> |key, value| {
-          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
           # A key is kept unless an explicit mapping or transformation consumed it.
           # Do not spill a copy of the raw body.
           value != __raw_body && !contains(__consumed, "," + encode_json(key))
@@ -1010,13 +1028,13 @@ parser_vrl: |
       # Slow path, in source key order: a name already taken gets the next free
       # _2, _3, ... suffix.
       for_each(__flat) -> |key, value| {
+          __token = "," + encode_json(key)
           key = replace(replace(key, "~1", "."), "~0", "~")
           if is_array(value) || is_object(value) {
               value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
                   replace(replace(inner, "~1", "."), "~0", "~")
               }, ["v"])
           }
-          __token = "," + encode_json(key)
           if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")
