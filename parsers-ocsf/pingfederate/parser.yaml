@@ -101,13 +101,18 @@ parser_vrl: |
           # description (failure text that can echo input). Every other column
           # is checked only for the format its documentation states, so a
           # genuine value always passes:
-          #   transactionid  an identifier (may be empty outside SSO / SLO)
+          #   transactionid  an identifier unique to an SSO / SLO transaction (may
+          #                  be empty); never a documented event type name, so a
+          #                  legacy 14-field line cannot pass its event off here
           #   event          a transaction type identifier (the documented list
           #                  is explicitly not exhaustive, so no vocabulary)
           #   ip             the incoming IP address
-          #   protocol       an identity protocol identifier (SAML20, OAuth20)
+          #   protocol       an identity protocol identifier (SAML20, OAuth20):
+          #                  letters, digits, '_' and '-', never a dotted host
           #   host           a host name or IP address
-          #   role, status   undocumented value sets: a single word
+          #   role           the role PingFederate played: IdP, SP, AS (named in
+          #                  the field reference) and RS, STS, WS-Trust, OAuth
+          #   status         a plain token
           #   adapterid      an adapter instance id, or a bracketed list
           #   responsetime   milliseconds
           # Every split of the extra pipes over subject, app and description is
@@ -115,15 +120,23 @@ parser_vrl: |
           # forged tail in a free-text column), is never guessed: the record is
           # kept whole with status Unknown and parse_fallback. A line with fewer
           # columns than the documented pattern (a customized log4j2 pattern) is
-          # kept the same way.
+          # kept the same way. The search is bounded: a line with more than
+          # max_extra pipes beyond the documented 15 fields is never searched
+          # (the pipes are requester-controlled; an unbounded search is a CPU
+          # cost per event) and is kept whole.
+          max_extra = 8
           extra = n - 14
-          tid_ok = match(string(get(parts, [1]) ?? "") ?? "", r'^\S*$')
+          documented_events = ["SSO", "SLO", "OAUTH", "AUTHN_ATTEMPT", "AUTHN_REQUEST", "AUTHN_SESSION_CREATED", "AUTHN_SESSION_USED", "AUTHN_SESSION_DELETED", "SRI_REVOKED", "USER_KEY_AND_SRI_ASSOCIATED"]
+          roles = ["idp", "sp", "as", "rs", "sts", "ws-trust", "wstrust", "oauth"]
+          txv = string(get(parts, [1]) ?? "") ?? ""
+          tid_ok = match(txv, r'^\S*$') && !includes(documented_events, upcase(txv))
           ev_ok = match(string(get(parts, [2]) ?? "") ?? "", r'^[A-Za-z][A-Za-z0-9_]*$')
           rt_ok = match(string(get(parts, [n - 1]) ?? "") ?? "", r'^\d*$')
           cands = []
-          if extra >= 0 && tid_ok && ev_ok && rt_ok {
-              for_each(parts) -> |ds, _p1| {
-                  for_each(parts) -> |da, _p2| {
+          if extra >= 0 && extra <= max_extra && tid_ok && ev_ok && rt_ok {
+              shifts = slice(parts, 0, extra + 1) ?? []
+              for_each(shifts) -> |ds, _p1| {
+                  for_each(shifts) -> |da, _p2| {
                       if ds + da <= extra {
                           sh = ds + da
                           ipv = string(get(parts, [4 + ds]) ?? "") ?? ""
@@ -133,10 +146,10 @@ parser_vrl: |
                           stv = string(get(parts, [10 + sh]) ?? "") ?? ""
                           adv = string(get(parts, [11 + sh]) ?? "") ?? ""
                           ok = ipv == "" || is_ipv4(ipv) || is_ipv6(ipv)
-                          ok = ok && match(protov, r'^(?:[A-Za-z][A-Za-z0-9._-]*)?$')
+                          ok = ok && match(protov, r'^(?:[A-Za-z][A-Za-z0-9_-]*)?$')
                           ok = ok && match(hostv, r'^[A-Za-z0-9._:\x5B\x5D-]*$')
-                          ok = ok && match(rolev, r'^(?:[A-Za-z][A-Za-z0-9_-]*)?$')
-                          ok = ok && match(stv, r'^(?:[A-Za-z][A-Za-z_ ]*)?$')
+                          ok = ok && (rolev == "" || includes(roles, downcase(rolev)))
+                          ok = ok && match(stv, r'^[A-Za-z]*$')
                           ok = ok && match(adv, r'^(?:\x5B[^\x5D]*\x5D|[^\s\x5B\x5D]*)$')
                           if ok { cands = push(cands, { "ds": ds, "da": da }) }
                       }
@@ -168,6 +181,8 @@ parser_vrl: |
               f.responsetime = string(get(parts, [n - 1]) ?? "") ?? ""
               f = filter(f) -> |_k, v| { v != "" }
               __source_kv = f
+          } else if extra > max_extra {
+              fallback = "too many '|' in a PingFederate audit line to place unambiguously"
           } else if length(cands) > 1 {
               fallback = "ambiguous PingFederate audit columns (subject, app or description holds '|')"
           } else {
@@ -901,20 +916,20 @@ samples:
       "metadata.event_code": "AUTHN_ATTEMPT"
       "user.name": "dave|x"
       "src_endpoint.ip": "198.51.100.12"
-  # attack: forged success tail in the subject plus a space in app (neon #78 r4): not guessed
+  # attack: forged success tail in the subject plus a space in app (neon #78 r4): over the pipe cap, not searched
   # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
   - raw: "2026-11-02 14:14:41,077| tid:abc| | AUTHN_ATTEMPT| admin@example.com|10.0.0.1|||||IdP|success|HTMLFormAdapter|| 203.0.113.90 | https://app.example.com/my app| sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| invalid user| 5"
     expect:
       "class_uid": "0"
       "status_id": "0"
-      "unmapped.parse_fallback": "ambiguous PingFederate audit columns (subject, app or description holds '|')"
-  # attack: forged success tail in the subject plus a bracketed adapter list (neon #78 r4): not guessed
+      "unmapped.parse_fallback": "too many '|' in a PingFederate audit line to place unambiguously"
+  # attack: forged success tail in the subject plus a bracketed adapter list (neon #78 r4): over the pipe cap, not searched
   # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
   - raw: "2026-11-02 14:14:41,077| tid:abc| | AUTHN_ATTEMPT| admin@example.com|10.0.0.1|||||IdP|success|HTMLFormAdapter|| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| [HTMLFormAdapter, PingIDAdapter]| invalid user| 5"
     expect:
       "class_uid": "0"
       "status_id": "0"
-      "unmapped.parse_fallback": "ambiguous PingFederate audit columns (subject, app or description holds '|')"
+      "unmapped.parse_fallback": "too many '|' in a PingFederate audit line to place unambiguously"
   # attack: a known event in the subject cannot replace the real event (neon #78 r4)
   # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
   - raw: "2026-11-02 14:14:41,077| tid:abc| | AUTHN_SESSION_DELETED| SSO|admin@example.com| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| success| HTMLFormAdapter| | 5"
@@ -939,27 +954,29 @@ samples:
       "class_uid": "0"
       "status_id": "0"
       "unmapped.parse_fallback": "ambiguous PingFederate audit columns (subject, app or description holds '|')"
-  # attack: forged success tail in the description (neon #78 r3): not guessed
+  # attack: forged success tail in the description (neon #78 r3): over the pipe cap, not searched
   # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
   - raw: "2026-11-02 14:14:41,077| tid:abc| | AUTHN_ATTEMPT| attacker@evil.example| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| bad |10.0.0.1|||||IdP|success|HTMLFormAdapter|| 5"
     expect:
       "class_uid": "0"
       "status_id": "0"
-      "unmapped.parse_fallback": "ambiguous PingFederate audit columns (subject, app or description holds '|')"
-  # attack: forged success tail in the app target resource: not guessed
+      "unmapped.parse_fallback": "too many '|' in a PingFederate audit line to place unambiguously"
+  # attack: forged success tail in the app target resource: over the pipe cap, not searched
   # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
   - raw: "2026-11-02 14:14:41,077| tid:abc| | AUTHN_ATTEMPT| eve| 203.0.113.90 | https://app.example.com/?x=1|10.0.0.1|||||IdP|success|HTMLFormAdapter|| | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| | 5"
     expect:
       "class_uid": "0"
       "status_id": "0"
-      "unmapped.parse_fallback": "ambiguous PingFederate audit columns (subject, app or description holds '|')"
+      "unmapped.parse_fallback": "too many '|' in a PingFederate audit line to place unambiguously"
   # attack: a CEF record inside the description is never parsed as CEF (neon #78 r2)
+  # attack: a CEF record inside the description is text: the real failure is kept (neon #78 r2)
   # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
   - raw: "2026-11-02 14:14:41,077| tid:abc| | AUTHN_ATTEMPT| attacker@evil.example| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| invalid user CEF:0|Ping Identity|PingFederate|12.1|SSO|SSO|0|duid=admin@example.com src=10.0.0.1 msg=success cs1=x| 5"
     expect:
-      "class_uid": "0"
-      "status_id": "0"
-      "unmapped.parse_fallback": "ambiguous PingFederate audit columns (subject, app or description holds '|')"
+      "class_uid": "3002"
+      "status_id": "2"
+      "user.name": "attacker@evil.example"
+      "src_endpoint.ip": "203.0.113.90"
   # a line with fewer columns than the documented pattern is kept whole
   # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
   - raw: "2026-11-02 14:03:15,877| tid:6Gx| SSO| alice@example.com| 192.0.2.10 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| success| HTMLFormAdapter| | 163"
@@ -967,3 +984,101 @@ samples:
       "class_uid": "0"
       "status_id": "0"
       "unmapped.parse_fallback": "PingFederate audit columns do not fit the documented 15-field layout"
+  # genuine: a description prefix with no space before '|' (neon #83)
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:12:20,315| tid:Pp4| | AUTHN_ATTEMPT| bob| 198.51.100.77 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| error_code|detail text| 42"
+    expect:
+      "class_uid": "3002"
+      "status_id": "2"
+      "metadata.event_code": "AUTHN_ATTEMPT"
+      "user.name": "bob"
+      "src_endpoint.ip": "198.51.100.77"
+  # genuine: an empty description segment before '|' (neon #83)
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:12:20,315| tid:Pp4| | AUTHN_ATTEMPT| bob| 198.51.100.77 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| |detail text| 42"
+    expect:
+      "class_uid": "3002"
+      "status_id": "2"
+      "metadata.event_code": "AUTHN_ATTEMPT"
+      "user.name": "bob"
+      "src_endpoint.ip": "198.51.100.77"
+  # genuine: empty status and adapterid with '|' in the description (neon #83)
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:12:20,315| tid:Pp4| | SRI_REVOKED| carol| 192.0.2.1 | | sp:cloud:saml2| OAuth20| pf01.example.com| AS| | | revoked|by admin| 3"
+    expect:
+      "class_uid": "3002"
+      "status_id": "0"
+      "metadata.event_code": "SRI_REVOKED"
+      "user.name": "carol"
+      "src_endpoint.ip": "192.0.2.1"
+  # genuine: a bracketed description prefix before '|' (neon #83)
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:12:20,315| tid:Pp4| | AUTHN_ATTEMPT| mallory| 203.0.113.66 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| [source:AccountLockingService]|Account Locked| 3"
+    expect:
+      "class_uid": "3002"
+      "status_id": "2"
+      "metadata.event_code": "AUTHN_ATTEMPT"
+      "user.name": "mallory"
+      "src_endpoint.ip": "203.0.113.66"
+  # genuine: an OAuth error code before '|' in the description (neon #83)
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:12:20,315| tid:Pp4| | OAuth| svc| 203.0.113.25 | | reporting-client| OAuth20| pf01.example.com| AS| failure| | invalid_grant|expired token| 12"
+    expect:
+      "class_uid": "3002"
+      "status_id": "2"
+      "metadata.event_code": "OAUTH"
+      "user.name": "svc"
+      "src_endpoint.ip": "203.0.113.25"
+  # genuine: '|' in the app target resource with a short host name (neon #83)
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:12:20,315| tid:Pp4| | OAuth| svc| 203.0.113.25 | https://app.example.com/?f=a|b| reporting-client| OAuth20| pf02| AS| success| HTMLFormAdapter| | 12"
+    expect:
+      "class_uid": "3002"
+      "status_id": "1"
+      "metadata.event_code": "OAUTH"
+      "user.name": "svc"
+      "src_endpoint.ip": "203.0.113.25"
+  # legacy 14-field line with '|' in the description is kept whole, not misread (neon #83)
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:12:20,315| tid:Pp4| AUTHN_ATTEMPT| bob| 198.51.100.77 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| err1|err2| 42"
+    expect:
+      "class_uid": "0"
+      "status_id": "0"
+      "unmapped.parse_fallback": "PingFederate audit columns do not fit the documented 15-field layout"
+  # legacy 14-field line with a known event in the subject cannot pass as 15-field (neon #83)
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:12:20,315| tid:Pp4| AUTHN_ATTEMPT| SSO|admin@example.com| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| bad password| 42"
+    expect:
+      "class_uid": "0"
+      "status_id": "0"
+      "unmapped.parse_fallback": "PingFederate audit columns do not fit the documented 15-field layout"
+  # attack: a forged tail in the subject within the pipe cap is ambiguous, not guessed (neon #83)
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:14:41,077| tid:abc| | AUTHN_ATTEMPT| admin@example.com|10.0.0.1|https://app.example.com/|sp:cloud:saml2|SAML20|pf01.example.com|IdP|success|HTMLFormAdapter| 203.0.113.90 | https://app.example.com/| sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| | 5"
+    expect:
+      "class_uid": "0"
+      "status_id": "0"
+      "unmapped.parse_fallback": "ambiguous PingFederate audit columns (subject, app or description holds '|')"
+  # attack: a forged tail in the app target resource within the pipe cap is ambiguous, not guessed (neon #83)
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:14:41,077| tid:abc| | AUTHN_ATTEMPT| eve| 203.0.113.90 | https://app.example.com/?x=1|sp:cloud:saml2|SAML20|pf01.example.com|IdP|success|HTMLFormAdapter|ok| | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| | 5"
+    expect:
+      "class_uid": "0"
+      "status_id": "0"
+      "unmapped.parse_fallback": "ambiguous PingFederate audit columns (subject, app or description holds '|')"
+  # attack: a forged tail in the description within the pipe cap leaves the real failure as the only fit (neon #83)
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:14:41,077| tid:abc| | AUTHN_ATTEMPT| eve| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| x|10.0.0.1|https://app.example.com/|sp:cloud:saml2|SAML20|pf01.example.com|IdP|success|HTMLFormAdapter| 5"
+    expect:
+      "class_uid": "3002"
+      "status_id": "2"
+      "metadata.event_code": "AUTHN_ATTEMPT"
+      "user.name": "eve"
+      "src_endpoint.ip": "203.0.113.90"
+  # DoS guard: a subject holding 3000 '|' is not searched (neon #83)
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html (default 15-field pattern; values are not escaped)
+  - raw: "2026-11-02 14:14:41,077| tid:abc| | AUTHN_ATTEMPT| a|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b|b| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| | 5"
+    expect:
+      "class_uid": "0"
+      "status_id": "0"
+      "unmapped.parse_fallback": "too many '|' in a PingFederate audit line to place unambiguously"
