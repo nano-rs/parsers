@@ -1,0 +1,73 @@
+# Vault writes one JSON entry per line, bare (file / socket device) or behind
+# a syslog header (syslog device). The parser captures the parsed entry as
+# its source unchanged, so a bare JSON line runs the shared source-equality
+# check and residual probes; a syslog line adds its header as syslog_header.
+source: mixed
+transforms:
+- source: time
+  kind: epoch_ms
+  target: time
+  reason: Successful ISO timestamp conversion to the emitted millisecond clock.
+- source: auth.token_issue_time
+  kind: epoch_ms
+  reason: The token issue time becomes the session's created_time; consume only when that clock is emitted.
+- source: response.auth.token_issue_time
+  kind: epoch_ms
+  reason: The issued token's issue time becomes the login session's created_time; consume only when that clock is emitted.
+- source: request.operation
+  kind: enum
+  target: activity_id
+  values:
+    create: 1
+    read: 2
+    list: 2
+    update: 3
+    patch: 3
+    delete: 4
+  reason: The Vault operation drives the API Activity; consume only when that activity is emitted.
+- source: type
+  kind: enum
+  target: metadata.type
+  values:
+    request: request
+    response: response
+  reason: The entry type is metadata.type (lowercased); consume only when emitted.
+consumed_candidates:
+- auth.accessor
+- auth.client_token
+- auth.display_name
+- auth.entity_id
+- auth.metadata.email
+- auth.metadata.username
+- auth.policies
+- auth.policy_results.granting_policies
+- auth.token_ttl
+- error
+- forwarded_from
+- request.headers.user-agent
+- request.id
+- request.mount_accessor
+- request.mount_point
+- request.mount_running_version
+- request.mount_type
+- request.namespace.id
+- request.namespace.path
+- request.operation
+- request.path
+- request.remote_address
+- request.remote_port
+- response.auth.accessor
+- response.auth.client_token
+- response.auth.display_name
+- response.auth.entity_id
+- response.auth.metadata.email
+- response.auth.metadata.username
+- response.auth.policies
+- response.auth.token_ttl
+- response.mount_accessor
+- response.mount_point
+- response.mount_type
+- type
+consumed_reason: Only source keys read by this parser are eligible for exact-value
+  consumption; the selected branch must emit the value. Unknown keys always spill,
+  even when their value equals an OCSF default.

@@ -1,0 +1,1369 @@
+name: aws_security_hub_ocsf
+display_name: AWS Security Hub Findings (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields, unaltered, in dotted snake_case unmapped keys.
+  Parses AWS Security Hub findings in the AWS Security Finding Format (ASFF),
+  including findings aggregated from GuardDuty, Inspector, Macie, AWS Config,
+  IAM Access Analyzer, Firewall Manager and partner products, into complete OCSF
+  1.9.0 findings carrying the cloud and security_control profiles (plus incident
+  when a VerificationState verdict is present). The class follows the finding:
+  a finding with Vulnerabilities[] (Inspector CVEs, package findings) is a
+  "Vulnerability Finding" (2002); one with Compliance.Status (Security Hub
+  controls, AWS Config rules) is a "Compliance Finding" (2003); everything else
+  (GuardDuty threats, Macie, Access Analyzer) is a "Detection Finding" (2004).
+  Severity.Label (or Severity.Normalized) maps to severity_id, Workflow.Status
+  to status_id (an ARCHIVED record is Archived and its activity is Close),
+  VerificationState to verdict, the originating integration to
+  metadata.product.feature.name and finding_info.product, Resources[] to
+  resources[] with their tags, and Network / Action / Process to evidences[].
+  A GuardDuty finding imported without an Action object has its action read
+  from ProductFields aws/guardduty/service/action/* (network connection,
+  API call, DNS request and the first port probe, IPv4 or IPv6). The API call is also
+  promoted to api, the Process to actor.process (uid "unknown" when ASFF has
+  no Pid) and the first EC2 instance resource to device (host profile).
+  metadata.uid is Id + UpdatedAt, so each update of a finding is its own record.
+  Accepts a bare ASFF finding (GetFindings, Firehose, S3 export) or the
+  EventBridge "Security Hub Findings - Imported" envelope, which carries one
+  finding per event. This is a separate lane from aws_guardduty, which parses
+  GuardDuty's native finding JSON. Anything else falls back to Base Event with
+  the raw record kept.
+match_values:
+  - aws_security_hub
+category: cloud
+vendor: "Amazon"
+product: "Security Hub"
+parser_vrl: |
+  # AWS Security Hub ASFF finding -> OCSF 1.9.0 Vulnerability (2002) /
+  # Compliance (2003) / Detection (2004) Finding
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+
+  parsed, err = parse_json(raw_log)
+  __source_kv = object(parsed) ?? {}
+  p = object(parsed) ?? {}
+
+  # The EventBridge envelope carries one finding in detail.findings[0].
+  f = p
+  env_findings = array(get(p, ["detail", "findings"]) ?? null) ?? []
+  if length(env_findings) > 0 { f = object(get(env_findings, [0]) ?? {}) ?? {} }
+  finding_id = to_string(f.Id) ?? ""
+  is_asff = finding_id != "" && (f.SchemaVersion != null || f.ProductArn != null)
+
+  if err != null || !is_object(parsed) || !is_asff {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": "Unrecognized Security Hub record",
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud"],
+              "uid": sha2("aws_security_hub|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "Security Hub findings",
+              "product": { "name": "AWS Security Hub", "vendor_name": "Amazon" }
+          },
+          "cloud": { "provider": "AWS" }
+      }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+  } else {
+      sev_obj = object(f.Severity) ?? {}
+      fpf = object(f.FindingProviderFields) ?? {}
+      compliance_src = object(f.Compliance) ?? {}
+      vulns_src = array(f.Vulnerabilities) ?? []
+
+      # ---- class by finding content ----
+      class_uid = 2004
+      class_name = "Detection Finding"
+      comp_status = upcase(to_string(compliance_src.Status) ?? "")
+      if length(vulns_src) > 0 {
+          class_uid = 2002
+          class_name = "Vulnerability Finding"
+      } else if comp_status != "" {
+          class_uid = 2003
+          class_name = "Compliance Finding"
+      }
+
+      # ---- times ----
+      created_ms = 0
+      created_str = to_string(f.CreatedAt) ?? ""
+      if created_str != "" {
+          ct, cterr = parse_timestamp(created_str, "%+")
+          if cterr == null { created_ms = to_unix_timestamp(ct, unit: "milliseconds") }
+      }
+      updated_ms = 0
+      updated_str = to_string(f.UpdatedAt) ?? ""
+      if updated_str != "" {
+          ut, uterr = parse_timestamp(updated_str, "%+")
+          if uterr == null { updated_ms = to_unix_timestamp(ut, unit: "milliseconds") }
+      }
+      first_ms = 0
+      first_str = to_string(f.FirstObservedAt) ?? ""
+      if first_str != "" {
+          ft, fterr = parse_timestamp(first_str, "%+")
+          if fterr == null { first_ms = to_unix_timestamp(ft, unit: "milliseconds") }
+      }
+      last_ms = 0
+      last_str = to_string(f.LastObservedAt) ?? ""
+      if last_str != "" {
+          lt, lterr = parse_timestamp(last_str, "%+")
+          if lterr == null { last_ms = to_unix_timestamp(lt, unit: "milliseconds") }
+      }
+      processed_ms = 0
+      processed_str = to_string(f.ProcessedAt) ?? ""
+      if processed_str != "" {
+          pt, pterr = parse_timestamp(processed_str, "%+")
+          if pterr == null { processed_ms = to_unix_timestamp(pt, unit: "milliseconds") }
+      }
+      time_ms = updated_ms
+      if time_ms == 0 { time_ms = created_ms }
+
+      # ---- severity: Label, else Normalized (0-100) ----
+      label = upcase(to_string(sev_obj.Label) ?? "")
+      if label == "" { label = upcase(to_string(get(fpf, ["Severity", "Label"]) ?? "") ?? "") }
+      severity_id = 0
+      severity = "Unknown"
+      if label == "INFORMATIONAL" { severity_id = 1; severity = "Informational" }
+      if label == "LOW" { severity_id = 2; severity = "Low" }
+      if label == "MEDIUM" { severity_id = 3; severity = "Medium" }
+      if label == "HIGH" { severity_id = 4; severity = "High" }
+      if label == "CRITICAL" { severity_id = 5; severity = "Critical" }
+      if severity_id == 0 && sev_obj.Normalized != null {
+          norm = to_int(sev_obj.Normalized) ?? -1
+          if norm == 0 { severity_id = 1; severity = "Informational" }
+          if norm >= 1 { severity_id = 2; severity = "Low" }
+          if norm >= 40 { severity_id = 3; severity = "Medium" }
+          if norm >= 70 { severity_id = 4; severity = "High" }
+          if norm >= 90 { severity_id = 5; severity = "Critical" }
+      }
+
+      # ---- lifecycle: Workflow.Status + RecordState ----
+      record_state = upcase(to_string(f.RecordState) ?? "")
+      workflow = upcase(to_string(get(f, ["Workflow", "Status"]) ?? "") ?? "")
+      status_id = 0
+      status_str = "Unknown"
+      if workflow == "NEW" { status_id = 1; status_str = "New" }
+      if workflow == "NOTIFIED" { status_id = 2; status_str = "In Progress" }
+      if workflow == "SUPPRESSED" { status_id = 3; status_str = "Suppressed" }
+      if workflow == "RESOLVED" { status_id = 4; status_str = "Resolved" }
+      if record_state == "ARCHIVED" && status_id <= 1 { status_id = 5; status_str = "Archived" }
+      activity_id = 1
+      activity_name = "Create"
+      if updated_ms > created_ms && created_ms > 0 { activity_id = 2; activity_name = "Update" }
+      if record_state == "ARCHIVED" { activity_id = 3; activity_name = "Close" }
+
+      # ---- the originating integration ----
+      product_name = to_string(f.ProductName) ?? ""
+      if product_name == "" { product_name = to_string(get(f, ["ProductFields", "aws/securityhub/ProductName"]) ?? "") ?? "" }
+      company = to_string(f.CompanyName) ?? ""
+      if company == "" { company = to_string(get(f, ["ProductFields", "aws/securityhub/CompanyName"]) ?? "") ?? "" }
+      product_arn = to_string(f.ProductArn) ?? ""
+      origin = {}
+      if product_name != "" { origin.name = product_name }
+      if company != "" { origin.vendor_name = company }
+      if product_arn != "" { origin.uid = product_arn }
+
+      types = array(f.Types) ?? []
+      title = to_string(f.Title) ?? ""
+      generator = to_string(f.GeneratorId) ?? ""
+
+      finding_info = { "uid": finding_id, "title": title }
+      if title == "" { finding_info.title = finding_id }
+      desc = to_string(f.Description) ?? ""
+      if desc != "" { finding_info.desc = desc }
+      if length(types) > 0 { finding_info.types = types }
+      if created_ms > 0 { finding_info.created_time = created_ms }
+      if updated_ms > 0 { finding_info.modified_time = updated_ms }
+      if first_ms > 0 { finding_info.first_seen_time = first_ms }
+      if last_ms > 0 { finding_info.last_seen_time = last_ms }
+      src_url = to_string(f.SourceUrl) ?? ""
+      if src_url != "" { finding_info.src_url = src_url }
+      if product_arn != "" { finding_info.product_uid = product_arn }
+      if length(keys(origin)) > 0 { finding_info.product = origin }
+      if product_name != "" { finding_info.data_sources = [product_name] }
+      if generator != "" { finding_info.analytic = { "uid": generator, "name": generator, "type_id": 1, "type": "Rule" } }
+
+      # ---- cloud ----
+      cloud = { "provider": "AWS" }
+      acct = to_string(f.AwsAccountId) ?? ""
+      if acct != "" { cloud.account = { "uid": acct } }
+      acct_name = to_string(f.AwsAccountName) ?? ""
+      if acct_name != "" && acct != "" { cloud.account.name = acct_name }
+      region = to_string(f.Region) ?? ""
+      if region != "" { cloud.region = region }
+
+      # ---- resources (the first EC2 instance is also the device) ----
+      resources = []
+      device = {}
+      for_each(array(f.Resources) ?? []) -> |_i, r| {
+          ec2 = object(get(r, ["Details", "AwsEc2Instance"]) ?? {}) ?? {}
+          rtype0 = to_string(get(r, ["Type"]) ?? "") ?? ""
+          if length(keys(device)) == 0 && (rtype0 == "AwsEc2Instance" || length(keys(ec2)) > 0) {
+              did = to_string(get(r, ["Id"]) ?? "") ?? ""
+              dparts = split(did, "/")
+              iid = to_string(get(dparts, [length(dparts) - 1]) ?? "") ?? ""
+              if iid != "" {
+                  device = { "type_id": 6, "type": "Virtual", "uid": iid, "instance_uid": iid, "hostname": iid }
+                  dns = to_string(ec2.PrivateDnsName) ?? ""
+                  if dns != "" { device.hostname = dns }
+                  dname = to_string(get(r, ["Tags", "Name"]) ?? "") ?? ""
+                  if dname != "" { device.name = dname }
+                  dip = to_string(get(array(ec2.IpV4Addresses) ?? [], [0]) ?? "") ?? ""
+                  if dip != "" { device.ip = downcase(dip) }
+                  dvpc = to_string(ec2.VpcId) ?? ""
+                  if dvpc != "" { device.vpc_uid = dvpc }
+                  dsub = to_string(ec2.SubnetId) ?? ""
+                  if dsub != "" { device.subnet_uid = dsub }
+                  dreg = to_string(get(r, ["Region"]) ?? "") ?? ""
+                  if dreg != "" { device.region = dreg }
+              }
+          }
+          rid = to_string(get(r, ["Id"]) ?? "") ?? ""
+          res = {}
+          if rid != "" {
+              res.uid = rid
+              rparts = split(rid, "/")
+              rname = to_string(get(rparts, [length(rparts) - 1]) ?? "") ?? ""
+              if rname != "" { res.name = rname }
+          }
+          rtype = to_string(get(r, ["Type"]) ?? "") ?? ""
+          if rtype != "" { res.type = rtype }
+          rregion = to_string(get(r, ["Region"]) ?? "") ?? ""
+          if rregion != "" { res.region = rregion }
+          rpart = to_string(get(r, ["Partition"]) ?? "") ?? ""
+          if rpart != "" { res.cloud_partition = rpart }
+          rtags = object(get(r, ["Tags"]) ?? {}) ?? {}
+          tag_list = []
+          for_each(rtags) -> |k, v| { tag_list = push(tag_list, { "name": k, "value": to_string(v) ?? "" }) }
+          if length(tag_list) > 0 { res.tags = tag_list }
+          if length(keys(res)) > 0 { resources = push(resources, res) }
+      }
+
+      # ---- malware ----
+      malware = []
+      for_each(array(f.Malware) ?? []) -> |_i, m| {
+          mtype = upcase(to_string(get(m, ["Type"]) ?? "") ?? "")
+          cid = 99
+          if mtype == "ADWARE" { cid = 1 }
+          if mtype == "BOTNET_AGENT" { cid = 3 }
+          if mtype == "EXPLOIT_KIT" { cid = 8 }
+          if mtype == "KEYLOGGER" { cid = 9 }
+          if mtype == "RANSOMWARE" { cid = 10 }
+          if mtype == "REMOTE_ACCESS" { cid = 11 }
+          if mtype == "COIN_MINER" { cid = 13 }
+          if mtype == "ROOTKIT" { cid = 15 }
+          if mtype == "SPYWARE" { cid = 17 }
+          if mtype == "TROJAN" { cid = 18 }
+          if mtype == "VIRUS" { cid = 19 }
+          if mtype == "WORM" { cid = 22 }
+          mal = { "classification_ids": [cid] }
+          mname = to_string(get(m, ["Name"]) ?? "") ?? ""
+          if mname != "" { mal.name = mname }
+          mpath = to_string(get(m, ["Path"]) ?? "") ?? ""
+          if mpath != "" { mal.path = mpath }
+          if mtype != "" { mal.classifications = [mtype] }
+          malware = push(malware, mal)
+      }
+
+      # ---- remediation ----
+      rec_text = to_string(get(f, ["Remediation", "Recommendation", "Text"]) ?? "") ?? ""
+      rec_url = to_string(get(f, ["Remediation", "Recommendation", "Url"]) ?? "") ?? ""
+      remediation = {}
+      if rec_text != "" { remediation.desc = rec_text }
+      if rec_url != "" {
+          if rec_text == "" { remediation.desc = rec_url }
+          remediation.references = [rec_url]
+      }
+
+      # ---- evidence: Network, Action (GuardDuty shapes), Process ----
+      src_ep = {}
+      dst_ep = {}
+      conn = {}
+      net = object(f.Network) ?? {}
+      if length(keys(net)) > 0 {
+          sip = to_string(net.SourceIpV4) ?? ""
+          if sip == "" { sip = to_string(net.SourceIpV6) ?? "" }
+          if sip != "" { src_ep.ip = downcase(sip) }
+          sport = to_int(net.SourcePort) ?? 0
+          if sport > 0 { src_ep.port = sport }
+          sdom = to_string(net.SourceDomain) ?? ""
+          if sdom != "" { src_ep.domain = sdom }
+          smac = to_string(net.SourceMac) ?? ""
+          if smac != "" { src_ep.mac = downcase(smac) }
+          dip = to_string(net.DestinationIpV4) ?? ""
+          if dip == "" { dip = to_string(net.DestinationIpV6) ?? "" }
+          if dip != "" { dst_ep.ip = downcase(dip) }
+          dport = to_int(net.DestinationPort) ?? 0
+          if dport > 0 { dst_ep.port = dport }
+          ddom = to_string(net.DestinationDomain) ?? ""
+          if ddom != "" { dst_ep.domain = ddom }
+          nproto = to_string(net.Protocol) ?? ""
+          if nproto != "" { conn.protocol_name = downcase(nproto) }
+          ndir = upcase(to_string(net.Direction) ?? "")
+          if ndir == "IN" { conn.direction_id = 1; conn.direction = "Inbound" }
+          if ndir == "OUT" { conn.direction_id = 2; conn.direction = "Outbound" }
+      }
+
+      act = object(f.Action) ?? {}
+      # GuardDuty findings imported into Security Hub carry no Action object:
+      # the action is flattened into ProductFields "aws/guardduty/service/action/...".
+      # Rebuild the ASFF Action shape from it so one code path maps both.
+      pf = object(f.ProductFields) ?? {}
+      gp = "aws/guardduty/service/action/"
+      g_type = to_string(get(pf, [gp + "actionType"]) ?? "") ?? ""
+      if length(keys(act)) == 0 && g_type != "" {
+          act.ActionType = g_type
+          gd_remote = {}
+          # PORT_PROBE flattens its first probe as portProbeDetails/0/.
+          for_each(["networkConnectionAction", "awsApiCallAction", "portProbeAction/portProbeDetails/0"]) -> |_i, kind| {
+              rp = gp + string!(kind) + "/remoteIpDetails/"
+              rd = {}
+              rv = to_string(get(pf, [rp + "ipAddressV4"]) ?? "") ?? ""
+              if rv != "" { rd.IpAddressV4 = rv }
+              rv = to_string(get(pf, [rp + "ipAddressV6"]) ?? "") ?? ""
+              if rv != "" { rd.IpAddressV6 = rv }
+              rv = to_string(get(pf, [rp + "country/countryName"]) ?? "") ?? ""
+              if rv != "" { rd.Country = { "CountryName": rv } }
+              rv = to_string(get(pf, [rp + "city/cityName"]) ?? "") ?? ""
+              if rv != "" { rd.City = { "CityName": rv } }
+              org = {}
+              rv = to_string(get(pf, [rp + "organization/asn"]) ?? "") ?? ""
+              if rv != "" { org.Asn = rv }
+              rv = to_string(get(pf, [rp + "organization/asnOrg"]) ?? "") ?? ""
+              if rv != "" { org.AsnOrg = rv }
+              rv = to_string(get(pf, [rp + "organization/isp"]) ?? "") ?? ""
+              if rv != "" { org.Isp = rv }
+              rv = to_string(get(pf, [rp + "organization/org"]) ?? "") ?? ""
+              if rv != "" { org.Org = rv }
+              if length(keys(org)) > 0 { rd.Organization = org }
+              if length(keys(rd)) > 0 { gd_remote = set!(gd_remote, [string!(kind)], rd) }
+          }
+          np = gp + "networkConnectionAction/"
+          gnc = {}
+          gv = to_string(get(pf, [np + "connectionDirection"]) ?? "") ?? ""
+          if gv != "" { gnc.ConnectionDirection = gv }
+          gv = to_string(get(pf, [np + "protocol"]) ?? "") ?? ""
+          if gv != "" { gnc.Protocol = gv }
+          gv = to_string(get(pf, [np + "localPortDetails/port"]) ?? "") ?? ""
+          if gv != "" { gnc.LocalPortDetails = { "Port": gv } }
+          gv = to_string(get(pf, [np + "remotePortDetails/port"]) ?? "") ?? ""
+          if gv != "" { gnc.RemotePortDetails = { "Port": gv } }
+          gv = to_string(get(pf, [np + "localIpDetails/ipAddressV4"]) ?? "") ?? ""
+          if gv != "" { gnc.LocalIpDetails = { "IpAddressV4": gv } }
+          gv = to_string(get(pf, [np + "localIpDetails/ipAddressV6"]) ?? "") ?? ""
+          if gv != "" && !exists(gnc.LocalIpDetails) { gnc.LocalIpDetails = { "IpAddressV6": gv } }
+          gr = object(get(gd_remote, ["networkConnectionAction"]) ?? {}) ?? {}
+          if length(keys(gr)) > 0 { gnc.RemoteIpDetails = gr }
+          if length(keys(gnc)) > 0 { act.NetworkConnectionAction = gnc }
+          ap = gp + "awsApiCallAction/"
+          gac = {}
+          gv = to_string(get(pf, [ap + "api"]) ?? "") ?? ""
+          if gv != "" { gac.Api = gv }
+          gv = to_string(get(pf, [ap + "serviceName"]) ?? "") ?? ""
+          if gv != "" { gac.ServiceName = gv }
+          gr = object(get(gd_remote, ["awsApiCallAction"]) ?? {}) ?? {}
+          if length(keys(gr)) > 0 { gac.RemoteIpDetails = gr }
+          if length(keys(gac)) > 0 { act.AwsApiCallAction = gac }
+          gv = to_string(get(pf, [gp + "dnsRequestAction/domain"]) ?? "") ?? ""
+          if gv != "" { act.DnsRequestAction = { "Domain": gv } }
+          pp = gp + "portProbeAction/portProbeDetails/0/"
+          gpd = {}
+          gv = to_string(get(pf, [pp + "localPortDetails/port"]) ?? "") ?? ""
+          if gv != "" { gpd.LocalPortDetails = { "Port": gv } }
+          gv = to_string(get(pf, [pp + "localIpDetails/ipAddressV4"]) ?? "") ?? ""
+          if gv != "" { gpd.LocalIpDetails = { "IpAddressV4": gv } }
+          gv = to_string(get(pf, [pp + "localIpDetails/ipAddressV6"]) ?? "") ?? ""
+          if gv != "" && !exists(gpd.LocalIpDetails) { gpd.LocalIpDetails = { "IpAddressV6": gv } }
+          gr = object(get(gd_remote, ["portProbeAction/portProbeDetails/0"]) ?? {}) ?? {}
+          if length(keys(gr)) > 0 { gpd.RemoteIpDetails = gr }
+          if length(keys(gpd)) > 0 { act.PortProbeAction = { "PortProbeDetails": [gpd] } }
+      }
+      api = {}
+      query = {}
+      remote = {}
+      api_call = object(act.AwsApiCallAction) ?? {}
+      if length(keys(api_call)) > 0 {
+          api_name = to_string(api_call.Api) ?? ""
+          api_svc = to_string(api_call.ServiceName) ?? ""
+          if api_name != "" { api.operation = api_name }
+          if api_svc != "" { api.service = { "name": api_svc } }
+          remote = object(api_call.RemoteIpDetails) ?? {}
+      }
+      net_act = object(act.NetworkConnectionAction) ?? {}
+      if length(keys(net_act)) > 0 {
+          remote = object(net_act.RemoteIpDetails) ?? {}
+          cdir = upcase(to_string(net_act.ConnectionDirection) ?? "")
+          if cdir == "INBOUND" { conn.direction_id = 1; conn.direction = "Inbound" }
+          if cdir == "OUTBOUND" { conn.direction_id = 2; conn.direction = "Outbound" }
+          aproto = to_string(net_act.Protocol) ?? ""
+          if aproto != "" && !exists(conn.protocol_name) { conn.protocol_name = downcase(aproto) }
+          lip = to_string(get(net_act, ["LocalIpDetails", "IpAddressV4"]) ?? "") ?? ""
+          if lip == "" { lip = to_string(get(net_act, ["LocalIpDetails", "IpAddressV6"]) ?? "") ?? "" }
+          if lip != "" {
+              if cdir == "OUTBOUND" {
+                  if !exists(src_ep.ip) { src_ep.ip = downcase(lip) }
+              } else if !exists(dst_ep.ip) {
+                  dst_ep.ip = downcase(lip)
+              }
+          }
+          lport = to_int(get(net_act, ["LocalPortDetails", "Port"]) ?? 0) ?? 0
+          rport = to_int(get(net_act, ["RemotePortDetails", "Port"]) ?? 0) ?? 0
+          if cdir == "OUTBOUND" {
+              if lport > 0 && !exists(src_ep.port) { src_ep.port = lport }
+              if rport > 0 && !exists(dst_ep.port) { dst_ep.port = rport }
+          } else {
+              if lport > 0 && !exists(dst_ep.port) { dst_ep.port = lport }
+              if rport > 0 && !exists(src_ep.port) { src_ep.port = rport }
+          }
+      }
+      dns_act = object(act.DnsRequestAction) ?? {}
+      qdomain = to_string(dns_act.Domain) ?? ""
+      if qdomain != "" { query = { "hostname": qdomain } }
+      probe = object(act.PortProbeAction) ?? {}
+      probe_details = array(probe.PortProbeDetails) ?? []
+      first_probe = get(probe_details, [0]) ?? null
+      if first_probe != null {
+          remote = object(get(first_probe, ["RemoteIpDetails"]) ?? {}) ?? {}
+          pport = to_int(get(first_probe, ["LocalPortDetails", "Port"]) ?? 0) ?? 0
+          if pport > 0 && !exists(dst_ep.port) { dst_ep.port = pport }
+          plip = to_string(get(first_probe, ["LocalIpDetails", "IpAddressV4"]) ?? "") ?? ""
+          if plip == "" { plip = to_string(get(first_probe, ["LocalIpDetails", "IpAddressV6"]) ?? "") ?? "" }
+          if plip != "" && !exists(dst_ep.ip) { dst_ep.ip = downcase(plip) }
+      }
+      # The remote party of a GuardDuty action: the destination of an outbound
+      # connection, the source otherwise.
+      if length(keys(remote)) > 0 {
+          rep = {}
+          rip = to_string(remote.IpAddressV4) ?? ""
+          if rip == "" { rip = to_string(remote.IpAddressV6) ?? "" }
+          if rip != "" { rep.ip = downcase(rip) }
+          rloc = {}
+          rcountry = to_string(get(remote, ["Country", "CountryName"]) ?? "") ?? ""
+          if rcountry != "" { rloc.country = rcountry }
+          rcity = to_string(get(remote, ["City", "CityName"]) ?? "") ?? ""
+          if rcity != "" { rloc.city = rcity }
+          if length(keys(rloc)) > 0 { rep.location = rloc }
+          ras = {}
+          rasn = to_int(get(remote, ["Organization", "Asn"]) ?? 0) ?? 0
+          if rasn > 0 { ras.number = rasn }
+          rasorg = to_string(get(remote, ["Organization", "AsnOrg"]) ?? "") ?? ""
+          if rasorg != "" { ras.name = rasorg }
+          if length(keys(ras)) > 0 { rep.autonomous_system = ras }
+          risp = to_string(get(remote, ["Organization", "Isp"]) ?? "") ?? ""
+          if risp != "" { rep.isp = risp }
+          rorg = to_string(get(remote, ["Organization", "Org"]) ?? "") ?? ""
+          if rorg != "" { rep.isp_org = rorg }
+          conn_dir = to_int(conn.direction_id)
+          if conn_dir == 2 {
+              if !exists(dst_ep.ip) { dst_ep = merge(dst_ep, rep) }
+          } else if !exists(src_ep.ip) {
+              src_ep = merge(src_ep, rep)
+          }
+      }
+      if length(keys(conn)) > 0 && !exists(conn.direction_id) { conn.direction_id = 0; conn.direction = "Unknown" }
+
+      proc_src = object(f.Process) ?? {}
+      process = {}
+      if length(keys(proc_src)) > 0 {
+          pname = to_string(proc_src.Name) ?? ""
+          if pname != "" { process.name = pname }
+          # pid is optional in ASFF; uid "unknown" satisfies the OCSF process
+          # constraint without inventing pid 0 (a real kernel pid).
+          ppid = -1
+          if proc_src.Pid != null { ppid = to_int(proc_src.Pid) ?? -1 }
+          if ppid >= 0 { process.pid = ppid } else { process.uid = "unknown" }
+          ppath = to_string(proc_src.Path) ?? ""
+          if ppath != "" {
+              fparts = split(ppath, "/")
+              fbase = to_string(get(fparts, [length(fparts) - 1]) ?? "") ?? ""
+              if fbase == "" { fbase = ppath }
+              process.file = { "path": ppath, "name": fbase, "type_id": 1, "type": "Regular File" }
+          }
+          parent_pid = to_int(proc_src.ParentPid) ?? 0
+          if parent_pid > 0 { process.parent_process = { "pid": parent_pid } }
+          plaunch = to_string(proc_src.LaunchedAt) ?? ""
+          if plaunch != "" {
+              plt, plerr = parse_timestamp(plaunch, "%+")
+              if plerr == null { process.created_time = to_unix_timestamp(plt, unit: "milliseconds") }
+          }
+          pterm = to_string(proc_src.TerminatedAt) ?? ""
+          if pterm != "" {
+              ptt, pterr2 = parse_timestamp(pterm, "%+")
+              if pterr2 == null { process.terminated_time = to_unix_timestamp(ptt, unit: "milliseconds") }
+          }
+      }
+
+      ev = {}
+      if length(keys(src_ep)) > 0 { ev.src_endpoint = src_ep }
+      if length(keys(dst_ep)) > 0 { ev.dst_endpoint = dst_ep }
+      if length(keys(conn)) > 0 { ev.connection_info = conn }
+      if length(keys(api)) > 0 { ev.api = api }
+      if length(keys(query)) > 0 { ev.query = query }
+      if length(keys(process)) > 0 { ev.process = process }
+      action_type = to_string(act.ActionType) ?? ""
+      if length(keys(ev)) > 0 && action_type != "" { ev.name = action_type }
+
+      record_uid = finding_id
+      if updated_str != "" { record_uid = finding_id + "|" + updated_str }
+
+      product = { "name": "AWS Security Hub", "vendor_name": "Amazon" }
+      if product_name != "" { product.feature = { "name": product_name } }
+      msg = title
+      if msg == "" { msg = finding_id }
+
+      ocsf = {
+          "class_uid": class_uid,
+          "class_name": class_name,
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": msg,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud", "security_control"],
+              "uid": record_uid,
+              "original_event_uid": finding_id,
+              "log_name": "Security Hub findings",
+              "log_provider": "AWS Security Hub",
+              "product": product
+          },
+          "cloud": cloud,
+          "finding_info": finding_info
+      }
+      if processed_ms > 0 { ocsf.metadata.processed_time = processed_ms }
+      schema_ver = to_string(f.SchemaVersion) ?? ""
+      if schema_ver != "" { ocsf.metadata.log_version = schema_ver }
+      if length(resources) > 0 { ocsf.resources = resources }
+      if length(malware) > 0 { ocsf.malware = malware }
+      if f.Confidence != null { ocsf.confidence_score = to_int(f.Confidence) ?? 0 }
+      verification = upcase(to_string(f.VerificationState) ?? "")
+      if verification == "UNKNOWN" { ocsf.verdict_id = 0; ocsf.verdict = "Unknown" }
+      if verification == "FALSE_POSITIVE" { ocsf.verdict_id = 1; ocsf.verdict = "False Positive" }
+      if verification == "TRUE_POSITIVE" { ocsf.verdict_id = 2; ocsf.verdict = "True Positive" }
+      if verification == "BENIGN_POSITIVE" { ocsf.verdict_id = 5; ocsf.verdict = "Benign" }
+      # Promote the API call, the process (as the actor) and the EC2 instance
+      # (as the device) to the top level, where nano's promoted columns read them.
+      profiles = ["cloud", "security_control"]
+      if length(keys(api)) > 0 { ocsf.api = api }
+      if length(keys(process)) > 0 {
+          ocsf.actor = { "process": process }
+          profiles = push(profiles, "host")
+      }
+      if length(keys(device)) > 0 {
+          ocsf.device = device
+          if !includes(profiles, "host") { profiles = push(profiles, "host") }
+      }
+      # verdict is bound to the incident profile.
+      if exists(ocsf.verdict_id) { profiles = push(profiles, "incident") }
+      ocsf.metadata.profiles = profiles
+      note = to_string(get(f, ["Note", "Text"]) ?? "") ?? ""
+      if note != "" { ocsf.comment = note }
+
+      if class_uid == 2002 {
+          ocsf.is_alert = severity_id >= 4
+          vulns = []
+          for_each(vulns_src) -> |_i, vsrc| {
+              vid = to_string(get(vsrc, ["Id"]) ?? "") ?? ""
+              vuln = {}
+              if vid != "" { vuln.title = vid }
+              cvss = []
+              for_each(array(get(vsrc, ["Cvss"]) ?? []) ?? []) -> |_j, c| {
+                  cscore = to_float(get(c, ["BaseScore"]) ?? null) ?? -1.0
+                  cver = to_string(get(c, ["Version"]) ?? "") ?? ""
+                  if cscore >= 0.0 && cver != "" {
+                      if starts_with(cver, "V") || starts_with(cver, "v") { cver = slice!(cver, 1) }
+                      cv = { "base_score": cscore, "version": cver }
+                      cvec = to_string(get(c, ["BaseVector"]) ?? "") ?? ""
+                      if cvec != "" { cv.vector_string = cvec }
+                      csrc = to_string(get(c, ["Source"]) ?? "") ?? ""
+                      if csrc != "" { cv.vendor_name = csrc }
+                      cvss = push(cvss, cv)
+                  }
+              }
+              if match(vid, r'^(?i)CVE-\d{4}-\d+$') {
+                  cve = { "uid": upcase(vid) }
+                  if length(cvss) > 0 { cve.cvss = cvss }
+                  vuln.cve = cve
+              } else if vid != "" {
+                  vuln.advisory = { "uid": vid, "title": vid }
+              } else {
+                  # OCSF needs one of cve / advisory / cwe: name it by the finding.
+                  vuln.advisory = { "uid": finding_id, "title": finding_info.title }
+                  vuln.title = finding_info.title
+              }
+              vvendor = to_string(get(vsrc, ["Vendor", "Name"]) ?? "") ?? ""
+              if vvendor != "" { vuln.vendor_name = vvendor }
+              vsev = to_string(get(vsrc, ["Vendor", "VendorSeverity"]) ?? "") ?? ""
+              if vsev != "" { vuln.severity = vsev }
+              vrefs = array(get(vsrc, ["ReferenceUrls"]) ?? []) ?? []
+              if length(vrefs) > 0 { vuln.references = vrefs }
+              vrel = array(get(vsrc, ["RelatedVulnerabilities"]) ?? []) ?? []
+              if length(vrel) > 0 { vuln.related_vulnerabilities = vrel }
+              vfix = upcase(to_string(get(vsrc, ["FixAvailable"]) ?? "") ?? "")
+              if vfix == "YES" { vuln.is_fix_available = true }
+              if vfix == "NO" { vuln.is_fix_available = false }
+              vexp = upcase(to_string(get(vsrc, ["ExploitAvailable"]) ?? "") ?? "")
+              if vexp == "YES" { vuln.is_exploit_available = true }
+              if vexp == "NO" { vuln.is_exploit_available = false }
+              pkgs = []
+              for_each(array(get(vsrc, ["VulnerablePackages"]) ?? []) ?? []) -> |_j, pk| {
+                  pkname = to_string(get(pk, ["Name"]) ?? "") ?? ""
+                  pkver = to_string(get(pk, ["Version"]) ?? "") ?? ""
+                  if pkname != "" && pkver != "" {
+                      pkg = { "name": pkname, "version": pkver }
+                      pkrel = to_string(get(pk, ["Release"]) ?? "") ?? ""
+                      if pkrel != "" { pkg.release = pkrel }
+                      pkepoch = to_string(get(pk, ["Epoch"]) ?? "") ?? ""
+                      if pkepoch != "" { pkg.epoch = to_int(pkepoch) ?? 0 }
+                      pkarch = to_string(get(pk, ["Architecture"]) ?? "") ?? ""
+                      if pkarch != "" { pkg.architecture = pkarch }
+                      pkfix = to_string(get(pk, ["FixedInVersion"]) ?? "") ?? ""
+                      if pkfix != "" { pkg.fixed_in_version = pkfix }
+                      pkmgr = to_string(get(pk, ["PackageManager"]) ?? "") ?? ""
+                      if pkmgr != "" { pkg.package_manager = pkmgr }
+                      pkpath = to_string(get(pk, ["FilePath"]) ?? "") ?? ""
+                      if pkpath != "" { pkg.path = pkpath }
+                      pkgs = push(pkgs, pkg)
+                  }
+              }
+              if length(pkgs) > 0 { vuln.affected_packages = pkgs }
+              if desc != "" { vuln.desc = desc }
+              if first_ms > 0 { vuln.first_seen_time = first_ms }
+              if last_ms > 0 { vuln.last_seen_time = last_ms }
+              if length(keys(remediation)) > 0 { vuln.remediation = remediation }
+              vulns = push(vulns, vuln)
+          }
+          ocsf.vulnerabilities = vulns
+          if length(resources) > 0 { ocsf.resource = resources[0] }
+      } else if class_uid == 2003 {
+          comp = { "status": comp_status }
+          comp_status_id = 99
+          if comp_status == "PASSED" { comp_status_id = 1 }
+          if comp_status == "WARNING" { comp_status_id = 2 }
+          if comp_status == "FAILED" { comp_status_id = 3 }
+          comp.status_id = comp_status_id
+          ctrl = to_string(compliance_src.SecurityControlId) ?? ""
+          if ctrl != "" { comp.control = ctrl }
+          reqs = array(compliance_src.RelatedRequirements) ?? []
+          if length(reqs) > 0 { comp.requirements = reqs }
+          stds = []
+          for_each(array(compliance_src.AssociatedStandards) ?? []) -> |_i, s| {
+              sid = to_string(get(s, ["StandardsId"]) ?? "") ?? ""
+              if sid != "" { stds = push(stds, sid) }
+          }
+          if length(stds) > 0 { comp.standards = stds }
+          reasons = array(compliance_src.StatusReasons) ?? []
+          first_reason = get(reasons, [0]) ?? null
+          if first_reason != null {
+              rcode = to_string(get(first_reason, ["ReasonCode"]) ?? "") ?? ""
+              if rcode != "" { comp.status_code = rcode }
+              rdesc = to_string(get(first_reason, ["Description"]) ?? "") ?? ""
+              if rdesc != "" { comp.status_detail = rdesc }
+          }
+          ocsf.compliance = comp
+          ocsf.is_alert = comp_status == "FAILED"
+          if length(keys(remediation)) > 0 { ocsf.remediation = remediation }
+          if length(resources) > 0 { ocsf.resource = resources[0] }
+          if length(keys(ev)) > 0 { ocsf.evidences = [ev] }
+      } else {
+          ocsf.is_alert = true
+          if length(keys(remediation)) > 0 { ocsf.remediation = remediation }
+          if length(keys(ev)) > 0 { ocsf.evidences = [ev] }
+      }
+
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # Values spill exactly as parsed: a parser never masks, redacts or withholds
+  # anything (masking is an opt-in pipeline step, never a parser concern).
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __copy = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __copy_json = encode_json(__copy)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__copy_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # CreatedAt: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # UpdatedAt: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # FirstObservedAt: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # LastObservedAt: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # ProcessedAt: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # Process.LaunchedAt: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # Process.TerminatedAt: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # Network.Protocol: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # Action.NetworkConnectionAction.Protocol: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # Network.SourceMac: Parser lowercases this source value; consume only when the normalized value is emitted.
+  # Severity.Label: The ASFF severity label normalized to the OCSF severity; consume only when the expected ID is emitted.
+  # FindingProviderFields.Severity.Label: The provider severity label, used when Severity.Label is absent; consume only when the expected ID is emitted.
+  # Workflow.Status: The ASFF workflow status normalized to the OCSF finding status; consume only when the expected ID is emitted.
+  # Compliance.Status: The ASFF compliance status normalized to the OCSF compliance status; consume only when the expected ID is emitted.
+  # VerificationState: The ASFF verification state normalized to the OCSF verdict; consume only when the expected ID is emitted.
+  # Network.Direction: Connection direction normalized to the OCSF direction_id in the evidence; consume only when that ID is emitted.
+  # Action.NetworkConnectionAction.ConnectionDirection: Connection direction normalized to the OCSF direction_id in the evidence; consume only when that ID is emitted.
+  # ProductFields.aws/guardduty/service/action/networkConnectionAction/protocol: Parser lowercases the GuardDuty protocol; consume only when the normalized value is emitted.
+  # ProductFields.aws/guardduty/service/action/networkConnectionAction/connectionDirection: GuardDuty connection direction normalized to the OCSF direction_id in the evidence; consume only when that ID is emitted.
+  # ProductFields.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV6: Parser lowercases the GuardDuty IPv6 address; consume only when the normalized value is emitted.
+  # ProductFields.aws/guardduty/service/action/networkConnectionAction/localIpDetails/ipAddressV6: Parser lowercases the GuardDuty IPv6 address; consume only when the normalized value is emitted.
+  # ProductFields.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/ipAddressV6: Parser lowercases the GuardDuty IPv6 address; consume only when the normalized value is emitted.
+  # ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/ipAddressV6: Parser lowercases the GuardDuty IPv6 address; consume only when the normalized value is emitted.
+  # ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localIpDetails/ipAddressV6: Parser lowercases the GuardDuty IPv6 address; consume only when the normalized value is emitted.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        CreatedAt
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if __mapped."finding_info"."created_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        UpdatedAt
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if __mapped."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        FirstObservedAt
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if __mapped."finding_info"."first_seen_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        LastObservedAt
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if __mapped."finding_info"."last_seen_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        ProcessedAt
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if __mapped."metadata"."processed_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        Process\.LaunchedAt
+      | Process\.TerminatedAt
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        Network\.Protocol
+      | Action\.NetworkConnectionAction\.Protocol
+      | Network\.SourceMac
+      | ProductFields\.aws/guardduty/service/action/networkConnectionAction/protocol
+      | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV6
+      | ProductFields\.aws/guardduty/service/action/networkConnectionAction/localIpDetails/ipAddressV6
+      | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/ipAddressV6
+      | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/ipAddressV6
+      | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localIpDetails/ipAddressV6
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        Severity\.Label
+      | FindingProviderFields\.Severity\.Label
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"informational": 1, "low": 2, "medium": 3, "high": 4, "critical": 5}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if __mapped."severity_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        Workflow\.Status
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"new": 1, "notified": 2, "suppressed": 3, "resolved": 4}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if __mapped."status_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        Compliance\.Status
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"passed": 1, "warning": 2, "failed": 3, "not_available": 99}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if __mapped."compliance"."status_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        VerificationState
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"unknown": 0, "false_positive": 1, "true_positive": 2, "benign_positive": 5}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if __mapped."verdict_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        Network\.Direction
+      | Action\.NetworkConnectionAction\.ConnectionDirection
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"in": 1, "out": 2, "inbound": 1, "outbound": 2}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        ProductFields\.aws/guardduty/service/action/networkConnectionAction/connectionDirection
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"inbound": 1, "outbound": 2}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    Action\.ActionType
+  | Action\.AwsApiCallAction\.Api
+  | Action\.AwsApiCallAction\.RemoteIpDetails\.City\.CityName
+  | Action\.AwsApiCallAction\.RemoteIpDetails\.Country\.CountryName
+  | Action\.AwsApiCallAction\.RemoteIpDetails\.IpAddressV4
+  | Action\.AwsApiCallAction\.RemoteIpDetails\.Organization\.Asn
+  | Action\.AwsApiCallAction\.RemoteIpDetails\.Organization\.AsnOrg
+  | Action\.AwsApiCallAction\.RemoteIpDetails\.Organization\.Isp
+  | Action\.AwsApiCallAction\.RemoteIpDetails\.Organization\.Org
+  | Action\.AwsApiCallAction\.ServiceName
+  | Action\.DnsRequestAction\.Domain
+  | Action\.NetworkConnectionAction\.ConnectionDirection
+  | Action\.NetworkConnectionAction\.LocalIpDetails\.IpAddressV4
+  | Action\.NetworkConnectionAction\.LocalPortDetails\.Port
+  | Action\.NetworkConnectionAction\.Protocol
+  | Action\.NetworkConnectionAction\.RemoteIpDetails\.City\.CityName
+  | Action\.NetworkConnectionAction\.RemoteIpDetails\.Country\.CountryName
+  | Action\.NetworkConnectionAction\.RemoteIpDetails\.IpAddressV4
+  | Action\.NetworkConnectionAction\.RemoteIpDetails\.Organization\.Asn
+  | Action\.NetworkConnectionAction\.RemoteIpDetails\.Organization\.AsnOrg
+  | Action\.NetworkConnectionAction\.RemoteIpDetails\.Organization\.Isp
+  | Action\.NetworkConnectionAction\.RemoteIpDetails\.Organization\.Org
+  | Action\.NetworkConnectionAction\.RemotePortDetails\.Port
+  | AwsAccountId
+  | AwsAccountName
+  | CompanyName
+  | Compliance\.RelatedRequirements
+  | Compliance\.SecurityControlId
+  | Compliance\.Status
+  | Confidence
+  | CreatedAt
+  | Description
+  | FindingProviderFields\.Severity\.Label
+  | FirstObservedAt
+  | GeneratorId
+  | Id
+  | LastObservedAt
+  | Network\.DestinationDomain
+  | Network\.DestinationIpV4
+  | Network\.DestinationIpV6
+  | Network\.DestinationPort
+  | Network\.Direction
+  | Network\.Protocol
+  | Network\.SourceDomain
+  | Network\.SourceIpV4
+  | Network\.SourceIpV6
+  | Network\.SourceMac
+  | Network\.SourcePort
+  | Note\.Text
+  | Process\.LaunchedAt
+  | Process\.Name
+  | Process\.ParentPid
+  | Process\.Path
+  | Process\.Pid
+  | Process\.TerminatedAt
+  | ProcessedAt
+  | ProductArn
+  | ProductFields\.aws/guardduty/service/action/actionType
+  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/api
+  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/city/cityName
+  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/country/countryName
+  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/ipAddressV4
+  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/ipAddressV6
+  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/organization/asn
+  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/organization/asnOrg
+  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/organization/isp
+  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/organization/org
+  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/serviceName
+  | ProductFields\.aws/guardduty/service/action/dnsRequestAction/domain
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/connectionDirection
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/localIpDetails/ipAddressV4
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/localIpDetails/ipAddressV6
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/localPortDetails/port
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/protocol
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/city/cityName
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/country/countryName
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV4
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV6
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/asn
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/asnOrg
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/isp
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/org
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remotePortDetails/port
+  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localIpDetails/ipAddressV4
+  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localIpDetails/ipAddressV6
+  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localPortDetails/port
+  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/city/cityName
+  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/country/countryName
+  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/ipAddressV4
+  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/ipAddressV6
+  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/asn
+  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/asnOrg
+  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/isp
+  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/org
+  | ProductFields\.aws/securityhub/CompanyName
+  | ProductFields\.aws/securityhub/ProductName
+  | ProductName
+  | Region
+  | Remediation\.Recommendation\.Text
+  | Remediation\.Recommendation\.Url
+  | SchemaVersion
+  | Severity\.Label
+  | Severity\.Normalized
+  | SourceUrl
+  | Title
+  | Types
+  | UpdatedAt
+  | VerificationState
+  | Workflow\.Status
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if !contains(__consumed, __token) && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # The canonical source spill above is the authoritative representation of
+  # containers. The cheap conditions run first; the source value set is built on
+  # first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, as-is. These
+  # entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__copy.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+# Sample provenance (sidecar samples/ directory). Account ids, IPs, ISP names
+# and owner names are replaced with documentation values.
+#   sh_full_asff_vuln_network.json, sh_control_failed_high.json,
+#   sh_control_passed_resolved.json, sh_control_archived_failed.json,
+#   sh_control_not_available.json, sh_inspector_cve.json:
+#     Elastic integrations test fixture
+#     https://github.com/elastic/integrations/blob/main/packages/aws/data_stream/securityhub_findings/_dev/test/pipeline/test-securityhub-findings.log
+#   sh_guardduty_ssh_bruteforce.json: GuardDuty finding as sent to Security Hub
+#     https://docs.aws.amazon.com/guardduty/latest/ug/securityhub-integration.html
+#   sh_macie_sensitive_data.json, sh_macie_policy.json: Macie findings in ASFF
+#     https://docs.aws.amazon.com/macie/latest/user/securityhub-integration.html
+#   sh_eventbridge_guardduty.json: the GuardDuty finding in the EventBridge
+#     "Security Hub Findings - Imported" envelope
+#     https://docs.aws.amazon.com/securityhub/latest/userguide/securityhub-cwe-event-formats.html
+#   sh_config_rule_failed.json: an AWS Config rule evaluation in ASFF, field set
+#     from the AWS Config integration and ASFF syntax pages
+#     https://docs.aws.amazon.com/securityhub/latest/userguide/securityhub-internal-providers.html
+#     https://docs.aws.amazon.com/securityhub/latest/userguide/securityhub-findings-format-syntax.html
+#   sh_guardduty_port_probe.json: a GuardDuty PORT_PROBE finding imported into
+#     Security Hub with the action in ProductFields, key layout from
+#     https://docs.aws.amazon.com/guardduty/latest/ug/securityhub-integration.html
+#   junk.json: a JSON record that is not a finding, Base Event fallback
+samples:
+  - raw: '{"SchemaVersion":"2018-10-08","Id":"arn:aws:securityhub:us-east-1:123456789012:security-control/S3.8/finding/00000000-0000-0000-0000-000000000001","ProductArn":"arn:aws:securityhub:us-east-1::product/aws/securityhub","ProductName":"Security Hub","CompanyName":"AWS","Region":"us-east-1","GeneratorId":"security-control/S3.8","AwsAccountId":"123456789012","Types":["Software and Configuration Checks/Industry and Regulatory Standards"],"CreatedAt":"2026-08-18T19:00:00.000Z","UpdatedAt":"2026-08-18T20:00:00.000Z","Severity":{"Label":"HIGH","Normalized":70},"Title":"S3 general purpose buckets should block public access","Compliance":{"Status":"FAILED","SecurityControlId":"S3.8","RelatedRequirements":["NIST.800-53.r5 AC-21"]},"Resources":[{"Type":"AwsS3Bucket","Id":"arn:aws:s3:::example-bucket","Partition":"aws","Region":"us-east-1","Tags":{"env":"prod"}}],"Workflow":{"Status":"NEW"},"RecordState":"ACTIVE"}'
+    expect:
+      class_uid: 2003
+      activity_id: 2
+      severity_id: 4
+      status_id: 1
+      compliance.status_id: 3
+      compliance.control: S3.8
+      is_alert: true
+      metadata.uid: arn:aws:securityhub:us-east-1:123456789012:security-control/S3.8/finding/00000000-0000-0000-0000-000000000001|2026-08-18T20:00:00.000Z
+      resources.0.tags.0.name: env
+      metadata.product.feature.name: Security Hub
+  - raw: '{"SchemaVersion":"2018-10-08","Id":"arn:aws:inspector2:us-east-1:123456789012:finding/0123456789abcdef","ProductArn":"arn:aws:securityhub:us-east-1::product/aws/inspector","ProductName":"Inspector","CompanyName":"Amazon","Region":"us-east-1","GeneratorId":"AWSInspector","AwsAccountId":"123456789012","Types":["Software and Configuration Checks/Vulnerabilities/CVE"],"CreatedAt":"2026-08-18T19:00:00Z","UpdatedAt":"2026-08-18T19:00:00Z","Severity":{"Label":"CRITICAL"},"Title":"CVE-2026-0001 - openssl","Vulnerabilities":[{"Id":"CVE-2026-0001","Cvss":[{"BaseScore":9.8,"BaseVector":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H","Version":"3.1"}],"VulnerablePackages":[{"Name":"openssl","Version":"3.0.1","FixedInVersion":"3.0.8"}],"FixAvailable":"YES"}],"Workflow":{"Status":"NEW"},"RecordState":"ACTIVE"}'
+    expect:
+      class_uid: 2002
+      activity_id: 1
+      severity_id: 5
+      vulnerabilities.0.cve.uid: CVE-2026-0001
+      vulnerabilities.0.cve.cvss.0.base_score: "9.8"
+      vulnerabilities.0.affected_packages.0.fixed_in_version: 3.0.8
+      vulnerabilities.0.is_fix_available: true
+  - raw: '{"version":"0","id":"9f1b6a2e-0000-4000-8000-000000000001","detail-type":"Security Hub Findings - Imported","source":"aws.securityhub","account":"123456789012","time":"2020-09-30T12:14:05Z","region":"us-east-1","resources":[],"detail":{"findings":[{"SchemaVersion":"2018-10-08","Id":"arn:aws:guardduty:us-east-1:123456789012:detector/abc/finding/def","ProductArn":"arn:aws:securityhub:us-east-1::product/aws/guardduty","ProductName":"GuardDuty","CompanyName":"Amazon","Region":"us-east-1","AwsAccountId":"123456789012","Types":["TTPs/Initial Access/UnauthorizedAccess:EC2-SSHBruteForce"],"CreatedAt":"2020-08-22T09:34:34.146Z","UpdatedAt":"2020-09-30T12:14:00.206Z","Severity":{"Label":"MEDIUM","Normalized":40},"Title":"198.51.100.23 is performing SSH brute force attacks","Action":{"ActionType":"NETWORK_CONNECTION","NetworkConnectionAction":{"ConnectionDirection":"INBOUND","Protocol":"TCP","LocalPortDetails":{"Port":22},"RemotePortDetails":{"Port":46717},"RemoteIpDetails":{"IpAddressV4":"198.51.100.23","Organization":{"Asn":64500,"AsnOrg":"EXAMPLE-ASN-ORG"}}}},"Workflow":{"Status":"NEW"},"RecordState":"ACTIVE"}]}}'
+    expect:
+      class_uid: 2004
+      activity_id: 2
+      severity_id: 3
+      evidences.0.src_endpoint.ip: 198.51.100.23
+      evidences.0.src_endpoint.port: 46717
+      evidences.0.dst_endpoint.port: 22
+      evidences.0.connection_info.direction_id: 1
+      metadata.product.feature.name: GuardDuty
+  # Review P1: GuardDuty imported into Security Hub has no Action object; ProductFields carry it. The EC2 resource is the device.
+  - raw: '{"SchemaVersion":"2018-10-08","Id":"arn:aws:guardduty:us-east-1:123456789012:detector/d4b040365221be2b54a6264dc9a4bc64/finding/46ba0ac2845071e23ccdeb2ae03bfdea","ProductArn":"arn:aws:securityhub:us-east-1:product/aws/guardduty","GeneratorId":"arn:aws:guardduty:us-east-1:123456789012:detector/d4b040365221be2b54a6264dc9a4bc64","AwsAccountId":"123456789012","Types":["TTPs/Initial Access/UnauthorizedAccess:EC2-SSHBruteForce"],"FirstObservedAt":"2020-08-22T09:15:57Z","LastObservedAt":"2020-09-30T11:56:49Z","CreatedAt":"2020-08-22T09:34:34.146Z","UpdatedAt":"2020-09-30T12:14:00.206Z","Severity":{"Product":2,"Label":"MEDIUM","Normalized":40},"Title":"198.51.100.23 is performing SSH brute force attacks against i-0c10c2c7863d1a356.","Description":"198.51.100.23 is performing SSH brute force attacks against i-0c10c2c7863d1a356. Brute force attacks are used to gain unauthorized access to your instance by guessing the SSH password.","SourceUrl":"https://us-east-1.console.aws.amazon.com/guardduty/home?region=us-east-1#/findings?macros=current&fId=46ba0ac2845071e23ccdeb2ae03bfdea","ProductFields":{"aws/guardduty/service/action/networkConnectionAction/remotePortDetails/portName":"Unknown","aws/guardduty/service/archived":"false","aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/asnOrg":"EXAMPLE-ASN-ORG","aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/geoLocation/lat":"42.5122","aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV4":"198.51.100.23","aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/geoLocation/lon":"-90.7384","aws/guardduty/service/action/networkConnectionAction/blocked":"false","aws/guardduty/service/action/networkConnectionAction/remotePortDetails/port":"46717","aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/country/countryName":"United States","aws/guardduty/service/serviceName":"guardduty","aws/guardduty/service/evidence":"","aws/guardduty/service/action/networkConnectionAction/localIpDetails/ipAddressV4":"192.0.2.6","aws/guardduty/service/detectorId":"d4b040365221be2b54a6264dc9a4bc64","aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/org":"ExampleISP","aws/guardduty/service/action/networkConnectionAction/connectionDirection":"INBOUND","aws/guardduty/service/eventFirstSeen":"2020-08-22T09:15:57Z","aws/guardduty/service/eventLastSeen":"2020-09-30T11:56:49Z","aws/guardduty/service/action/networkConnectionAction/localPortDetails/portName":"SSH","aws/guardduty/service/action/actionType":"NETWORK_CONNECTION","aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/city/cityName":"Example City","aws/guardduty/service/additionalInfo":"","aws/guardduty/service/resourceRole":"TARGET","aws/guardduty/service/action/networkConnectionAction/localPortDetails/port":"22","aws/guardduty/service/action/networkConnectionAction/protocol":"TCP","aws/guardduty/service/count":"74","aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/asn":"209","aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/isp":"ExampleISP","aws/securityhub/FindingId":"arn:aws:securityhub:us-east-1::product/aws/guardduty/arn:aws:guardduty:us-east-1:123456789012:detector/d4b040365221be2b54a6264dc9a4bc64/finding/46ba0ac2845071e23ccdeb2ae03bfdea","aws/securityhub/ProductName":"GuardDuty","aws/securityhub/CompanyName":"Amazon"},"Resources":[{"Type":"AwsEc2Instance","Id":"arn:aws:ec2:us-east-1:123456789012:instance/i-0c10c2c7863d1a356","Partition":"aws","Region":"us-east-1","Tags":{"Name":"kubectl"},"Details":{"AwsEc2Instance":{"Type":"t2.micro","ImageId":"ami-02354e95b39ca8dec","IpV4Addresses":["203.0.113.16","192.0.2.6"],"VpcId":"vpc-a0c2d7c7","SubnetId":"subnet-4975b475","LaunchedAt":"2020-08-03T23:21:57Z"}}}],"WorkflowState":"NEW","Workflow":{"Status":"NEW"},"RecordState":"ACTIVE"}'
+    expect:
+      evidences.0.src_endpoint.ip: 198.51.100.23
+      evidences.0.src_endpoint.port: 46717
+      evidences.0.dst_endpoint.ip: 192.0.2.6
+      evidences.0.dst_endpoint.port: 22
+      evidences.0.connection_info.protocol_name: tcp
+      evidences.0.connection_info.direction_id: 1
+      evidences.0.name: NETWORK_CONNECTION
+      device.instance_uid: i-0c10c2c7863d1a356
+      device.vpc_uid: vpc-a0c2d7c7
+  # Review P1/P2: AwsApiCallAction promotes to api, Process to actor.process (uid unknown with no Pid, never pid 0).
+  - raw: '{"SchemaVersion":"2018-10-08","Id":"arn:aws:guardduty:us-east-1:123456789012:detector/abc/finding/0a1b2c3d","ProductArn":"arn:aws:securityhub:us-east-1::product/aws/guardduty","ProductName":"GuardDuty","CompanyName":"Amazon","Region":"us-east-1","GeneratorId":"arn:aws:guardduty:us-east-1:123456789012:detector/abc","AwsAccountId":"123456789012","Types":["TTPs/Discovery/Recon:IAMUser-MaliciousIPCaller"],"CreatedAt":"2026-08-18T20:00:00.000Z","UpdatedAt":"2026-08-18T20:00:00.000Z","Severity":{"Label":"HIGH","Normalized":70},"Title":"API ListBuckets was invoked from a known malicious IP address.","Action":{"ActionType":"AWS_API_CALL","AwsApiCallAction":{"Api":"ListBuckets","ServiceName":"s3.amazonaws.com","CallerType":"Remote IP","RemoteIpDetails":{"IpAddressV4":"203.0.113.77","Organization":{"Asn":64501,"AsnOrg":"EXAMPLE-NET"},"Country":{"CountryName":"Example Country"}}}},"Process":{"Name":"aws-cli","Path":"/usr/local/bin/aws"},"Resources":[{"Type":"AwsEc2Instance","Id":"arn:aws:ec2:us-east-1:123456789012:instance/i-0abcdef1234567890","Partition":"aws","Region":"us-east-1","Tags":{"Name":"build-runner"},"Details":{"AwsEc2Instance":{"Type":"t3.micro","IpV4Addresses":["192.0.2.44"],"VpcId":"vpc-0a1b2c3d","SubnetId":"subnet-0a1b2c3d","PrivateDnsName":"ip-192-0-2-44.ec2.internal"}}}],"Workflow":{"Status":"NEW"},"RecordState":"ACTIVE"}'
+    expect:
+      api.operation: ListBuckets
+      api.service.name: s3.amazonaws.com
+      actor.process.name: aws-cli
+      actor.process.uid: unknown
+      actor.process.pid: "<missing>"
+      device.hostname: ip-192-0-2-44.ec2.internal
+      device.ip: 192.0.2.44
+      evidences.0.src_endpoint.ip: 203.0.113.77
+  # Review round 2 P2: a PORT_PROBE imported via ProductFields rebuilds portProbeDetails/0 into evidences.
+  - raw: '{"SchemaVersion":"2018-10-08","ProductArn":"arn:aws:securityhub:us-east-1::product/aws/guardduty","GeneratorId":"arn:aws:guardduty:us-east-1:123456789012:detector/abc","AwsAccountId":"123456789012","CreatedAt":"2026-08-18T20:00:00.000Z","UpdatedAt":"2026-08-18T20:00:00.000Z","Severity":{"Label":"LOW","Normalized":20},"Resources":[{"Type":"AwsEc2Instance","Id":"arn:aws:ec2:us-east-1:123456789012:instance/i-0abcdef1234567890","Partition":"aws","Region":"us-east-1","Details":{"AwsEc2Instance":{"Type":"t3.micro","IpV4Addresses":["192.0.2.44"],"VpcId":"vpc-0a1b2c3d"}}}],"Workflow":{"Status":"NEW"},"RecordState":"ACTIVE","Id":"arn:aws:guardduty:us-east-1:123456789012:detector/abc/finding/pp01","Types":["TTPs/Discovery/Recon:EC2-PortProbeUnprotectedPort"],"Title":"Unprotected port on EC2 instance i-0abcdef1234567890 is being probed.","ProductFields":{"aws/guardduty/service/action/actionType":"PORT_PROBE","aws/guardduty/service/action/portProbeAction/blocked":"false","aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localPortDetails/port":"3389","aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localPortDetails/portName":"RDP","aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localIpDetails/ipAddressV4":"192.0.2.44","aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/ipAddressV4":"198.51.100.99","aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/country/countryName":"Example Country","aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/city/cityName":"Example City","aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/asn":"64502","aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/asnOrg":"EXAMPLE-PROBE-NET","aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/isp":"ExampleISP","aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/org":"ExampleOrg","aws/securityhub/ProductName":"GuardDuty","aws/securityhub/CompanyName":"Amazon"}}'
+    expect:
+      evidences.0.name: PORT_PROBE
+      evidences.0.src_endpoint.ip: 198.51.100.99
+      evidences.0.src_endpoint.autonomous_system.number: 64502
+      evidences.0.dst_endpoint.ip: 192.0.2.44
+      evidences.0.dst_endpoint.port: 3389
+  # Review round 2 P2: ProductFields ipAddressV6 on remote and local details (lowercased).
+  - raw: '{"SchemaVersion":"2018-10-08","ProductArn":"arn:aws:securityhub:us-east-1::product/aws/guardduty","GeneratorId":"arn:aws:guardduty:us-east-1:123456789012:detector/abc","AwsAccountId":"123456789012","CreatedAt":"2026-08-18T20:00:00.000Z","UpdatedAt":"2026-08-18T20:00:00.000Z","Severity":{"Label":"LOW","Normalized":20},"Resources":[{"Type":"AwsEc2Instance","Id":"arn:aws:ec2:us-east-1:123456789012:instance/i-0abcdef1234567890","Partition":"aws","Region":"us-east-1","Details":{"AwsEc2Instance":{"Type":"t3.micro","IpV4Addresses":["192.0.2.44"],"VpcId":"vpc-0a1b2c3d"}}}],"Workflow":{"Status":"NEW"},"RecordState":"ACTIVE","Id":"arn:aws:guardduty:us-east-1:123456789012:detector/abc/finding/v601","Types":["TTPs/Initial Access/UnauthorizedAccess:EC2-SSHBruteForce"],"Title":"2001:db8::99 is performing SSH brute force attacks.","ProductFields":{"aws/guardduty/service/action/actionType":"NETWORK_CONNECTION","aws/guardduty/service/action/networkConnectionAction/connectionDirection":"INBOUND","aws/guardduty/service/action/networkConnectionAction/protocol":"TCP","aws/guardduty/service/action/networkConnectionAction/localPortDetails/port":"22","aws/guardduty/service/action/networkConnectionAction/remotePortDetails/port":"50001","aws/guardduty/service/action/networkConnectionAction/localIpDetails/ipAddressV6":"2001:DB8::44","aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV6":"2001:DB8::99","aws/securityhub/ProductName":"GuardDuty","aws/securityhub/CompanyName":"Amazon"}}'
+    expect:
+      evidences.0.src_endpoint.ip: "2001:db8::99"
+      evidences.0.src_endpoint.port: 50001
+      evidences.0.dst_endpoint.ip: "2001:db8::44"
+      evidences.0.dst_endpoint.port: 22
+  - raw: '{"SchemaVersion":"2018-10-08","ProductArn":"arn:aws:securityhub:us-east-1::product/aws/guardduty","GeneratorId":"arn:aws:guardduty:us-east-1:123456789012:detector/abc","AwsAccountId":"123456789012","CreatedAt":"2026-08-18T20:00:00.000Z","UpdatedAt":"2026-08-18T20:00:00.000Z","Severity":{"Label":"LOW","Normalized":20},"Resources":[{"Type":"AwsEc2Instance","Id":"arn:aws:ec2:us-east-1:123456789012:instance/i-0abcdef1234567890","Partition":"aws","Region":"us-east-1","Details":{"AwsEc2Instance":{"Type":"t3.micro","IpV4Addresses":["192.0.2.44"],"VpcId":"vpc-0a1b2c3d"}}}],"Workflow":{"Status":"NEW"},"RecordState":"ACTIVE","Id":"arn:aws:guardduty:us-east-1:123456789012:detector/abc/finding/ap601","Types":["TTPs/Discovery/Recon:IAMUser-MaliciousIPCaller"],"Title":"API ListBuckets was invoked from a known malicious IP address.","ProductFields":{"aws/guardduty/service/action/actionType":"AWS_API_CALL","aws/guardduty/service/action/awsApiCallAction/api":"ListBuckets","aws/guardduty/service/action/awsApiCallAction/serviceName":"s3.amazonaws.com","aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/ipAddressV6":"2001:db8::77","aws/securityhub/ProductName":"GuardDuty","aws/securityhub/CompanyName":"Amazon"}}'
+    expect:
+      api.operation: ListBuckets
+      evidences.0.src_endpoint.ip: "2001:db8::77"
+  # Review P2: a Vulnerabilities[] entry without Id is named by the finding (OCSF needs cve, advisory or cwe).
+  - raw: '{"SchemaVersion":"2018-10-08","Id":"arn:aws:inspector2:us-east-1:123456789012:finding/0000aaaa","ProductArn":"arn:aws:securityhub:us-east-1::product/aws/inspector","ProductName":"Inspector","CompanyName":"Amazon","Region":"us-east-1","GeneratorId":"AWSInspector","AwsAccountId":"123456789012","Types":["Software and Configuration Checks/Vulnerabilities/CVE"],"CreatedAt":"2026-08-18T20:00:00Z","UpdatedAt":"2026-08-18T20:00:00Z","Severity":{"Label":"MEDIUM"},"Title":"Package finding without an identifier","Vulnerabilities":[{"VulnerablePackages":[{"Name":"libexample","Version":"1.2.3"}]}],"Workflow":{"Status":"NEW"},"RecordState":"ACTIVE"}'
+    expect:
+      class_uid: 2002
+      vulnerabilities.0.advisory.uid: "arn:aws:inspector2:us-east-1:123456789012:finding/0000aaaa"
+      vulnerabilities.0.affected_packages.0.name: libexample
+  - raw: "not a finding"
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: unparsable input

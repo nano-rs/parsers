@@ -13,10 +13,7 @@ START = '# NAN-2421 residual spill.'
 END = '# END NAN-2421 residual spill'
 
 
-KINDS = ('lowercase', 'epoch_ms', 'scale', 'enum', 'hex', 'truncate')
-# A truncate rule must keep a useful prefix: a tiny bound would let a parser
-# "consume" a field while keeping almost none of it outside raw_data.
-TRUNCATE_MIN_LENGTH = 256
+KINDS = ('lowercase', 'epoch_ms', 'scale', 'enum', 'hex')
 SENSITIVE = re.compile(r'[\x00-\x1f"\\\'{}]')
 
 
@@ -72,8 +69,6 @@ def rule_body(rule, templates):
         text = text.replace('__FORMAT__', vrl_string(fmt if isinstance(fmt, str) else '%+'))
     elif rule['kind'] == 'scale':
         text = text.replace('__FACTOR__', vrl_number(float(rule['factor'])))
-    elif rule['kind'] == 'truncate':
-        text = text.replace('__LENGTH__', str(rule['length']))
     elif rule['kind'] == 'enum':
         values = rule['values']
         # The template skips an absent source, which the old loop looked up as "".
@@ -146,10 +141,6 @@ def check_rule(rule):
         assert isinstance(values, dict) and values, f'{rule["source"]}: enum needs a non-empty values mapping'
     if rule['kind'] == 'epoch_ms':
         assert 'format' not in rule or (isinstance(rule['format'], str) and rule['format']), f'{rule["source"]}: epoch_ms format must be a non-empty string'
-    if rule['kind'] == 'truncate':
-        assert isinstance(rule.get('target'), str) and rule['target'], f'{rule["source"]}: truncate needs a target'
-        length = rule.get('length')
-        assert type(length) is int and length >= TRUNCATE_MIN_LENGTH, f'{rule["source"]}: truncate length must be an integer >= {TRUNCATE_MIN_LENGTH}'
 
 
 def transformations(config):

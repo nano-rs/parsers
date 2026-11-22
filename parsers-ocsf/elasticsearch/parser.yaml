@@ -1,0 +1,883 @@
+name: elasticsearch_ocsf
+display_name: Elasticsearch / OpenSearch (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields, unaltered, in dotted snake_case unmapped keys.
+  Parses Elasticsearch and OpenSearch node logs into complete OCSF 1.9.0 records.
+  Accepts the JSON server log (Elasticsearch 7 `"type":"server"` and the 8.x ECS
+  layout), the Elasticsearch security audit log (`event.type` / `event.action`),
+  the OpenSearch security plugin audit log (`audit_category`), and the search and
+  indexing slow logs (7.x `index_search_slowlog` / `index_indexing_slowlog` and
+  the 8.x ECS `elasticsearch.slowlog.*` layout).
+    audit authentication_success, OpenSearch AUTHENTICATED      -> Authentication 3002 Logon
+    audit authentication_failed, realm_authentication_failed,
+    anonymous_access_denied, OpenSearch FAILED_LOGIN            -> Authentication 3002 Logon, Failure
+    audit run_as_granted / run_as_denied                        -> Authentication 3002 Account Switch
+    audit access_granted / access_denied, tampered_request,
+    OpenSearch GRANTED_PRIVILEGES / MISSING_PRIVILEGES /
+    BAD_HEADERS                                                 -> API Activity 6003 (denials
+                                                                   carry action Denied)
+    audit security_config_change on users (put_user,
+    delete_user, change_password, change_disable_user, ...)     -> User Management 3007
+    other security_config_change actions                        -> API Activity 6003
+    audit connection_granted / connection_denied (IP filter)    -> Network Activity 4001
+    search slow log                                             -> Datastore Activity 6005 Query
+    indexing slow log                                           -> Datastore Activity 6005 Write
+    server log "started" / "stopped" (org.elasticsearch.node.Node) -> Application Lifecycle 6002
+    server log ERROR / FATAL                                    -> Application Error 6008
+    other server log lines and audit categories                 -> Base Event 0
+  Account Change 3001 is deprecated in OCSF 1.9 and is not emitted. The cluster
+  uuid is metadata.tenant_uid, the node name is the reporting endpoint.
+match_values:
+  - elasticsearch
+category: application
+vendor: "Elastic"
+product: "Elasticsearch"
+parser_vrl: |
+  # Elasticsearch / OpenSearch server, audit and slow logs -> OCSF 1.9.0.
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+  shape = ""
+  e = {}
+  f = {}
+  parsed, perr = parse_json(raw_log)
+  if perr == null && is_object(parsed) {
+      e = object!(parsed)
+      __source_kv = e
+      # Elasticsearch writes dotted top-level keys ("user.name"); nest them.
+      f = unflatten(e)
+      etype = string(get(f, ["event", "type"]) ?? "") ?? ""
+      dataset = string(get(f, ["event", "dataset"]) ?? "") ?? ""
+      ltype = string(f.type) ?? ""
+      if exists(f.audit_category) {
+          shape = "opensearch_audit"
+      } else if ltype == "audit" || (exists(f.event.action) && etype != "" && dataset == "") {
+          shape = "audit"
+      } else if dataset == "elasticsearch.slowlog" || ends_with(ltype, "_slowlog") || exists(f.elasticsearch.slowlog) {
+          shape = "slowlog"
+      } else if exists(f.message) && (dataset != "" || ltype == "server" || ltype == "deprecation" || exists(f.log.level) || exists(f.level)) {
+          shape = "server"
+      }
+  }
+
+  product = { "name": "Elasticsearch", "vendor_name": "Elastic" }
+  if shape == "opensearch_audit" { product = { "name": "OpenSearch", "vendor_name": "OpenSearch Project" } }
+
+  if shape == "" {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("elasticsearch|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "elasticsearch",
+              "log_provider": "Elasticsearch",
+              "product": product
+          },
+          "unmapped": { "parse_error": "not an Elasticsearch or OpenSearch JSON log record" }
+      }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+  } else {
+      # ---- time: ISO 8601, or Elasticsearch's comma-decimal "2022-09-04T22:54:53,028+0000" ----
+      tstr = string(get(f, ["@timestamp"]) ?? "") ?? ""
+      if tstr == "" { tstr = string(f.timestamp) ?? "" }
+      time_ms = 0
+      tnorm = replace(tstr, ",", ".")
+      tp, tperr = parse_timestamp(tnorm, "%+")
+      if tperr != null { tp, tperr = parse_timestamp(tnorm, "%Y-%m-%dT%H:%M:%S%.f%z") }
+      if tperr != null { tp, tperr = parse_timestamp(tnorm, "%Y-%m-%dT%H:%M:%S%.f", timezone: "UTC") }
+      if tperr == null { time_ms = to_unix_timestamp(tp, unit: "milliseconds") }
+
+      node_name = string(get(f, ["node", "name"]) ?? "") ?? ""
+      if node_name == "" { node_name = string(get(f, ["elasticsearch", "node", "name"]) ?? "") ?? "" }
+      if node_name == "" { node_name = string(f.audit_node_name) ?? "" }
+      cluster_uuid = string(get(f, ["cluster", "uuid"]) ?? "") ?? ""
+      if cluster_uuid == "" { cluster_uuid = string(get(f, ["elasticsearch", "cluster", "uuid"]) ?? "") ?? "" }
+      cluster_name = string(get(f, ["cluster", "name"]) ?? "") ?? ""
+      if cluster_name == "" { cluster_name = string(get(f, ["elasticsearch", "cluster", "name"]) ?? "") ?? "" }
+      if cluster_name == "" { cluster_name = string(f.audit_cluster_name) ?? "" }
+
+      class_uid = 0
+      activity_id = 99
+      activity_name = "Other"
+      status_id = 0
+      status_str = "Unknown"
+      severity_id = 1
+      severity = "Informational"
+      log_level = ""
+      event_code = ""
+      message = ""
+      status_detail = ""
+      denied = false
+      src_ep = {}
+      user = {}
+      actor = {}
+      api_op = ""
+      req_uid = ""
+      http_method = ""
+      url_path = ""
+      url_query = ""
+      indices = []
+      corr = ""
+      log_name = "elasticsearch"
+      logger = ""
+      ocsf = {}
+
+      if shape == "audit" || shape == "opensearch_audit" {
+          log_name = "audit"
+          if shape == "audit" {
+              # ================= Elasticsearch security audit =================
+              action = string(get(f, ["event", "action"]) ?? "") ?? ""
+              etype = string(get(f, ["event", "type"]) ?? "") ?? ""
+              event_code = action
+              origin = string(get(f, ["origin", "address"]) ?? "") ?? ""
+              uname = string(get(f, ["user", "name"]) ?? "") ?? ""
+              urealm = string(get(f, ["user", "realm"]) ?? "") ?? ""
+              roles = array(get(f, ["user", "roles"]) ?? []) ?? []
+              run_as = string(get(f, ["user", "run_as", "name"]) ?? "") ?? ""
+              # Under es-security-runas-user, user.name is the impersonated (effective)
+              # user and user.run_by.* is the user that authenticated: the real actor.
+              run_by = string(get(f, ["user", "run_by", "name"]) ?? "") ?? ""
+              run_by_realm = string(get(f, ["user", "run_by", "realm"]) ?? "") ?? ""
+              api_op = string(f.action) ?? ""
+              req_uid = string(get(f, ["request", "id"]) ?? "") ?? ""
+              http_method = string(get(f, ["request", "method"]) ?? "") ?? ""
+              url_path = string(get(f, ["url", "path"]) ?? "") ?? ""
+              url_query = string(get(f, ["url", "query"]) ?? "") ?? ""
+              indices = array(f.indices) ?? []
+              corr = string(get(f, ["trace", "id"]) ?? "") ?? ""
+              if uname != "" { user.name = uname }
+              if length(roles) > 0 { user.groups = map_values(roles) -> |rv| { { "name": to_string(rv) ?? "" } } }
+              if urealm != "" { user.domain = urealm }
+              cfg = object(get(f, ["put"]) ?? {}) ?? {}
+              if length(cfg) == 0 { cfg = object(get(f, ["delete"]) ?? {}) ?? {} }
+              if length(cfg) == 0 { cfg = object(get(f, ["change"]) ?? {}) ?? {} }
+              if action == "authentication_success" {
+                  class_uid = 3002; activity_id = 1; activity_name = "Logon"
+                  status_id = 1; status_str = "Success"
+              } else if includes(["authentication_failed", "realm_authentication_failed", "anonymous_access_denied"], action) {
+                  class_uid = 3002; activity_id = 1; activity_name = "Logon"
+                  status_id = 2; status_str = "Failure"
+                  severity_id = 2; severity = "Low"
+                  status_detail = action
+                  if action == "anonymous_access_denied" && uname == "" { user.name = "_anonymous" }
+              } else if action == "run_as_granted" || action == "run_as_denied" {
+                  class_uid = 3002; activity_id = 7; activity_name = "Account Switch"
+                  if action == "run_as_granted" { status_id = 1; status_str = "Success" } else {
+                      status_id = 2; status_str = "Failure"; severity_id = 3; severity = "Medium"; status_detail = action
+                  }
+                  if run_as != "" {
+                      # The authenticated user is the actor; the run-as user is the subject.
+                      actor.user = user
+                      user = { "name": run_as }
+                      rr = string(get(f, ["user", "run_as", "realm"]) ?? "") ?? ""
+                      if rr != "" { user.domain = rr }
+                  }
+              } else if action == "access_granted" || action == "access_denied" || action == "tampered_request" {
+                  class_uid = 6003
+                  if action == "access_granted" { status_id = 1; status_str = "Success" } else {
+                      status_id = 2; status_str = "Failure"; severity_id = 3; severity = "Medium"; status_detail = action; denied = true
+                  }
+                  if action == "tampered_request" { severity_id = 4; severity = "High"; denied = false }
+              } else if action == "connection_granted" || action == "connection_denied" {
+                  class_uid = 4001
+                  if action == "connection_granted" { activity_id = 1; activity_name = "Open"; status_id = 1; status_str = "Success" } else {
+                      activity_id = 5; activity_name = "Refuse"; status_id = 2; status_str = "Failure"; severity_id = 2; severity = "Low"
+                      status_detail = string(f.rule) ?? action
+                  }
+              } else if etype == "security_config_change" {
+                  status_id = 1; status_str = "Success"
+                  target = object(cfg.user) ?? {}
+                  tname = string(target.name) ?? ""
+                  if includes(["put_user", "delete_user", "change_password", "change_disable_user", "change_enable_user"], action) {
+                      class_uid = 3007
+                      if action == "put_user" { activity_id = 2; activity_name = "Update" }
+                      if action == "delete_user" { activity_id = 3; activity_name = "Delete" }
+                      if action == "change_password" { activity_id = 8; activity_name = "Password Change" }
+                      if action == "change_disable_user" { activity_id = 5; activity_name = "Disable" }
+                      if action == "change_enable_user" { activity_id = 4; activity_name = "Enable" }
+                      if tname == "" { tname = "unknown" }
+                      actor.user = user
+                      user = { "name": tname }
+                  } else {
+                      class_uid = 6003
+                      api_op = action
+                      if starts_with(action, "put_") || starts_with(action, "change_") { activity_id = 3; activity_name = "Update" }
+                      if starts_with(action, "delete_") || starts_with(action, "invalidate_") { activity_id = 4; activity_name = "Delete" }
+                      if starts_with(action, "create_") { activity_id = 1; activity_name = "Create" }
+                  }
+              }
+              if run_by != "" && run_by != uname && (class_uid == 6003 || class_uid == 3007) {
+                  rb = { "name": run_by }
+                  if run_by_realm != "" { rb.domain = run_by_realm }
+                  actor.user = rb
+              }
+              if origin != "" {
+                  r = parse_regex(origin, r'^(?:\x5B(?P<ip6>[0-9A-Fa-f:.]+)\x5D|(?P<ip4>[0-9]{1,3}(?:\.[0-9]{1,3}){3})):(?P<port>[0-9]+)$') ?? {}
+                  rip = string(r.ip4) ?? string(r.ip6) ?? ""
+                  if rip != "" { src_ep.ip = rip; src_ep.port = to_int(r.port) ?? 0 }
+              }
+          } else {
+              # ================= OpenSearch security plugin audit =================
+              cat = string(f.audit_category) ?? ""
+              event_code = cat
+              uname = string(f.audit_request_effective_user) ?? ""
+              # OpenSearch logs the sentinel "<NONE>" when no credentials were read.
+              if uname == "<NONE>" { uname = "" }
+              init_user = string(f.audit_request_initiating_user) ?? ""
+              if init_user == "<NONE>" { init_user = "" }
+              api_op = string(f.audit_transport_action) ?? string(f.audit_request_privilege) ?? ""
+              http_method = string(f.audit_rest_request_method) ?? ""
+              url_path = string(f.audit_rest_request_path) ?? ""
+              req_uid = string(f.audit_request_id) ?? ""
+              indices = array(f.audit_trace_indices) ?? []
+              rip = string(f.audit_request_remote_address) ?? ""
+              if is_ipv4(rip) || is_ipv6(rip) { src_ep.ip = rip }
+              if uname != "" { user.name = uname }
+              uroles = array(f.audit_request_user_roles) ?? []
+              if length(uroles) > 0 { user.groups = map_values(uroles) -> |rv| { { "name": to_string(rv) ?? "" } } }
+              if cat == "AUTHENTICATED" {
+                  class_uid = 3002; activity_id = 1; activity_name = "Logon"; status_id = 1; status_str = "Success"
+              } else if cat == "FAILED_LOGIN" {
+                  class_uid = 3002; activity_id = 1; activity_name = "Logon"; status_id = 2; status_str = "Failure"
+                  severity_id = 2; severity = "Low"
+                  status_detail = string(f.audit_authentication_failure_reason) ?? cat
+                  if uname == "" {
+                      attempted = string(f.audit_request_attempted_user) ?? ""
+                      if attempted == "" || attempted == "<NONE>" { attempted = "unknown" }
+                      user.name = attempted
+                  }
+              } else if cat == "SSL_EXCEPTION" {
+                  # A failed TLS / client-certificate handshake is a failed logon at the transport.
+                  class_uid = 3002; activity_id = 1; activity_name = "Logon"; status_id = 2; status_str = "Failure"
+                  severity_id = 3; severity = "Medium"
+                  exc = string(f.audit_request_exception_stacktrace) ?? ""
+                  status_detail = "SSL_EXCEPTION"
+                  if exc != "" { status_detail = string(split(exc, "\n")[0]) ?? exc }
+                  ocsf.auth_protocol_id = 99; ocsf.auth_protocol = "TLS"
+                  if length(user) == 0 { user.name = "unknown" }
+              } else if cat == "GRANTED_PRIVILEGES" || cat == "MISSING_PRIVILEGES" || cat == "BAD_HEADERS" || cat == "OPENDISTRO_SECURITY_INDEX_ATTEMPT" {
+                  class_uid = 6003
+                  if cat == "GRANTED_PRIVILEGES" { status_id = 1; status_str = "Success" } else {
+                      status_id = 2; status_str = "Failure"; severity_id = 3; severity = "Medium"; status_detail = cat
+                      if cat == "MISSING_PRIVILEGES" { denied = true }
+                  }
+                  # An attempt to write the security plugin's own users / roles index.
+                  if cat == "OPENDISTRO_SECURITY_INDEX_ATTEMPT" { severity_id = 4; severity = "High"; denied = true }
+              }
+              if init_user != "" && init_user != uname && class_uid == 6003 { actor.user = { "name": init_user } }
+          }
+
+          if class_uid == 6003 {
+              # Activity from the transport action: indices:data/read/* -> Read, ...
+              if api_op == "" { api_op = http_method + " " + url_path }
+              if activity_id == 99 {
+                  if starts_with(api_op, "indices:data/read") || starts_with(api_op, "cluster:monitor") || starts_with(api_op, "indices:monitor") { activity_id = 2; activity_name = "Read" }
+                  if starts_with(api_op, "indices:admin/create") || starts_with(api_op, "indices:admin/auto_create") || starts_with(api_op, "indices:data/write/index") { activity_id = 1; activity_name = "Create" }
+                  if starts_with(api_op, "indices:data/write/update") || starts_with(api_op, "indices:data/write/bulk") || starts_with(api_op, "indices:admin/mapping/put") || starts_with(api_op, "indices:admin/settings/update") || starts_with(api_op, "cluster:admin/settings/update") { activity_id = 3; activity_name = "Update" }
+                  if starts_with(api_op, "indices:admin/delete") || starts_with(api_op, "indices:data/write/delete") { activity_id = 4; activity_name = "Delete" }
+              }
+              api_obj = { "operation": api_op, "service": { "name": product.name } }
+              if req_uid != "" { api_obj.request = { "uid": req_uid } }
+              ocsf.api = api_obj
+              if !exists(actor.user) {
+                  if length(user) > 0 { actor.user = user } else { actor.app_name = "unknown" }
+              }
+              ocsf.actor = actor
+              if length(indices) > 0 {
+                  ocsf.resources = map_values(indices) -> |iv| { { "type": "index", "name": to_string(iv) ?? "" } }
+              }
+              if denied {
+                  ocsf.metadata_profiles = ["security_control"]
+                  ocsf.action_id = 2; ocsf.action = "Denied"
+                  ocsf.disposition_id = 2; ocsf.disposition = "Blocked"
+              }
+          } else if class_uid == 3002 {
+              if length(user) == 0 { user = { "name": "unknown" } }
+              ocsf.user = user
+              ocsf.service = { "name": product.name }
+              if length(actor) > 0 { ocsf.actor = actor }
+              ocsf.is_remote = true
+          } else if class_uid == 3007 {
+              ocsf.user = user
+              if length(actor) > 0 { ocsf.actor = actor }
+          }
+          if class_uid == 3002 || class_uid == 6003 {
+              if length(src_ep) == 0 { src_ep = { "name": "unknown" } }
+              if http_method != "" || url_path != "" {
+                  hr = {}
+                  if http_method != "" { hr.http_method = http_method }
+                  if url_path != "" {
+                      uo = { "path": url_path }
+                      if url_query != "" { uo.query_string = url_query }
+                      hr.url = uo
+                  }
+                  ocsf.http_request = hr
+              }
+          }
+          message = event_code
+      } else if shape == "slowlog" {
+          # ================= search / indexing slow log =================
+          log_name = "slowlog"
+          sl = object(get(f, ["elasticsearch", "slowlog"]) ?? {}) ?? {}
+          if length(sl) == 0 { sl = f }
+          logger = string(get(f, ["log", "logger"]) ?? "") ?? ""
+          if logger == "" { logger = string(f.component) ?? "" }
+          ltype = string(f.type) ?? ""
+          is_index = contains(logger, "indexing") || ltype == "index_indexing_slowlog"
+          log_level = string(get(f, ["log", "level"]) ?? "") ?? ""
+          if log_level == "" { log_level = string(f.level) ?? "" }
+          if upcase(log_level) == "WARN" { severity_id = 2; severity = "Low" }
+          class_uid = 6005
+          if is_index { activity_id = 5; activity_name = "Write" } else { activity_id = 4; activity_name = "Query" }
+          status_id = 1; status_str = "Success"
+          smsg = string(sl.message) ?? ""
+          message = smsg
+          im = parse_regex(smsg, r'^\x5B(?P<i>[^\x5D/]+)') ?? {}
+          idx = string(im.i) ?? ""
+          if idx == "" { idx = "unknown" }
+          ocsf.table = { "name": idx }
+          dbn = cluster_name
+          if dbn == "" { dbn = "elasticsearch" }
+          ocsf.database = { "name": dbn, "type_id": 6, "type": "NoSQL" }
+          ocsf.type_id = 3
+          ocsf.type = "Table"
+          src = string(sl.source) ?? ""
+          if src != "" {
+              qi = { "query_string": src }
+              stype = string(sl.search_type) ?? ""
+              if stype != "" { qi.name = stype } else if is_index { qi.name = "index" } else { qi.name = "search" }
+              ocsf.query_info = qi
+          }
+          took = to_int(sl.took_millis) ?? -1
+          if took >= 0 { ocsf.duration = took }
+          oid = string(sl.id) ?? ""
+          if oid != "" && !is_index { actor.app_uid = oid }
+          sun = string(get(f, ["user", "name"]) ?? "") ?? ""
+          if sun != "" { actor.user = { "name": sun } }
+          if length(actor) == 0 { actor = { "app_name": "unknown" } }
+          ocsf.actor = actor
+          ocsf.src_endpoint = { "name": "unknown" }
+          corr = string(get(f, ["trace", "id"]) ?? "") ?? ""
+      } else {
+          # ================= server log =================
+          log_level = string(get(f, ["log", "level"]) ?? "") ?? ""
+          if log_level == "" { log_level = string(f.level) ?? "" }
+          logger = string(get(f, ["log", "logger"]) ?? "") ?? ""
+          if logger == "" { logger = string(f.component) ?? "" }
+          ltype = string(f.type) ?? ""
+          if ltype == "deprecation" || contains(string(get(f, ["event", "dataset"]) ?? "") ?? "", "deprecation") { log_name = "deprecation" } else { log_name = "server" }
+          message = string(f.message) ?? ""
+          lvl = upcase(log_level)
+          if lvl == "WARN" || lvl == "WARNING" { severity_id = 3; severity = "Medium" }
+          if lvl == "ERROR" { severity_id = 4; severity = "High" }
+          if lvl == "FATAL" || lvl == "CRITICAL" { severity_id = 6; severity = "Fatal" }
+          is_node = ends_with(logger, ".node.Node") || logger == "o.e.n.Node" || ends_with(logger, "node.Node")
+          if is_node && (message == "started" || starts_with(message, "started ")) {
+              class_uid = 6002; activity_id = 3; activity_name = "Start"; status_id = 1; status_str = "Success"
+          } else if is_node && (message == "stopped" || message == "closed") {
+              class_uid = 6002; activity_id = 4; activity_name = "Stop"; status_id = 1; status_str = "Success"
+          } else if lvl == "ERROR" || lvl == "FATAL" || lvl == "CRITICAL" {
+              class_uid = 6008; activity_id = 1; activity_name = "General Error"; status_id = 2; status_str = "Failure"
+              ex = string(get(f, ["error", "message"]) ?? "") ?? ""
+              if ex == "" { ex = string(get(f, ["error", "type"]) ?? "") ?? "" }
+              if ex != "" { status_detail = ex }
+          }
+          if class_uid == 6002 { ocsf.app = product }
+          corr = string(get(f, ["trace", "id"]) ?? "") ?? ""
+      }
+
+      cls_name = "Base Event"
+      cat_uid = 0
+      cat_name = "Uncategorized"
+      if class_uid == 3002 { cls_name = "Authentication"; cat_uid = 3; cat_name = "Identity & Access Management" }
+      if class_uid == 3007 { cls_name = "User Management"; cat_uid = 3; cat_name = "Identity & Access Management" }
+      if class_uid == 4001 { cls_name = "Network Activity"; cat_uid = 4; cat_name = "Network Activity" }
+      if class_uid == 6002 { cls_name = "Application Lifecycle"; cat_uid = 6; cat_name = "Application Activity" }
+      if class_uid == 6003 { cls_name = "API Activity"; cat_uid = 6; cat_name = "Application Activity" }
+      if class_uid == 6005 { cls_name = "Datastore Activity"; cat_uid = 6; cat_name = "Application Activity" }
+      if class_uid == 6008 { cls_name = "Application Error"; cat_uid = 6; cat_name = "Application Activity" }
+
+      profiles = array(ocsf.metadata_profiles) ?? []
+      del(ocsf.metadata_profiles)
+      ocsf.class_uid = class_uid
+      ocsf.class_name = cls_name
+      ocsf.category_uid = cat_uid
+      ocsf.category_name = cat_name
+      ocsf.activity_id = activity_id
+      ocsf.activity_name = activity_name
+      ocsf.type_uid = class_uid * 100 + activity_id
+      ocsf.severity_id = severity_id
+      ocsf.severity = severity
+      ocsf.status_id = status_id
+      ocsf.status = status_str
+      if status_detail != "" { ocsf.status_detail = status_detail }
+      if message != "" { ocsf.message = message }
+      if (class_uid == 3002 || class_uid == 3007 || class_uid == 4001 || class_uid == 6003) && length(src_ep) > 0 { ocsf.src_endpoint = src_ep }
+      if class_uid == 4001 && !exists(ocsf.src_endpoint) { ocsf.src_endpoint = { "name": "unknown" } }
+      node_ep = {}
+      if node_name != "" { node_ep.name = node_name }
+      nip = string(f.audit_node_host_address) ?? ""
+      if is_ipv4(nip) || is_ipv6(nip) { node_ep.ip = nip }
+      if class_uid != 0 && class_uid != 6002 && class_uid != 6008 && class_uid != 3007 && length(node_ep) > 0 { ocsf.dst_endpoint = node_ep }
+      ocsf.time = time_ms
+      ocsf.raw_data = raw_log
+      meta = {
+          "version": "1.9.0",
+          "uid": sha2("elasticsearch|raw|" + raw_log, variant: "SHA-256"),
+          "log_name": log_name,
+          "log_provider": product.name,
+          "product": product
+      }
+      if length(profiles) > 0 { meta.profiles = profiles }
+      if event_code != "" { meta.event_code = event_code }
+      if log_level != "" { meta.log_level = log_level }
+      if cluster_uuid != "" { meta.tenant_uid = cluster_uuid }
+      if corr != "" { meta.correlation_uid = corr }
+      if logger != "" { meta.loggers = [{ "name": logger }] }
+      ocsf.metadata = meta
+
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # Values spill exactly as parsed: a parser never masks, redacts or withholds
+  # anything (masking is an opt-in pipeline step, never a parser concern).
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __copy = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __copy_json = encode_json(__copy)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__copy_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # @timestamp: ISO 8601 event clock converted to event milliseconds.
+  # timestamp: ISO 8601 event clock converted to event milliseconds (the comma-decimal form is normalized by the parser and stays residual when the generic parse rejects it).
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        @timestamp
+      | timestamp
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if __mapped."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    action
+  | audit_authentication_failure_reason
+  | audit_category
+  | audit_cluster_name
+  | audit_node_host_address
+  | audit_node_name
+  | audit_request_attempted_user
+  | audit_request_effective_user
+  | audit_request_id
+  | audit_request_initiating_user
+  | audit_request_privilege
+  | audit_request_remote_address
+  | audit_request_user_roles
+  | audit_rest_request_method
+  | audit_rest_request_path
+  | audit_trace_indices
+  | audit_transport_action
+  | cluster\.name
+  | cluster\.uuid
+  | component
+  | elasticsearch\.cluster\.name
+  | elasticsearch\.cluster\.uuid
+  | elasticsearch\.node\.name
+  | elasticsearch\.slowlog\.id
+  | elasticsearch\.slowlog\.message
+  | elasticsearch\.slowlog\.search_type
+  | elasticsearch\.slowlog\.source
+  | elasticsearch\.slowlog\.took_millis
+  | error\.message
+  | error\.type
+  | event\.action
+  | id
+  | indices
+  | level
+  | log\.level
+  | log\.logger
+  | message
+  | node\.name
+  | put\.user\.name
+  | request\.id
+  | request\.method
+  | rule
+  | search_type
+  | source
+  | took_millis
+  | trace\.id
+  | url\.path
+  | url\.query
+  | user\.name
+  | user\.realm
+  | user\.roles
+  | user\.run_as\.name
+  | user\.run_as\.realm
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if !contains(__consumed, __token) && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # The canonical source spill above is the authoritative representation of
+  # containers. The cheap conditions run first; the source value set is built on
+  # first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, as-is. These
+  # entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__copy.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  - raw: '{"type":"audit", "timestamp":"2020-12-30T22:10:15,510+0200", "node.id":"AAAAAAAAAAAAAAAAAAAAAA", "event.type":"rest", "event.action":"authentication_failed", "user.name":"elastic", "origin.type":"rest", "origin.address":"[::1]:51504", "url.path":"/_security/user/user1", "url.query":"pretty", "request.method":"POST", "request.id":"POv8p_qeTl2tb5xoFl0HIg"}'
+    expect:
+      class_uid: 3002
+      status_id: 2
+      "user.name": "elastic"
+      "src_endpoint.ip": "::1"
+      time: 1609359015510
+  - raw: '{"type":"audit", "timestamp":"2020-12-30T22:30:06,949+0200", "node.id":"AAAAAAAAAAAAAAAAAAAAAA", "event.type":"transport", "event.action":"access_denied", "authentication.type":"REALM", "user.name":"user1", "user.realm":"default_native", "user.roles":["test_role"], "origin.type":"rest", "origin.address":"[::1]:52434", "request.id":"yKOgWn2CRQCKYgZRz3phJw", "action":"indices:admin/auto_create", "request.name":"CreateIndexRequest", "indices":["<index-{now/d+1d}>"]}'
+    expect:
+      class_uid: 6003
+      activity_id: 1
+      status_id: 2
+      action_id: 2
+      "api.operation": "indices:admin/auto_create"
+      "actor.user.name": "user1"
+  - raw: '{"type":"audit", "timestamp":"2020-12-30T21:56:43,608+0200", "node.id":"AAAAAAAAAAAAAAAAAAAAAA", "event.type":"rest", "event.action":"anonymous_access_denied", "origin.type":"rest", "origin.address":"[::1]:50543", "url.path":"/twitter/_async_search", "url.query":"pretty", "request.method":"POST", "request.id":"TqA9OisyQ8WTl1ivJUV1AA"}'
+    expect:
+      class_uid: 3002
+      status_id: 2
+  - raw: '{"@timestamp":"2024-03-01T10:00:00.000+00:00","audit_format_version":4,"audit_category":"FAILED_LOGIN","audit_request_origin":"REST","audit_request_layer":"REST","audit_rest_request_method":"GET","audit_rest_request_path":"/_cluster/health","audit_request_remote_address":"192.0.2.15","audit_request_effective_user":"admin","audit_request_effective_user_is_admin":false,"audit_node_name":"opensearch-node1","audit_cluster_name":"opensearch-cluster"}'
+    expect:
+      class_uid: 3002
+      status_id: 2
+      "metadata.product.name": "OpenSearch"
+  - raw: '{"@timestamp":"2022-09-04T22:57:24.367Z", "log.level":"DEBUG",  "elasticsearch.slowlog.id":"myApp1","elasticsearch.slowlog.message":"[test_1][0]","elasticsearch.slowlog.search_type":"QUERY_THEN_FETCH","elasticsearch.slowlog.source":"{}","elasticsearch.slowlog.stats":"[]","elasticsearch.slowlog.took":"115.1micros","elasticsearch.slowlog.took_millis":0,"elasticsearch.slowlog.total_hits":"20 hits","elasticsearch.slowlog.total_shards":1 , "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.slowlog","process.thread.name":"elasticsearch[node-1][search][T#4]","log.logger":"index.search.slowlog.query","elasticsearch.cluster.uuid":"AAAAAAAAAAAAAAAAAAAAAA","elasticsearch.node.id":"AAAAAAAAAAAAAAAAAAAAAA","elasticsearch.node.name":"node-1","elasticsearch.cluster.name":"elasticsearch"}'
+    expect:
+      class_uid: 6005
+      activity_id: 4
+      "table.name": "test_1"
+  - raw: '{"@timestamp":"2022-09-04T22:54:04.249Z", "log.level": "ERROR", "message":"fatal error in thread [main], exiting", "ecs.version": "1.2.0","service.name":"ES_ECS","event.dataset":"elasticsearch.server","log.logger":"org.elasticsearch.bootstrap.ElasticsearchUncaughtExceptionHandler","elasticsearch.node.name":"node-1","elasticsearch.cluster.name":"elasticsearch"}'
+    expect:
+      class_uid: 6008
+  - raw: 'not json at all'
+    expect:
+      class_uid: 0
+      "unmapped.parse_fallback": "unparsable input"
+  # neon #79: User Management keeps the source address
+  - raw: "{\"type\":\"audit\", \"timestamp\":\"2020-12-30T22:35:21,481+0200\", \"node.id\":\"AAAAAAAAAAAAAAAAAAAAAA\", \"event.type\":\"security_config_change\", \"event.category\":\"user\", \"event.action\":\"put_user\", \"user.name\":\"elastic\", \"user.realm\":\"reserved\", \"origin.type\":\"rest\", \"origin.address\":\"[::1]:52520\", \"request.id\":\"VIiSvhp4Riim_tpkQCVSQA\", \"put\":{\"user\":{\"name\":\"user1\",\"enabled\":false,\"has_password\":true}}}"
+    expect:
+      "class_uid": 3007
+      "src_endpoint.ip": "::1"
+      "src_endpoint.port": 52520
+  # neon #79: user.run_by is the actor on an impersonated request
+  - raw: "{\"type\":\"audit\", \"timestamp\":\"2020-12-30T22:51:10,214+0200\", \"node.id\":\"AAAAAAAAAAAAAAAAAAAAAA\", \"event.type\":\"transport\", \"event.action\":\"access_denied\", \"authentication.type\":\"REALM\", \"user.name\":\"target_user\", \"user.realm\":\"default_native\", \"user.run_by.name\":\"service_acct\", \"user.run_by.realm\":\"default_file\", \"user.roles\":[\"read_only\"], \"origin.type\":\"rest\", \"origin.address\":\"192.0.2.33:52710\", \"request.id\":\"AAAAAAAAAAAAAAAAAAAAAA\", \"action\":\"indices:data/write/delete\", \"request.name\":\"DeleteRequest\", \"indices\":[\"orders\"]}"
+    expect:
+      "class_uid": 6003
+      "actor.user.name": "service_acct"
+      "actor.user.domain": "default_file"
+  # neon #79: user.run_by is the actor on an impersonated user change
+  - raw: "{\"type\":\"audit\", \"timestamp\":\"2020-12-30T22:52:01,003+0200\", \"node.id\":\"AAAAAAAAAAAAAAAAAAAAAA\", \"event.type\":\"security_config_change\", \"event.category\":\"user\", \"event.action\":\"put_user\", \"user.name\":\"target_user\", \"user.realm\":\"default_native\", \"user.run_by.name\":\"service_acct\", \"user.run_by.realm\":\"default_file\", \"origin.type\":\"rest\", \"origin.address\":\"192.0.2.33:52712\", \"request.id\":\"AAAAAAAAAAAAAAAAAAAAAB\", \"put\":{\"user\":{\"name\":\"user2\",\"enabled\":true,\"has_password\":true}}}"
+    expect:
+      "class_uid": 3007
+      "actor.user.name": "service_acct"
+      "user.name": "user2"
+      "src_endpoint.ip": "192.0.2.33"
+  # neon #79 r2: <NONE> initiating user is not emitted as an actor user
+  - raw: "{\"@timestamp\":\"2024-03-01T10:02:41.007+00:00\",\"audit_format_version\":4,\"audit_category\":\"MISSING_PRIVILEGES\",\"audit_request_origin\":\"REST\",\"audit_request_layer\":\"TRANSPORT\",\"audit_transport_request_type\":\"DeleteIndexRequest\",\"audit_transport_action\":\"indices:admin/delete\",\"audit_request_privilege\":\"indices:admin/delete\",\"audit_trace_indices\":[\"security-auditlog-2024.03.01\"],\"audit_request_remote_address\":\"192.0.2.15\",\"audit_request_effective_user\":\"<NONE>\",\"audit_request_initiating_user\":\"<NONE>\",\"audit_request_effective_user_is_admin\":false,\"audit_trace_task_id\":\"AAAAAAAAAAAAAAAAAAAAAA:1234\",\"audit_node_id\":\"AAAAAAAAAAAAAAAAAAAAAA\",\"audit_node_name\":\"opensearch-node1\",\"audit_node_host_address\":\"192.0.2.2\",\"audit_node_host_name\":\"opensearch-node1\",\"audit_cluster_name\":\"opensearch-cluster\"}"
+    expect:
+      "class_uid": 6003
+      "actor.app_name": "unknown"
+  # neon #79: OpenSearch <NONE> effective user falls back to the attempted user
+  - raw: "{\"@timestamp\":\"2024-03-01T10:00:10.000+00:00\",\"audit_format_version\":4,\"audit_category\":\"FAILED_LOGIN\",\"audit_request_origin\":\"REST\",\"audit_request_layer\":\"REST\",\"audit_rest_request_method\":\"GET\",\"audit_rest_request_path\":\"/_cluster/health\",\"audit_request_remote_address\":\"203.0.113.40\",\"audit_request_effective_user\":\"<NONE>\",\"audit_request_attempted_user\":\"bob\",\"audit_authentication_failure_reason\":\"WRONG_PASSWORD\",\"audit_request_effective_user_is_admin\":false,\"audit_node_id\":\"AAAAAAAAAAAAAAAAAAAAAA\",\"audit_node_name\":\"opensearch-node1\",\"audit_node_host_address\":\"192.0.2.2\",\"audit_node_host_name\":\"opensearch-node1\",\"audit_cluster_name\":\"opensearch-cluster\"}"
+    expect:
+      "class_uid": 3002
+      "status_id": 2
+      "user.name": "bob"
+  # neon #79: security index write attempt is a High denial
+  - raw: "{\"@timestamp\":\"2024-03-01T10:06:00.000+00:00\",\"audit_format_version\":4,\"audit_category\":\"OPENDISTRO_SECURITY_INDEX_ATTEMPT\",\"audit_request_origin\":\"REST\",\"audit_request_layer\":\"TRANSPORT\",\"audit_transport_request_type\":\"BulkShardRequest\",\"audit_transport_action\":\"indices:data/write/bulk[s]\",\"audit_trace_indices\":[\".opendistro_security\"],\"audit_request_remote_address\":\"198.51.100.41\",\"audit_request_effective_user\":\"analyst\",\"audit_request_initiating_user\":\"analyst\",\"audit_request_effective_user_is_admin\":false,\"audit_node_id\":\"AAAAAAAAAAAAAAAAAAAAAA\",\"audit_node_name\":\"opensearch-node1\",\"audit_node_host_address\":\"192.0.2.2\",\"audit_node_host_name\":\"opensearch-node1\",\"audit_cluster_name\":\"opensearch-cluster\"}"
+    expect:
+      "class_uid": 6003
+      "severity_id": 4
+      "action_id": 2
+      "src_endpoint.ip": "198.51.100.41"
+  # neon #79: SSL_EXCEPTION is a failed TLS logon with the source kept
+  - raw: "{\"@timestamp\":\"2024-03-01T10:05:12.000+00:00\",\"audit_format_version\":4,\"audit_category\":\"SSL_EXCEPTION\",\"audit_request_origin\":\"TRANSPORT\",\"audit_request_layer\":\"TRANSPORT\",\"audit_request_exception_stacktrace\":\"javax.net.ssl.SSLHandshakeException: Received fatal alert: certificate_unknown\",\"audit_request_remote_address\":\"198.51.100.40\",\"audit_node_id\":\"AAAAAAAAAAAAAAAAAAAAAA\",\"audit_node_name\":\"opensearch-node1\",\"audit_node_host_address\":\"192.0.2.2\",\"audit_node_host_name\":\"opensearch-node1\",\"audit_cluster_name\":\"opensearch-cluster\"}"
+    expect:
+      "class_uid": 3002
+      "status_id": 2
+      "auth_protocol": "TLS"
+      "src_endpoint.ip": "198.51.100.40"
+  # NAN-3702: metadata.uid is sha256("elasticsearch|raw|" + raw), so the same
+  # record parsed twice gets the same uid (a random uid could never match).
+  - raw: "NAN-3702 determinism probe: not a elasticsearch record"
+    expect:
+      "metadata.uid": "1563161aca97bc3c6e724bfcb7a21a2708fc76be52afb1160902f38d8e2c5280"

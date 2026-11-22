@@ -1,0 +1,670 @@
+name: gcp_vpc_flow_ocsf
+display_name: GCP VPC Flow Logs (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields, unaltered, in dotted snake_case unmapped keys.
+  Parses Google Cloud VPC Flow Logs (the Cloud Logging LogEntry exported through
+  a Pub/Sub or storage sink, jsonPayload connection / src_instance / dest_instance
+  / src_vpc / dest_vpc / src_location / dest_location) into complete OCSF 1.9.0
+  "Network Activity" (class_uid 4001) Traffic records carrying the cloud profile.
+  The 5-tuple lands on src_endpoint / dst_endpoint / connection_info, the VM,
+  zone, VPC and subnet on each endpoint, the geo and ASN on location /
+  autonomous_system, and bytes_sent / packets_sent on traffic.bytes / packets
+  and bytes_out / packets_out (a flow entry is one direction, src -> dest, so
+  bytes_in is never set; the reporting side is connection_info.direction). The match is narrow on
+  purpose: only entries whose logName ends in `vpc_flows` (compute.googleapis.com
+  or networkmanagement.googleapis.com) are mapped, so this lane never claims
+  Cloud Audit Logs (gcp_audit) or other Cloud Logging entries. Anything else
+  falls back to Base Event with the raw entry kept.
+match_values:
+  - gcp_vpc_flow
+category: cloud
+vendor: "Google"
+product: "VPC Flow Logs"
+parser_vrl: |
+  # GCP VPC Flow Logs LogEntry -> OCSF 1.9.0 Network Activity (class_uid 4001)
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+
+  parsed, err = parse_json(raw_log)
+  __source_kv = object(parsed) ?? {}
+  p = object(parsed) ?? {}
+  jp = object(p.jsonPayload) ?? {}
+  conn = object(jp.connection) ?? {}
+  log_name = to_string(p.logName) ?? ""
+  is_flow = match(log_name, r'(?:%2F|/)vpc_flows$') && length(keys(conn)) > 0
+
+  if err != null || !is_object(parsed) || !is_flow {
+      fallback_reason = "unparsable input"
+      if err == null && is_object(parsed) { fallback_reason = "not a VPC flow log entry" }
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": "Unrecognized GCP VPC flow log entry",
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud"],
+              "uid": sha2("gcp_vpc_flow|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "vpc_flows",
+              "product": { "name": "Google Cloud VPC Flow Logs", "vendor_name": "Google" }
+          },
+          "cloud": { "provider": "GCP" }
+      }
+      if log_name != "" { .metadata.log_name = log_name }
+      insert_fb = to_string(p.insertId) ?? ""
+      if insert_fb != "" { .metadata.uid = insert_fb }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], fallback_reason)
+  } else {
+      resource = object(p.resource) ?? {}
+      rlabels = object(resource.labels) ?? {}
+
+      # ---- times: LogEntry timestamp is the event clock; flow window kept ----
+      time_ms = 0
+      ts_str = to_string(p.timestamp) ?? ""
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+      start_ms = 0
+      st_str = to_string(jp.start_time) ?? ""
+      if st_str != "" {
+          st, sterr = parse_timestamp(st_str, "%+")
+          if sterr == null { start_ms = to_unix_timestamp(st, unit: "milliseconds") }
+      }
+      end_ms = 0
+      et_str = to_string(jp.end_time) ?? ""
+      if et_str != "" {
+          et, eterr = parse_timestamp(et_str, "%+")
+          if eterr == null { end_ms = to_unix_timestamp(et, unit: "milliseconds") }
+      }
+      if time_ms == 0 { time_ms = end_ms }
+      if time_ms == 0 { time_ms = start_ms }
+
+      # ---- 5-tuple ----
+      src_ip = to_string(conn.src_ip) ?? ""
+      dst_ip = to_string(conn.dest_ip) ?? ""
+      src_port = to_int(conn.src_port) ?? -1
+      dst_port = to_int(conn.dest_port) ?? -1
+      proto_num = to_int(conn.protocol) ?? -1
+      proto_name = ""
+      if proto_num == 1 { proto_name = "icmp" }
+      if proto_num == 6 { proto_name = "tcp" }
+      if proto_num == 17 { proto_name = "udp" }
+      if proto_num == 47 { proto_name = "gre" }
+      if proto_num == 50 { proto_name = "esp" }
+      if proto_num == 58 { proto_name = "ipv6-icmp" }
+      if proto_num == 132 { proto_name = "sctp" }
+
+      src_endpoint = {}
+      if src_ip != "" { src_endpoint.ip = downcase(src_ip) }
+      if src_port >= 0 { src_endpoint.port = src_port }
+      dst_endpoint = {}
+      if dst_ip != "" { dst_endpoint.ip = downcase(dst_ip) }
+      if dst_port >= 0 { dst_endpoint.port = dst_port }
+
+      # ---- per-side VM, VPC and geo annotations ----
+      src_inst = object(jp.src_instance) ?? {}
+      vm = to_string(src_inst.vm_name) ?? ""
+      if vm != "" { src_endpoint.hostname = vm; src_endpoint.name = vm }
+      z = to_string(src_inst.zone) ?? ""
+      if z != "" { src_endpoint.zone = z }
+      src_vpc = object(jp.src_vpc) ?? {}
+      v = to_string(src_vpc.vpc_name) ?? ""
+      if v != "" { src_endpoint.vpc_uid = v }
+      sn = to_string(src_vpc.subnetwork_name) ?? ""
+      if sn != "" { src_endpoint.subnet_uid = sn }
+      src_loc = object(jp.src_location) ?? {}
+      loc = {}
+      lc = to_string(src_loc.country) ?? ""
+      if lc != "" { loc.country = lc }
+      lct = to_string(src_loc.continent) ?? ""
+      if lct != "" { loc.continent = lct }
+      lcy = to_string(src_loc.city) ?? ""
+      if lcy != "" { loc.city = lcy }
+      lr = to_string(src_loc.region) ?? ""
+      if lr != "" { loc.region = lr }
+      if length(keys(loc)) > 0 { src_endpoint.location = loc }
+      asn = to_int(src_loc.asn) ?? 0
+      if asn > 0 { src_endpoint.autonomous_system = { "number": asn } }
+
+      dst_inst = object(jp.dest_instance) ?? {}
+      vm = to_string(dst_inst.vm_name) ?? ""
+      if vm != "" { dst_endpoint.hostname = vm; dst_endpoint.name = vm }
+      z = to_string(dst_inst.zone) ?? ""
+      if z != "" { dst_endpoint.zone = z }
+      dst_vpc = object(jp.dest_vpc) ?? {}
+      v = to_string(dst_vpc.vpc_name) ?? ""
+      if v != "" { dst_endpoint.vpc_uid = v }
+      sn = to_string(dst_vpc.subnetwork_name) ?? ""
+      if sn != "" { dst_endpoint.subnet_uid = sn }
+      dst_loc = object(jp.dest_location) ?? {}
+      loc = {}
+      lc = to_string(dst_loc.country) ?? ""
+      if lc != "" { loc.country = lc }
+      lct = to_string(dst_loc.continent) ?? ""
+      if lct != "" { loc.continent = lct }
+      lcy = to_string(dst_loc.city) ?? ""
+      if lcy != "" { loc.city = lcy }
+      lr = to_string(dst_loc.region) ?? ""
+      if lr != "" { loc.region = lr }
+      if length(keys(loc)) > 0 { dst_endpoint.location = loc }
+      asn = to_int(dst_loc.asn) ?? 0
+      if asn > 0 { dst_endpoint.autonomous_system = { "number": asn } }
+
+      if length(keys(src_endpoint)) == 0 && length(keys(dst_endpoint)) == 0 { src_endpoint.ip = "0.0.0.0" }
+
+      # ---- reporter: which VM's NIC sampled the flow ----
+      reporter = upcase(to_string(jp.reporter) ?? "")
+      direction_id = 0
+      direction = "Unknown"
+      if reporter == "SRC" { direction_id = 2; direction = "Outbound" }
+      if reporter == "DEST" { direction_id = 1; direction = "Inbound" }
+
+      connection_info = { "direction_id": direction_id, "direction": direction }
+      if proto_num >= 0 { connection_info.protocol_num = proto_num }
+      if proto_name != "" { connection_info.protocol_name = proto_name }
+      if is_ipv4(src_ip) { connection_info.protocol_ver_id = 4; connection_info.protocol_ver = "Internet Protocol version 4 (IPv4)" }
+      if is_ipv6(src_ip) { connection_info.protocol_ver_id = 6; connection_info.protocol_ver = "Internet Protocol version 6 (IPv6)" }
+
+      # ---- traffic: bytes_sent / packets_sent are src -> dest ----
+      bytes_sent = to_int(jp.bytes_sent) ?? 0
+      packets_sent = to_int(jp.packets_sent) ?? 0
+      traffic = { "bytes": bytes_sent, "packets": packets_sent }
+      # OCSF bytes_out is src_endpoint -> dst_endpoint (NAN-2995, as aws_vpc_flow).
+      # A VPC flow entry is one direction, src -> dest, whichever VM reported it,
+      # so bytes_sent is always bytes_out; bytes_in stays unset.
+      traffic.bytes_out = bytes_sent
+      traffic.packets_out = packets_sent
+
+      # ---- cloud: the project and zone of the logging subnetwork ----
+      cloud = { "provider": "GCP" }
+      project = to_string(rlabels.project_id) ?? ""
+      if project == "" {
+          lm, lmerr = parse_regex(log_name, r'^projects/(?P<p>[^/]+)/')
+          if lmerr == null { project = string(lm.p) ?? "" }
+      }
+      if project != "" { cloud.project_uid = project; cloud.account = { "uid": project } }
+      rloc = to_string(rlabels.location) ?? ""
+      if rloc != "" { cloud.zone = rloc }
+      rep_inst = src_inst
+      if reporter == "DEST" { rep_inst = dst_inst }
+      rep_region = to_string(rep_inst.region) ?? ""
+      if rep_region != "" { cloud.region = rep_region }
+
+      msg = "VPC flow"
+      if src_ip != "" && dst_ip != "" {
+          msg = msg + " " + src_ip + ":" + to_string(src_port) + " -> " + dst_ip + ":" + to_string(dst_port)
+      }
+      if proto_name != "" { msg = msg + " " + proto_name }
+
+      ocsf = {
+          "class_uid": 4001,
+          "class_name": "Network Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": 6,
+          "activity_name": "Traffic",
+          "type_uid": 400106,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 1,
+          "status": "Success",
+          "time": time_ms,
+          "message": msg,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud"],
+              "uid": sha2("gcp_vpc_flow|raw|" + raw_log, variant: "SHA-256"),
+              "log_name": log_name,
+              "log_provider": "Google Cloud VPC Flow Logs",
+              "product": { "name": "Google Cloud VPC Flow Logs", "vendor_name": "Google" }
+          },
+          "cloud": cloud,
+          "connection_info": connection_info,
+          "traffic": traffic
+      }
+      insert_id = to_string(p.insertId) ?? ""
+      if insert_id != "" { ocsf.metadata.uid = insert_id }
+      if length(keys(src_endpoint)) > 0 { ocsf.src_endpoint = src_endpoint }
+      if length(keys(dst_endpoint)) > 0 { ocsf.dst_endpoint = dst_endpoint }
+      if start_ms > 0 { ocsf.start_time = start_ms }
+      if end_ms > 0 { ocsf.end_time = end_ms }
+      if end_ms >= start_ms && start_ms > 0 { ocsf.duration = end_ms - start_ms }
+      recv_str = to_string(p.receiveTimestamp) ?? ""
+      if recv_str != "" {
+          rt, rterr = parse_timestamp(recv_str, "%+")
+          if rterr == null { ocsf.metadata.logged_time = to_unix_timestamp(rt, unit: "milliseconds") }
+      }
+
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # Values spill exactly as parsed: a parser never masks, redacts or withholds
+  # anything (masking is an opt-in pipeline step, never a parser concern).
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __copy = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __copy_json = encode_json(__copy)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__copy_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # timestamp: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # jsonPayload.start_time: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # jsonPayload.end_time: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # receiveTimestamp: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # jsonPayload.reporter: The reporting side (SRC / DEST) is normalized to the OCSF direction from that VM's view; consume only when the expected ID is emitted.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        timestamp
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if __mapped."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        jsonPayload\.start_time
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if __mapped."start_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        jsonPayload\.end_time
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if __mapped."end_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        receiveTimestamp
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if __mapped."metadata"."logged_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        jsonPayload\.reporter
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"src": 2, "dest": 1}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if __mapped."connection_info"."direction_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    insertId
+  | jsonPayload\.bytes_sent
+  | jsonPayload\.connection\.dest_ip
+  | jsonPayload\.connection\.dest_port
+  | jsonPayload\.connection\.protocol
+  | jsonPayload\.connection\.src_ip
+  | jsonPayload\.connection\.src_port
+  | jsonPayload\.dest_instance\.project_id
+  | jsonPayload\.dest_instance\.region
+  | jsonPayload\.dest_instance\.vm_name
+  | jsonPayload\.dest_instance\.zone
+  | jsonPayload\.dest_location\.asn
+  | jsonPayload\.dest_location\.city
+  | jsonPayload\.dest_location\.continent
+  | jsonPayload\.dest_location\.country
+  | jsonPayload\.dest_location\.region
+  | jsonPayload\.dest_vpc\.project_id
+  | jsonPayload\.dest_vpc\.subnetwork_name
+  | jsonPayload\.dest_vpc\.vpc_name
+  | jsonPayload\.end_time
+  | jsonPayload\.packets_sent
+  | jsonPayload\.reporter
+  | jsonPayload\.src_instance\.project_id
+  | jsonPayload\.src_instance\.region
+  | jsonPayload\.src_instance\.vm_name
+  | jsonPayload\.src_instance\.zone
+  | jsonPayload\.src_location\.asn
+  | jsonPayload\.src_location\.city
+  | jsonPayload\.src_location\.continent
+  | jsonPayload\.src_location\.country
+  | jsonPayload\.src_location\.region
+  | jsonPayload\.src_vpc\.project_id
+  | jsonPayload\.src_vpc\.subnetwork_name
+  | jsonPayload\.src_vpc\.vpc_name
+  | jsonPayload\.start_time
+  | logName
+  | receiveTimestamp
+  | resource\.labels\.location
+  | resource\.labels\.project_id
+  | timestamp
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if !contains(__consumed, __token) && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # The canonical source spill above is the authoritative representation of
+  # containers. The cheap conditions run first; the source value set is built on
+  # first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, as-is. These
+  # entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__copy.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+# Sample provenance (sidecar samples/ directory). Project, VM, IP and ASN
+# values are replaced with documentation values.
+#   vpc_egress_internet_src.json, vpc_ingress_internet_dest.json,
+#   vpc_internal_dest.json, vpc_internal_src.json:
+#     Elastic integrations test fixture (shape kept, values replaced)
+#     https://github.com/elastic/integrations/blob/main/packages/gcp/data_stream/vpcflow/_dev/test/pipeline/test-vpcflow.log
+#   vpc_gke_udp_dns.json, vpc_ipv6_icmp.json: field set from the Google Cloud
+#     "VPC Flow Logs record format" reference (GKE annotations, network_service,
+#     networkmanagement.googleapis.com logName)
+#     https://cloud.google.com/vpc/docs/about-flow-logs-records
+#   not_vpc_flow_firewall.json: a Firewall Rules Logging entry, which this lane
+#     must not claim (Base Event fallback)
+#     https://cloud.google.com/firewall/docs/firewall-rules-logging
+#   junk.json: malformed input, Base Event fallback
+samples:
+  - raw: '{"insertId":"ut8lbrffooxyw","jsonPayload":{"bytes_sent":"1776","connection":{"dest_ip":"203.0.113.13","dest_port":33478,"protocol":6,"src_ip":"192.0.2.76","src_port":5601},"dest_location":{"asn":64496,"continent":"America","country":"usa"},"end_time":"2019-06-14T03:45:37.301953198Z","packets_sent":"7","reporter":"SRC","rtt_msec":"36","src_instance":{"project_id":"example-project","region":"us-east1","vm_name":"kibana","zone":"us-east1-b"},"src_vpc":{"project_id":"example-project","subnetwork_name":"default","vpc_name":"default"},"start_time":"2019-06-14T03:45:37.186193305Z"},"logName":"projects/example-project/logs/compute.googleapis.com%2Fvpc_flows","receiveTimestamp":"2019-06-14T03:50:10.845445834Z","resource":{"labels":{"location":"us-east1-b","project_id":"example-project","subnetwork_id":"1234567890123456789","subnetwork_name":"default"},"type":"gce_subnetwork"},"timestamp":"2019-06-14T03:50:10.845445834Z"}'
+    expect:
+      class_uid: 4001
+      activity_id: 6
+      metadata.uid: ut8lbrffooxyw
+      src_endpoint.ip: 192.0.2.76
+      src_endpoint.hostname: kibana
+      dst_endpoint.port: 33478
+      dst_endpoint.autonomous_system.number: 64496
+      connection_info.direction_id: 2
+      traffic.bytes_out: 1776
+      cloud.project_uid: example-project
+  # Review P1: a DEST-reported flow still sent its bytes src -> dest, so they are bytes_out.
+  - raw: '{"insertId":"ut8lbrffooxzc","jsonPayload":{"bytes_sent":"52","connection":{"dest_ip":"192.0.2.76","dest_port":22,"protocol":6,"src_ip":"198.51.100.200","src_port":51234},"dest_instance":{"project_id":"example-project","region":"us-east1","vm_name":"kibana","zone":"us-east1-b"},"end_time":"2019-06-14T03:41:02.100000000Z","packets_sent":"1","reporter":"DEST","start_time":"2019-06-14T03:41:02.100000000Z"},"logName":"projects/example-project/logs/compute.googleapis.com%2Fvpc_flows","resource":{"labels":{"project_id":"example-project"}},"timestamp":"2019-06-14T03:42:10Z"}'
+    expect:
+      connection_info.direction_id: 1
+      traffic.bytes_out: 52
+      traffic.packets_out: 1
+      traffic.bytes_in: <missing>
+      traffic.packets_in: <missing>
+  - raw: '{"insertId":"fw0001","jsonPayload":{"connection":{"dest_ip":"192.0.2.76","dest_port":22,"protocol":6,"src_ip":"198.51.100.200","src_port":51234},"disposition":"DENIED"},"logName":"projects/example-project/logs/compute.googleapis.com%2Ffirewall","timestamp":"2026-08-18T21:11:00Z"}'
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: not a VPC flow log entry

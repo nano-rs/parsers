@@ -13,19 +13,86 @@ SAMPLED=0
 UNSAMPLED=0
 UNSAMPLED_NAMES=""
 
-# `vector vrl --print-object` emits timestamps as VRL literals (t'2026-01-01T…'),
-# which is not valid JSON. Rewrite them to plain strings so the result can be
-# fed to jq. Used to tell "ran to completion" from "aborted": a program that
-# finishes emits a JSON object, one that aborts emits "aborted" or a bare error.
-normalize_vector_output() {
-    # `vector vrl` emits raw control characters (a literal tab or newline
-    # preserved from the source log) INSIDE JSON strings. That is well-formed as
-    # far as the event goes, but jq rejects it, and the caller then reports the
-    # parser as having aborted at runtime — a false failure that hits any source
-    # whose raw log contains a tab (rendered Windows event text, auditd
-    # PROCTITLE). Escape them so jq sees legal JSON; content is unchanged.
-    printf '%s' "$1" | grep -v "INFO vector" | perl -pe "s/t'([^']*)'/\"\$1\"/g" \
-        | perl -pe 's/([\x00-\x08\x0b\x0c\x0e-\x1f])/sprintf("\\\\u%04x", ord($1))/ge; s/\t/\\\\t/g'
+# One private scratch directory per run, removed on any exit; the per-parser
+# files live inside it under fixed names. A plain `mktemp -d` template works on
+# GNU and BSD (macOS) mktemp alike, and concurrent runs never share a file.
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/validate_vrl.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+
+# ---------------------------------------------------------------------------
+# Telling "ran to completion" from "aborted"
+#
+# `vector vrl` exits 0 when a program aborts at runtime: it prints the error
+# message (or just "aborted") and returns success. Only a COMPILE error gives a
+# non-zero exit. So the exit code separates "compiles" from "does not", and
+# something else has to separate "finished" from "aborted".
+#
+# This script used to decide that by scraping `--print-object` output: rewrite
+# the t'…' timestamp literals into JSON strings with a regex, then ask jq
+# whether the result parsed. The regex matched ANY `t'…'`, so a sample value
+# such as `'root'@host` or `'commit'` was rewritten too, the JSON broke, and a
+# parser that had run fine was reported as aborted.
+#
+# Now the program itself reports completion. Each run appends one final
+# expression to the parser:
+#
+#     "<marker>:" + encode_base64(encode_json(.))
+#
+# and runs WITHOUT --print-object, so vector prints that expression's value.
+# The final expression is reached only if nothing before it aborted, so:
+#   - the marker line present  -> the program completed; the payload is the
+#                                 event as real JSON (encode_json renders
+#                                 timestamps as strings and escapes control
+#                                 characters), base64 so no event content can
+#                                 alter or imitate the line
+#   - the marker line absent   -> the program aborted; vector printed the error
+# The marker carries a per-run random nonce, so a sample or an abort message
+# can never forge it. Event content is never pattern-matched.
+#
+# Limitation: a program that leaves via `return` skips the appended
+# expression and is reported as aborted. No parser in this repo uses `return`;
+# if one ever does, this check needs a different completion signal.
+# ---------------------------------------------------------------------------
+NONCE="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+DONE_MARKER="__nano_vrl_completed__:${NONCE}:"
+
+# write_probe_program <vrl source> <out file>
+write_probe_program() {
+    printf '%s\n"%s" + encode_base64(encode_json(.))\n' "$1" "$DONE_MARKER" > "$2"
+}
+
+# run_probe <event file> <probe program file>
+# Sets PROBE_RC (vector's exit status: non-zero = compile error), PROBE_OUT
+# (vector's full output, for messages), PROBE_JSON (the emitted event as
+# JSON, empty if the program aborted) and PROBE_NONOBJ (1 when the program
+# completed but left `.` as something other than a JSON object). Returns 0
+# only if the program completed AND emitted an object: a log event must be an
+# object (validate-ocsf.sh requires one, and the expect: lookups below index
+# into it), so `. = null`, `false`, a scalar or an array is a failure too.
+run_probe() {
+    PROBE_RC=0
+    PROBE_OUT=$(vector vrl --input "$1" --program "$2" 2>&1) || PROBE_RC=$?
+    PROBE_JSON=""
+    PROBE_NONOBJ=0
+    [ "$PROBE_RC" -eq 0 ] || return 1
+    local line
+    # The marker line is a VRL string literal of base64 chars, so it is also
+    # a valid JSON string: let jq strip the marker and decode it.
+    line=$(printf '%s\n' "$PROBE_OUT" | grep -F "\"${DONE_MARKER}" | tail -1) || true
+    [ -n "$line" ] || return 1
+    PROBE_JSON=$(printf '%s' "$line" | jq -r --arg m "$DONE_MARKER" 'ltrimstr($m) | @base64d') || return 1
+    [ -n "$PROBE_JSON" ] || return 1
+    # PROBE_JSON is kept verbatim (exact numeric formatting); only its type
+    # is checked here.
+    if ! printf '%s' "$PROBE_JSON" | jq -e 'type == "object"' >/dev/null 2>&1; then
+        PROBE_NONOBJ=1
+        return 1
+    fi
+}
+
+# Output for humans: vector's lines minus its INFO log banner.
+vector_messages() {
+    printf '%s\n' "$1" | grep -v "INFO vector" || true
 }
 
 # Minimal test events — just enough structure for VRL to compile + run against.
@@ -106,20 +173,23 @@ EOF
         continue
     fi
 
-    # Write VRL to temp file (vector vrl reads from file)
-    vrl_file=$(mktemp "${TMPDIR:-/tmp}/nano_vrl.XXXXXX")
-    echo "$vrl_program" > "$vrl_file"
-
-    # Write test event to temp file
-    event_file=$(mktemp "${TMPDIR:-/tmp}/nano_event.XXXXXX")
-    echo "$event_json" > "$event_file"
+    # vector vrl reads the program and the event from files.
+    src_file="$WORK/source.vrl"
+    printf '%s\n' "$vrl_program" > "$src_file"
+    event_file="$WORK/event.json"
+    printf '%s\n' "$event_json" > "$event_file"
+    # The probe program is the parser plus the completion marker (see
+    # run_probe), used for every runtime check below. Compiling is judged on
+    # the parser ALONE: an incomplete last line such as `.x =` would otherwise
+    # take the appended marker as its right-hand side and compile.
+    vrl_file="$WORK/program.vrl"
+    write_probe_program "$vrl_program" "$vrl_file"
 
     # Run Vector VRL validation
-    # --print-object outputs the transformed event
     # Exit code 0 = valid, non-zero = compilation error
     output=""
     compiled=0
-    if output=$(vector vrl --input "$event_file" --program "$vrl_file" --print-object 2>&1); then
+    if output=$(vector vrl --input "$event_file" --program "$src_file" --print-object 2>&1); then
         compiled=1
         # Check for warnings in output
         if echo "$output" | grep -qi "warning"; then
@@ -143,14 +213,12 @@ EOF
     # behind a green run (FRO-677: a float array index in the PRI decode, and
     # string! on a non-participating optional regex group).
     #
-    # The reliable signal is whether `--print-object` emitted a JSON object. A
-    # parser that handles a bad line writes its complaint INTO the event (e.g.
-    # .metadata.parse_error) and still emits an object; one that aborts emits
-    # "aborted" or a bare error line instead. So: parseable as JSON = ran to
-    # completion, not parseable = aborted.
+    # The signal is the completion marker (run_probe). A parser that handles a
+    # bad line writes its complaint INTO the event (e.g. .metadata.parse_error)
+    # and still completes; one that aborts never reaches the marker.
     if [ "$compiled" -eq 1 ] && [ "$is_enrichment" -eq 0 ]; then
-        if ! normalize_vector_output "$output" | jq -e . >/dev/null 2>&1; then
-            echo "  NOTE: aborts on the generic stub event (no JSON emitted)"
+        if ! run_probe "$event_file" "$vrl_file"; then
+            echo "  NOTE: aborts or emits a non-object on the generic stub event (no event emitted)"
             echo "        Not blocking — the stub is not a meaningful input for"
             echo "        most parsers. Add samples: to assert real behaviour."
         fi
@@ -177,18 +245,21 @@ EOF
         idx=0
         while [ "$idx" -lt "$sample_count" ]; do
             raw=$(yq ".samples[$idx].raw" "$parser_file")
-            sample_event=$(mktemp "${TMPDIR:-/tmp}/nano_sample.XXXXXX")
+            sample_event="$WORK/sample.json"
             jq -nc --arg m "$raw" '{message: $m}' > "$sample_event"
 
-            s_out=$(vector vrl --input "$sample_event" --program "$vrl_file" --print-object 2>&1)
-            s_json=$(normalize_vector_output "$s_out")
-
-            if ! printf '%s' "$s_json" | jq -e . >/dev/null 2>&1; then
-                echo "  FAIL: sample[$idx] aborted at runtime — the parser would DROP this event"
-                echo "    input:  $raw"
-                echo "$s_out" | grep -v "INFO vector" | head -3 | sed 's/^/    output: /'
+            if ! run_probe "$sample_event" "$vrl_file"; then
+                if [ "$PROBE_NONOBJ" -eq 1 ]; then
+                    echo "  FAIL: sample[$idx] left the event as a non-object ($(printf '%s' "$PROBE_JSON" | jq -r 'type' 2>/dev/null || echo unknown)) — the parser would DROP this event"
+                    echo "    input:  $raw"
+                else
+                    echo "  FAIL: sample[$idx] aborted at runtime — the parser would DROP this event"
+                    echo "    input:  $raw"
+                    vector_messages "$PROBE_OUT" | head -3 | sed 's/^/    output: /'
+                fi
                 sample_failed=1
             else
+                s_json="$PROBE_JSON"
                 # Assert declared expectations, if any
                 exp_keys=$(yq -o=json ".samples[$idx].expect // {}" "$parser_file" | jq -r 'keys[]?')
                 for key in $exp_keys; do
@@ -211,7 +282,13 @@ EOF
                     # in arrays; asserting into them is not exotic.
                     got=$(printf '%s' "$s_json" | jq -r --arg p "$key" '
                         ($p | split(".") | map(if test("^[0-9]+$") then tonumber else . end)) as $path
-                        | getpath($path) as $v | if $v == null then "<missing>" else $v end')
+                        | getpath($path) as $v | if $v == null then "<missing>"
+                          # encode_json writes a whole-valued float as 1.0;
+                          # VRL prints it as 1. Compare the VRL form, which is
+                          # what every existing expectation was written against.
+                          elif ($v | type) == "number" and $v == ($v | floor)
+                               and $v > -9007199254740992 and $v < 9007199254740992 then $v + 0
+                          else $v end')
                     if [ "$got" != "$want" ]; then
                         echo "  FAIL: sample[$idx] expected $key = '$want' but got '$got'"
                         echo "    input: $raw"
@@ -219,7 +296,6 @@ EOF
                     fi
                 done
             fi
-            rm -f "$sample_event"
             idx=$((idx + 1))
         done
 
@@ -234,7 +310,6 @@ EOF
         UNSAMPLED_NAMES="${UNSAMPLED_NAMES}${parser_name} "
     fi
 
-    rm -f "$vrl_file" "$event_file"
 done < "$CHANGED_FILE"
 
 echo ""
