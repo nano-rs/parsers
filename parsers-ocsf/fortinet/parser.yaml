@@ -12,6 +12,7 @@ description: >
   (3002). Any other subtype, and any line without recognisable FortiGate keys,
   still emits a Network Activity record with activity_id 99 and the raw line in
   `message`.
+  An inline timezone (offset, common abbreviation or IANA name) is honored; timestamps without an offset are read as UTC; set the device to UTC or use a per-source timezone.
 match_values:
   - fortinet
 category: network
@@ -59,7 +60,23 @@ parser_vrl: |
       d = to_string(kv.date) ?? ""
       t = to_string(kv.time) ?? ""
       if d != "" && t != "" {
+          # Inline timezone: an offset (-0400, +01:00), a common abbreviation (a
+          # fixed offset: CET +0100, EDT -0400, ...) or an IANA name; UTC only when
+          # it is absent or unrecognized.
+          tz_in = strip_whitespace(to_string(kv.tz) ?? "")
+          tz_off = ""
+          if match(tz_in, r'^[+-]\d{2}:?\d{2}$') { tz_off = replace(tz_in, ":", "") }
+          if tz_off == "" { tz_off = string(get({"UTC": "+0000", "GMT": "+0000", "Z": "+0000", "UT": "+0000", "WET": "+0000", "WEST": "+0100", "BST": "+0100", "IST": "+0530", "CET": "+0100", "CEST": "+0200", "MET": "+0100", "MEST": "+0200", "EET": "+0200", "EEST": "+0300", "MSK": "+0300", "EST": "-0500", "EDT": "-0400", "CST": "-0600", "CDT": "-0500", "MST": "-0700", "MDT": "-0600", "PST": "-0800", "PDT": "-0700", "AKST": "-0900", "AKDT": "-0800", "HST": "-1000", "JST": "+0900", "KST": "+0900", "HKT": "+0800", "SGT": "+0800", "AWST": "+0800", "ACST": "+0930", "AEST": "+1000", "AEDT": "+1100", "NZST": "+1200", "NZDT": "+1300"}, [upcase(tz_in)]) ?? "") ?? "" }
+          tz_name = "UTC"
+          if tz_off == "" && match(tz_in, r'^[A-Za-z]+/[A-Za-z0-9_+\-]+(?:/[A-Za-z0-9_+\-]+)?$') { tz_name = tz_in }
           ts, ts_err = parse_timestamp(d + " " + t, "%Y-%m-%d %H:%M:%S", timezone: "UTC")
+          if tz_off != "" {
+              tz_ts, tz_err = parse_timestamp(d + " " + t + " " + tz_off, "%Y-%m-%d %H:%M:%S %z")
+              if tz_err == null { ts = tz_ts; ts_err = null }
+          } else if tz_name != "UTC" {
+              tz_ts, tz_err = parse_timestamp(d + " " + t, "%Y-%m-%d %H:%M:%S", timezone: tz_name)
+              if tz_err == null { ts = tz_ts; ts_err = null }
+          }
           if ts_err == null { time_ms = to_int(to_unix_timestamp(ts, unit: "milliseconds")) }
       }
   }
@@ -963,3 +980,15 @@ samples:
 - raw: "<189>date=2024-10-30 time=09:54:00 devname=\"FGT-EDGE\" logid=\"0100032002\" type=\"event\" subtype=\"system\" level=\"information\" vd=\"root\" logdesc=\"Admin login successful\" user=\"admin\" ui=\"ssh(10.0.0.9)\" action=\"login\" status=\"success\" reason=\"none\" msg=\"Administrator admin logged in successfully from ssh(10.0.0.9)\""
   expect:
     "metadata.uid": "b368b9fe408f04b5d423d2c27d68c106c1d7c26ae57c7b78d0856502244205f0"
+# inline tz offset: date/time are the firewall's local clock (-0400)
+- raw: "<189>date=2024-10-30 time=09:54:00 tz=\"-0400\" devname=\"FGT-EDGE\" logid=\"0100032002\" type=\"event\" subtype=\"system\" level=\"information\" vd=\"root\" logdesc=\"Admin login successful\" user=\"admin\" ui=\"ssh(10.0.0.9)\" action=\"login\" status=\"success\" reason=\"none\" msg=\"Administrator admin logged in successfully from ssh(10.0.0.9)\""
+  expect:
+    "time": 1730296440000
+# inline tz offset with a colon (+01:00)
+- raw: "<189>date=2024-10-30 time=09:54:00 tz=\"+01:00\" devname=\"FGT-EDGE\" logid=\"0100032002\" type=\"event\" subtype=\"system\" level=\"information\" vd=\"root\" logdesc=\"Admin login successful\" user=\"admin\" ui=\"ssh(10.0.0.9)\" action=\"login\" status=\"success\" reason=\"none\" msg=\"Administrator admin logged in successfully from ssh(10.0.0.9)\""
+  expect:
+    "time": 1730278440000
+# no tz: UTC
+- raw: "<189>date=2024-10-30 time=09:54:00 devname=\"FGT-EDGE\" logid=\"0100032002\" type=\"event\" subtype=\"system\" level=\"information\" vd=\"root\" logdesc=\"Admin login successful\" user=\"admin\" ui=\"ssh(10.0.0.9)\" action=\"login\" status=\"success\" reason=\"none\" msg=\"Administrator admin logged in successfully from ssh(10.0.0.9)\""
+  expect:
+    "time": 1730282040000

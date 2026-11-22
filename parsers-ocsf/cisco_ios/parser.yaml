@@ -23,6 +23,7 @@ description: >
   abbreviation is kept in unmapped); a clock without a year takes the current
   year. A line with no tag and no PRI is a Base Event marked with
   unmapped.parse_fallback.
+  An inline timezone (offset, common abbreviation or IANA name) is honored; timestamps without an offset are read as UTC; set the device to UTC or use a per-source timezone.
 match_values:
   - cisco_ios
 category: network
@@ -83,7 +84,24 @@ parser_vrl: |
           if dm.year1 != null { hdr.year = dm.year1 }
           if dm.tz != null { hdr.tz = dm.tz }
           if dm.tail != null && dm.tail != "" { hdr.process = dm.tail }
-          tsp, tse = parse_timestamp(string!(dm.mon) + " " + string!(dm.day) + " " + year + " " + string!(dm.hms) + (string(dm.frac) ?? ""), "%b %d %Y %H:%M:%S%.f", timezone: "UTC")
+          # Inline timezone: an offset (-0400, +01:00), a common abbreviation (a
+          # fixed offset: CET +0100, EDT -0400, ...) or an IANA name; UTC only when
+          # it is absent or unrecognized.
+          tz_in = strip_whitespace(string(dm.tz) ?? "")
+          tz_off = ""
+          if match(tz_in, r'^[+-]\d{2}:?\d{2}$') { tz_off = replace(tz_in, ":", "") }
+          if tz_off == "" { tz_off = string(get({"UTC": "+0000", "GMT": "+0000", "Z": "+0000", "UT": "+0000", "WET": "+0000", "WEST": "+0100", "BST": "+0100", "IST": "+0530", "CET": "+0100", "CEST": "+0200", "MET": "+0100", "MEST": "+0200", "EET": "+0200", "EEST": "+0300", "MSK": "+0300", "EST": "-0500", "EDT": "-0400", "CST": "-0600", "CDT": "-0500", "MST": "-0700", "MDT": "-0600", "PST": "-0800", "PDT": "-0700", "AKST": "-0900", "AKDT": "-0800", "HST": "-1000", "JST": "+0900", "KST": "+0900", "HKT": "+0800", "SGT": "+0800", "AWST": "+0800", "ACST": "+0930", "AEST": "+1000", "AEDT": "+1100", "NZST": "+1200", "NZDT": "+1300"}, [upcase(tz_in)]) ?? "") ?? "" }
+          tz_name = "UTC"
+          if tz_off == "" && match(tz_in, r'^[A-Za-z]+/[A-Za-z0-9_+\-]+(?:/[A-Za-z0-9_+\-]+)?$') { tz_name = tz_in }
+          ios_clock = string!(dm.mon) + " " + string!(dm.day) + " " + year + " " + string!(dm.hms) + (string(dm.frac) ?? "")
+          tsp, tse = parse_timestamp(ios_clock, "%b %d %Y %H:%M:%S%.f", timezone: "UTC")
+          if tz_off != "" {
+              tz_ts, tz_err = parse_timestamp(ios_clock + " " + tz_off, "%b %d %Y %H:%M:%S%.f %z")
+              if tz_err == null { tsp = tz_ts; tse = null }
+          } else if tz_name != "UTC" {
+              tz_ts, tz_err = parse_timestamp(ios_clock, "%b %d %Y %H:%M:%S%.f", timezone: tz_name)
+              if tz_err == null { tsp = tz_ts; tse = null }
+          }
           if tse == null { time_ms = to_unix_timestamp(tsp, unit: "milliseconds") }
       } else {
           im, ie = parse_regex(head, r'^(?P<iso>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s+(?P<rest>.*)$')
@@ -940,3 +958,15 @@ samples:
       class_uid: 6003
       actor.user.name: admin
       src_endpoint.hostname: rtr01
+  # show-timezone CET (+0100), year from the line
+  - raw: "<182>: host-1: 115649616: Jan 23 2026 14:54:28.511 CET: %FMANFP-6-IPV6ACCESSLOGP: R0/0: fman_fp_image: list ACL-IPv6-OUTSIDE denied udp 2001:db8::(38370) -> 2001:db8:1::(3370), 1 packet"
+    expect:
+      "time": 1769176468511
+  # show-timezone MST (-0700)
+  - raw: "<182>: host-1: 115649616: Jan 23 2026 14:54:28.511 MST: %FMANFP-6-IPV6ACCESSLOGP: R0/0: fman_fp_image: list ACL-IPv6-OUTSIDE denied udp 2001:db8::(38370) -> 2001:db8:1::(3370), 1 packet"
+    expect:
+      "time": 1769205268511
+  # show-timezone UTC
+  - raw: "<182>: host-1: 115649616: Jan 23 2026 14:54:28.511 UTC: %FMANFP-6-IPV6ACCESSLOGP: R0/0: fman_fp_image: list ACL-IPv6-OUTSIDE denied udp 2001:db8::(38370) -> 2001:db8:1::(3370), 1 packet"
+    expect:
+      "time": 1769180068511

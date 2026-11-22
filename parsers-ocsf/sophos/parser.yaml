@@ -18,6 +18,7 @@ description: >
   "security_control" wherever an allow/deny verdict is a real control decision
   (not on 3002, where allow/deny is the authentication OUTCOME -> status_id).
   The OCSF counterpart of parsers/sophos - deploy one or the other, never both.
+  An inline timezone (offset, common abbreviation or IANA name) is honored; timestamps without an offset are read as UTC; set the device to UTC or use a per-source timezone.
 ocsf_version: "1.9.0"
 match_values:
   - sophos
@@ -78,7 +79,23 @@ parser_vrl: |
   date_str = to_string(kv.date) ?? ""
   time_str = to_string(kv.time) ?? ""
   if date_str != "" && time_str != "" {
+      # Inline timezone: an offset (-0400, +01:00), a common abbreviation (a
+      # fixed offset: CET +0100, EDT -0400, ...) or an IANA name; UTC only when
+      # it is absent or unrecognized.
+      tz_in = strip_whitespace(to_string(kv.timezone) ?? "")
+      tz_off = ""
+      if match(tz_in, r'^[+-]\d{2}:?\d{2}$') { tz_off = replace(tz_in, ":", "") }
+      if tz_off == "" { tz_off = string(get({"UTC": "+0000", "GMT": "+0000", "Z": "+0000", "UT": "+0000", "WET": "+0000", "WEST": "+0100", "BST": "+0100", "IST": "+0530", "CET": "+0100", "CEST": "+0200", "MET": "+0100", "MEST": "+0200", "EET": "+0200", "EEST": "+0300", "MSK": "+0300", "EST": "-0500", "EDT": "-0400", "CST": "-0600", "CDT": "-0500", "MST": "-0700", "MDT": "-0600", "PST": "-0800", "PDT": "-0700", "AKST": "-0900", "AKDT": "-0800", "HST": "-1000", "JST": "+0900", "KST": "+0900", "HKT": "+0800", "SGT": "+0800", "AWST": "+0800", "ACST": "+0930", "AEST": "+1000", "AEDT": "+1100", "NZST": "+1200", "NZDT": "+1300"}, [upcase(tz_in)]) ?? "") ?? "" }
+      tz_name = "UTC"
+      if tz_off == "" && match(tz_in, r'^[A-Za-z]+/[A-Za-z0-9_+\-]+(?:/[A-Za-z0-9_+\-]+)?$') { tz_name = tz_in }
       t, terr = parse_timestamp(date_str + " " + time_str, "%Y-%m-%d %H:%M:%S", timezone: "UTC")
+      if tz_off != "" {
+          tz_ts, tz_err = parse_timestamp(date_str + " " + time_str + " " + tz_off, "%Y-%m-%d %H:%M:%S %z")
+          if tz_err == null { t = tz_ts; terr = null }
+      } else if tz_name != "UTC" {
+          tz_ts, tz_err = parse_timestamp(date_str + " " + time_str, "%Y-%m-%d %H:%M:%S", timezone: tz_name)
+          if tz_err == null { t = tz_ts; terr = null }
+      }
       if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
   }
 
@@ -1090,3 +1107,19 @@ samples:
     expect:
       "metadata.uid": "33c153115e43dd16e07597782fd33d4e5449bf239ba0e2ece538317dfcd52887"
       "metadata.original_event_uid": "062516617101"
+  # timezone BST (+0100)
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:46:00 timezone=\"BST\" device_name=\"XGS2100\" log_id=062516617101 log_type=\"Event\" log_component=\"Admin\" log_subtype=\"Admin\" status=\"Successful\" priority=Information user_name=\"admin\" message=\"Admin logged in from 10.1.1.5\" reason=\"\""
+    expect:
+      "time": 1787046360000
+  # timezone EST (-0500)
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:46:00 timezone=\"EST\" device_name=\"XGS2100\" log_id=062516617101 log_type=\"Event\" log_component=\"Admin\" log_subtype=\"Admin\" status=\"Successful\" priority=Information user_name=\"admin\" message=\"Admin logged in from 10.1.1.5\" reason=\"\""
+    expect:
+      "time": 1787067960000
+  # timezone as an IANA name (Asia/Tokyo, +0900)
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:46:00 timezone=\"Asia/Tokyo\" device_name=\"XGS2100\" log_id=062516617101 log_type=\"Event\" log_component=\"Admin\" log_subtype=\"Admin\" status=\"Successful\" priority=Information user_name=\"admin\" message=\"Admin logged in from 10.1.1.5\" reason=\"\""
+    expect:
+      "time": 1787017560000
+  # unrecognized timezone: UTC
+  - raw: "<30>device=\"SFW\" date=2026-08-18 time=10:46:00 timezone=\"XYZT\" device_name=\"XGS2100\" log_id=062516617101 log_type=\"Event\" log_component=\"Admin\" log_subtype=\"Admin\" status=\"Successful\" priority=Information user_name=\"admin\" message=\"Admin logged in from 10.1.1.5\" reason=\"\""
+    expect:
+      "time": 1787049960000

@@ -467,7 +467,7 @@ def run_parser(path, supplied=None, output_dir=None):
     assert config_path.exists(), f'{path.parent.name}: missing field-coverage.yaml'
     config = yaml.safe_load(config_path.read_text())
     update(path, check=True)
-    naive = naive_timestamps(doc_text := path.read_text())
+    naive = naive_timestamps(yaml.safe_load(path.read_text())['parser_vrl'])
     assert not naive, f'{path.parent.name}: parse_timestamp without timezone: "UTC" reads a clock in the host timezone: {naive[:3]}'
     rules, steps = validate_config(config)
     mappings = mappings_of(config)
@@ -574,10 +574,37 @@ def run_parser(path, supplied=None, output_dir=None):
 TIMESTAMP_CALL = re.compile(r'parse_timestamp!?\(')
 
 
-def naive_timestamps(text):
-    """parse_timestamp(...) calls with no explicit timezone argument. Without
-    one VRL reads an offset-less clock in the HOST timezone, so the same line
-    gets a different time on every Vector host."""
+def strip_comments(vrl):
+    """VRL with every # comment removed (a '#' inside a string is kept)."""
+    out, i, n = [], 0, len(vrl)
+    while i < n:
+        c = vrl[i]
+        if c == '"':
+            j = i + 1
+            while j < n and vrl[j] != '"':
+                j += 2 if vrl[j] == '\\' else 1
+            out.append(vrl[i:j + 1]); i = j + 1
+        elif c == "'" and i and vrl[i - 1] == 'r':
+            j = vrl.find("'", i + 1)
+            j = n if j < 0 else j
+            out.append(vrl[i:j + 1]); i = j + 1
+        elif c == '#':
+            j = vrl.find('\n', i)
+            i = n if j < 0 else j
+        else:
+            out.append(c); i += 1
+    return ''.join(out)
+
+
+TIMEZONE_ARG = re.compile(r',\s*timezone\s*:')
+
+
+def naive_timestamps(vrl):
+    """parse_timestamp(...) calls (comments ignored) without a named timezone:
+    argument. Without one VRL reads an offset-less clock in the HOST timezone,
+    so the same line gets a different time on every Vector host. The argument
+    may be a literal or a variable (a source's own timezone field)."""
+    text = strip_comments(vrl)
     bad = []
     for m in TIMESTAMP_CALL.finditer(text):
         i, depth = m.end(), 1
@@ -596,7 +623,9 @@ def naive_timestamps(text):
             elif c == ')':
                 depth -= 1
             i += 1
-        if 'timezone' not in text[m.end():i]:
+        args = text[m.end():i]
+        # A format that carries an offset ("%+", %z, %:z) needs no timezone.
+        if not TIMEZONE_ARG.search(args) and not re.search(r'"[^"]*(?:%\+|%:?z)[^"]*"', args):
             bad.append(text[m.start():i][:80])
     return bad
 
@@ -616,7 +645,7 @@ def verify_provenance(path, program, samples, outputs_sources, mappings, rules):
     items = [(key, None) for key in mappings] + [(rule['source'], rule) for rule in rules]
     declared = {(key, None): targets for key, targets in mappings.items()}
     declared.update({(rule['source'], id(rule)): [norm_path(rule['target'])] for rule in rules})
-    found = provenance.probe(program, samples, sources, outputs, items, per_key=40, declared=declared)
+    found = provenance.probe(program, samples, sources, outputs, items, per_key=40, declared=declared, scope=path.parent.name)
     missing = []
     for key, targets in mappings.items():
         for target in targets:
@@ -625,7 +654,7 @@ def verify_provenance(path, program, samples, outputs_sources, mappings, rules):
     for rule in rules:
         if norm_path(rule['target']) not in found.get((rule['source'], id(rule)), {}):
             missing.append(f'{rule["source"]} ({rule["kind"]}) -> {rule["target"]}')
-    assert not missing, f'{path.parent.name}: declared mapping(s) without provenance in any sample (perturbing the source does not move the target): ' + ', '.join(missing[:12]) + (' ...' if len(missing) > 12 else '')
+    assert not missing, f'{path.parent.name}: declared mapping(s) without provenance in any sample (perturbing the source does not move the target; PROVENANCE_SEED={provenance.BASE_SEED}): ' + ', '.join(missing[:12]) + (' ...' if len(missing) > 12 else '')
 
 
 def main():
