@@ -1,0 +1,895 @@
+name: cloudflare_zero_trust_ocsf
+display_name: Cloudflare Zero Trust (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Cloudflare Zero Trust Logpush JSON (one record per line) into OCSF
+  1.9.0. The dataset is recognized from its fields: Gateway DNS
+  (QueryName + ResolverDecision) becomes DNS Activity (4003) Response with
+  the resolver decision as action, Gateway HTTP (HTTPMethod / HTTPHost)
+  becomes HTTP Activity (4002), Gateway Network (Transport / SNI) becomes
+  Network Activity (4001), and Access requests (AppDomain / AppUUID) become
+  Authentication (3002) with Allowed driving the status. The Gateway user
+  (Email / UserID) is the actor, the WARP device is `device`, the matched
+  Gateway policy is firewall_rule, and RayID / RequestID / SessionID become
+  correlation ids. A blocked malicious file download is High severity.
+  Datetime / CreatedAt are accepted as RFC 3339, Unix seconds or Unix
+  nanoseconds. This is a separate source type from `cloudflare` (zone
+  HTTP / firewall / DNS Logpush), so both can be deployed side by side.
+  JSON that matches no Zero Trust dataset becomes Base Event marked with
+  unmapped.parse_fallback.
+match_values:
+  - cloudflare_zero_trust
+category: network
+vendor: "Cloudflare"
+product: "Cloudflare Zero Trust"
+parser_vrl: |
+  # Cloudflare Zero Trust Logpush -> OCSF 1.9.0 DNS Activity (4003) /
+  # HTTP Activity (4002) / Network Activity (4001) / Authentication (3002)
+  raw_log = if is_string(.message) { string!(.message) } else { encode_json(.) }
+  __raw_body = raw_log
+  __source_kv = {}
+
+  p, perr = parse_json(raw_log)
+  ok = perr == null && is_object(p)
+  if ok { __source_kv = object!(p) } else { p = {} }
+
+  dataset = ""
+  if ok {
+      if exists(p.QueryName) && (exists(p.ResolverDecision) || exists(p.QueryTypeName)) {
+          dataset = "dns"
+      } else if exists(p.HTTPMethod) || exists(p.HTTPHost) {
+          dataset = "http"
+      } else if exists(p.AppDomain) || exists(p.AppUUID) {
+          dataset = "access"
+      } else if exists(p.Transport) || exists(p.SNI) {
+          dataset = "network"
+      }
+  }
+
+  # ---- event clock: RFC 3339, Unix seconds or Unix nanoseconds ----
+  time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
+  ts_raw = p.Datetime
+  if ts_raw == null { ts_raw = p.CreatedAt }
+  if is_string(ts_raw) && match(string!(ts_raw), r'^\d+$') { ts_raw = to_int(ts_raw) ?? ts_raw }
+  if is_integer(ts_raw) {
+      n = int!(ts_raw)
+      if n > 100000000000000000 {
+          time_ms = to_int(n * 0.000001)
+      } else if n > 100000000000 {
+          time_ms = n
+      } else {
+          time_ms = n * 1000
+      }
+  } else if is_string(ts_raw) {
+      t, te = parse_timestamp(string!(ts_raw), "%+")
+      if te == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+  }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": sha2("cloudflare_zero_trust|raw|" + raw_log, variant: "SHA-256"),
+      "profiles": ["host", "security_control"],
+      "log_name": "cloudflare_zero_trust",
+      "product": { "name": "Cloudflare Zero Trust", "vendor_name": "Cloudflare" }
+  }
+  if dataset == "dns" { metadata.log_name = "gateway_dns" }
+  if dataset == "http" { metadata.log_name = "gateway_http" }
+  if dataset == "network" { metadata.log_name = "gateway_network" }
+  if dataset == "access" { metadata.log_name = "access_requests" }
+  corr = string(p.RayID) ?? string(p.RequestID) ?? string(p.SessionID) ?? ""
+  if corr != "" { metadata.correlation_uid = corr }
+  acct = string(p.AccountID) ?? ""
+  if acct != "" { metadata.tenant_uid = acct }
+
+  # ---- Gateway user and WARP device ----
+  usr = {}
+  em = string(p.Email) ?? ""
+  if em != "" { usr.email_addr = em; usr.name = em }
+  uid = string(p.UserID) ?? string(p.UserUID) ?? ""
+  if uid != "" { usr.uid = uid }
+  device = {}
+  dn = string(p.DeviceName) ?? ""
+  if dn != "" { device.name = dn; device.hostname = dn }
+  did = string(p.DeviceID) ?? ""
+  if did != "" { device.uid = did }
+  sint = string(p.SourceInternalIP) ?? ""
+  if sint != "" { device.ip = sint }
+  if length(device) > 0 { device.type_id = 0; device.type = "Unknown" }
+
+  rule = {}
+  pid = string(p.PolicyID) ?? ""
+  if pid != "" { rule.uid = pid }
+  pname = string(p.PolicyName) ?? string(p.Policy) ?? ""
+  if pname != "" { rule.name = pname }
+
+  # ---- verdict ----
+  verdict = downcase(string(p.Action) ?? string(p.ResolverDecision) ?? "")
+  if dataset == "dns" { verdict = downcase(string(p.ResolverDecision) ?? "") }
+  action_id = 0
+  action = "Unknown"
+  disposition_id = 0
+  disposition = "Unknown"
+  if starts_with(verdict, "allow") || verdict == "on" || verdict == "noscan" {
+      action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed"
+  } else if starts_with(verdict, "block") || verdict == "off" {
+      action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
+  } else if contains(verdict, "override") || contains(verdict, "safesearch") || verdict == "isolate" || verdict == "redirect" {
+      action_id = 4; action = "Modified"; disposition_id = 7; disposition = "Custom Action"
+  }
+  severity_id = 1
+  severity = "Informational"
+  if action_id == 2 { severity_id = 2; severity = "Low" }
+
+  base = {
+      "time": time_ms,
+      "raw_data": raw_log,
+      "metadata": metadata,
+      "action_id": action_id, "action": action,
+      "disposition_id": disposition_id, "disposition": disposition
+  }
+
+  if dataset == "dns" {
+      # ================= Gateway DNS (4003) =================
+      rc = to_int(p.RCode) ?? -1
+      rcodes = ["NoError", "FormError", "ServError", "NXDomain", "NotImp", "Refused"]
+      cats = array(p.MatchedCategoryNames) ?? []
+      if action_id == 2 && (includes(cats, "Malware") || includes(cats, "Phishing") || includes(cats, "Command and Control & Botnet") || includes(cats, "Spyware")) {
+          severity_id = 4; severity = "High"
+      }
+      . = merge(base, {
+          "class_uid": 4003, "class_name": "DNS Activity",
+          "category_uid": 4, "category_name": "Network Activity",
+          "activity_id": 2, "activity_name": "Response",
+          "type_uid": 400302,
+          "severity_id": severity_id, "severity": severity,
+          "query": { "hostname": replace(downcase(string(p.QueryName) ?? ""), r'\.$', "") }
+      })
+      qtn = string(p.QueryTypeName) ?? ""
+      if qtn != "" { .query.type = qtn }
+      qsz = to_int(p.QuerySize) ?? 0
+      if qsz > 0 { .traffic = { "bytes_out": qsz } }
+      if rc >= 0 {
+          .rcode_id = if rc <= 5 { rc } else { 99 }
+          .rcode = if rc <= 5 { string(get(rcodes, [rc]) ?? "Other") ?? "Other" } else { to_string(rc) }
+          if rc == 0 { .status_id = 1; .status = "Success" } else { .status_id = 2; .status = "Failure" }
+      }
+      ans = []
+      for_each(array(p.ResolvedIPs) ?? []) -> |_i, ip| {
+          ans = push(ans, { "rdata": ip })
+      }
+      if length(ans) > 0 { .answers = ans }
+      src = {}
+      sip = string(p.SrcIP) ?? ""
+      if sip != "" { src.ip = sip }
+      sp = to_int(p.SrcPort) ?? 0
+      if sp > 0 { src.port = sp }
+      dst = { "svc_name": "dns" }
+      dip = string(p.DstIP) ?? ""
+      if dip != "" { dst.ip = dip }
+      dp = to_int(p.DstPort) ?? 0
+      if dp > 0 { dst.port = dp }
+      # A WARP client egressing without a reported IP is still identified by its device.
+      if !exists(src.ip) && dn != "" { src.hostname = dn }
+      if exists(src.ip) || exists(src.hostname) { .src_endpoint = src }
+      .dst_endpoint = dst
+      proto = downcase(string(p.Protocol) ?? "")
+      if proto != "" { .app_name = proto }
+  } else if dataset == "http" {
+      # ================= Gateway HTTP (4002) =================
+      method = upcase(string(p.HTTPMethod) ?? "")
+      acts = { "CONNECT": 1, "DELETE": 2, "GET": 3, "HEAD": 4, "OPTIONS": 5, "POST": 6, "PUT": 7, "TRACE": 8, "PATCH": 9 }
+      activity_id = int(get(acts, [method]) ?? 99) ?? 99
+      names = { "1": "Connect", "2": "Delete", "3": "Get", "4": "Head", "5": "Options", "6": "Post", "7": "Put", "8": "Trace", "9": "Patch" }
+      activity_name = string(get(names, [to_string(activity_id)]) ?? "Other") ?? "Other"
+      bfr = downcase(string(p.BlockedFileReason) ?? "")
+      if action_id == 2 && bfr == "malware" { severity_id = 4; severity = "High" }
+      code = to_int(p.HTTPStatusCode) ?? 0
+      url = {}
+      us = string(p.URL) ?? ""
+      if us != "" { url.url_string = us }
+      hh = downcase(string(p.HTTPHost) ?? "")
+      if hh != "" { url.hostname = hh }
+      if !exists(url.url_string) { url.path = "/" }
+      req = { "url": url }
+      if method != "" { req.http_method = method }
+      ua = string(p.UserAgent) ?? ""
+      if ua != "" { req.user_agent = ua }
+      ref = string(p.Referer) ?? ""
+      if ref != "" { req.referrer = ref }
+      ver = string(p.HTTPVersion) ?? ""
+      if ver != "" { req.version = ver }
+      rid = string(p.RequestID) ?? ""
+      if rid != "" { req.uid = rid }
+      . = merge(base, {
+          "class_uid": 4002, "class_name": "HTTP Activity",
+          "category_uid": 4, "category_name": "Network Activity",
+          "activity_id": activity_id, "activity_name": activity_name,
+          "type_uid": 400200 + activity_id,
+          "severity_id": severity_id, "severity": severity,
+          "http_request": req
+      })
+      if code > 0 {
+          .http_response = { "code": code }
+          .http_status = code
+          if code < 400 { .status_id = 1; .status = "Success" } else { .status_id = 2; .status = "Failure" }
+      }
+      # A Gateway block answers with a redirect to the block page; the request failed.
+      if action_id == 2 { .status_id = 2; .status = "Failure" }
+      src = {}
+      sip = string(p.SourceIP) ?? ""
+      if sip != "" { src.ip = sip }
+      sp = to_int(p.SourcePort) ?? 0
+      if sp > 0 { src.port = sp }
+      scc = string(p.SourceIPCountryCode) ?? ""
+      if scc != "" { src.location = { "country": scc } }
+      dst = {}
+      dip = string(p.DestinationIP) ?? ""
+      if dip != "" { dst.ip = dip }
+      dp = to_int(p.DestinationPort) ?? 0
+      if dp > 0 { dst.port = dp }
+      if hh != "" { dst.hostname = hh }
+      dcc = string(p.DestinationIPCountryCode) ?? ""
+      if dcc != "" { dst.location = { "country": dcc } }
+      # A WARP client egressing without a reported IP is still identified by its device.
+      if !exists(src.ip) && dn != "" { src.hostname = dn }
+      if exists(src.ip) || exists(src.hostname) { .src_endpoint = src }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      bfn = string(p.BlockedFileName) ?? ""
+      if bfn != "" {
+          f = { "name": bfn, "type_id": 1, "type": "Regular File" }
+          bsz = to_int(p.BlockedFileSize) ?? 0
+          if bsz > 0 { f.size = bsz }
+          bfh = string(p.BlockedFileHash) ?? ""
+          if match(bfh, r'^[0-9A-Fa-f]{64}$') {
+              f.hashes = [{ "algorithm_id": 3, "algorithm": "SHA-256", "value": downcase(bfh) }]
+          } else if bfh != "" {
+              f.hashes = [{ "algorithm_id": 99, "algorithm": "Other", "value": bfh }]
+          }
+          .file = f
+      }
+  } else if dataset == "network" {
+      # ================= Gateway Network (4001) =================
+      activity_id = 6
+      activity_name = "Traffic"
+      if action_id == 2 { activity_id = 5; activity_name = "Refuse" }
+      nstatus_id = 0
+      nstatus = "Unknown"
+      if action_id == 1 { nstatus_id = 1; nstatus = "Success" }
+      if action_id == 2 { nstatus_id = 2; nstatus = "Failure" }
+      . = merge(base, {
+          "class_uid": 4001, "class_name": "Network Activity",
+          "category_uid": 4, "category_name": "Network Activity",
+          "activity_id": activity_id, "activity_name": activity_name,
+          "type_uid": 400100 + activity_id,
+          "severity_id": severity_id, "severity": severity,
+          "status_id": nstatus_id, "status": nstatus
+      })
+      src = {}
+      sip = string(p.SourceIP) ?? ""
+      if sip != "" { src.ip = sip }
+      sp = to_int(p.SourcePort) ?? 0
+      if sp > 0 { src.port = sp }
+      dst = {}
+      dip = string(p.DestinationIP) ?? ""
+      if dip != "" { dst.ip = dip }
+      dp = to_int(p.DestinationPort) ?? 0
+      if dp > 0 { dst.port = dp }
+      sni = downcase(string(p.SNI) ?? "")
+      if sni != "" { dst.hostname = sni }
+      # A WARP client egressing without a reported IP is still identified by its device.
+      if !exists(src.ip) && dn != "" { src.hostname = dn }
+      if exists(src.ip) || exists(src.hostname) { .src_endpoint = src }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      tr = downcase(string(p.Transport) ?? "")
+      conn = { "direction_id": 2 }
+      if tr == "tcp" { conn.protocol_num = 6; conn.protocol_name = "tcp" }
+      if tr == "udp" { conn.protocol_num = 17; conn.protocol_name = "udp" }
+      if tr == "icmp" { conn.protocol_num = 1; conn.protocol_name = "icmp" }
+      ssid = string(p.SessionID) ?? ""
+      if ssid != "" { conn.uid = ssid }
+      .connection_info = conn
+  } else if dataset == "access" {
+      # ================= Access requests (3002) =================
+      act = downcase(string(p.Action) ?? "")
+      activity_id = 99
+      activity_name = "Other"
+      if act == "login" || act == "sso" { activity_id = 1; activity_name = "Logon" }
+      if act == "logout" { activity_id = 2; activity_name = "Logoff" }
+      allowed = p.Allowed
+      status_id = 0
+      status_str = "Unknown"
+      if allowed == true {
+          status_id = 1; status_str = "Success"
+          action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed"
+      } else if allowed == false {
+          status_id = 2; status_str = "Failure"
+          action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
+          severity_id = 2; severity = "Low"
+      }
+      if length(usr) == 0 { usr.name = "unknown" }
+      . = merge(base, {
+          "class_uid": 3002, "class_name": "Authentication",
+          "category_uid": 3, "category_name": "Identity & Access Management",
+          "activity_id": activity_id, "activity_name": activity_name,
+          "type_uid": 300200 + activity_id,
+          "severity_id": severity_id, "severity": severity,
+          "status_id": status_id, "status": status_str,
+          "action_id": action_id, "action": action,
+          "disposition_id": disposition_id, "disposition": disposition,
+          "user": usr,
+          "is_remote": true
+      })
+      svc = {}
+      ad = string(p.AppDomain) ?? ""
+      if ad != "" { svc.name = ad }
+      au = string(p.AppUUID) ?? ""
+      if au != "" { svc.uid = au }
+      if length(svc) > 0 { .service = svc }
+      src = {}
+      ipa = string(p.IPAddress) ?? ""
+      if ipa != "" { src.ip = ipa }
+      cc = string(p.Country) ?? ""
+      if cc != "" { src.location = { "country": upcase(cc) } }
+      if length(src) > 0 && exists(src.ip) { .src_endpoint = src }
+      if ad != "" { .dst_endpoint = { "hostname": downcase(string(get(split(ad, "/"), [0]) ?? ad) ?? ad) } }
+  } else {
+      . = merge(base, {
+          "class_uid": 0, "class_name": "Base Event",
+          "category_uid": 0, "category_name": "Uncategorized",
+          "activity_id": 99, "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": 1, "severity": "Informational",
+          "status_id": 0, "status": "Unknown"
+      })
+      if ok {
+          . = set!(., ["unmapped", "parse_fallback"], "unrecognized Zero Trust dataset")
+      } else {
+          . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+      }
+  }
+
+  if dataset != "" && dataset != "access" && length(usr) > 0 { .actor = { "user": usr } }
+  if dataset == "access" && length(device) > 0 { .device = device }
+  if dataset != "" && dataset != "access" && length(device) > 0 { .device = device }
+  if dataset != "" && length(rule) > 0 { .firewall_rule = rule }
+
+  .
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # Datetime: RFC 3339 Logpush clock converted to event milliseconds.
+  # Datetime: Unix-seconds Logpush clock converted to event milliseconds.
+  # Datetime: Unix-nanoseconds Logpush clock converted to event milliseconds.
+  # CreatedAt: RFC 3339 Access clock converted to event milliseconds.
+  # CreatedAt: Unix-seconds Access clock converted to event milliseconds.
+  # CreatedAt: Unix-nanoseconds Access clock converted to event milliseconds.
+  # QueryName: Query name lowercased into query.hostname.
+  # HTTPHost: Host lowercased into http_request.url.hostname and dst_endpoint.hostname.
+  # SNI: SNI lowercased into dst_endpoint.hostname.
+  # HTTPMethod: Method is upper case on the wire; the parser upcases it, so a lower-case source is the only transformed form.
+  # Action: Gateway / Access verdict normalized to the OCSF action; consume only when the expected ID is emitted.
+  # ResolverDecision: Resolver decision normalized to the OCSF action; consume only when the expected ID is emitted.
+  # Transport: Transport name normalized to the IANA protocol number.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        Datetime
+      | CreatedAt
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        Datetime
+      | CreatedAt
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        Datetime
+      | CreatedAt
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 0.000001)
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        QueryName
+      | HTTPHost
+      | SNI
+      | HTTPMethod
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        Action
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"allow": 1, "allowedonnorulematch": 1, "block": 2, "login": 1}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."action_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        ResolverDecision
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"allowedonnopolicymatch": 1, "allowedbyqueryname": 1, "allowedbyanswername": 1, "blockedrule": 2, "blockedbycategory": 2, "blockedalwayscategory": 2}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."action_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        Transport
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"tcp": 6, "udp": 17, "icmp": 1}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."connection_info"."protocol_num" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    AccountID
+  | AppDomain
+  | AppUUID
+  | BlockedFileHash
+  | BlockedFileName
+  | BlockedFileSize
+  | DestinationIP
+  | DestinationIPCountryCode
+  | DestinationPort
+  | DeviceID
+  | DeviceName
+  | DstIP
+  | DstPort
+  | Email
+  | HTTPHost
+  | HTTPMethod
+  | HTTPStatusCode
+  | HTTPVersion
+  | IPAddress
+  | PolicyID
+  | PolicyName
+  | Policy
+  | Protocol
+  | QueryName
+  | QuerySize
+  | QueryTypeName
+  | RCode
+  | RayID
+  | Referer
+  | RequestID
+  | ResolvedIPs
+  | SNI
+  | SessionID
+  | SourceIP
+  | SourceIPCountryCode
+  | SourceInternalIP
+  | SourcePort
+  | SrcIP
+  | SrcPort
+  | Transport
+  | URL
+  | UserAgent
+  | UserID
+  | UserUID
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # Sources: Cloudflare Logpush dataset field references
+  #   https://developers.cloudflare.com/logs/reference/log-fields/account/gateway_dns/
+  #   https://developers.cloudflare.com/logs/reference/log-fields/account/gateway_http/
+  #   https://developers.cloudflare.com/logs/reference/log-fields/account/gateway_network/
+  #   https://developers.cloudflare.com/logs/reference/log-fields/account/access_requests/
+  # and the Elastic cloudflare_logpush integration test fixtures
+  #   https://github.com/elastic/integrations/tree/main/packages/cloudflare_logpush/data_stream
+  # Users, IPs, device and account ids replaced with documentation values.
+  # Gateway DNS, allowed, RFC 3339 clock
+  - raw: '{"ApplicationID":0,"ColoCode":"ORD","ColoID":14,"Datetime":"2023-05-02T22:49:53Z","DeviceID":"00000000-0000-0000-0000-000000000001","DeviceName":"zt-test-vm1","DstIP":"198.51.100.53","DstPort":443,"Email":"user@example.com","Location":"GCP default","LocationID":"00000000-0000-0000-0000-000000000002","MatchedCategoryIDs":[7,163],"MatchedCategoryNames":["Photography","Weather"],"Policy":"7bdc7a9c-81d3-4816-8e56-de1acad3dec5","PolicyID":"1412","Protocol":"https","QueryCategoryIDs":[26,155],"QueryCategoryNames":["Technology","Technology"],"QueryName":"security.example.com","QueryNameReversed":"com.example.security","QuerySize":48,"QueryType":1,"QueryTypeName":"A","RCode":0,"RData":[{"type":"1","data":"CHNlY3VyaXR5BnVidW50dQMjb20AAAEAAQAAAAgABLl9vic="}],"ResolvedIPs":["203.0.113.1","203.0.113.2"],"ResolverDecision":"allowedOnNoPolicyMatch","SrcIP":"192.0.2.2","SrcPort":0,"TimeZone":"UTC","TimeZoneInferredMethod":"fromLocalTime","UserID":"00000000-0000-0000-0000-000000000003"}'
+    expect:
+      class_uid: 4003
+      activity_id: 2
+      query.hostname: security.example.com
+      query.type: A
+      rcode_id: 0
+      action_id: 1
+      actor.user.email_addr: user@example.com
+      src_endpoint.ip: 192.0.2.2
+      answers.0.rdata: 203.0.113.1
+      time: 1683067793000
+  # Gateway DNS, blocked malware domain, Unix seconds clock
+  - raw: '{"ApplicationID":0,"ColoCode":"LHR","ColoID":736,"Datetime":"1743566846","DeviceName":"laptop-01","DstIP":"198.51.100.53","DstPort":443,"Email":"me@example.com","Location":"Default Location","MatchedCategoryNames":["Malware"],"PolicyName":"block-security-threats","PolicyID":"a9bc8fb6a134943fc829d82b72e356df","Protocol":"https","QueryCategoryNames":["Security threats","Malware"],"QueryName":"bad.example.net","QueryNameReversed":"net.example.bad","QuerySize":46,"QueryType":28,"QueryTypeName":"AAAA","RCode":0,"RData":[],"ResolvedIPs":[],"ResolverDecision":"blockedRule","SrcIP":"","SrcPort":0,"TimeZone":"","TimeZoneInferredMethod":"noScheduleConfigured","UserID":"10d3bda2088ec9b9d71caa6d7f3a6657"}'
+    expect:
+      class_uid: 4003
+      action_id: 2
+      severity_id: 4
+      firewall_rule.name: block-security-threats
+      time: 1743566846000
+  # Gateway HTTP, blocked malware download, Unix nanoseconds clock
+  - raw: '{"AccountID":"00000000000000000000000000000000","Action":"block","BlockedFileHash":"91dc1db739a705105e1c763bfdbdaa84c0de8","BlockedFileName":"downloaded_test","BlockedFileReason":"malware","BlockedFileSize":43,"BlockedFileType":"bin","Datetime":"1683147305000000000","DestinationIP":"203.0.113.80","DestinationPort":443,"DeviceID":"00000000-0000-0000-0000-000000000001","DeviceName":"zt-test-vm1","DownloadedFileNames":["downloaded_file","downloaded_test"],"Email":"user@example.com","FileInfo":{"files":[{"name":"downloaded_file","size":43},{"name":"downloaded_test","size":341}]},"HTTPHost":"files.example.com","HTTPMethod":"GET","HTTPStatusCode":302,"HTTPVersion":"HTTP/2","IsIsolated":false,"PolicyID":"85063bec-74cb-4546-85a3-e0cde2cdfda2","PolicyName":"Block malware","Referer":"https://www.example.com/","RequestID":"1884fec9b600007fb06a299400000001","SourceInternalIP":"192.168.1.123","SourceIP":"192.0.2.2","SourcePort":47924,"UntrustedCertificateAction":"none","UploadedFileNames":[],"URL":"https://files.example.com/downloaded_test","UserAgent":"Mozilla/5.0 (X11; Ubuntu; Linux x86_64) Firefox/112.0","UserID":"00000000-0000-0000-0000-000000000003"}'
+    expect:
+      class_uid: 4002
+      activity_id: 3
+      action_id: 2
+      severity_id: 4
+      status_id: 2
+      file.name: downloaded_test
+      http_request.url.hostname: files.example.com
+      device.ip: 192.168.1.123
+      time: 1683147305000
+  # Gateway HTTP, allowed POST upload with country codes
+  - raw: '{"AccountID":"00000000000000000000000000000000","Action":"allow","BlockedFileHash":"","BlockedFileName":"","BlockedFileReason":"unknown","BlockedFileSize":0,"Datetime":"2025-03-31T23:56:50Z","DestinationIP":"203.0.113.81","DestinationPort":443,"DeviceName":"laptop-01","DownloadedFileNames":[],"Email":"me@example.com","FileInfo":{"files":[{"direction":"upload","file_name":"report.txt","file_size":2101,"content_type":"text/plain; charset=utf-8","action":"none"}]},"HTTPHost":"example.com","HTTPMethod":"POST","HTTPStatusCode":200,"HTTPVersion":"HTTP/2","PolicyID":"","PolicyName":"","Referer":"https://example.com/","RequestID":"41f2a0ec9fc6350040394cc3c80fb1c1","SessionID":"6b357874b7ed7a833defcdb6f9e92f6a","SourceInternalIP":"","SourceIP":"","SourcePort":56509,"UntrustedCertificateAction":"none","UploadedFileNames":["report.txt"],"URL":"https://example.com","UserAgent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36","UserID":"10d3bda2088ec9b9d71caa6d7f3a6657","CategoryIDs":[26,81],"CategoryNames":["Technology","Content Servers"],"Quarantined":false,"SourceIPContinentCode":"NA","SourceIPCountryCode":"US","DestinationIPContinentCode":"NA","DestinationIPCountryCode":"US","ForensicCopyStatus":"none"}'
+    expect:
+      class_uid: 4002
+      activity_id: 6
+      action_id: 1
+      http_response.code: 200
+      status_id: 1
+  # Gateway Network, allowed TCP session with SNI
+  - raw: '{"AccountID":"00000000000000000000000000000000","Action":"allowedOnNoRuleMatch","Datetime":"2023-05-19T06:42:57+09:30","DestinationIP":"203.0.113.90","DestinationPort":443,"DeviceID":"00000000-0000-0000-0000-000000000001","DeviceName":"zt-test-vm1","Email":"user@example.com","OverrideIP":"198.51.100.4","OverridePort":8080,"PolicyID":"85063bec-74cb-4546-85a3-e0cde2cdfda2","PolicyName":"My policy","SNI":"www.example.org","SessionID":"5f2d04be-3512-11e8-b467-0ed5f89f718b","SourceIP":"192.0.2.2","SourceInternalIP":"192.168.1.3","SourcePort":47924,"Transport":"tcp","UserID":"00000000-0000-0000-0000-000000000003"}'
+    expect:
+      class_uid: 4001
+      activity_id: 6
+      dst_endpoint.hostname: www.example.org
+      connection_info.protocol_num: 6
+      status_id: 1
+      time: 1684444377000
+  # Gateway Network, blocked UDP flow
+  - raw: '{"AccountID":"00000000000000000000000000000000","Action":"block","Datetime":"2026-04-29T08:04:00Z","DestinationIP":"203.0.113.91","DestinationPort":3389,"DeviceID":"00000000-0000-0000-0000-000000000001","DeviceName":"zt-test-vm1","Email":"user@example.com","PolicyID":"85063bec-74cb-4546-85a3-e0cde2cdfda3","PolicyName":"Block RDP","SessionID":"5f2d04be-3512-11e8-b467-0ed5f89f718c","SourceIP":"192.0.2.2","SourceInternalIP":"192.168.1.3","SourcePort":47925,"Transport":"udp","UserID":"00000000-0000-0000-0000-000000000003"}'
+    expect:
+      class_uid: 4001
+      activity_id: 5
+      action_id: 2
+      status_id: 2
+      firewall_rule.name: Block RDP
+  # Gateway DNS with a fully qualified (trailing-dot) query name
+  - raw: '{"ColoCode":"ORD","Datetime":"2026-04-29T08:02:00Z","DeviceName":"zt-test-vm1","DstIP":"198.51.100.53","DstPort":53,"Email":"user@example.com","QueryName":"Login.Example.COM.","QueryType":1,"QueryTypeName":"A","RCode":0,"ResolvedIPs":["203.0.113.45"],"ResolverDecision":"allowedOnNoPolicyMatch","SrcIP":"192.0.2.2","SrcPort":0,"UserID":"00000000-0000-0000-0000-000000000003"}'
+    expect:
+      class_uid: 4003
+      query.hostname: login.example.com
+  # Access request, allowed one-time-PIN login
+  - raw: '{"Action":"login","Allowed":true,"AppDomain":"app.example.com/warp","AppUUID":"00000000-0000-0000-0000-000000000004","Connection":"onetimepin","Country":"us","CreatedAt":"2023-05-24T02:48:33+09:30","Email":"user@example.com","IPAddress":"192.0.2.93","PurposeJustificationPrompt":"Please provide your reason for accessing the application.","PurposeJustificationResponse":"I need to access the application for work purposes.","RayID":"00c0ffeeabc12345","TemporaryAccessApprovers":["approver1@example.com","approver2@example.com"],"TemporaryAccessDuration":7200,"UserUID":"00000000-0000-0000-0000-000000000003"}'
+    expect:
+      class_uid: 3002
+      activity_id: 1
+      status_id: 1
+      user.email_addr: user@example.com
+      src_endpoint.location.country: US
+      metadata.correlation_uid: 00c0ffeeabc12345
+  # Access request, denied SAML login
+  - raw: '{"Action":"login","Allowed":false,"AppDomain":"wiki.example.com","AppUUID":"00000000-0000-0000-0000-000000000005","Connection":"saml","Country":"de","CreatedAt":1684862313,"Email":"contractor@example.net","IPAddress":"198.51.100.200","RayID":"00c0ffeeabc12399","UserUID":"00000000-0000-0000-0000-000000000006"}'
+    expect:
+      class_uid: 3002
+      status_id: 2
+      action_id: 2
+      time: 1684862313000
+  # JSON from another dataset, and a malformed line -> Base Event
+  - raw: '{"EventType":"somethingElse","Datetime":"2026-01-01T00:00:00Z"}'
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: unrecognized Zero Trust dataset
+  - raw: 'not json'
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: unparsable input
