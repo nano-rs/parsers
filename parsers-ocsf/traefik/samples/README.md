@@ -29,3 +29,5 @@ sizes and durations are as published.
 | `json_bracketed_ipv6_service_url_no_clienthost.json` | bare IPv6 ClientAddr, ServiceURL with `[v6]:port` | constructed |
 | `json_unrelated_object_fallback.json` | review regression: JSON with no Traefik keys is a fallback | synthetic |
 | `malformed.json` | garbage (Base Event fallback) | synthetic |
+| `json_ipv6_default_port_service_url.json` | review regression: bracketed IPv6 ClientAddr and default-port IPv6 ServiceURL (`http://[v6]/`) | constructed from the field list |
+| `json_bracketed_ipv6_service_addr_no_port.json` | review regression: bracketed IPv6 ServiceAddr without a port | constructed |

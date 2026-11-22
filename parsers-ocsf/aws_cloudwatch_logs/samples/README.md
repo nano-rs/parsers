@@ -20,3 +20,4 @@ Account IDs use 123456789012 / 210987654321 and IPs documentation ranges.
 | `envelope_single_json_secret_array_zero.json` | review regression: one-event envelope with a JSON message holding a secret key, arrays and values equal to mapped ones (`0`, `4`, `"AWS"`); no `unmapped.log_events`, every field under `unmapped.message_json.*`, the secret redacted | constructed |
 | `envelope_empty_log_events.json` | review regression: `logEvents: []` (fallback "envelope without log events") | constructed |
 | `malformed.json` | not a CloudWatch shape (Base Event fallback) | synthetic |
+| `forwarder_preexisting_message_json.json` | review regression: an input key `message_json` is kept, never overwritten by the parsed JSON message | constructed |

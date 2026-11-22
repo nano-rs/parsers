@@ -60,9 +60,14 @@ parser_vrl: |
               e = object!(dj)
               # The decoded LogEntry is the source, so its unmapped fields spill (and
               # are redacted); the wrapper's own fields ride along without the base64 body.
+              # A decoded key the wrapper also has would be overwritten, so then the
+              # wrapper is kept as captured (base64 body included) and nothing is lost.
               w = p
               __discard = del(w.message.data)
-              __source_kv = merge(e, w)
+              wkeys = keys(w)
+              collide = false
+              for_each(e) -> |k, _v| { if includes(wkeys, k) { collide = true } }
+              if !collide { __source_kv = merge(e, w) }
           }
       }
       is_entry = exists(e.logName) || exists(e.insertId) || exists(e.textPayload) || exists(e.jsonPayload) || exists(e.protoPayload) || (exists(e.resource) && exists(e.timestamp))
@@ -147,9 +152,9 @@ parser_vrl: |
       rip = string(hr.remoteIp) ?? ""
       rport = 0
       if !is_ipv4(rip) && !is_ipv6(rip) {
-          rmm = parse_regex(rip, r'^(?:\x5B(?P<ip6>[^\x5D]+)\x5D|(?P<ip4>[^:\x5B\x5D]+)):(?P<port>\d+)$') ?? {}
+          rmm = parse_regex(rip, r'^(?:\x5B(?P<ip6>[^\x5D]+)\x5D(?::(?P<port6>\d+))?|(?P<ip4>[^:\x5B\x5D]+):(?P<port>\d+))$') ?? {}
           rip = string(rmm.ip6) ?? string(rmm.ip4) ?? ""
-          rport = to_int(rmm.port) ?? 0
+          rport = to_int(string(rmm.port6) ?? string(rmm.port) ?? "") ?? 0
       }
       if is_ipv4(rip) || is_ipv6(rip) {
           hr_src = { "ip": downcase(rip) }
@@ -159,9 +164,9 @@ parser_vrl: |
       sip = string(hr.serverIp) ?? ""
       sport = 0
       if !is_ipv4(sip) && !is_ipv6(sip) {
-          smm = parse_regex(sip, r'^(?:\x5B(?P<ip6>[^\x5D]+)\x5D|(?P<ip4>[^:\x5B\x5D]+)):(?P<port>\d+)$') ?? {}
+          smm = parse_regex(sip, r'^(?:\x5B(?P<ip6>[^\x5D]+)\x5D(?::(?P<port6>\d+))?|(?P<ip4>[^:\x5B\x5D]+):(?P<port>\d+))$') ?? {}
           sip = string(smm.ip6) ?? string(smm.ip4) ?? ""
-          sport = to_int(smm.port) ?? 0
+          sport = to_int(string(smm.port6) ?? string(smm.port) ?? "") ?? 0
       }
       if is_ipv4(sip) || is_ipv6(sip) {
           hr_dst = { "ip": downcase(sip) }

@@ -129,9 +129,9 @@ parser_vrl: |
           if is_ipv4(caddr) || is_ipv6(caddr) {
               client_ip = caddr
           } else {
-              cm = parse_regex(caddr, r'^(?:\x5B(?P<ip6>[^\x5D]+)\x5D|(?P<ip4>[^:\x5B\x5D]+)):(?P<port>\d+)$') ?? {}
+              cm = parse_regex(caddr, r'^(?:\x5B(?P<ip6>[^\x5D]+)\x5D(?::(?P<port6>\d+))?|(?P<ip4>[^:\x5B\x5D]+):(?P<port>\d+))$') ?? {}
               client_ip = string(cm.ip6) ?? string(cm.ip4) ?? ""
-              client_port = to_int(cm.port) ?? 0
+              client_port = to_int(string(cm.port6) ?? string(cm.port) ?? "") ?? 0
           }
       }
       src_endpoint = {}
@@ -161,9 +161,9 @@ parser_vrl: |
           if is_ipv4(svc_addr) || is_ipv6(svc_addr) {
               sip = svc_addr
           } else {
-              sm = parse_regex(svc_addr, r'^(?:\x5B(?P<ip6>[^\x5D]+)\x5D|(?P<host>[^:\x5B\x5D]+)):(?P<port>\d+)$') ?? {}
+              sm = parse_regex(svc_addr, r'^(?:\x5B(?P<ip6>[^\x5D]+)\x5D(?::(?P<port6>\d+))?|(?P<host>[^:\x5B\x5D]+):(?P<port>\d+))$') ?? {}
               sip = string(sm.ip6) ?? string(sm.host) ?? ""
-              sport = to_int(sm.port) ?? 0
+              sport = to_int(string(sm.port6) ?? string(sm.port) ?? "") ?? 0
               if sip == "" && !contains(svc_addr, ":") { sip = svc_addr }
           }
           if is_ipv4(sip) || is_ipv6(sip) { dst_endpoint.ip = downcase(sip) } else if sip != "" { dst_endpoint.hostname = downcase(sip) }

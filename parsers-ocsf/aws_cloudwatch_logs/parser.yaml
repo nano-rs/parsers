@@ -131,7 +131,8 @@ parser_vrl: |
           mobj = object!(mj)
           # A JSON message passes through as source, so the residual spill keeps every
           # field (arrays too, and values equal to a mapped value), redacting secrets.
-          __source_kv = set!(__source_kv, ["message_json"], mobj)
+          # An input that already has a message_json key keeps it: never overwrite.
+          if !exists(__source_kv.message_json) { __source_kv = set!(__source_kv, ["message_json"], mobj) }
           level = string(mobj.level) ?? string(mobj.severity) ?? string(mobj.log_level) ?? string(mobj.levelname) ?? ""
       } else {
           lm = parse_regex(inner, r'^\S+\t\S+\t(?P<level>TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\t') ?? {}

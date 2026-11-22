@@ -22,3 +22,4 @@ https://cloud.google.com/logging/docs/reference/v2/rest/v2/LogEntry
 | `audit_iap_with_http_request_denied.json` | review regression: AuditLog with httpRequest stays API Activity; `granted: false` with no status.code is a failure | IAP audit fields: https://cloud.google.com/iap/docs/audit-log-howto |
 | `json_without_logentry_fields.json` | JSON that is not a LogEntry (fallback) | synthetic |
 | `malformed.json` | not JSON (fallback) | synthetic |
+| `pubsub_push_wrapper_key_collision.json` | review regression: decoded LogEntry has a key the wrapper also has (`subscription`); the wrapper is kept whole, nothing is overwritten | constructed |
