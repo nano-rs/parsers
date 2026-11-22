@@ -6,16 +6,20 @@ Usage: field_coverage_check.py PARSER [SAMPLES] [--output-dir DIR]
 SAMPLES is a sidecar directory or file; by default check inline AND sidecar samples.
 Transformed values require a justified field-coverage.yaml rule and actual output.
 
+Parsers never mask, redact or withhold anything: every source field must be
+mapped or spilled unaltered, and no check here makes an exception for a key
+that looks like a credential. Masking is an opt-in pipeline step.
+
 field-coverage.yaml has exactly two opt-in lists, both validated by
 validate_config() and both requiring a one-line `reason` per entry:
-- `transforms`: per-field value transforms (residual_spill.KINDS, including the
-  bounded `truncate` copy); a rule consumes a source field only when its
-  transformed value is in the emitted event.
+- `transforms`: per-field value transforms (residual_spill.KINDS); a rule
+  consumes a source field only when its transformed value is in the emitted
+  event (never in unmapped, raw_data or a raw-body message).
 - `source_normalize`: envelope steps (NORMALIZE_KINDS) a JSON parser applies to
-  its input before capturing `__source_kv`. The capture must EQUAL the input
-  after exactly those steps, no step overwrites a key (it is skipped instead),
-  and each step is probed with an unknown field and a secret injected inside
-  the payload it unwraps.
+  its input before capturing `__source_kv`. Every step is lossless: the capture
+  must EQUAL the input after exactly those steps, no step overwrites a key (it
+  is skipped instead), and each step is probed with an unknown field injected
+  inside the payload it unwraps.
 """
 import argparse
 import base64
@@ -30,8 +34,6 @@ import tempfile
 import yaml
 from residual_spill import ROOT, check_rule, update
 
-# Keys that hold a secret value; mirrors spill.vrl (descriptive credential_* keys are not secrets).
-SECRET = re.compile(r'password|secret|authorization|token|(?:^|[^a-z0-9\s]|client)credentials?(?:$|[^a-z0-9_\s])|credential_?(?:data|value|val|blob|hash|key)(?:$|[^a-z0-9_\s])', re.I)
 MISSING = object()
 # source_normalize step kinds and their required parameters (and types).
 NORMALIZE_KINDS = {
@@ -39,14 +41,11 @@ NORMALIZE_KINDS = {
     'base64_json_merge': {'path': str},
     'parse_json_object': {'paths': list, 'target': str},
     'parse_kv_merge': {'path': str, 'match': str, 'key_value_delimiter': str, 'field_delimiter': str},
-    'withhold': {'paths': list, 'match': str},
 }
-# A sample or probe credential: never emitted outside raw_data.
-SECRET_MARKER = 'nan2421-secret'
 # Optional source_normalize parameters (and types).
-NORMALIZE_OPTIONAL = {'parse_json_object': {'arrays': bool, 'keep': list}, 'parse_kv_merge': {'tail_key': str}}
+NORMALIZE_OPTIONAL = {'parse_json_object': {'arrays': bool}, 'parse_kv_merge': {'tail_keys': list}}
 NORMALIZE_UNKNOWN = 'nan2421-normalize-unknown'
-NORMALIZE_PROBE = {'NormalizeProbe': NORMALIZE_UNKNOWN, 'clientSecret': 'nan2421-secret'}
+NORMALIZE_PROBE = {'NormalizeProbe': NORMALIZE_UNKNOWN}
 
 
 def flatten(value, prefix=''):
@@ -76,15 +75,6 @@ def same(a, b):
     # VRL to_string conversions preserve scalar numeric/boolean values.
     scalar = lambda v: json.dumps(v, separators=(',', ':')) if not isinstance(v, str) else v
     return a is not None and b is not None and not isinstance(a, (dict, list)) and not isinstance(b, (dict, list)) and scalar(a) == scalar(b)
-
-
-def redact(value):
-    if isinstance(value, dict):
-        sensitive_pair = any(k.lower() in ('name', 'key') and isinstance(v, str) and SECRET.search(v) for k, v in value.items())
-        return {k: '<redacted>' if SECRET.search(k) or (sensitive_pair and k.lower() in ('value', 'values')) else redact(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [redact(v) for v in value]
-    return value
 
 
 def snake(key):
@@ -135,16 +125,6 @@ def transformed(rule, value, output, mapped, raw=MISSING):
             want = int(value, 16)
         elif kind == 'enum':
             want = rule['values'].get(str(value).lower(), MISSING)
-        elif kind == 'truncate':
-            # A bounded copy: the first `length` characters, in a named target.
-            # An over-bound value counts only when the event flags itself
-            # metadata.is_truncated AND keeps the raw body as raw_data, its one
-            # lossless copy.
-            if not isinstance(value, str) or not rule.get('target'): return False
-            want = value[:rule['length']]
-            if len(value) > rule['length']:
-                if (output.get('metadata') or {}).get('is_truncated') is not True: return False
-                if raw is MISSING or output.get('raw_data') != raw: return False
         else:
             raise AssertionError(f'unknown transform {kind}')
     except (ValueError, TypeError, AttributeError, OverflowError):
@@ -167,11 +147,10 @@ def check(source, output, raw, rules, consumed=(), candidates=None):
     assert 'unmapped' not in output or residual, 'empty unmapped'
     mapped_event = mapped_view(output, raw)
     mapped = list(values(mapped_event))
-    safe = list(flatten(redact(source)))
+    fields = list(flatten(source))
     used = set()
-    for key, value in safe:
-        original = value
-        if value != '<redacted>' and (key in consumed or ((candidates is None or key in candidates) and represented(original, mapped)) or any(r['source'] == key and transformed(r, original, output, mapped, raw) for r in rules)):
+    for key, value in fields:
+        if key in consumed or ((candidates is None or key in candidates) and represented(value, mapped)) or any(r['source'] == key and transformed(r, value, output, mapped, raw) for r in rules):
             continue
         if value == raw: continue
         base = '.'.join(snake(part) for part in key.split('.'))
@@ -186,7 +165,7 @@ def check(source, output, raw, rules, consumed=(), candidates=None):
                 matched = True
                 break
         assert matched, f'{key}: missing or altered residual (source value not printed)'
-    return len(safe)
+    return len(fields)
 
 
 def reference_consumed(source, output):
@@ -247,15 +226,9 @@ def check_step(step):
         assert all(isinstance(p, str) and p for p in step['paths']), 'parse_json_object paths are dotted strings'
         assert '.' not in step['target'], 'parse_json_object target is a top-level key'
         assert step['target'] not in step['paths'], 'parse_json_object target is not one of its paths'
-        if 'keep' in step:
-            assert step['keep'] and all(isinstance(k, str) and k for k in step['keep']), 'parse_json_object keep lists key names'
-            assert 'withheld_fields' not in step['keep'], 'parse_json_object keep may not name withheld_fields'
-            assert not step.get('arrays'), 'parse_json_object keep moves objects only'
     if kind == 'parse_kv_merge':
         assert '.' not in step['path'], 'parse_kv_merge unpacks a top-level key'
-        assert 'tail_key' not in step or (step['tail_key'] and re.fullmatch(r'\w+', step['tail_key'])), 'parse_kv_merge tail_key is a plain key name'
-    if kind == 'withhold':
-        assert all(isinstance(p, str) and p and all(p.split('.')) for p in step['paths']), 'withhold paths are dotted strings'
+        assert 'tail_keys' not in step or (step['tail_keys'] and all(isinstance(k, str) and re.fullmatch(r'\w+', k) for k in step['tail_keys'])), 'parse_kv_merge tail_keys are plain key names'
     if 'match' in params:
         try:
             re.compile(step['match'])
@@ -273,17 +246,8 @@ def validate_config(config):
         check_rule(rule)
     steps = config.get('source_normalize') or []
     assert isinstance(steps, list), 'source_normalize must be a list'
-    for index, step in enumerate(steps):
+    for step in steps:
         check_step(step)
-        # withhold is a fallback for what an unpack step could not unpack, never
-        # a way to drop a field outright.
-        if step['kind'] == 'withhold':
-            # Each withheld path is one an earlier unpack step reads, so withhold
-            # only ever catches what that step could not unpack.
-            unpacked = {p for s in steps[:index] if s['kind'] != 'withhold' for p in ([s['path']] if 'path' in s else s.get('paths', []))}
-            assert unpacked, 'withhold must follow an unpack step'
-            stray = [p for p in step['paths'] if p not in unpacked]
-            assert not stray, f'withhold paths {stray} are not read by an earlier unpack step'
     return rules, steps
 
 
@@ -317,77 +281,35 @@ def vrl_kv(text, step):
     return vrl_parse_kv([(text, step['key_value_delimiter'], step['field_delimiter'])])[0]
 
 
-WITHHOLD_PROGRAM = '''t = if is_string(.v) { string!(.v) } else { encode_json(.v) }
-. = {"t": t, "bytes": length(t), "sha256": sha2(t, variant: "SHA-256")}
-'''
-_WITHHOLD_CACHE = {}
-
-
-def vrl_withhold(values):
-    """For each value, its text (the string itself, else VRL encode_json) and
-    that text's UTF-8 byte length and sha256, computed by Vector so the checker
-    expects exactly what a parser's sha2/length/encode_json produce. Cached."""
-    keys = [json.dumps(v, sort_keys=True) for v in values]
-    todo = {k: v for k, v in zip(keys, values) if k not in _WITHHOLD_CACHE}
-    if todo:
-        with tempfile.TemporaryDirectory(prefix='field-coverage-withhold-') as tmp:
-            tmp = Path(tmp)
-            (tmp/'w.vrl').write_text(WITHHOLD_PROGRAM)
-            (tmp/'w.json').write_text(''.join(json.dumps({'v': v})+'\n' for v in todo.values()))
-            run = subprocess.run(['vector', 'vrl', '--program', str(tmp/'w.vrl'), '--input', str(tmp/'w.json'), '--print-object'], text=True, capture_output=True, timeout=180)
-        assert run.returncode == 0, run.stderr
-        outputs = [json.loads(line, strict=False) for line in run.stdout.splitlines() if line.startswith('{')]
-        assert len(outputs) == len(todo), f'Vector returned {len(outputs)} digests for {len(todo)} values'
-        for key, out in zip(todo, outputs):
-            _WITHHOLD_CACHE[key] = out
-    return [_WITHHOLD_CACHE[k] for k in keys]
-
-
-def vrl_digest(value):
-    return vrl_withhold([value])[0]
-
-
-_WITHHELD = {'count': 0}
-
-
-def withheld(digest):
-    """What a withheld value is replaced by (parsers emit the same object).
-
-    The ONE place any step withholds data (withhold, parse_json_object keep, and
-    any future kind): it counts each use, so withholds_data() sees every one.
-    """
-    _WITHHELD['count'] += 1
-    return {'withheld': True, 'bytes': digest['bytes'], 'sha256': digest['sha256']}
-
-
-def withholds_data(original, steps, **kwargs):
-    """(normalized source, whether any step withheld data while building it).
-    A sample where data was withheld must keep the raw body as raw_data."""
-    before = _WITHHELD['count']
-    source = normalized_source(original, steps, **kwargs)
-    return source, _WITHHELD['count'] != before
-
-
-def _kv_parts(text, step):
-    """(text to parse, tail value or MISSING) for a parse_kv_merge step."""
-    tail = step.get('tail_key')
-    if not tail:
-        return text, MISSING
-    marker = step['field_delimiter'] + tail + step['key_value_delimiter']
-    at = text.find(marker)
-    if at <= 0:
-        return text, MISSING
-    # The tail key takes the rest of the line verbatim (Keycloak's
-    # representation JSON), never split on the field delimiter.
-    head, value = text[:at], text[at + len(marker):]
+def _unquote(value):
     if value.startswith('"'):
         try:
             unquoted = json.loads(value)
         except ValueError:
             unquoted = None
         if isinstance(unquoted, str):
-            value = unquoted
-    return head, value
+            return unquoted
+    return value
+
+
+def _kv_parts(text, step):
+    """(text to parse, {tail key: value}) for a parse_kv_merge step.
+
+    `tail_keys` are keys a line ends with, in order, whose values may hold the
+    field delimiter (Keycloak: representation JSON, requestUri, cookies=[...],
+    stackTrace). From the last to the first, each is cut off the end at its
+    `<fd><key><kvd>` marker: the LAST occurrence for every key but the first,
+    the FIRST occurrence for the first key (its JSON may hold anything). Each
+    takes its text verbatim (a JSON string literal unquoted), never split.
+    """
+    tails = {}
+    keys = step.get('tail_keys') or []
+    for index in range(len(keys) - 1, -1, -1):
+        marker = step['field_delimiter'] + keys[index] + step['key_value_delimiter']
+        at = text.find(marker) if index == 0 else text.rfind(marker)
+        if at > 0:
+            text, tails[keys[index]] = text[:at], _unquote(text[at + len(marker):])
+    return text, tails
 
 
 def _kv_text(source, step):
@@ -395,40 +317,32 @@ def _kv_text(source, step):
     return value if isinstance(value, str) and re.search(step['match'], value) else None
 
 
-def normalized_source(original, rules, parse_kv=vrl_kv, digest=vrl_digest):
+def normalized_source(original, rules, parse_kv=vrl_kv):
     """The source a parser is expected to capture for a JSON input.
 
     By default that is the parsed input itself. A parser that unwraps a known
     envelope declares each step in `source_normalize` (field-coverage.yaml), and
-    its `__source_kv` must equal the input after exactly these steps. No step
-    overwrites a key: on a collision the step is skipped and the input kept as
-    it was, so a colliding field can never vanish from the capture.
+    its `__source_kv` must equal the input after exactly these steps. Every step
+    is lossless and no step overwrites a key: on a collision the step is skipped
+    and the input kept as it was, so a colliding field can never vanish.
 
     - unwrap_single {path}: a one-element array of an object becomes the object
       (a CloudWatch Logs envelope carrying one logEvent).
     - base64_json_merge {path}: a base64 string that decodes to a JSON object is
       removed and the decoded object merged with the remaining keys (a Pub/Sub
       push wrapper's `message.data`); skipped if any top-level key collides.
-    - parse_json_object {paths, target, arrays?, keep?}: the first path holding a
-      string that parses to a JSON object (or array, with arrays: true) is moved;
-      with `keep`, only an object is moved (an already-decoded one too) and it is
-      cut to its allowlisted scalar fields, the rest withheld as withheld_fields, parsed, to the top-level `target` (a
-      JSON log message passed through for spill and redaction; the raw text is
-      removed like the other envelope steps); skipped if `target` exists.
+    - parse_json_object {paths, target, arrays?}: the first path holding a
+      string that parses to a JSON object (or array, with arrays: true) is
+      moved, parsed, to the top-level `target` (a JSON log message passed
+      through for spill; the JSON text itself is removed like the other
+      envelope steps, and raw_data keeps it); skipped if `target` exists.
     - parse_kv_merge {path, match, key_value_delimiter, field_delimiter}: a
       top-level string matching `match` that VRL parse_key_value (whitespace
       strict) parses to a non-empty object is removed and its pairs merged in;
-      with `tail_key`, the text from the first `<fd><tail_key><kvd>` on is that
-      key's value verbatim (a JSON string literal unquoted), never split
+      with `tail_keys`, the keys a line ends with are cut off first and keep
+      their text verbatim (_kv_parts), never split on the field delimiter
       (Keycloak's JSON log `message`); skipped on a parse error, an empty
       result, or a key colliding with the remaining keys.
-    - withhold {paths, match}: at the first listed path that exists, a string
-      or array whose text (the string, else its VRL encode_json) matches
-      `match` is replaced by {withheld: true, bytes, sha256} of that text. An
-      object or scalar is never withheld, a withhold step must follow an
-      unpack step, and the event must keep the raw body as raw_data. For text that
-      may carry credentials and that an earlier step could not unpack (so key
-      redaction cannot reach it): it is kept only in raw_data.
     """
     source = copy.deepcopy(original)
     for rule in rules or ():
@@ -456,12 +370,6 @@ def normalized_source(original, rules, parse_kv=vrl_kv, digest=vrl_digest):
         elif kind == 'parse_json_object':
             for path in rule['paths']:
                 value = _get(source, path)
-                if rule.get('keep') and isinstance(value, dict) and rule['target'] not in source:
-                    # With `keep`, an already-decoded object is filtered the same way.
-                    parent, _, leaf = path.rpartition('.')
-                    del (_get(source, parent) if parent else source)[leaf]
-                    source[rule['target']] = kept_fields(value, rule['keep'], digest)
-                    break
                 if isinstance(value, str):
                     try:
                         # VRL parse_json skips a leading UTF-8 byte order mark.
@@ -469,13 +377,7 @@ def normalized_source(original, rules, parse_kv=vrl_kv, digest=vrl_digest):
                     except ValueError:
                         break
                     if (isinstance(parsed, dict) or (rule.get('arrays') and isinstance(parsed, list))) and rule['target'] not in source:
-                        # Moved, not copied: the unredacted JSON text leaves the
-                        # source, so only its redacted fields can spill.
                         parent, _, leaf = path.rpartition('.')
-                        if rule.get('keep'):
-                            if not isinstance(parsed, dict):
-                                break
-                            parsed = kept_fields(parsed, rule['keep'], digest)
                         del (_get(source, parent) if parent else source)[leaf]
                         source[rule['target']] = parsed
                     break
@@ -483,42 +385,16 @@ def normalized_source(original, rules, parse_kv=vrl_kv, digest=vrl_digest):
             text = _kv_text(source, rule)
             if text is None:
                 continue
-            tail = rule.get('tail_key')
-            text, tail_value = _kv_parts(text, rule)
+            text, tails = _kv_parts(text, rule)
             pairs = parse_kv(text, rule)
             rest = {k: v for k, v in source.items() if k != rule['path']}
-            if isinstance(pairs, dict) and pairs and tail_value is not MISSING:
-                pairs = None if tail in pairs else {**pairs, tail: tail_value}
+            if isinstance(pairs, dict) and pairs and tails:
+                pairs = None if pairs.keys() & tails.keys() else {**pairs, **tails}
             if isinstance(pairs, dict) and pairs and not pairs.keys() & rest.keys():
                 source = {**rest, **pairs}
-        elif kind == 'withhold':
-            for path in rule['paths']:
-                value = _get(source, path)
-                if value is MISSING:
-                    continue
-                if not isinstance(value, (str, list)):
-                    # An object is structured: the spill key-redacts it, so it is
-                    # never withheld (and neither is a scalar).
-                    break
-                found = digest(value)
-                if re.search(rule['match'], found['t']):
-                    parent, _, leaf = path.rpartition('.')
-                    (_get(source, parent) if parent else source)[leaf] = withheld(found)
-                break
         else:
             raise AssertionError(f'unknown source_normalize kind {kind}')
     return source
-
-
-def kept_fields(obj, keep, digest=vrl_digest):
-    """An object cut to its allowlisted scalar fields; every other field is
-    withheld together as `withheld_fields` ({withheld, bytes, sha256} of their
-    VRL encode_json), so nothing outside the allowlist can spill."""
-    kept = {k: v for k, v in obj.items() if k in keep and not isinstance(v, (dict, list))}
-    rest = {k: v for k, v in obj.items() if k not in kept}
-    if rest:
-        kept['withheld_fields'] = withheld(digest(rest))
-    return kept
 
 
 def json_object(text):
@@ -532,34 +408,15 @@ def inject_probe(original, step):
     `step` unwraps, or None when this input has no such payload."""
     probe = copy.deepcopy(original)
     kind = step['kind']
-    if kind == 'withhold':
-        # The secret goes into the value itself; the step must then withhold it.
-        for path in step['paths']:
-            value, holder, leaf = _locate(probe, path)
-            if value is MISSING:
-                continue
-            if isinstance(value, str):
-                holder[leaf] = value + ' clientSecret="nan2421-secret"'
-            elif isinstance(value, list):
-                value.append({'message': 'clientSecret="nan2421-secret"'})
-            else:
-                return None
-            return probe
-        return None
     if kind == 'parse_kv_merge':
         if _kv_text(probe, step) is None:
             return None
         kd, fd = step['key_value_delimiter'], step['field_delimiter']
         pairs = ''.join(f'{fd}{k}{kd}"{v}"' for k, v in NORMALIZE_PROBE.items())
         text = probe[step['path']]
-        head, tail = _kv_parts(text, step)
-        if tail is not MISSING:
-            # Before the tail key, which takes the rest of the line verbatim.
-            marker = fd + step['tail_key'] + kd
-            at = text.find(marker)
-            probe[step['path']] = text[:at] + pairs + text[at:]
-        else:
-            probe[step['path']] = text + pairs
+        head, _tails = _kv_parts(text, step)
+        # Before the tail keys, which take the rest of the line verbatim.
+        probe[step['path']] = head + pairs + text[len(head):]
         return probe
     for path in step['paths'] if kind == 'parse_json_object' else [step['path']]:
         value, holder, leaf = _locate(probe, path)
@@ -577,9 +434,6 @@ def inject_probe(original, step):
                 holder[leaf] = base64.b64encode(json.dumps(decoded).encode()).decode()
                 return probe
         elif kind == 'parse_json_object':
-            if step.get('keep') and isinstance(value, dict):
-                value.update(copy.deepcopy(NORMALIZE_PROBE))
-                return probe
             if not isinstance(value, str):
                 continue
             parsed = json_object(value)
@@ -591,29 +445,27 @@ def inject_probe(original, step):
     return None
 
 
-def applied(probe, step, steps, parse_kv=vrl_kv, digest=vrl_digest):
-    """Whether `steps` act on the probe planted for `step`: an unpacking step
-    surfaces the unknown field; a withhold step leaves no trace of the secret."""
-    normalized = normalized_source(probe, steps, parse_kv, digest)
-    if step['kind'] == 'withhold' or step.get('keep'):
-        text = json.dumps(normalized)
-        return 'nan2421-secret' not in text and '"withheld": true' in text
-    return NORMALIZE_UNKNOWN in [v for _, v in flatten(normalized)]
+def applied(probe, step, steps, parse_kv=vrl_kv):
+    """Whether `step` (the last of `steps`) ITSELF acts on the probe planted for
+    it: run the steps before it, then it alone. It must change the source and
+    surface the unknown field. A step an earlier one already made a no-op is
+    never counted as exercised."""
+    before = normalized_source(probe, steps[:-1], parse_kv)
+    after = normalized_source(before, [step], parse_kv)
+    return after != before and NORMALIZE_UNKNOWN in [v for _, v in flatten(after)]
 
 
-def normalize_probes(samples, steps, parse_kv=vrl_kv, digest=vrl_digest):
-    """One probe per declared step: a real sample with an unknown field and a
-    secret injected inside the payload the step unwraps (or into the value a
-    withhold step withholds). A declared step that no sample exercises fails,
-    so an opt-in can never go untested."""
+def normalize_probes(samples, steps, parse_kv=vrl_kv):
+    """One probe per declared step: a real sample with an unknown field
+    injected inside the payload the step unwraps. A declared step that no
+    sample exercises fails, so an opt-in can never go untested."""
     probes = []
     for index, step in enumerate(steps):
-        prefix = 'withhold_probe' if step['kind'] == 'withhold' or step.get('keep') else 'normalize_probe'
         for _name, event in samples:
             original = json_object(event['message'])
             probe = original and inject_probe(original, step)
-            if probe and applied(probe, step, steps, parse_kv, digest):
-                probes.append((f'{prefix}_{index}', {'message': json.dumps(probe)}))
+            if probe and applied(probe, step, steps[:index + 1], parse_kv):
+                probes.append((f'normalize_probe_{index}', {'message': json.dumps(probe)}))
                 break
         else:
             raise AssertionError(f'source_normalize step {index} ({step["kind"]}) is exercised by no sample')
@@ -654,8 +506,9 @@ def run_parser(path, supplied=None, output_dir=None):
     assert samples, f'{path}: no samples'
     assert not steps or config['source'] in ('json', 'mixed'), 'source_normalize needs a JSON source'
     real_samples = list(samples)
-    # Probe unseen keys, nested values, scalar/object arrays, redaction and
-    # snake-case collisions on real JSON branch input.
+    # Probe unseen keys, nested values, scalar/object arrays, credential-named
+    # keys (which spill as-is, like any other) and snake-case collisions on
+    # real JSON branch input.
     if config['source'] in ('json', 'mixed'):
         for _name, event in samples:
             try: obj = json.loads(event['message'])
@@ -690,17 +543,6 @@ def run_parser(path, supplied=None, output_dir=None):
     vrl_parse_kv([(_kv_parts(text, s)[0], s['key_value_delimiter'], s['field_delimiter'])
                   for _, event in samples for s in steps if s['kind'] == 'parse_kv_merge'
                   for text in [_kv_text(json_object(event['message']) or {}, s)] if text is not None])
-    # And one more computes the digest of every value a withhold step may see.
-    if steps:
-        seen = []
-        def collect(value):
-            seen.append(value)
-            return {'t': '', 'bytes': 0, 'sha256': ''}
-        for _, event in samples:
-            original = json_object(event['message'])
-            if original:
-                normalized_source(original, steps, digest=collect)
-        vrl_withhold(seen)
     program = doc['parser_vrl'] + '\n.__coverage_source = __source_kv\n'
     with tempfile.TemporaryDirectory(prefix='field-coverage-') as tmp:
         tmp = Path(tmp)
@@ -722,12 +564,7 @@ def run_parser(path, supplied=None, output_dir=None):
                 except json.JSONDecodeError: original = {}
                 if not isinstance(original, dict): original = {}
                 if isinstance(original, dict) and original:
-                    expected, withheld_any = withholds_data(original, steps)
-                    assert source == expected, f'{name}: JSON source capture changed fields'
-                    # Whatever any step withheld survives only in raw_data, so the
-                    # event must carry the raw body there, unchanged.
-                    if withheld_any:
-                        assert output.get('raw_data') == event['message'], f'{name}: a withheld value needs raw_data equal to the raw body'
+                    assert source == normalized_source(original, steps), f'{name}: JSON source capture changed fields'
             try:
                 consumed = []
                 if config.get('reference') == 'windows_sysmon':
@@ -739,14 +576,7 @@ def run_parser(path, supplied=None, output_dir=None):
                 assert dict(flatten(source)).get(probe['source']) == 'nan2421-text-unknown', 'text probe missing from parsed source'
             if name.startswith('normalize_probe_'):
                 assert NORMALIZE_UNKNOWN in [v for _, v in flatten(source)], f'{name}: unwrapped probe field missing from parsed source'
-            # SECRET_MARKER, injected by every probe and used by samples for a
-            # credential, may survive only in raw_data: never in unmapped, never in
-            # a mapped OCSF attribute (a message echoing the raw body included).
-            kept = {k: v for k, v in output.items() if k != 'raw_data'}
-            assert SECRET_MARKER not in json.dumps(kept), 'secret leaked outside raw_data'
-            if name in ('residual_probe', 'text_residual_probe') or name.startswith(('normalize_probe_', 'withhold_probe_')):
-                assert 'nan2421-secret' not in json.dumps(output.get('unmapped', {})), 'secret leaked in spill'
-            else:
+            if name not in ('residual_probe', 'text_residual_probe') and not name.startswith('normalize_probe_'):
                 spill_keys.update(output.get('unmapped', {}))
             if output_dir:
                 dest = output_dir/path.parent.name
