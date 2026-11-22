@@ -53,8 +53,9 @@ parser_vrl: |
   fallback = "not a PingFederate audit record"
 
   # CEF only when a real CEF header starts the body (a syslog header may precede
-  # it); "CEF:" elsewhere, say inside a pipe line's description, is just text.
-  cm, cm_err = parse_regex(raw_log, r'(?:^|\s)(?P<cef>CEF:\d+\|.*)$')
+  # it); "CEF:" elsewhere, say inside a pipe line's description or subject, is
+  # just text. A syslog header never holds '|', so nothing before CEF: may.
+  cm, cm_err = parse_regex(raw_log, r'^(?:[^|\r\n]*\s)?(?P<cef>CEF:\d+\|.*)$')
   if cm_err == null {
       c, cerr = parse_cef(string!(cm.cef))
       if cerr == null {
@@ -88,22 +89,72 @@ parser_vrl: |
       if merr == null {
           parts = map_values(split(string!(m.rest), "|")) -> |v| { strip_whitespace(string!(v)) }
           n = length(parts)
-          # The 14-field pattern has status at column 9 (0-based, after %d), the
-          # 15-field one (transactionid after trackingid) at column 10. Column
-          # counts alone cannot tell them apart once a description holds '|', so
-          # the layout is chosen by where the status value sits.
+          # The 14-field pattern has event at column 1 (0-based, after %d) and
+          # the 15-field one (transactionid after trackingid) at column 2. Two
+          # columns can hold a raw '|': the subject (the submitted username,
+          # logged verbatim) and the description. The layout is therefore read
+          # from fixed structure, never from the column count or one column:
+          #   - the event column sits before the subject, so it cannot be moved
+          #     by the subject; it picks the 14- or 15-field layout
+          #   - the subject's extra pipes (shift d) are found where ip, role and
+          #     status all sit in their own vocabularies
+          #   - whatever pipes remain belong to the description
+          # When more than one shift fits (a subject that embeds a fake tail),
+          # a non-success status wins over success, then the largest shift: a
+          # crafted subject must never turn a failed login into a success.
           statuses = ["success", "failure", "failed", "inprogress", "in progress"]
-          st9 = downcase(string(get(parts, [9]) ?? "") ?? "")
-          st10 = downcase(string(get(parts, [10]) ?? "") ?? "")
+          roles = ["idp", "sp", "as", "oauth", "ws-trust", "wstrust"]
+          p1 = string(get(parts, [1]) ?? "") ?? ""
+          p1_event = match(p1, r'^(?:[A-Z][A-Z0-9_]*|OAuth)$')
+          cands = []
+          for_each([13, 14]) -> |_bi, bv| {
+              b = bv
+              s0 = b - 11
+              evc = string(get(parts, [s0 - 1]) ?? "") ?? ""
+              if n >= b && match(evc, r'^[A-Za-z][A-Za-z0-9_]*$') {
+                  for_each(parts) -> |d, _pv| {
+                      if d <= n - b {
+                          ipv = string(get(parts, [s0 + 1 + d]) ?? "") ?? ""
+                          rolev = downcase(string(get(parts, [s0 + 6 + d]) ?? "") ?? "")
+                          stv = downcase(string(get(parts, [s0 + 7 + d]) ?? "") ?? "")
+                          ip_ok = ipv == "" || is_ipv4(ipv) || is_ipv6(ipv)
+                          role_ok = rolev == "" || includes(roles, rolev)
+                          st_ok = stv == "" || includes(statuses, stv)
+                          if ip_ok && role_ok && st_ok && (ipv != "" || rolev != "") {
+                              cands = push(cands, { "b": b, "d": d, "st": stv })
+                          }
+                      }
+                  }
+              }
+          }
+          c13 = filter(cands) -> |_ci, c| { c.b == 13 }
+          c14 = filter(cands) -> |_ci, c| { c.b == 14 }
+          pick = []
+          if length(c13) > 0 && (p1_event || length(c14) == 0) { pick = c13 } else if length(c14) > 0 { pick = c14 }
           base = 0
-          if n >= 14 && includes(statuses, st10) {
-              base = 14
-          } else if n >= 13 && includes(statuses, st9) {
-              base = 13
-          } else if n == 13 {
-              base = 13
-          } else if n >= 14 {
-              base = 14
+          shift = 0
+          if length(pick) > 0 {
+              ns = filter(pick) -> |_ci, c| { c.st != "success" }
+              if length(ns) > 0 { pick = ns }
+              shift = -1
+              for_each(pick) -> |_ci, c| {
+                  cd = int(c.d) ?? 0
+                  if cd > shift { shift = cd; base = int(c.b) ?? 0 }
+              }
+          } else {
+              # no column set fits the structure: keep the record, reading the
+              # layout from where a status word sits
+              st9 = downcase(string(get(parts, [9]) ?? "") ?? "")
+              st10 = downcase(string(get(parts, [10]) ?? "") ?? "")
+              if n >= 14 && includes(statuses, st10) {
+                  base = 14
+              } else if n >= 13 && includes(statuses, st9) {
+                  base = 13
+              } else if n == 13 {
+                  base = 13
+              } else if n >= 14 {
+                  base = 14
+              }
           }
           names = []
           if base == 13 { names = ["trackingid", "event", "subject", "ip", "app", "connectionid", "protocol", "host", "role", "status", "adapterid", "description", "responsetime"] }
@@ -111,16 +162,27 @@ parser_vrl: |
           if length(names) > 0 {
               form = "pipe"
               f.timestamp = string!(m.timestamp)
+              s0 = base - 11
               for_each(names) -> |i, name| {
-                  v = string(get(parts, [i]) ?? "") ?? ""
+                  v = ""
+                  if i < s0 {
+                      v = string(get(parts, [i]) ?? "") ?? ""
+                  } else if i == s0 {
+                      subj_cols = slice(parts, s0, s0 + shift + 1) ?? []
+                      v = join!(subj_cols, "|")
+                  } else if i < base - 2 {
+                      v = string(get(parts, [i + shift]) ?? "") ?? ""
+                  }
                   if v != "" { f = set!(f, [string!(name)], v) }
               }
-              if n > base {
-                  # A description that itself holds '|' spans the extra columns.
-                  desc = join!(slice!(parts, base - 2, n - 1), "|")
-                  if desc != "" { f.description = desc } else { f = remove!(f, ["description"]) }
+              # the description spans every column left between adapterid and
+              # responsetime (it may itself hold '|')
+              desc_cols = slice(parts, base - 2 + shift, n - 1) ?? []
+              desc = join!(desc_cols, "|")
+              if desc != "" { f.description = desc }
+              if n > base - 1 + shift {
                   last = string(get(parts, [n - 1]) ?? "") ?? ""
-                  if last != "" { f.responsetime = last } else { f = remove!(f, ["responsetime"]) }
+                  if last != "" { f.responsetime = last }
               }
               f = filter(f) -> |_k, v| { v != "" }
               __source_kv = f
@@ -161,7 +223,7 @@ parser_vrl: |
       # ---- time: ISO 8601 with a zone, else log4j %d / CEF rt read as UTC
       # (neither carries a zone), else epoch seconds or milliseconds ----
       time_ms = 0
-      ts = string(f.timestamp) ?? ""
+      ts = string(get(f, ["timestamp"]) ?? "") ?? ""
       if ts != "" {
           tsn = replace(ts, ",", ".")
           if match(ts, r'^\d{9,13}$') {
@@ -797,3 +859,30 @@ samples:
       "class_uid": "0"
       "metadata.uid": "b85d6bc8a56b271a11ae0c688b4c3d1683769c236f466fdd4dadd2181668524f"
       "unmapped.parse_fallback": "not a PingFederate audit record"
+  # neon #78 r2: a CEF record inside a pipe line's description is text, not a CEF event
+  - raw: "2026-11-02 14:14:41,077| tid:abc| AUTHN_ATTEMPT| attacker@evil.example| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| invalid user CEF:0|Ping Identity|PingFederate|12.1|SSO|SSO|0|duid=admin@example.com src=10.0.0.1 msg=success cs1=x| 5"
+    expect:
+      "class_uid": "3002"
+      "status_id": "2"
+      "user.name": "attacker@evil.example"
+      "src_endpoint.ip": "203.0.113.90"
+  # neon #78 r2: another product's CEF inside a description does not drop the login
+  - raw: "2026-11-02 14:14:41,077| tid:abc| AUTHN_ATTEMPT| attacker@evil.example| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| bad input CEF:0|Other|Other|1.0|1|1|1|a=b| 5"
+    expect:
+      "class_uid": "3002"
+      "status_id": "2"
+      "user.name": "attacker@evil.example"
+  # neon #78 r2: empty status with '|' in the description keeps the 14-field layout
+  - raw: "2026-11-02 14:20:00,000| tid:abc| SRI_REVOKED| carol| 192.0.2.1 | | sp:cloud:saml2| OAuth20| pf01.example.com| AS| | | revoked|by admin| 3"
+    expect:
+      "class_uid": "3002"
+      "user.name": "carol"
+      "src_endpoint.ip": "192.0.2.1"
+      "metadata.event_code": "SRI_REVOKED"
+  # neon #78 r2: a subject holding a forged tail cannot turn a failure into a success
+  - raw: "2026-11-02 14:21:00,000| tid:abc| AUTHN_ATTEMPT| SSO|admin@example.com|10.0.0.1|app|sp|SAML20|pf01|IdP|success| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| | 5"
+    expect:
+      "class_uid": "3002"
+      "status_id": "2"
+      "src_endpoint.ip": "203.0.113.90"
+      "metadata.event_code": "AUTHN_ATTEMPT"

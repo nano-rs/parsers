@@ -131,14 +131,23 @@ parser_vrl: |
       result_rt = string(f.x_edge_result_type) ?? ""
       resp_rt = string(f.x_edge_response_result_type) ?? ""
       country_rt = string(f.c_country) ?? ""
-      results = ["Hit", "RefreshHit", "Miss", "LimitExceeded", "CapacityExceeded", "Error", "Redirect", "LambdaExecutionError", "OriginShieldHit", "MissGeneratedResponse", "FunctionGeneratedResponse", "FunctionExecutionError", "FunctionThrottledError"]
-      aligned = code >= 100 && code <= 599 && match(method, r'^[A-Z]+$')
+      results = ["Hit", "RefreshHit", "Miss", "LimitExceeded", "CapacityExceeded", "Error", "Redirect", "LambdaExecutionError", "LambdaGeneratedResponse", "LambdaValidationError", "OriginShieldHit", "MissGeneratedResponse", "FunctionGeneratedResponse", "FunctionExecutionError", "FunctionThrottledError", "FunctionValidationError"]
+      # A result type AWS adds later still has the documented shape: PascalCase
+      # ending in one of the documented outcome words. A shifted column (a
+      # country code, a host, a number) never does.
+      result_shape = r'^(?:[A-Z][a-z]+)+(?:Hit|Miss|Error|Response|Exceeded|Redirect)$'
+      # sc-status 000: the viewer closed the connection before a response was
+      # sent. cs-method "-" (read as empty): a malformed viewer request.
+      # Methods may carry '-' (M-SEARCH, VERSION-CONTROL).
+      sc_raw = string(f.sc_status) ?? ""
+      code_ok = (code >= 100 && code <= 599) || (code == 0 && (sc_raw == "000" || sc_raw == "0"))
+      aligned = code_ok && (method == "" || match(method, r'^[A-Z][A-Z0-9_-]*$'))
       aligned = aligned && (proto_rt == "" || includes(["http", "https", "ws", "wss", "grpcs"], downcase(proto_rt)))
       aligned = aligned && (pver_rt == "" || starts_with(pver_rt, "HTTP/"))
       aligned = aligned && (ipver_rt == "" || ipver_rt == "IPv4" || ipver_rt == "IPv6")
       aligned = aligned && (port_rt == "" || match(port_rt, r'^\d{1,5}$'))
-      aligned = aligned && (result_rt == "" || includes(results, result_rt))
-      aligned = aligned && (resp_rt == "" || includes(results, resp_rt))
+      aligned = aligned && (result_rt == "" || includes(results, result_rt) || match(result_rt, result_shape))
+      aligned = aligned && (resp_rt == "" || includes(results, resp_rt) || match(resp_rt, result_shape))
       aligned = aligned && (country_rt == "" || match(country_rt, r'^[A-Z]{2}$'))
       if !aligned { fallback = "real-time field selection not in the documented order" }
   }
@@ -848,3 +857,21 @@ samples:
       "class_uid": "0"
       "metadata.uid": "3d310f50f62fb9fd9acdf91d6e26c3faf596a146959e62dc4c39194e3c5f4d3f"
       "unmapped.parse_fallback": "not a CloudFront access log line"
+  # neon #78 r2: Lambda@Edge generated response is a documented result type
+  - raw: "1762067709.123\t198.51.100.23\t192.0.2.200\t0.002\t200\t1650\tGET\thttps\td111111abcdef8.cloudfront.net\t/images/logo.png\t356\tIAD89-C1\trTmExampleReqId0001xYz==\twww.example.com\t0.004\tHTTP/2.0\tIPv4\tMozilla/5.0%20(Macintosh;%20Intel%20Mac%20OS%20X%2014_5)\thttps://www.example.com/\t-\tv=2\tLambdaGeneratedResponse\t-\tTLSv1.3\tTLS_AES_128_GCM_SHA256\tLambdaGeneratedResponse\t-\t-\timage/png\t1302\t-\t-\t52110\tHit\tUS\tgzip,%20br\timage/avif,image/webp,*/*\t/images/*\t-\t-"
+    expect:
+      "class_uid": "4002"
+      "http_response.code": "200"
+  # neon #78 r2: CloudFront Functions validation error
+  - raw: "1762067709.123\t198.51.100.23\t192.0.2.200\t0.002\t200\t1650\tGET\thttps\td111111abcdef8.cloudfront.net\t/images/logo.png\t356\tIAD89-C1\trTmExampleReqId0001xYz==\twww.example.com\t0.004\tHTTP/2.0\tIPv4\tMozilla/5.0%20(Macintosh;%20Intel%20Mac%20OS%20X%2014_5)\thttps://www.example.com/\t-\tv=2\tFunctionValidationError\t-\tTLSv1.3\tTLS_AES_128_GCM_SHA256\tHit\t-\t-\timage/png\t1302\t-\t-\t52110\tHit\tUS\tgzip,%20br\timage/avif,image/webp,*/*\t/images/*\t-\t-"
+    expect:
+      "class_uid": "4002"
+  # neon #78 r2: sc-status 000 with cs-method "-" (viewer closed a malformed request)
+  - raw: "1762067709.123\t198.51.100.23\t192.0.2.200\t0.002\t000\t1650\t-\thttps\td111111abcdef8.cloudfront.net\t/images/logo.png\t356\tIAD89-C1\trTmExampleReqId0001xYz==\twww.example.com\t0.004\tHTTP/2.0\tIPv4\tMozilla/5.0%20(Macintosh;%20Intel%20Mac%20OS%20X%2014_5)\thttps://www.example.com/\t-\tv=2\tHit\t-\tTLSv1.3\tTLS_AES_128_GCM_SHA256\tHit\t-\t-\timage/png\t1302\t-\t-\t52110\tHit\tUS\tgzip,%20br\timage/avif,image/webp,*/*\t/images/*\t-\t-"
+    expect:
+      "class_uid": "4002"
+  # neon #78 r2: hyphenated method
+  - raw: "1762067709.123\t198.51.100.23\t192.0.2.200\t0.002\t200\t1650\tM-SEARCH\thttps\td111111abcdef8.cloudfront.net\t/images/logo.png\t356\tIAD89-C1\trTmExampleReqId0001xYz==\twww.example.com\t0.004\tHTTP/2.0\tIPv4\tMozilla/5.0%20(Macintosh;%20Intel%20Mac%20OS%20X%2014_5)\thttps://www.example.com/\t-\tv=2\tHit\t-\tTLSv1.3\tTLS_AES_128_GCM_SHA256\tHit\t-\t-\timage/png\t1302\t-\t-\t52110\tHit\tUS\tgzip,%20br\timage/avif,image/webp,*/*\t/images/*\t-\t-"
+    expect:
+      "class_uid": "4002"
+      "http_request.http_method": "M-SEARCH"
