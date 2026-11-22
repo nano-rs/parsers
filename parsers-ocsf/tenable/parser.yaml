@@ -17,8 +17,9 @@ description: >
   high / critical, or 0-4) maps to severity_id 1-5. The state maps to the
   lifecycle: OPEN is Create / New, REOPENED (or a Security Center cumulative
   record with hasBeenMitigated) is Update / New with status_detail, FIXED (or
-  a Security Center patched record: mitigateTime / lastMitigated set, or
-  sourceType patched) is Close / Resolved, and an accepted risk is
+  a Security Center patched record: sourceType patched, or a non-cumulative
+  record whose mitigateTime / lastMitigated is not older than lastSeen) is
+  Close / Resolved, and an accepted risk is
   Suppressed. Every CVE id becomes its own vulnerabilities[] entry carrying
   the CVSS v2 / v3 / v4 base scores and vectors (N/A and other non-CVE
   tokens are dropped); a plugin without a CVE is an advisory keyed by its
@@ -197,9 +198,13 @@ parser_vrl: |
           # hasBeenMitigated is "1" both on a cumulative record that resurfaced
           # (reopened) and on a patched record that is currently fixed; the
           # patched one carries a positive mitigation time (or sourceType patched).
+          # A cumulative record is the live view: a mitigation time older than
+          # lastSeen is history from before the finding resurfaced, not a fix.
           mitigated_at = 0
           if e.mitigateTime != null { mitigated_at = to_int(e.mitigateTime) ?? 0 } else if e.lastMitigated != null { mitigated_at = to_int(e.lastMitigated) ?? 0 }
-          if mitigated_at > 0 || downcase(to_string(e.sourceType) ?? "") == "patched" {
+          src_type = downcase(to_string(e.sourceType) ?? "")
+          seen_at = to_int(e.lastSeen) ?? 0
+          if src_type == "patched" || (src_type != "cumulative" && mitigated_at > 0 && (seen_at == 0 || mitigated_at >= seen_at)) {
               state = "FIXED"
           } else if (to_string(e.hasBeenMitigated) ?? "") == "1" {
               state = "REOPENED"
@@ -985,6 +990,12 @@ samples:
       is_alert: false
       vulnerabilities.0.cve.uid: CVE-2023-21830
       vulnerabilities.1: <missing>
+  # Cumulative record that resurfaced after an old mitigation: still open (REOPENED)
+  - raw: '{"pluginID":"171861","severity":{"id":"4","name":"Critical"},"hasBeenMitigated":"1","lastMitigated":"1674000000","sourceType":"cumulative","ip":"192.0.2.31","port":"445","protocol":"TCP","pluginName":"Oracle Java SE Multiple Vulnerabilities (January 2023 CPU)","firstSeen":"1673000000","lastSeen":"1675123200","cve":"CVE-2023-21830"}'
+    expect:
+      activity_id: 2
+      is_alert: true
+      status_detail: Previously mitigated
   - raw: '{"asset":{"fqdn":"v6-host.example.com","uuid":"00000000-0000-4000-8000-000000000060","ipv6":"2001:db8::60"},"plugin":{"id":156641,"name":"Security Updates for Microsoft SharePoint Server 2016 (January 2022)","cve":["CVE-2022-21837"]},"port":{"port":445,"protocol":"TCP"},"severity":"high","finding_id":"02716af9-1adb-4057-b4d5-dcb0c36b2999","last_found":"2023-05-04T05:03:13.737Z","state":"OPEN"}'
     expect:
       resource.ip: 2001:db8::60

@@ -1,10 +1,13 @@
-# The parser scrubs credentials from the line BEFORE parsing it, so the source
-# it maps (and spills) is the scrubbed record, not the raw JSON. It is
-# therefore declared as a text source: the JSON source-equality assertion
-# would demand the live token back. The text probe below injects an unknown
-# key and a password into a JSON sample to keep the residual and redaction
-# probes running.
-source: text
+# Vault writes one JSON entry per line, bare (file / socket device) or behind
+# a syslog header (syslog device), so the source is mixed. A clean, HMAC'd
+# JSON entry is captured exactly as written, so the JSON source-equality check
+# and the residual probe both run on it. The parser scrubs credentials BEFORE
+# mapping, so an entry that carries a clear credential is mapped and spilled
+# from the scrubbed record; those samples (log_raw, hmac_accessor=false) use
+# the syslog device form, where the checker reads the parsed source instead
+# of demanding the live credential back. The text probe below also injects an
+# unknown key and a password into a response entry.
+source: mixed
 probe:
   mode: before
   anchor: '}'
