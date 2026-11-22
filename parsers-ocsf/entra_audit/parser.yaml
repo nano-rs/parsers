@@ -1,0 +1,851 @@
+name: entra_audit_ocsf
+display_name: Microsoft Entra ID Audit Logs (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Microsoft Entra ID (Azure AD) directory audit records into OCSF 1.9.0.
+  Two shapes are accepted, one record per event: the diagnostic-settings
+  AuditLogs record (Event Hub or storage export, `category: AuditLogs` with the
+  audit in `properties`) and the bare Microsoft Graph directoryAudit resource
+  (`/auditLogs/directoryAudits`). Routing:
+    * user lifecycle, password change / reset, enable / disable, security info
+      (MFA method) registration and removal, directory role membership,
+      service principal credential add / remove,
+      app role assignment to a user or to a
+      service principal (the grantee SP is the
+      user, the granted role is privileges[])      -> User Management 3007
+    * group lifecycle and membership, app role
+      assignment to a group, a role-assignable
+      group added to / removed from a role         -> Group Management 3006
+    * everything else (application consent, app and service principal
+      changes, policies, devices, directory)       -> API Activity 6003
+  The initiator is `actor` (user or app / service principal) and the target is
+  the subject (`user` / `group`); every target lands in `resources`. Role
+  assignments fill `iam_roles`, security info registration fills
+  `auth_factors`. Privileged changes (role assignment, application consent,
+  delegated permission grants, credential adds, conditional access policy
+  changes) are raised to Medium severity; failures are at least Low. This is
+  the audit companion to `azure_signin` (sign-ins are not handled here). An
+  Event Hubs `{"records": [...]}` or Graph `{"value": [...]}` envelope is not
+  exploded in VRL: explode it upstream; one that reaches the lane is kept whole
+  as a Base Event marked with unmapped.parse_fallback. metadata.uid is
+  deterministic (sha256 of the audit id and activity time) so a replay dedupes.
+match_values:
+  - entra_audit
+category: cloud
+vendor: "Microsoft"
+product: "Microsoft Entra ID"
+parser_vrl: |
+  # Microsoft Entra ID directory audit -> OCSF 1.9.0 (3007 / 3006 / 6003)
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+
+  parsed, err = parse_json(raw_log)
+  p = {}
+  if err == null && is_object(parsed) { p = object!(parsed) }
+  __source_kv = p
+
+  # ---- which shape is this? ----
+  a = {}
+  diag = false
+  cat_top = downcase(to_string(p.category) ?? "")
+  if cat_top == "auditlogs" && is_object(p.properties) {
+      a = object!(p.properties)
+      diag = true
+  } else if exists(p.activityDisplayName) || (exists(p.initiatedBy) && exists(p.targetResources)) {
+      a = p
+  }
+
+  if length(keys(a)) == 0 {
+      fb_reason = "unparsable input"
+      if length(keys(p)) > 0 { fb_reason = "not an Entra ID directory audit record" }
+      if is_array(p.records) || is_array(p.value) { fb_reason = "envelope: explode records upstream" }
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": to_unix_timestamp(now(), unit: "milliseconds"),
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud"],
+              "uid": sha2("entra_audit|raw|" + raw_log, variant: "SHA-256"),
+              "log_name": "AuditLogs",
+              "log_provider": "Microsoft Entra ID",
+              "product": { "name": "Microsoft Entra ID", "vendor_name": "Microsoft" }
+          },
+          "cloud": { "provider": "Azure" }
+      }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], fb_reason)
+  } else {
+      # ---- clock: the audit's own activity time, else the record time ----
+      time_ms = 0
+      ts_str = to_string(a.activityDateTime) ?? ""
+      if ts_str == "" { ts_str = to_string(p.time) ?? "" }
+      if ts_str != "" {
+          t, terr = parse_timestamp(ts_str, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+      if time_ms == 0 { time_ms = to_unix_timestamp(now(), unit: "milliseconds") }
+
+      natural_id = to_string(a.id) ?? ""
+      activity_display = to_string(a.activityDisplayName) ?? ""
+      if activity_display == "" { activity_display = to_string(p.operationName) ?? "" }
+      if activity_display == "" { activity_display = "Unknown" }
+      act_l = downcase(activity_display)
+      audit_cat = to_string(a.category) ?? ""
+      audit_cat_l = downcase(audit_cat)
+      op_type = downcase(to_string(a.operationType) ?? "")
+      logged_by = to_string(a.loggedByService) ?? ""
+      if logged_by == "" { logged_by = "Core Directory" }
+      correlation = to_string(a.correlationId) ?? ""
+      if correlation == "" { correlation = to_string(p.correlationId) ?? "" }
+      tenant_id = to_string(p.tenantId) ?? ""
+      if tenant_id == "" {
+          tm, tmerr = parse_regex(to_string(p.resourceId) ?? "", r'(?i)^/tenants/(?P<t>[^/]+)')
+          if tmerr == null { tenant_id = string(tm.t) ?? "" }
+      }
+      caller_ip = to_string(p.callerIpAddress) ?? ""
+      if caller_ip == "<null>" { caller_ip = "" }
+
+      # ---- result -> status ----
+      result_l = downcase(to_string(a.result) ?? "")
+      status_id = 0
+      status_str = "Unknown"
+      if result_l == "success" { status_id = 1; status_str = "Success" }
+      if result_l == "failure" { status_id = 2; status_str = "Failure" }
+      if result_l == "timeout" { status_id = 99; status_str = "Timeout" }
+
+      # ---- initiator -> actor ----
+      initiated = object(a.initiatedBy) ?? {}
+      init_user = object(initiated.user) ?? {}
+      init_app = object(initiated.app) ?? {}
+      actor_user = { "name": "unknown" }
+      actor = {}
+      src_ip = ""
+      iu_upn = to_string(init_user.userPrincipalName) ?? ""
+      iu_id = to_string(init_user.id) ?? ""
+      iu_name = to_string(init_user.displayName) ?? ""
+      ia_name = to_string(init_app.displayName) ?? ""
+      ia_spn = to_string(init_app.servicePrincipalName) ?? ""
+      ia_spid = to_string(init_app.servicePrincipalId) ?? ""
+      ia_appid = to_string(init_app.appId) ?? ""
+      if iu_upn != "" || iu_id != "" {
+          actor_user = { "type_id": 1, "type": "User" }
+          actor_user.name = if iu_upn != "" { iu_upn } else if iu_name != "" { iu_name } else { iu_id }
+          if contains(iu_upn, "@") { actor_user.email_addr = iu_upn }
+          if iu_id != "" { actor_user.uid = iu_id }
+          if iu_name != "" { actor_user.display_name = iu_name }
+          src_ip = to_string(init_user.ipAddress) ?? ""
+      } else if ia_name != "" || ia_spid != "" || ia_appid != "" {
+          actor_user = { "type_id": 4, "type": "Service" }
+          actor_user.name = if ia_name != "" { ia_name } else if ia_spn != "" { ia_spn } else if ia_appid != "" { ia_appid } else { ia_spid }
+          if ia_spid != "" { actor_user.uid = ia_spid }
+          if ia_name != "" { actor.app_name = ia_name }
+          if ia_appid != "" { actor.app_uid = ia_appid }
+          src_ip = to_string(init_app.ipAddress) ?? ""
+      }
+      actor.user = actor_user
+      if src_ip == "" || src_ip == "<null>" { src_ip = caller_ip }
+
+      # ---- targets -> subject user / group, role, resources[] ----
+      targets = array(a.targetResources) ?? []
+      subj_user = {}
+      subj_group = {}
+      subj_sp = {}
+      # The app role's resource SP (the API, e.g. Microsoft Graph) carries the
+      # AppRole.* modified properties; the grantee SP does not.
+      grantee_sp = {}
+      role_name = ""
+      role_uid = ""
+      app_role = ""
+      resources = []
+      for_each(targets) -> |_i, target| {
+          tg = object(target) ?? {}
+          t_type = to_string(tg.type) ?? ""
+          t_type_l = downcase(t_type)
+          t_id = to_string(tg.id) ?? ""
+          t_upn = to_string(tg.userPrincipalName) ?? ""
+          t_name = to_string(tg.displayName) ?? ""
+          label = if t_upn != "" { t_upn } else if t_name != "" { t_name } else { t_id }
+          res = { "type": t_type }
+          if t_id != "" { res.uid = t_id }
+          if label != "" { res.name = label }
+          resources = push(resources, res)
+          if t_type_l == "user" && length(keys(subj_user)) == 0 {
+              subj_user = { "name": label, "type_id": 1, "type": "User" }
+              if t_id != "" { subj_user.uid = t_id }
+              if contains(t_upn, "@") { subj_user.email_addr = t_upn }
+              if t_name != "" { subj_user.display_name = t_name }
+          }
+          if t_type_l == "group" && length(keys(subj_group)) == 0 {
+              subj_group = { "name": label }
+              if t_id != "" { subj_group.uid = t_id }
+          }
+          if t_type_l == "role" && role_name == "" {
+              role_name = label
+              role_uid = t_id
+          }
+          # Role membership changes carry the role as a modified property of the
+          # user / group target; app role assignments carry AppRole.Value.
+          t_has_app_role = false
+          for_each(array(tg.modifiedProperties) ?? []) -> |_j, mp| {
+                  mpo = object(mp) ?? {}
+                  mp_name = to_string(mpo.displayName) ?? ""
+                  if starts_with(mp_name, "AppRole.") { t_has_app_role = true }
+                  if mp_name == "AppRole.Value" && app_role == "" {
+                      av = to_string(mpo.newValue) ?? ""
+                      if av == "" { av = to_string(mpo.oldValue) ?? "" }
+                      app_role = strip_whitespace(replace(av, "\"", ""))
+                  }
+                  if mp_name == "Role.ObjectID" && role_uid == "" {
+                      role_uid = strip_whitespace(replace(to_string(mpo.newValue) ?? "", "\"", ""))
+                  }
+                  if mp_name == "Role.DisplayName" && role_name == "" {
+                      rv = to_string(mpo.newValue) ?? ""
+                      if rv == "" { rv = to_string(mpo.oldValue) ?? "" }
+                      role_name = strip_whitespace(replace(rv, "\"", ""))
+                  }
+          }
+          if t_type_l == "serviceprincipal" {
+              sp = { "name": label, "type_id": 4, "type": "Service" }
+              if t_id != "" { sp.uid = t_id }
+              if length(keys(subj_sp)) == 0 { subj_sp = sp }
+              if !t_has_app_role && length(keys(grantee_sp)) == 0 { grantee_sp = sp }
+          }
+      }
+      have_user = length(keys(subj_user)) > 0
+      have_group = length(keys(subj_group)) > 0
+      have_sp = length(keys(subj_sp)) > 0
+
+      # ---- route and pick the activity ----
+      class_uid = 6003
+      activity_id = 99
+      activity_name = "Other"
+      is_role = contains(act_l, "member to role") || contains(act_l, "member from role")
+      is_cred = act_l == "add service principal credentials" || act_l == "remove service principal credentials"
+      is_secinfo = contains(act_l, "security info")
+      # App role assignments are logged under ApplicationManagement, so they are
+      # routed by activity name, not by audit category.
+      is_app_role = starts_with(act_l, "add app role assignment") || starts_with(act_l, "remove app role assignment")
+      app_role_to_group = is_app_role && have_group && (ends_with(act_l, " group") || contains(act_l, " to group") || contains(act_l, " from group"))
+      app_role_to_user = is_app_role && have_user && (contains(act_l, " to user") || contains(act_l, " from user"))
+      # App role (application permission) granted to / revoked from a service
+      # principal: the subject is the grantee SP, not the resource API SP.
+      app_role_to_sp = is_app_role && have_sp && !have_user && !have_group
+      if app_role_to_sp && length(keys(grantee_sp)) > 0 { subj_sp = grantee_sp }
+      # A role-assignable group added to / removed from a directory role.
+      group_role = is_role && have_group && !have_user && !have_sp
+      user_cat = audit_cat_l == "usermanagement" || audit_cat_l == "rolemanagement" || audit_cat_l == "userauthenticationmethod" || logged_by == "Authentication Methods" || logged_by == "Self-service Password Management"
+      if app_role_to_group || group_role {
+          class_uid = 3006
+          if starts_with(act_l, "add app role assignment") { activity_id = 1; activity_name = "Assign Privileges" }
+          if starts_with(act_l, "remove app role assignment") { activity_id = 2; activity_name = "Revoke Privileges" }
+          if group_role && starts_with(act_l, "add") { activity_id = 12; activity_name = "Assign Roles" }
+          if group_role && starts_with(act_l, "remove") { activity_id = 13; activity_name = "Remove Roles" }
+      } else if (have_user && (user_cat || is_role || app_role_to_user)) || (have_sp && (is_role || is_cred || app_role_to_sp)) {
+          class_uid = 3007
+          if act_l == "add user" || act_l == "create user" || act_l == "invite external user" { activity_id = 1; activity_name = "Create" }
+          if act_l == "update user" || act_l == "change user license" || act_l == "user changed default security info" { activity_id = 2; activity_name = "Update" }
+          if act_l == "delete user" || act_l == "hard delete user" { activity_id = 3; activity_name = "Delete" }
+          if act_l == "enable account" || act_l == "restore user" { activity_id = 4; activity_name = "Enable" }
+          if act_l == "disable account" { activity_id = 5; activity_name = "Disable" }
+          if contains(act_l, "change user password") || starts_with(act_l, "change password") { activity_id = 8; activity_name = "Password Change" }
+          if contains(act_l, "reset user password") || starts_with(act_l, "reset password") { activity_id = 9; activity_name = "Password Reset" }
+          if is_secinfo && contains(act_l, "registered") { activity_id = 12; activity_name = "Enable MFA Factors" }
+          if is_secinfo && contains(act_l, "deleted") { activity_id = 13; activity_name = "Disable MFA Factors" }
+          if starts_with(act_l, "add app role assignment") { activity_id = 14; activity_name = "Assign Privileges" }
+          if starts_with(act_l, "remove app role assignment") { activity_id = 15; activity_name = "Remove Privileges" }
+          if is_role && starts_with(act_l, "add") { activity_id = 16; activity_name = "Assign Roles" }
+          if is_role && starts_with(act_l, "remove") { activity_id = 17; activity_name = "Remove Roles" }
+          if act_l == "add service principal credentials" { activity_id = 18; activity_name = "Add Programmatic Credentials" }
+          if act_l == "remove service principal credentials" { activity_id = 19; activity_name = "Remove Programmatic Credentials" }
+      } else if have_group && audit_cat_l == "groupmanagement" {
+          class_uid = 3006
+          if act_l == "add group" { activity_id = 6; activity_name = "Create" }
+          if act_l == "delete group" || act_l == "hard delete group" { activity_id = 5; activity_name = "Delete" }
+          if act_l == "update group" { activity_id = 9; activity_name = "Update" }
+          if act_l == "add member to group" { activity_id = 3; activity_name = "Add User" }
+          if act_l == "remove member from group" { activity_id = 4; activity_name = "Remove User" }
+          if starts_with(act_l, "add app role assignment") { activity_id = 1; activity_name = "Assign Privileges" }
+          if starts_with(act_l, "remove app role assignment") { activity_id = 2; activity_name = "Revoke Privileges" }
+      } else {
+          if op_type == "add" || op_type == "create" { activity_id = 1; activity_name = "Create" }
+          if op_type == "update" || op_type == "assign" || op_type == "unassign" { activity_id = 3; activity_name = "Update" }
+          if op_type == "delete" || op_type == "remove" { activity_id = 4; activity_name = "Delete" }
+          # The activity verb is more precise than operationType ("Consent to
+          # application" and "Add delegated permission grant" are typed Assign).
+          if starts_with(act_l, "add ") || starts_with(act_l, "consent to ") { activity_id = 1; activity_name = "Create" }
+          if starts_with(act_l, "update ") || starts_with(act_l, "set ") { activity_id = 3; activity_name = "Update" }
+          if starts_with(act_l, "delete ") || starts_with(act_l, "remove ") || starts_with(act_l, "hard delete ") || starts_with(act_l, "revoke ") { activity_id = 4; activity_name = "Delete" }
+      }
+
+      # ---- severity: privileged changes Medium, failures at least Low ----
+      severity_id = 1
+      severity = "Informational"
+      if (is_role && starts_with(act_l, "add")) || act_l == "consent to application" || starts_with(act_l, "add delegated permission grant") || act_l == "add app role assignment to service principal" || act_l == "add service principal credentials" || contains(act_l, "conditional access policy") || act_l == "add owner to application" || act_l == "add owner to service principal" {
+          severity_id = 3
+          severity = "Medium"
+      }
+      if status_id == 2 && severity_id < 2 { severity_id = 2; severity = "Low" }
+
+      ocsf = {
+          "class_uid": class_uid,
+          "category_uid": 3,
+          "category_name": "Identity & Access Management",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": activity_display,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud"],
+              "log_name": "AuditLogs",
+              "log_provider": logged_by,
+              "product": { "name": "Microsoft Entra ID", "vendor_name": "Microsoft" }
+          },
+          "api": { "operation": activity_display, "service": { "name": logged_by } },
+          "actor": actor
+      }
+      if class_uid == 3007 {
+          ocsf.class_name = "User Management"
+          ocsf.user = if have_user { subj_user } else { subj_sp }
+          if role_name != "" {
+              role = { "name": role_name }
+              if role_uid != "" { role.uid = role_uid }
+              ocsf.iam_roles = [role]
+          }
+          if app_role != "" && (activity_id == 14 || activity_id == 15) { ocsf.privileges = [app_role] }
+          if activity_id == 12 || activity_id == 13 {
+              # The registered method is only named in resultReason ("User registered Mobile Phone SMS").
+              rr = downcase(to_string(a.resultReason) ?? "")
+              factor_id = 99
+              factor = "Other"
+              if contains(rr, "sms") { factor_id = 1; factor = "SMS" }
+              if contains(rr, "authenticator") || contains(rr, "notification") { factor_id = 5; factor = "Push Notification" }
+              if contains(rr, "phone call") || contains(rr, "voice") { factor_id = 3; factor = "Phone Call" }
+              if contains(rr, "fido") || contains(rr, "passkey") { factor_id = 10; factor = "WebAuthn" }
+              if contains(rr, "email") { factor_id = 8; factor = "Email" }
+              if contains(rr, "security question") { factor_id = 2; factor = "Security Question" }
+              if contains(rr, "software oath") || contains(rr, "hardware oath") { factor_id = 7; factor = "OTP" }
+              if contains(rr, "windows hello") { factor_id = 4; factor = "Biometric" }
+              ocsf.auth_factors = [{ "factor_type_id": factor_id, "factor_type": factor, "provider": "Microsoft Entra ID" }]
+          }
+      } else if class_uid == 3006 {
+          ocsf.class_name = "Group Management"
+          ocsf.group = subj_group
+          if have_user { ocsf.user = subj_user }
+          if role_name != "" {
+              grole = { "name": role_name }
+              if role_uid != "" { grole.uid = role_uid }
+              ocsf.iam_roles = [grole]
+          }
+          if app_role != "" && (activity_id == 1 || activity_id == 2) { ocsf.privileges = [app_role] }
+      } else {
+          ocsf.class_name = "API Activity"
+          ocsf.category_uid = 6
+          ocsf.category_name = "Application Activity"
+      }
+      if src_ip != "" {
+          ocsf.src_endpoint = { "ip": downcase(src_ip) }
+      } else if class_uid == 6003 {
+          ocsf.src_endpoint = { "ip": "0.0.0.0" }
+      }
+      if length(resources) > 0 { ocsf.resources = resources }
+      reason = to_string(a.resultReason) ?? ""
+      if reason != "" { ocsf.status_detail = reason }
+      if audit_cat != "" { ocsf.metadata.event_code = audit_cat }
+      if correlation != "" { ocsf.metadata.correlation_uid = correlation }
+
+      # ---- user agent: properties.userAgent, else the User-Agent additional detail ----
+      ua = to_string(a.userAgent) ?? ""
+      for_each(array(a.additionalDetails) ?? []) -> |_k, d| {
+          dd = object(d) ?? {}
+          if ua == "" && downcase(to_string(dd.key) ?? "") == "user-agent" { ua = to_string(dd.value) ?? "" }
+      }
+      if ua != "" { ocsf.http_request = { "user_agent": ua } }
+
+      cloud = { "provider": "Azure" }
+      if tenant_id != "" {
+          cloud.account = { "uid": tenant_id }
+          cloud.org = { "uid": tenant_id }
+      }
+      ocsf.cloud = cloud
+
+      uid_src = if natural_id != "" { "entra_audit|" + natural_id + "|" + ts_str } else { "entra_audit|raw|" + raw_log }
+      ocsf.metadata.uid = sha2(uid_src, variant: "SHA-256")
+      if natural_id != "" { ocsf.metadata.original_event_uid = natural_id }
+      if !diag { ocsf.metadata.log_name = "directoryAudits" }
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # time: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # properties.activityDateTime: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # activityDateTime: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # properties.result: Entra audit result normalized to the OCSF status caption; verify the emitted caption.
+  # result: Entra audit result normalized to the OCSF status caption; verify the emitted caption.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        time
+      | properties\.activityDateTime
+      | activityDateTime
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        properties\.result
+      | result
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"success": "Success", "failure": "Failure", "timeout": "Timeout"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."status" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    activityDateTime
+  | activityDisplayName
+  | callerIpAddress
+  | category
+  | correlationId
+  | id
+  | initiatedBy\.app\.appId
+  | initiatedBy\.app\.displayName
+  | initiatedBy\.app\.ipAddress
+  | initiatedBy\.app\.servicePrincipalId
+  | initiatedBy\.app\.servicePrincipalName
+  | initiatedBy\.user\.displayName
+  | initiatedBy\.user\.id
+  | initiatedBy\.user\.ipAddress
+  | initiatedBy\.user\.userPrincipalName
+  | loggedByService
+  | operationName
+  | properties
+  | properties\.activityDateTime
+  | properties\.activityDisplayName
+  | properties\.category
+  | properties\.correlationId
+  | properties\.id
+  | properties\.initiatedBy\.app\.appId
+  | properties\.initiatedBy\.app\.displayName
+  | properties\.initiatedBy\.app\.ipAddress
+  | properties\.initiatedBy\.app\.servicePrincipalId
+  | properties\.initiatedBy\.app\.servicePrincipalName
+  | properties\.initiatedBy\.user\.displayName
+  | properties\.initiatedBy\.user\.id
+  | properties\.initiatedBy\.user\.ipAddress
+  | properties\.initiatedBy\.user\.userPrincipalName
+  | properties\.loggedByService
+  | properties\.result
+  | properties\.resultReason
+  | properties\.userAgent
+  | result
+  | resultReason
+  | tenantId
+  | time
+  | userAgent
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+# Sample sources (samples/*.json and the inline samples below). Record shapes are
+# taken from these public references; identifiers, tenants, users and IPs are
+# replaced with documentation values (zero UUID tenant, example.com, 192.0.2.x,
+# 198.51.100.x, 203.0.113.x).
+#   diag_* (diagnostic-settings AuditLogs record):
+#     https://learn.microsoft.com/en-us/entra/identity/monitoring-health/reference-azure-monitor-audit-log-schema
+#     https://github.com/elastic/integrations/blob/main/packages/azure/data_stream/auditlogs/_dev/test/pipeline/test-audit-logs-sample.log
+#       (diag_add_service_principal_credentials follows its first record)
+#   activity names and categories (role, consent, security info, conditional access):
+#     https://learn.microsoft.com/en-us/entra/identity/monitoring-health/reference-audit-activities
+#     https://learn.microsoft.com/en-us/entra/identity/authentication/howto-authentication-methods-activity
+#   graph_* (Microsoft Graph directoryAudit resource):
+#     https://learn.microsoft.com/en-us/graph/api/resources/directoryaudit
+#     https://learn.microsoft.com/en-us/graph/api/directoryaudit-get
+#       (graph_add_member_to_group follows the documented response example)
+#   envelope_records / non_audit_json / junk: fallback branches (Base Event).
+samples:
+  # Directory role assignment: User Management, Assign Roles, role from modifiedProperties.
+  - raw: "{\"time\":\"2026-11-20T14:05:11.1234567Z\",\"resourceId\":\"/tenants/00000000-0000-0000-0000-000000000000/providers/Microsoft.aadiam\",\"operationName\":\"Add member to role\",\"operationVersion\":\"1.0\",\"category\":\"AuditLogs\",\"tenantId\":\"00000000-0000-0000-0000-000000000000\",\"resultSignature\":\"None\",\"durationMs\":0,\"callerIpAddress\":\"192.0.2.10\",\"correlationId\":\"aaaaaaaa-0000-0000-0000-000000000002\",\"Level\":4,\"properties\":{\"id\":\"Directory_aaaaaaaa-0000-0000-0000-000000000002_ABCDE_2\",\"category\":\"RoleManagement\",\"correlationId\":\"aaaaaaaa-0000-0000-0000-000000000002\",\"result\":\"success\",\"resultReason\":\"\",\"activityDisplayName\":\"Add member to role\",\"activityDateTime\":\"2026-11-20T14:05:11.1234567+00:00\",\"loggedByService\":\"Core Directory\",\"operationType\":\"Assign\",\"initiatedBy\":{\"user\":{\"id\":\"11111111-1111-1111-1111-111111111111\",\"displayName\":null,\"userPrincipalName\":\"admin@example.com\",\"ipAddress\":\"192.0.2.10\",\"roles\":[]}},\"targetResources\":[{\"id\":\"22222222-2222-2222-2222-222222222222\",\"displayName\":null,\"type\":\"User\",\"userPrincipalName\":\"bob@example.com\",\"modifiedProperties\":[{\"displayName\":\"Role.ObjectID\",\"oldValue\":null,\"newValue\":\"\\\"33333333-3333-3333-3333-333333333333\\\"\"},{\"displayName\":\"Role.DisplayName\",\"oldValue\":null,\"newValue\":\"\\\"Global Administrator\\\"\"},{\"displayName\":\"Role.TemplateId\",\"oldValue\":null,\"newValue\":\"\\\"62e90394-69f5-4237-9190-012177145e10\\\"\"},{\"displayName\":\"Role.WellKnownObjectName\",\"oldValue\":null,\"newValue\":\"\\\"CompanyAdministrator\\\"\"}],\"administrativeUnits\":[]}],\"additionalDetails\":[{\"key\":\"User-Agent\",\"value\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0\"}]}}"
+    expect:
+      class_uid: 3007
+      activity_id: 16
+      severity_id: 3
+      "iam_roles.0.name": "Global Administrator"
+      "iam_roles.0.uid": "33333333-3333-3333-3333-333333333333"
+      "user.name": "bob@example.com"
+      "actor.user.name": "admin@example.com"
+  # MFA method registration: Enable MFA Factors with the factor from resultReason.
+  - raw: "{\"time\":\"2026-11-20T14:05:11.1234567Z\",\"resourceId\":\"/tenants/00000000-0000-0000-0000-000000000000/providers/Microsoft.aadiam\",\"operationName\":\"User registered security info\",\"operationVersion\":\"1.0\",\"category\":\"AuditLogs\",\"tenantId\":\"00000000-0000-0000-0000-000000000000\",\"resultSignature\":\"None\",\"durationMs\":0,\"callerIpAddress\":\"198.51.100.24\",\"correlationId\":\"aaaaaaaa-0000-0000-0000-000000000006\",\"Level\":4,\"properties\":{\"id\":\"Directory_aaaaaaaa-0000-0000-0000-000000000006_ABCDE_6\",\"category\":\"UserManagement\",\"correlationId\":\"aaaaaaaa-0000-0000-0000-000000000006\",\"result\":\"success\",\"resultReason\":\"User registered Mobile Phone SMS\",\"activityDisplayName\":\"User registered security info\",\"activityDateTime\":\"2026-11-20T14:05:11.1234567+00:00\",\"loggedByService\":\"Authentication Methods\",\"operationType\":\"Add\",\"initiatedBy\":{\"user\":{\"id\":\"22222222-2222-2222-2222-222222222222\",\"displayName\":\"Bob\",\"userPrincipalName\":\"bob@example.com\",\"ipAddress\":\"198.51.100.24\",\"roles\":[]}},\"targetResources\":[{\"id\":\"22222222-2222-2222-2222-222222222222\",\"displayName\":\"Bob\",\"type\":\"User\",\"userPrincipalName\":\"bob@example.com\",\"modifiedProperties\":[],\"administrativeUnits\":[]}],\"additionalDetails\":[{\"key\":\"User-Agent\",\"value\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0\"}]}}"
+    expect:
+      class_uid: 3007
+      activity_id: 12
+      "auth_factors.0.factor_type_id": 1
+      "src_endpoint.ip": "198.51.100.24"
+  # Application consent: API Activity Create, Medium.
+  - raw: "{\"time\":\"2026-11-20T14:05:11.1234567Z\",\"resourceId\":\"/tenants/00000000-0000-0000-0000-000000000000/providers/Microsoft.aadiam\",\"operationName\":\"Consent to application\",\"operationVersion\":\"1.0\",\"category\":\"AuditLogs\",\"tenantId\":\"00000000-0000-0000-0000-000000000000\",\"resultSignature\":\"None\",\"durationMs\":0,\"callerIpAddress\":\"192.0.2.10\",\"correlationId\":\"aaaaaaaa-0000-0000-0000-000000000005\",\"Level\":4,\"properties\":{\"id\":\"Directory_aaaaaaaa-0000-0000-0000-000000000005_ABCDE_5\",\"category\":\"ApplicationManagement\",\"correlationId\":\"aaaaaaaa-0000-0000-0000-000000000005\",\"result\":\"success\",\"resultReason\":\"\",\"activityDisplayName\":\"Consent to application\",\"activityDateTime\":\"2026-11-20T14:05:11.1234567+00:00\",\"loggedByService\":\"Core Directory\",\"operationType\":\"Assign\",\"initiatedBy\":{\"user\":{\"id\":\"11111111-1111-1111-1111-111111111111\",\"displayName\":null,\"userPrincipalName\":\"admin@example.com\",\"ipAddress\":\"192.0.2.10\",\"roles\":[]}},\"targetResources\":[{\"id\":\"55555555-5555-5555-5555-555555555555\",\"displayName\":\"contoso-mail-sync\",\"type\":\"ServicePrincipal\",\"modifiedProperties\":[{\"displayName\":\"ConsentContext.IsAdminConsent\",\"oldValue\":null,\"newValue\":\"\\\"True\\\"\"},{\"displayName\":\"ConsentContext.IsAppOnly\",\"oldValue\":null,\"newValue\":\"\\\"False\\\"\"},{\"displayName\":\"ConsentContext.OnBehalfOfAll\",\"oldValue\":null,\"newValue\":\"\\\"True\\\"\"},{\"displayName\":\"ConsentAction.Permissions\",\"oldValue\":null,\"newValue\":\"\\\"[] => [[Id: abcd, ClientId: 55555555-5555-5555-5555-555555555555, PrincipalId: , ResourceId: 66666666-6666-6666-6666-666666666666, ConsentType: AllPrincipals, Scope:  Mail.Read offline_access User.Read, CreatedDateTime: , LastModifiedDateTime ]]; \\\"\"}]}],\"additionalDetails\":[{\"key\":\"User-Agent\",\"value\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0\"}]}}"
+    expect:
+      class_uid: 6003
+      activity_id: 1
+      severity_id: 3
+  # Graph directoryAudit group membership.
+  - raw: "{\"id\":\"Directory_bbbbbbbb-0000-0000-0000-000000000001\",\"category\":\"GroupManagement\",\"correlationId\":\"bbbbbbbb-0000-0000-0000-000000000001\",\"result\":\"success\",\"resultReason\":\"Successfully added member to group\",\"activityDisplayName\":\"Add member to group\",\"activityDateTime\":\"2026-11-20T21:20:02.7215374Z\",\"loggedByService\":\"Core Directory\",\"operationType\":\"Assign\",\"initiatedBy\":{\"user\":{\"id\":\"11111111-1111-1111-1111-111111111111\",\"displayName\":\"Jamie Doe\",\"userPrincipalName\":\"jdoe@example.com\",\"ipAddress\":\"192.0.2.55\"},\"app\":null},\"targetResources\":[{\"id\":\"44444444-4444-4444-4444-444444444444\",\"displayName\":\"Example Group\",\"type\":\"Group\",\"modifiedProperties\":[{\"displayName\":\"Account Enabled\",\"oldValue\":\"false\",\"newValue\":\"true\"}],\"groupType\":\"unifiedGroups\"},{\"id\":\"22222222-2222-2222-2222-222222222222\",\"displayName\":null,\"type\":\"User\",\"userPrincipalName\":\"bob@example.com\"}],\"additionalDetails\":[{\"key\":\"Additional Detail Name\",\"value\":\"Additional Detail Value\"}]}"
+    expect:
+      class_uid: 3006
+      activity_id: 3
+      "group.name": "Example Group"
+      "metadata.log_name": "directoryAudits"
+  # Unparsable input: Base Event with the fallback marker.
+  - raw: "not an Entra ID audit record"
+    expect:
+      class_uid: 0
+      "unmapped.parse_fallback": "unparsable input"
+  # Review fix: app role assignments (ApplicationManagement) route to 3007 / 3006.
+  - raw: "{\"time\":\"2026-11-20T14:05:11.1234567Z\",\"resourceId\":\"/tenants/00000000-0000-0000-0000-000000000000/providers/Microsoft.aadiam\",\"operationName\":\"Add app role assignment grant to user\",\"operationVersion\":\"1.0\",\"category\":\"AuditLogs\",\"tenantId\":\"00000000-0000-0000-0000-000000000000\",\"resultSignature\":\"None\",\"durationMs\":0,\"callerIpAddress\":\"192.0.2.10\",\"correlationId\":\"aaaaaaaa-0000-0000-0000-000000000011\",\"Level\":4,\"properties\":{\"id\":\"Directory_aaaaaaaa-0000-0000-0000-000000000011_ABCDE_11\",\"category\":\"ApplicationManagement\",\"correlationId\":\"aaaaaaaa-0000-0000-0000-000000000011\",\"result\":\"success\",\"resultReason\":\"\",\"activityDisplayName\":\"Add app role assignment grant to user\",\"activityDateTime\":\"2026-11-20T14:05:11.1234567+00:00\",\"loggedByService\":\"Core Directory\",\"operationType\":\"Assign\",\"initiatedBy\":{\"user\":{\"id\":\"11111111-1111-1111-1111-111111111111\",\"displayName\":null,\"userPrincipalName\":\"admin@example.com\",\"ipAddress\":\"192.0.2.10\",\"roles\":[]}},\"targetResources\":[{\"id\":\"55555555-5555-5555-5555-555555555555\",\"displayName\":\"Contoso HR Portal\",\"type\":\"ServicePrincipal\",\"modifiedProperties\":[{\"displayName\":\"AppRole.Id\",\"oldValue\":null,\"newValue\":\"\\\"aaaaaaaa-1111-1111-1111-111111111111\\\"\"},{\"displayName\":\"AppRole.Value\",\"oldValue\":null,\"newValue\":\"\\\"HR.Admin\\\"\"},{\"displayName\":\"AppRole.DisplayName\",\"oldValue\":null,\"newValue\":\"\\\"HR Administrator\\\"\"}]},{\"id\":\"22222222-2222-2222-2222-222222222222\",\"displayName\":null,\"type\":\"User\",\"userPrincipalName\":\"bob@example.com\",\"modifiedProperties\":[]}],\"additionalDetails\":[{\"key\":\"User-Agent\",\"value\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0\"}]}}"
+    expect:
+      class_uid: 3007
+      activity_id: 14
+      "user.name": "bob@example.com"
+      "privileges.0": "HR.Admin"
+  - raw: "{\"time\":\"2026-11-20T14:05:11.1234567Z\",\"resourceId\":\"/tenants/00000000-0000-0000-0000-000000000000/providers/Microsoft.aadiam\",\"operationName\":\"Add app role assignment to group\",\"operationVersion\":\"1.0\",\"category\":\"AuditLogs\",\"tenantId\":\"00000000-0000-0000-0000-000000000000\",\"resultSignature\":\"None\",\"durationMs\":0,\"callerIpAddress\":\"192.0.2.10\",\"correlationId\":\"aaaaaaaa-0000-0000-0000-000000000012\",\"Level\":4,\"properties\":{\"id\":\"Directory_aaaaaaaa-0000-0000-0000-000000000012_ABCDE_12\",\"category\":\"ApplicationManagement\",\"correlationId\":\"aaaaaaaa-0000-0000-0000-000000000012\",\"result\":\"success\",\"resultReason\":\"\",\"activityDisplayName\":\"Add app role assignment to group\",\"activityDateTime\":\"2026-11-20T14:05:11.1234567+00:00\",\"loggedByService\":\"Core Directory\",\"operationType\":\"Assign\",\"initiatedBy\":{\"user\":{\"id\":\"11111111-1111-1111-1111-111111111111\",\"displayName\":null,\"userPrincipalName\":\"admin@example.com\",\"ipAddress\":\"192.0.2.10\",\"roles\":[]}},\"targetResources\":[{\"id\":\"55555555-5555-5555-5555-555555555555\",\"displayName\":\"Contoso HR Portal\",\"type\":\"ServicePrincipal\",\"modifiedProperties\":[{\"displayName\":\"AppRole.Id\",\"oldValue\":null,\"newValue\":\"\\\"aaaaaaaa-1111-1111-1111-111111111111\\\"\"},{\"displayName\":\"AppRole.Value\",\"oldValue\":null,\"newValue\":\"\\\"HR.Admin\\\"\"},{\"displayName\":\"AppRole.DisplayName\",\"oldValue\":null,\"newValue\":\"\\\"HR Administrator\\\"\"}]},{\"id\":\"44444444-4444-4444-4444-444444444444\",\"displayName\":\"Finance-Admins\",\"type\":\"Group\",\"modifiedProperties\":[]}],\"additionalDetails\":[{\"key\":\"User-Agent\",\"value\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0\"}]}}"
+    expect:
+      class_uid: 3006
+      activity_id: 1
+      "group.name": "Finance-Admins"
+      "privileges.0": "HR.Admin"
+  # Review fix: a role-assignable group added to a directory role.
+  - raw: "{\"time\":\"2026-11-20T14:05:11.1234567Z\",\"resourceId\":\"/tenants/00000000-0000-0000-0000-000000000000/providers/Microsoft.aadiam\",\"operationName\":\"Add member to role\",\"operationVersion\":\"1.0\",\"category\":\"AuditLogs\",\"tenantId\":\"00000000-0000-0000-0000-000000000000\",\"resultSignature\":\"None\",\"durationMs\":0,\"callerIpAddress\":\"192.0.2.10\",\"correlationId\":\"aaaaaaaa-0000-0000-0000-000000000013\",\"Level\":4,\"properties\":{\"id\":\"Directory_aaaaaaaa-0000-0000-0000-000000000013_ABCDE_13\",\"category\":\"RoleManagement\",\"correlationId\":\"aaaaaaaa-0000-0000-0000-000000000013\",\"result\":\"success\",\"resultReason\":\"\",\"activityDisplayName\":\"Add member to role\",\"activityDateTime\":\"2026-11-20T14:05:11.1234567+00:00\",\"loggedByService\":\"Core Directory\",\"operationType\":\"Assign\",\"initiatedBy\":{\"user\":{\"id\":\"11111111-1111-1111-1111-111111111111\",\"displayName\":null,\"userPrincipalName\":\"admin@example.com\",\"ipAddress\":\"192.0.2.10\",\"roles\":[]}},\"targetResources\":[{\"id\":\"44444444-4444-4444-4444-444444444445\",\"displayName\":\"Tier0-Admins\",\"type\":\"Group\",\"modifiedProperties\":[{\"displayName\":\"Role.ObjectID\",\"oldValue\":null,\"newValue\":\"\\\"33333333-3333-3333-3333-333333333334\\\"\"},{\"displayName\":\"Role.DisplayName\",\"oldValue\":null,\"newValue\":\"\\\"Privileged Role Administrator\\\"\"}]}],\"additionalDetails\":[{\"key\":\"User-Agent\",\"value\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0\"}]}}"
+    expect:
+      class_uid: 3006
+      activity_id: 12
+      "group.name": "Tier0-Admins"
+      "iam_roles.0.name": "Privileged Role Administrator"
+      "iam_roles.0.uid": "33333333-3333-3333-3333-333333333334"
+      severity_id: 3
+  # Review fix: app role (application permission) granted to a service principal
+  # routes to 3007 with the grantee SP as user, not the resource API SP.
+  - raw: "{\"time\":\"2026-11-20T14:05:11.1234567Z\",\"resourceId\":\"/tenants/00000000-0000-0000-0000-000000000000/providers/Microsoft.aadiam\",\"operationName\":\"Add app role assignment to service principal\",\"operationVersion\":\"1.0\",\"category\":\"AuditLogs\",\"tenantId\":\"00000000-0000-0000-0000-000000000000\",\"resultSignature\":\"None\",\"durationMs\":0,\"callerIpAddress\":\"192.0.2.10\",\"correlationId\":\"aaaaaaaa-0000-0000-0000-000000000031\",\"Level\":4,\"properties\":{\"id\":\"Directory_aaaaaaaa-0000-0000-0000-000000000031_ABCDE_31\",\"category\":\"ApplicationManagement\",\"correlationId\":\"aaaaaaaa-0000-0000-0000-000000000031\",\"result\":\"success\",\"resultReason\":\"\",\"activityDisplayName\":\"Add app role assignment to service principal\",\"activityDateTime\":\"2026-11-20T14:05:11.1234567+00:00\",\"loggedByService\":\"Core Directory\",\"operationType\":\"Assign\",\"initiatedBy\":{\"user\":{\"id\":\"11111111-1111-1111-1111-111111111111\",\"displayName\":null,\"userPrincipalName\":\"admin@example.com\",\"ipAddress\":\"192.0.2.10\",\"roles\":[]}},\"targetResources\":[{\"id\":\"66666666-6666-6666-6666-666666666666\",\"displayName\":\"Microsoft Graph\",\"type\":\"ServicePrincipal\",\"modifiedProperties\":[{\"displayName\":\"AppRole.Id\",\"oldValue\":null,\"newValue\":\"\\\"19dbc75e-c2e2-444c-a770-ec69d8559fc7\\\"\"},{\"displayName\":\"AppRole.Value\",\"oldValue\":null,\"newValue\":\"\\\"Directory.ReadWrite.All\\\"\"},{\"displayName\":\"AppRole.DisplayName\",\"oldValue\":null,\"newValue\":\"\\\"Read and write directory data\\\"\"}]},{\"id\":\"77777777-7777-7777-7777-777777777777\",\"displayName\":\"contoso-sync-app\",\"type\":\"ServicePrincipal\",\"modifiedProperties\":[]}],\"additionalDetails\":[{\"key\":\"User-Agent\",\"value\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0\"}]}}"
+    expect:
+      class_uid: 3007
+      activity_id: 14
+      "user.name": "contoso-sync-app"
+      "user.uid": "77777777-7777-7777-7777-777777777777"
+      "privileges.0": "Directory.ReadWrite.All"
+      severity_id: 3

@@ -25,6 +25,7 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [SentinelOne](parsers-ocsf/sentinelone) | `sentinelone` | SentinelOne | JSON | Threats, activity logs, Deep Visibility (process, network, DNS, file, registry) |
 | [VMware Carbon Black](parsers-ocsf/carbon_black) | `carbon_black` | VMware | JSON | CB Analytics alerts, watchlist hits, process events with MITRE TTPs |
 | [Microsoft Defender EDR](parsers-ocsf/defender_edr) | `defender_edr` | Microsoft | JSON | Process creation, network connections, file events, logon activities |
+| [Microsoft Defender XDR](parsers-ocsf/defender_xdr) | `defender_xdr` | Microsoft | JSON (Graph security API + streaming API) | Alerts (alerts_v2) and incidents as findings with evidence, MITRE techniques and classification; AlertInfo / AlertEvidence rows |
 | [Microsoft Sysmon](parsers-ocsf/windows_sysmon) | `windows_sysmon` | Microsoft | JSON (Vector/Winlogbeat/NXLog) | Process, network, file, registry, DNS events from Sysmon |
 | [Microsoft Sysmon (XML)](parsers-ocsf/sysmon_xml) | `windows_sysmon` | Microsoft | Native XML | All 29 Sysmon event IDs with hash splitting and MITRE extraction |
 | [Microsoft Sysmon for Linux (XML)](parsers-ocsf/sysmon_linux_xml) | `linux_sysmon` | Microsoft | Native XML | Sysmon for Linux: process, network, file events with MITRE extraction |
@@ -64,6 +65,7 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Cloudflare Zero Trust](parsers-ocsf/cloudflare_zero_trust) | `cloudflare_zero_trust` | Cloudflare | JSON (Logpush) | Gateway DNS, Gateway HTTP, Gateway Network, Access requests |
 | [Cisco Umbrella](parsers-ocsf/cisco_umbrella) | `cisco_umbrella` | Cisco | CSV | DNS and proxy logs with domain categorization and identity |
 | [Infoblox DHCP](parsers-ocsf/infoblox_dhcp) | `infoblox_dhcp` | Infoblox | Syslog | DISCOVER, OFFER, REQUEST, ACK, RELEASE, NAK, INFORM |
+| [Windows DNS Server](parsers-ocsf/windows_dns) | `windows_dns` | Microsoft | Debug log text / Analytical ETW JSON (Winlogbeat, NXLog) | Queries, responses and recursion (ETW 256-262, debug PACKET lines) with rcode, flags, opcode and transaction id; audit events as Base Event |
 | [ISC BIND](parsers-ocsf/bind_dns) | `bind_dns` | ISC | Syslog / file channel | Query log, ACL and zone transfer denials, RPZ rewrites, other named categories |
 | [Conduit MITM Proxy](parsers-ocsf/conduit_proxy) | `conduit_proxy` | Conduit | JSON | HTTP/HTTPS requests with TLS interception status, threat scoring, DLP |
 | [AWS Network Firewall](parsers-ocsf/aws_network_firewall) | `aws_network_firewall` | Amazon | JSON (Suricata EVE `event`) | Alert logs as Detection Finding (allowed / blocked / rejected, rule, 5-tuple, HTTP / TLS evidence), netflow logs as Network Activity, TLS engine revocation / SNI errors |
@@ -91,8 +93,10 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Amazon CloudFront](parsers-ocsf/aws_cloudfront) | `aws_cloudfront` | Amazon | Tab-separated W3C / JSON | Standard (legacy) access logs, real-time logs and standard logging v2 JSON as HTTP Activity: viewer, edge, cache result, TLS, geo-blocked requests |
 | [Azure Activity Log](parsers-ocsf/azure_activity) | `azure_activity` | Microsoft | JSON | Operations, status, caller identity, resources |
 | [Azure Sign-in Logs](parsers-ocsf/azure_signin) | `azure_signin` | Microsoft | JSON | Entra ID sign-ins: interactive, non-interactive, service principal |
+| [Microsoft Entra ID Audit Logs](parsers-ocsf/entra_audit) | `entra_audit` | Microsoft | JSON (diagnostic settings + Graph directoryAudits) | User, group and directory role changes, MFA security info registration, app consent and permission grants, credential adds. OCSF only |
 | [Azure Monitor diagnostic export](parsers-ocsf/azure_monitor) | `azure_monitor` | Microsoft | JSON (Diagnostic Settings → Event Hubs / storage) | One lane for a mixed hub, dispatched on `category`: Activity Log (all 8 categories; Defender for Cloud alerts as Detection Finding), Entra ID sign-ins (interactive, non-interactive, service principal, managed identity) and Entra ID audit (user / group / role management). Unknown categories kept whole as Base Event. OCSF only |
 | [Azure Firewall](parsers-ocsf/azure_firewall) | `azure_firewall` | Microsoft | JSON | Network rules, application rules, threat intel, DNS proxy |
+| [Azure NSG / VNet Flow Logs](parsers-ocsf/azure_nsg_flow) | `azure_nsg_flow` | Microsoft | JSON (NSG v1/v2, VNet v4/v5 flowTuples) | Allow / deny flows with rule, direction, state and byte / packet counters |
 | [Microsoft Defender for Cloud](parsers-ocsf/defender_for_cloud) | `defender_for_cloud` | Microsoft | JSON (continuous export / Event Hubs, REST API, Logic App) | Security alerts as Detection Finding with ATT&CK and entities; assessments, sub-assessments and regulatory compliance as Compliance Finding |
 | [GCP Audit Log](parsers-ocsf/gcp_audit) | `gcp_audit` | Google | JSON | IAM changes, API calls, resource operations, authorization |
 | [GCP VPC Flow Logs](parsers-ocsf/gcp_vpc_flow) | `gcp_vpc_flow` | Google | JSON (Cloud Logging LogEntry) | VPC flows (logName `vpc_flows` only): 5-tuple, bytes / packets, VM, VPC, subnet, geo and ASN per side |
@@ -146,6 +150,7 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 |--------|-------------|--------|--------|-------------|
 | [Apache HTTP Server](parsers-ocsf/apache) | `apache_access` | Apache | Combined/common log | Client IP, method, status, bytes, user agent, referrer |
 | [Nginx](parsers-ocsf/nginx) | `nginx` | Nginx | Combined / JSON / error | Access and error logs with upstream and proxy support |
+| [Microsoft IIS](parsers-ocsf/iis) | `iis` | Microsoft | W3C extended log | Default and extended field sets, `#Fields`-driven JSON wrapper, NXLog / App Service named keys |
 | [Squid Proxy](parsers-ocsf/squid_proxy) | `squid_proxy` | Squid Project | Access log | Cache hit/miss, URL extraction, HTTP metadata |
 | [MongoDB](parsers-ocsf/mongodb) | `mongodb` | MongoDB | JSON (4.4+ structured log, auditLog) | Authentication success and failure, connections, slow queries, start and shutdown, audit authCheck denials, collection and user changes |
 | [Elasticsearch / OpenSearch](parsers-ocsf/elasticsearch) | `elasticsearch` | Elastic / OpenSearch | JSON (server, audit, slow log) | Security audit (authentication, access granted / denied, run-as, IP filter, user changes), OpenSearch audit categories, search and indexing slow logs, node start / stop and errors |

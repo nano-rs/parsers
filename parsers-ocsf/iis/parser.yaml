@@ -1,0 +1,793 @@
+name: iis_ocsf
+display_name: Microsoft IIS (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Microsoft Internet Information Services (IIS) W3C extended access logs
+  into complete OCSF 1.9.0 "HTTP Activity" (class_uid 4002) records, emitted on
+  the root. activity_id follows the HTTP method, status_id the response code
+  (4xx and 5xx are Failure), severity rises to Low on 4xx and Medium on 5xx.
+  c-ip is src_endpoint; s-ip / s-port / s-computername / s-sitename are
+  dst_endpoint; cs-username is actor.user; time-taken is duration (ms);
+  sc-bytes / cs-bytes are traffic and response / request length; "-" is empty
+  and "+" in cs(User-Agent) is decoded to a space. sc-substatus and
+  sc-win32-status, cs(Cookie) and any field the mapping does not consume land
+  in unmapped.
+
+  Layout. A W3C log's columns are declared by the `#Fields:` directive, but
+  Vector delivers one line per event and VRL keeps no state between events, so
+  a data line cannot see its file's header. Three input shapes are accepted:
+    * A bare data line, laid out by its column count: 11 = the IIS 6 /
+      Microsoft Learn example set (date time c-ip cs-username s-ip s-port
+      cs-method cs-uri-stem cs-uri-query sc-status cs(User-Agent)); 14 = the
+      IIS 7.x default; 15 = the IIS 8.5 / 10 default (date time s-ip cs-method
+      cs-uri-stem cs-uri-query s-port cs-username c-ip cs(User-Agent)
+      cs(Referer) sc-status sc-substatus sc-win32-status time-taken); 16 = that
+      default plus an X-Forwarded-For custom field; 22 = every standard W3C
+      field in IIS order (adds s-sitename s-computername cs-version cs(Cookie)
+      cs-host sc-bytes cs-bytes); 23 = that plus X-Forwarded-For. Any other
+      count is a Base Event with the columns kept and unmapped.parse_fallback
+      set: configure one of these field sets, or use the next shape.
+    * A JSON wrapper carrying the header with the line,
+      {"fields": "<#Fields value>", "line": "<data line>"} (`#Fields` and `log`
+      are accepted as key aliases). The header drives the layout exactly, so
+      any field order and custom fields work.
+    * A JSON record with named W3C keys (NXLog `w3c` parser: `cs-method`,
+      `c-ip`, `cs(User-Agent)`; Azure App Service HTTP logs: `CsMethod`, `CIp`,
+      `UserAgent`, `TimeGenerated`).
+  Directive lines (#Software, #Version, #Date, #Fields, #Remark) are kept as a
+  Base Event (class_uid 0): metadata.event_code is the directive, message its
+  value, and a #Fields value is also metadata.log_format. Anything unparseable
+  is a Base Event with the raw line in raw_data and unmapped.parse_fallback.
+  Samples follow Microsoft Learn's W3C logging reference
+  (https://learn.microsoft.com/en-us/windows/win32/http/w3c-logging,
+  https://learn.microsoft.com/en-us/iis/configuration/system.applicationhost/sites/site/logfile/)
+  and Elastic's IIS integration fixtures
+  (https://github.com/elastic/integrations/tree/main/packages/iis/data_stream/access/_dev/test/pipeline),
+  with addresses and hosts replaced by documentation values.
+match_values:
+  - iis
+category: application
+vendor: "Microsoft"
+product: "Internet Information Services"
+parser_vrl: |
+  # Microsoft IIS W3C extended log -> OCSF 1.9.0 HTTP Activity (4002) / Base Event (0)
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+  line = strip_whitespace(raw_log)
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
+
+  # Column layouts by token count (snake_case W3C names).
+  base14 = ["date", "time", "s_ip", "cs_method", "cs_uri_stem", "cs_uri_query", "s_port", "cs_username", "c_ip", "cs_user_agent", "sc_status", "sc_substatus", "sc_win32_status", "time_taken"]
+  base15 = ["date", "time", "s_ip", "cs_method", "cs_uri_stem", "cs_uri_query", "s_port", "cs_username", "c_ip", "cs_user_agent", "cs_referer", "sc_status", "sc_substatus", "sc_win32_status", "time_taken"]
+  full22 = ["date", "time", "s_sitename", "s_computername", "s_ip", "cs_method", "cs_uri_stem", "cs_uri_query", "s_port", "cs_username", "c_ip", "cs_version", "cs_user_agent", "cs_cookie", "cs_referer", "cs_host", "sc_status", "sc_substatus", "sc_win32_status", "sc_bytes", "cs_bytes", "time_taken"]
+  layouts = {
+      "11": ["date", "time", "c_ip", "cs_username", "s_ip", "s_port", "cs_method", "cs_uri_stem", "cs_uri_query", "sc_status", "cs_user_agent"],
+      "14": base14,
+      "15": base15,
+      "16": push(base15, "x_forwarded_for"),
+      "22": full22,
+      "23": push(full22, "x_forwarded_for")
+  }
+  # Named JSON keys, normalized (lowercase, no - _ ( )), to the snake name.
+  aliases = {
+      "date": "date", "time": "time", "ssitename": "s_sitename", "sitename": "s_sitename",
+      "scomputername": "s_computername", "computername": "s_computername",
+      "sip": "s_ip", "csmethod": "cs_method", "csuristem": "cs_uri_stem", "csuriquery": "cs_uri_query",
+      "sport": "s_port", "csusername": "cs_username", "cip": "c_ip", "csversion": "cs_version",
+      "csuseragent": "cs_user_agent", "useragent": "cs_user_agent", "cscookie": "cs_cookie", "cookie": "cs_cookie",
+      "csreferer": "cs_referer", "referer": "cs_referer", "cshost": "cs_host", "scstatus": "sc_status",
+      "scsubstatus": "sc_substatus", "scwin32status": "sc_win32_status", "scbytes": "sc_bytes",
+      "csbytes": "cs_bytes", "timetaken": "time_taken", "xforwardedfor": "x_forwarded_for"
+  }
+
+  f = {}
+  shape = "invalid"
+  directive = ""
+  directive_value = ""
+  header = ""
+  wrapped_line = ""
+  iso_time = ""
+
+  parsed, jerr = parse_json(line)
+  if jerr == null && is_object(parsed) {
+      obj = object!(parsed)
+      __source_kv = obj
+      header = to_string(obj.fields) ?? ""
+      if header == "" { header = to_string(get(obj, ["#Fields"]) ?? null) ?? "" }
+      wrapped_line = to_string(obj.line) ?? ""
+      if wrapped_line == "" { wrapped_line = to_string(obj.log) ?? "" }
+      if header != "" && wrapped_line != "" {
+          # ---- JSON wrapper: the #Fields header drives the layout ----
+          hm, hmerr = parse_regex(header, r'^(?:#Fields:\s*)?(?P<names>.+)$')
+          names = []
+          if hmerr == null { names = split(strip_whitespace(to_string(hm.names)), " ") }
+          vals = split(strip_whitespace(wrapped_line), " ")
+          if length(names) > 0 && length(names) == length(vals) {
+              shape = "header"
+              for_each(names) -> |i, nm| {
+                  sn = downcase(to_string(nm))
+                  sn = replace(replace(replace(sn, "(", "_"), ")", ""), "-", "_")
+                  v = string(get(vals, [i]) ?? null) ?? "-"
+                  if v != "-" && v != "" { f = set!(f, [sn], v) }
+              }
+          }
+      } else {
+          # ---- JSON record with named W3C keys (NXLog, App Service) ----
+          for_each(obj) -> |k, v| {
+              nk = replace(downcase(k), r'[-_()]', "")
+              sn = string(get(aliases, [nk]) ?? null) ?? ""
+              if sn != "" && v != null && v != "-" && v != "" { f = set!(f, [sn], v) }
+          }
+          if (get(f, ["cs_method"]) ?? null) != null || (get(f, ["sc_status"]) ?? null) != null || (get(f, ["cs_uri_stem"]) ?? null) != null {
+              shape = "named"
+              iso_time = to_string(obj.TimeGenerated) ?? ""
+              if iso_time == "" { iso_time = to_string(obj.EventTime) ?? "" }
+          }
+      }
+  } else {
+      dm, dmerr = parse_regex(line, r'^#(?P<directive>[A-Za-z-]+):\s*(?P<value>.*)$')
+      lm, lmerr = parse_regex(line, r'^(?P<date>\d{4}-\d{2}-\d{2}) (?P<time>\d{2}:\d{2}:\d{2}) (?P<rest>\S.*)$')
+      if dmerr == null {
+          shape = "directive"
+          directive = to_string(dm.directive)
+          directive_value = to_string(dm.value)
+          __source_kv = { "directive": directive, "value": directive_value }
+      } else if lmerr == null {
+          # ---- bare data line: layout by column count ----
+          toks = split(line, " ")
+          cols = array(get(layouts, [to_string(length(toks))]) ?? null) ?? []
+          if length(cols) > 0 {
+              shape = "positional"
+              for_each(toks) -> |i, v| {
+                  sn = string(get(cols, [i]) ?? null) ?? ""
+                  if sn != "" && v != "-" && v != "" { f = set!(f, [sn], v) }
+              }
+          } else {
+              for_each(toks) -> |i, v| { __source_kv = set!(__source_kv, ["column_" + to_string(i)], v) }
+          }
+      }
+  }
+
+  metadata = {
+      "version": "1.9.0",
+      "profiles": ["host"],
+      "uid": sha2("iis|raw|" + raw_log, variant: "SHA-256"),
+      "log_name": "W3C",
+      "log_provider": "IIS",
+      "product": { "name": "Internet Information Services", "vendor_name": "Microsoft" }
+  }
+
+  if shape == "positional" || shape == "header" || shape == "named" {
+      method = upcase(to_string(get(f, ["cs_method"]) ?? null) ?? "")
+      stem = to_string(get(f, ["cs_uri_stem"]) ?? null) ?? ""
+      query = to_string(get(f, ["cs_uri_query"]) ?? null) ?? ""
+      host = to_string(get(f, ["cs_host"]) ?? null) ?? ""
+      ua_raw = to_string(get(f, ["cs_user_agent"]) ?? null) ?? ""
+      ua = replace(ua_raw, "+", " ")
+      referer = to_string(get(f, ["cs_referer"]) ?? null) ?? ""
+      username = to_string(get(f, ["cs_username"]) ?? null) ?? ""
+      c_ip = downcase(to_string(get(f, ["c_ip"]) ?? null) ?? "")
+      s_ip = downcase(to_string(get(f, ["s_ip"]) ?? null) ?? "")
+      s_port = to_int(get(f, ["s_port"]) ?? null) ?? 0
+      code = to_int(get(f, ["sc_status"]) ?? null) ?? 0
+      sc_bytes = -1
+      if (get(f, ["sc_bytes"]) ?? null) != null { sc_bytes = to_int(get(f, ["sc_bytes"]) ?? null) ?? -1 }
+      cs_bytes = -1
+      if (get(f, ["cs_bytes"]) ?? null) != null { cs_bytes = to_int(get(f, ["cs_bytes"]) ?? null) ?? -1 }
+      taken = -1
+      if (get(f, ["time_taken"]) ?? null) != null { taken = to_int(get(f, ["time_taken"]) ?? null) ?? -1 }
+      version = to_string(get(f, ["cs_version"]) ?? null) ?? ""
+      xff = to_string(get(f, ["x_forwarded_for"]) ?? null) ?? ""
+
+      # ---- time: date + time are UTC in W3C logs ----
+      time_ms = to_unix_timestamp(now(), unit: "milliseconds")
+      d = to_string(get(f, ["date"]) ?? null) ?? ""
+      tm = to_string(get(f, ["time"]) ?? null) ?? ""
+      if d != "" && tm != "" { iso_time = d + "T" + tm + "Z" }
+      if iso_time != "" {
+          ts, tserr = parse_timestamp(iso_time, "%+")
+          if tserr == null { time_ms = to_unix_timestamp(ts, unit: "milliseconds") }
+      }
+      if shape == "positional" {
+          # The parse result of a positional line: the decoded user agent and the
+          # combined UTC clock stand in for the raw tokens.
+          __source_kv = f
+          if ua_raw != "" { __source_kv.cs_user_agent = ua }
+          if iso_time != "" {
+              __discard = del(__source_kv.date)
+              __discard = del(__source_kv.time)
+              __source_kv.timestamp = iso_time
+          }
+      }
+
+      activity_ids = { "CONNECT": 1, "DELETE": 2, "GET": 3, "HEAD": 4, "OPTIONS": 5, "POST": 6, "PUT": 7, "TRACE": 8, "PATCH": 9 }
+      activity_names = { "CONNECT": "Connect", "DELETE": "Delete", "GET": "Get", "HEAD": "Head", "OPTIONS": "Options", "POST": "Post", "PUT": "Put", "TRACE": "Trace", "PATCH": "Patch" }
+      activity_id = int(get(activity_ids, [method]) ?? 99) ?? 99
+      activity_name = string(get(activity_names, [method]) ?? "Other") ?? "Other"
+
+      status_id = 0
+      status_str = "Unknown"
+      severity_id = 1
+      severity = "Informational"
+      if code > 0 && code < 400 { status_id = 1; status_str = "Success" }
+      if code >= 400 { status_id = 2; status_str = "Failure"; severity_id = 2; severity = "Low" }
+      if code >= 500 { severity_id = 3; severity = "Medium" }
+
+      # ---- url ----
+      scheme = "http"
+      if s_port == 443 { scheme = "https" }
+      if stem == "" { stem = "/" }
+      url = { "path": stem }
+      if query != "" { url.query_string = query }
+      # cs-host is the Host header verbatim, so a non-default port rides along
+      # ("app.example.com:8443", "[2001:db8::1]:8443"). Hostname columns get the
+      # bare host; url_string keeps the header as sent.
+      host_name = host
+      hm, hmerr = parse_regex(host, r'^\x5B(?P<h>[0-9A-Fa-f:.]+)\x5D(?::\d+)?$')
+      if hmerr == null {
+          host_name = to_string(hm.h)
+      } else {
+          hm2, hm2err = parse_regex(host, r'^(?P<h>[^:]+):\d+$')
+          if hm2err == null { host_name = to_string(hm2.h) }
+      }
+      if host != "" {
+          url.hostname = downcase(host_name)
+          url.scheme = scheme
+          url.url_string = scheme + "://" + host + stem
+          if query != "" { url.url_string = url.url_string + "?" + query }
+      }
+      if s_port > 0 { url.port = s_port }
+
+      http_request = { "url": url }
+      if method != "" { http_request.http_method = method }
+      if ua != "" { http_request.user_agent = ua }
+      if referer != "" { http_request.referrer = referer }
+      if version != "" { http_request.version = version }
+      if cs_bytes >= 0 { http_request.length = cs_bytes }
+      if xff != "" {
+          xs = []
+          for_each(split(xff, ",")) -> |_i, part| {
+              ip = strip_whitespace(replace(to_string(part), "+", ""))
+              # Proxies (Application Gateway, ARR, F5) often append the client port.
+              xm, xmerr = parse_regex(ip, r'^(?P<ip>(?:[0-9]{1,3}\.){3}[0-9]{1,3}):\d+$')
+              if xmerr == null {
+                  ip = to_string(xm.ip)
+              } else {
+                  xm6, xm6err = parse_regex(ip, r'^\x5B(?P<ip>[0-9A-Fa-f:]+)\x5D(?::\d+)?$')
+                  if xm6err == null { ip = to_string(xm6.ip) }
+              }
+              if match(ip, ip_re) { xs = push(xs, downcase(ip)) }
+          }
+          if length(xs) > 0 { http_request.x_forwarded_for = xs }
+      }
+      http_response = {}
+      if code > 0 { http_response.code = code }
+      if sc_bytes >= 0 { http_response.length = sc_bytes }
+
+      src_endpoint = {}
+      if match(c_ip, ip_re) { src_endpoint.ip = c_ip } else if c_ip != "" { src_endpoint.hostname = c_ip }
+      dst_endpoint = {}
+      if match(s_ip, ip_re) { dst_endpoint.ip = s_ip }
+      if s_port > 0 { dst_endpoint.port = s_port }
+      comp = to_string(get(f, ["s_computername"]) ?? null) ?? ""
+      if comp != "" { dst_endpoint.hostname = comp }
+      site = to_string(get(f, ["s_sitename"]) ?? null) ?? ""
+      if site != "" { dst_endpoint.svc_name = site }
+      if comp == "" && host_name != "" { dst_endpoint.hostname = downcase(host_name) }
+
+      ocsf = {
+          "class_uid": 4002,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": 400200 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "http_request": http_request
+      }
+      if length(keys(http_response)) > 0 { ocsf.http_response = http_response }
+      if code > 0 { ocsf.status_code = to_string(code) }
+      if length(keys(src_endpoint)) > 0 { ocsf.src_endpoint = src_endpoint }
+      if length(keys(dst_endpoint)) > 0 { ocsf.dst_endpoint = dst_endpoint }
+      if username != "" { ocsf.actor = { "user": { "name": username } } }
+      if taken >= 0 { ocsf.duration = taken }
+      traffic = {}
+      if sc_bytes >= 0 { traffic.bytes_in = sc_bytes }
+      if cs_bytes >= 0 { traffic.bytes_out = cs_bytes }
+      if length(keys(traffic)) > 0 { ocsf.traffic = traffic }
+      if shape == "header" {
+          ocsf.metadata.log_format = header
+          ocsf.message = wrapped_line
+      }
+      . = ocsf
+  } else {
+      # ---- directive line or unparseable input: Base Event, never a drop ----
+      time_ms = to_unix_timestamp(now(), unit: "milliseconds")
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata
+      }
+      if shape == "directive" {
+          .metadata.event_code = directive
+          .message = directive_value
+          if directive == "Fields" { .metadata.log_format = directive_value }
+          if directive == "Date" {
+              dts, dterr = parse_timestamp(directive_value, "%Y-%m-%d %H:%M:%S")
+              if dterr == null { .time = to_unix_timestamp(dts, unit: "milliseconds") }
+          }
+      } else {
+          .metadata.log_level = "error"
+          # NAN-5264: explicit fallback marker; nano parser health counts it.
+          . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+      }
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # c_ip: Parser lowercases addresses and the host header; consume only when the normalized value is emitted.
+  # s_ip: Parser lowercases addresses and the host header; consume only when the normalized value is emitted.
+  # cs_host: Parser lowercases addresses and the host header; consume only when the normalized value is emitted.
+  # c-ip: Parser lowercases addresses and the host header; consume only when the normalized value is emitted.
+  # s-ip: Parser lowercases addresses and the host header; consume only when the normalized value is emitted.
+  # cs-host: Parser lowercases addresses and the host header; consume only when the normalized value is emitted.
+  # CIp: Parser lowercases addresses and the host header; consume only when the normalized value is emitted.
+  # SIp: Parser lowercases addresses and the host header; consume only when the normalized value is emitted.
+  # CsHost: Parser lowercases addresses and the host header; consume only when the normalized value is emitted.
+  # timestamp: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # TimeGenerated: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  # EventTime: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        c_ip
+      | s_ip
+      | cs_host
+      | c\-ip
+      | s\-ip
+      | cs\-host
+      | CIp
+      | SIp
+      | CsHost
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        timestamp
+      | TimeGenerated
+      | EventTime
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    \#Fields
+  | CIp
+  | ComputerName
+  | CsBytes
+  | CsHost
+  | CsMethod
+  | CsUriQuery
+  | CsUriStem
+  | CsUsername
+  | EventTime
+  | Referer
+  | SIp
+  | SPort
+  | ScBytes
+  | ScStatus
+  | TimeGenerated
+  | TimeTaken
+  | UserAgent
+  | X\-Forwarded\-For
+  | c\-ip
+  | c_ip
+  | cs\x28Referer\x29
+  | cs\x28User\-Agent\x29
+  | cs\-bytes
+  | cs\-host
+  | cs\-method
+  | cs\-uri\-query
+  | cs\-uri\-stem
+  | cs\-username
+  | cs\-version
+  | cs_bytes
+  | cs_host
+  | cs_method
+  | cs_referer
+  | cs_uri_query
+  | cs_uri_stem
+  | cs_user_agent
+  | cs_username
+  | cs_version
+  | directive
+  | fields
+  | line
+  | log
+  | s\-computername
+  | s\-ip
+  | s\-port
+  | s\-sitename
+  | s_computername
+  | s_ip
+  | s_port
+  | s_sitename
+  | sc\-bytes
+  | sc\-status
+  | sc_bytes
+  | sc_status
+  | time\-taken
+  | time_taken
+  | timestamp
+  | value
+  | x_forwarded_for
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # Microsoft Learn W3C logging example (IIS 6 field set), documentation IPs:
+  # https://learn.microsoft.com/en-us/windows/win32/http/w3c-logging
+  - raw: '2002-05-02 17:42:15 192.0.2.55 - 192.0.2.10 80 GET /images/picture.jpg - 200 Mozilla/4.0+(compatible;MSIE+5.5;+Windows+2000+Server)'
+    expect:
+      class_uid: 4002
+      activity_id: 3
+      http_response.code: 200
+      src_endpoint.ip: 192.0.2.55
+      http_request.user_agent: Mozilla/4.0 (compatible;MSIE 5.5; Windows 2000 Server)
+  # IIS 10 default field set, after Elastic's iis access pipeline fixtures:
+  # https://github.com/elastic/integrations/tree/main/packages/iis/data_stream/access/_dev/test/pipeline
+  - raw: '2026-11-20 09:10:11 192.0.2.10 GET /favicon.ico - 80 - 198.51.100.25 Mozilla/5.0+(Macintosh;+Intel+Mac+OS+X+10.14;+rv:64.0)+Gecko/20100101+Firefox/64.0 http://www.example.com/ 404 0 2 47'
+    expect:
+      class_uid: 4002
+      status_id: 2
+      severity_id: 2
+      duration: 47
+      unmapped.sc_win_32_status: "2"
+  - raw: '2026-11-20 10:25:01 W3SVC2 WEB01 192.0.2.10 PROPFIND /owa/ - 443 - 198.51.100.66 HTTP/1.1 Microsoft-WebDAV-MiniRedir/10.0.19045 - - mail.example.com 401 2 5 1293 512 15 203.0.113.9'
+    expect:
+      class_uid: 4002
+      dst_endpoint.hostname: WEB01
+      http_request.url.url_string: https://mail.example.com/owa/
+      http_request.x_forwarded_for.0: 203.0.113.9
+      traffic.bytes_in: 1293
+  - raw: '#Fields: date time s-ip cs-method cs-uri-stem cs-uri-query s-port cs-username c-ip cs(User-Agent) cs(Referer) sc-status sc-substatus sc-win32-status time-taken'
+    expect:
+      class_uid: 0
+      metadata.event_code: Fields
+  - raw: 'this is not an IIS log line'
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: unparsable input
+  # Review fix: cs-host with a port and X-Forwarded-For entries with client ports.
+  - raw: "2026-11-20 11:02:44 W3SVC3 WEB02 192.0.2.10 GET /api/orders id=42 8443 - 198.51.100.40 HTTP/1.1 Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64) - - app.example.com:8443 200 0 0 5120 610 31 198.51.100.77:54321"
+    expect:
+      class_uid: 4002
+      "http_request.url.hostname": "app.example.com"
+      "http_request.url.url_string": "http://app.example.com:8443/api/orders?id=42"
+      "http_request.x_forwarded_for.0": "198.51.100.77"
+      "dst_endpoint.hostname": "WEB02"
+  - raw: "2026-11-20 11:03:10 W3SVC3 - 192.0.2.10 GET /health - 8443 - 198.51.100.41 HTTP/1.1 kube-probe/1.29 - - [2001:db8::10]:8443 200 0 0 2 180 1 [2001:db8::77]:50123"
+    expect:
+      "http_request.url.hostname": "2001:db8::10"
+      "dst_endpoint.hostname": "2001:db8::10"
+      "http_request.x_forwarded_for.0": "2001:db8::77"
