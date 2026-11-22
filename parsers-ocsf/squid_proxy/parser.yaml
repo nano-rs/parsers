@@ -24,8 +24,11 @@ parser_vrl: |
   # Format: time elapsed remotehost code/status bytes method URL rfc931
   #         peerstatus/peerhost type ["referrer"]
 
-  raw_log = strip_whitespace(string!(.message))
-  __raw_body = raw_log
+  # raw_data is the original line, untouched; parsing works on a trimmed,
+  # whitespace-collapsed copy.
+  raw_in = string!(.message)
+  raw_log = strip_whitespace(raw_in)
+  __raw_body = raw_in
   __source_kv = {}
   raw_log = replace(raw_log, r'\s+', " ")
 
@@ -198,7 +201,7 @@ parser_vrl: |
           "disposition": disposition_name,
           "time": time_ms,
           "duration": duration_ms,
-          "raw_data": raw_log,
+          "raw_data": raw_in,
           "metadata": {
               "version": "1.9.0",
               "uid": sha2("squid_proxy|raw|" + raw_log, variant: "SHA-256"),
@@ -238,7 +241,7 @@ parser_vrl: |
           "status_id": 0,
           "status": "Unknown",
           "time": 0,
-          "raw_data": raw_log,
+          "raw_data": raw_in,
           "metadata": {
               "version": "1.9.0",
               "uid": sha2("squid_proxy|raw|" + raw_log, variant: "SHA-256"),
