@@ -39,12 +39,23 @@ Target paths drop array indices (`resources.uid` covers every resource), and
 targets. A human-readable mapped message is a target like any other.
 
 `field_coverage_check.py` verifies every declaration by provenance: in at
-least one sample, perturbing the source value (a small shape-preserving
-change, exactly that source field and nothing else) must move the value at the
-declared target with it. A declaration that only matches by coincidence, or
-that no sample exercises, fails the parser. `scripts/infer_mappings.py
-<parser>` writes the declarations the same way (review its output);
-`--all-keys` considers every captured key for a new parser.
+least one sample, replacing that source value with a fresh random sentinel of
+the same type and shape (drawn per run, so it cannot coincide with anything
+the parser holds; a clock moves by whole seconds, a `scale` source by more
+than one unit of the result) must move the value at the declared target from
+the old value to exactly the sentinel, converted by the rule if there is one.
+Lists are compared element by element as multisets, so a static list never
+passes. Only that source field may change (a longer text containing it, such
+as a raw message, may change with it). A declaration that only matches by
+coincidence, or that no sample exercises, fails the parser.
+`scripts/infer_mappings.py <parser>` writes the declarations the same way
+(review its output); `--all-keys` considers every captured key for a new
+parser. Set `PROVENANCE_SEED` to reproduce a run.
+
+Source keys are flattened with escaped segments: a nested path is `a.b`, a
+literal dotted key is `a~1b` (and a literal `~` is `~0`), so the two are
+different fields, mapped and spilled independently. Declare a literal dotted
+key in its escaped form.
 
 Every additional normalization has a per-parser `field-coverage.yaml` entry:
 source path, transform kind, destination path, and a one-line reason.

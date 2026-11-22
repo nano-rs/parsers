@@ -754,6 +754,22 @@ parser_vrl: |
       }
   }
   __consumed = ""
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
   # BEGIN parser-specific transformations
   # CreatedAt: Successful ISO timestamp conversion to the emitted millisecond clock.
   # UpdatedAt: Successful ISO timestamp conversion to the emitted millisecond clock.
@@ -771,7 +787,7 @@ parser_vrl: |
   # ProductFields.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV6: Parser lowercases the GuardDuty IPv6 address; consume only when the normalized value is emitted.
   # ProductFields.aws/guardduty/service/action/networkConnectionAction/localIpDetails/ipAddressV6: Parser lowercases the GuardDuty IPv6 address; consume only when the normalized value is emitted.
   # ProductFields.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/ipAddressV6: Parser lowercases the GuardDuty IPv6 address; consume only when the normalized value is emitted.
-  for_each(flatten(__source_kv)) -> |key, value| {
+  for_each(__flat) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
         CreatedAt
@@ -945,28 +961,13 @@ parser_vrl: |
   __decl = "\n\"Action.ActionType\"\t[\"evidences.name\"]\n\"Action.AwsApiCallAction.Api\"\t[\"api.operation\",\"evidences.api.operation\"]\n\"Action.AwsApiCallAction.RemoteIpDetails.Country.CountryName\"\t[\"evidences.src_endpoint.location.country\"]\n\"Action.AwsApiCallAction.RemoteIpDetails.IpAddressV4\"\t[\"evidences.src_endpoint.ip\"]\n\"Action.AwsApiCallAction.RemoteIpDetails.Organization.Asn\"\t[\"evidences.src_endpoint.autonomous_system.number\"]\n\"Action.AwsApiCallAction.RemoteIpDetails.Organization.AsnOrg\"\t[\"evidences.src_endpoint.autonomous_system.name\"]\n\"Action.AwsApiCallAction.ServiceName\"\t[\"api.service.name\",\"evidences.api.service.name\"]\n\"AwsAccountId\"\t[\"cloud.account.uid\"]\n\"CompanyName\"\t[\"finding_info.product.vendor_name\"]\n\"Compliance.RelatedRequirements\"\t[\"compliance.requirements\"]\n\"Compliance.SecurityControlId\"\t[\"compliance.control\"]\n\"Compliance.Status\"\t[\"compliance.status\"]\n\"Confidence\"\t[\"confidence_score\"]\n\"Description\"\t[\"finding_info.desc\",\"vulnerabilities.desc\"]\n\"GeneratorId\"\t[\"finding_info.analytic.name\",\"finding_info.analytic.uid\"]\n\"Id\"\t[\"finding_info.uid\",\"metadata.original_event_uid\",\"vulnerabilities.advisory.uid\"]\n\"Note.Text\"\t[\"comment\"]\n\"Process.Name\"\t[\"actor.process.name\",\"evidences.process.name\"]\n\"Process.ParentPid\"\t[\"actor.process.parent_process.pid\"]\n\"Process.Path\"\t[\"actor.process.file.path\",\"evidences.process.file.path\"]\n\"Process.Pid\"\t[\"actor.process.pid\"]\n\"ProductArn\"\t[\"finding_info.product.uid\",\"finding_info.product_uid\"]\n\"ProductFields.aws/guardduty/service/action/actionType\"\t[\"evidences.name\"]\n\"ProductFields.aws/guardduty/service/action/awsApiCallAction/api\"\t[\"api.operation\",\"evidences.api.operation\"]\n\"ProductFields.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/ipAddressV6\"\t[\"evidences.src_endpoint.ip\"]\n\"ProductFields.aws/guardduty/service/action/awsApiCallAction/serviceName\"\t[\"api.service.name\",\"evidences.api.service.name\"]\n\"ProductFields.aws/guardduty/service/action/networkConnectionAction/localIpDetails/ipAddressV4\"\t[\"evidences.dst_endpoint.ip\"]\n\"ProductFields.aws/guardduty/service/action/networkConnectionAction/localPortDetails/port\"\t[\"evidences.dst_endpoint.port\"]\n\"ProductFields.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/city/cityName\"\t[\"evidences.src_endpoint.location.city\"]\n\"ProductFields.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/country/countryName\"\t[\"evidences.src_endpoint.location.country\"]\n\"ProductFields.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV4\"\t[\"evidences.src_endpoint.ip\"]\n\"ProductFields.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/asn\"\t[\"evidences.src_endpoint.autonomous_system.number\"]\n\"ProductFields.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/asnOrg\"\t[\"evidences.src_endpoint.autonomous_system.name\"]\n\"ProductFields.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/isp\"\t[\"evidences.src_endpoint.isp\"]\n\"ProductFields.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/org\"\t[\"evidences.src_endpoint.isp_org\"]\n\"ProductFields.aws/guardduty/service/action/networkConnectionAction/remotePortDetails/port\"\t[\"evidences.src_endpoint.port\"]\n\"ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localIpDetails/ipAddressV4\"\t[\"evidences.dst_endpoint.ip\"]\n\"ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localPortDetails/port\"\t[\"evidences.dst_endpoint.port\"]\n\"ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/city/cityName\"\t[\"evidences.src_endpoint.location.city\"]\n\"ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/country/countryName\"\t[\"evidences.src_endpoint.location.country\"]\n\"ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/ipAddressV4\"\t[\"evidences.src_endpoint.ip\"]\n\"ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/asn\"\t[\"evidences.src_endpoint.autonomous_system.number\"]\n\"ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/asnOrg\"\t[\"evidences.src_endpoint.autonomous_system.name\"]\n\"ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/isp\"\t[\"evidences.src_endpoint.isp\"]\n\"ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/org\"\t[\"evidences.src_endpoint.isp_org\"]\n\"ProductFields.aws/securityhub/CompanyName\"\t[\"finding_info.product.vendor_name\"]\n\"ProductFields.aws/securityhub/ProductName\"\t[\"finding_info.data_sources\",\"finding_info.product.name\",\"metadata.product.feature.name\"]\n\"ProductName\"\t[\"finding_info.data_sources\",\"finding_info.product.name\",\"metadata.product.feature.name\"]\n\"Region\"\t[\"cloud.region\"]\n\"Remediation.Recommendation.Text\"\t[\"remediation.desc\",\"vulnerabilities.remediation.desc\"]\n\"Remediation.Recommendation.Url\"\t[\"remediation.references\",\"vulnerabilities.remediation.references\"]\n\"SchemaVersion\"\t[\"metadata.log_version\"]\n\"SourceUrl\"\t[\"finding_info.src_url\"]\n\"Title\"\t[\"finding_info.title\",\"message\",\"vulnerabilities.advisory.title\",\"vulnerabilities.title\"]\n\"Types\"\t[\"finding_info.types\"]\n"
   __preserve = []
   # END parser-specific transformations
-  # Escape literal dots before flattening so dotted source keys cannot overwrite
-  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
-  # In compact JSON only an object key is followed by ':', so a source whose text
-  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
-  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
-  __escaped = object!(__copy.source)
-  __tilde = false
-  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
-      __escaped = map_keys(__escaped, recursive: true) -> |key| {
-          replace(replace(key, "~", "~0"), ".", "~1")
-      }
-      # Keys without a "~" decode to themselves, including the object keys inside
-      # an array that flatten leaves escaped; encode_json never escapes a "~".
-      __tilde = contains(encode_json(__escaped), "~")
-  }
-  __flat = flatten(__escaped)
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
   # target paths + "\n" per mapped source key (a raw newline never occurs in
   # compact JSON). A key is consumed when its value, or every element of a scalar
-  # array, is at one of its own targets.
+  # array, is at one of its own targets. Keys stay ESCAPED here and in __consumed:
+  # a literal dotted key ("a~1b") and the nested path ("a.b") are different
+  # fields, and mapping one never consumes the other.
   for_each(__flat) -> |key, value| {
-      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
       # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
       __kt = encode_json(key)
       if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
@@ -1004,7 +1005,6 @@ parser_vrl: |
   __names = {}
   if __distinct {
       __kept = filter(__flat) -> |key, value| {
-          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
           # A key is kept unless an explicit mapping or transformation consumed it.
           # Do not spill a copy of the raw body.
           value != __raw_body && !contains(__consumed, "," + encode_json(key))
@@ -1038,13 +1038,13 @@ parser_vrl: |
       # Slow path, in source key order: a name already taken gets the next free
       # _2, _3, ... suffix.
       for_each(__flat) -> |key, value| {
+          __token = "," + encode_json(key)
           key = replace(replace(key, "~1", "."), "~0", "~")
           if is_array(value) || is_object(value) {
               value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
                   replace(replace(inner, "~1", "."), "~0", "~")
               }, ["v"])
           }
-          __token = "," + encode_json(key)
           if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")

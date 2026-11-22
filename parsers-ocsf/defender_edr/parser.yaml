@@ -691,6 +691,22 @@ parser_vrl: |
       }
   }
   __consumed = ""
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
   # BEGIN parser-specific transformations
   # DeviceName: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
   # DeviceName: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
@@ -718,12 +734,13 @@ parser_vrl: |
   # RemoteDeviceName: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
   # MacAddress: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
   # MacAddress: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
+  # Timestamp: ISO clock converted to epoch milliseconds; only the selected successful clock is consumed.
   # LogonType: Authentication branch translates Defender logon names into OCSF logon_type_id.
   # Protocol: Network branch translates protocol names to IANA numbers.
   # RemediationAction: Finding branch maps remediation to security-control disposition.
   # AlertState: Finding branch normalizes the finding lifecycle state.
   # Severity: Vendor severity is normalized to the OCSF severity enumeration.
-  for_each(flatten(__source_kv)) -> |key, value| {
+  for_each(__flat) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
         DeviceName
@@ -923,6 +940,17 @@ parser_vrl: |
       }
       if match(key, r'(?x)
       \A(?:
+        Timestamp
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
         LogonType
       )\z') {
           __value = value
@@ -986,28 +1014,13 @@ parser_vrl: |
   __decl = "\n\"AccountName\"\t[\"process.user.name\",\"user.name\"]\n\"AccountSid\"\t[\"process.user.uid\",\"user.uid\"]\n\"ActionType\"\t[\"finding_info.types\",\"metadata.event_code\"]\n\"AlertId\"\t[\"finding_info.uid\",\"metadata.correlation_uid\",\"metadata.original_event_uid\"]\n\"Category\"\t[\"finding_info.analytic.uid\"]\n\"DetectionSource\"\t[\"finding_info.analytic.name\"]\n\"DeviceId\"\t[\"device.uid\",\"evidences.device.uid\"]\n\"DeviceName\"\t[\"device.hostname\",\"device.network_interfaces.hostname\",\"dst_endpoint.hostname\",\"evidences.device.hostname\",\"src_endpoint.hostname\"]\n\"DnsQueryResult\"\t[\"answers.rdata\"]\n\"FileName\"\t[\"evidences.file.name\",\"file.name\",\"process.file.name\",\"process.name\"]\n\"FileSize\"\t[\"file.size\"]\n\"FolderPath\"\t[\"evidences.file.path\",\"file.path\",\"process.file.path\"]\n\"InitiatingProcessAccountName\"\t[\"actor.user.name\"]\n\"InitiatingProcessCommandLine\"\t[\"actor.process.cmd_line\",\"evidences.actor.process.cmd_line\"]\n\"InitiatingProcessFileName\"\t[\"actor.process.file.name\",\"actor.process.name\",\"evidences.actor.process.file.name\",\"evidences.actor.process.name\",\"process.file.name\",\"process.name\"]\n\"InitiatingProcessFolderPath\"\t[\"actor.process.file.path\",\"evidences.actor.process.file.path\"]\n\"InitiatingProcessId\"\t[\"actor.process.pid\",\"evidences.actor.process.pid\",\"process.pid\"]\n\"InitiatingProcessSHA256\"\t[\"actor.process.file.hashes.value\"]\n\"LocalIP\"\t[\"src_endpoint.ip\"]\n\"LocalPort\"\t[\"src_endpoint.port\"]\n\"LogonId\"\t[\"session.uid\"]\n\"LogonType\"\t[\"logon_type\"]\n\"MacAddress\"\t[\"device.mac\",\"device.network_interfaces.mac\"]\n\"NetworkAdapterName\"\t[\"device.network_interfaces.name\"]\n\"ProcessCommandLine\"\t[\"process.cmd_line\"]\n\"ProcessId\"\t[\"process.pid\"]\n\"RegistryKey\"\t[\"reg_key.path\",\"reg_value.path\"]\n\"RegistryValueData\"\t[\"reg_value.data\"]\n\"RegistryValueName\"\t[\"reg_value.name\"]\n\"RemoteIP\"\t[\"dst_endpoint.ip\",\"src_endpoint.ip\"]\n\"RemotePort\"\t[\"dst_endpoint.port\"]\n\"RemoteUrl\"\t[\"dst_endpoint.hostname\",\"query.hostname\"]\n\"ReportId\"\t[\"metadata.original_event_uid\"]\n\"ThreatName\"\t[\"malware.name\"]\n\"Title\"\t[\"finding_info.title\"]\n"
   __preserve = []
   # END parser-specific transformations
-  # Escape literal dots before flattening so dotted source keys cannot overwrite
-  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
-  # In compact JSON only an object key is followed by ':', so a source whose text
-  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
-  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
-  __escaped = object!(__copy.source)
-  __tilde = false
-  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
-      __escaped = map_keys(__escaped, recursive: true) -> |key| {
-          replace(replace(key, "~", "~0"), ".", "~1")
-      }
-      # Keys without a "~" decode to themselves, including the object keys inside
-      # an array that flatten leaves escaped; encode_json never escapes a "~".
-      __tilde = contains(encode_json(__escaped), "~")
-  }
-  __flat = flatten(__escaped)
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
   # target paths + "\n" per mapped source key (a raw newline never occurs in
   # compact JSON). A key is consumed when its value, or every element of a scalar
-  # array, is at one of its own targets.
+  # array, is at one of its own targets. Keys stay ESCAPED here and in __consumed:
+  # a literal dotted key ("a~1b") and the nested path ("a.b") are different
+  # fields, and mapping one never consumes the other.
   for_each(__flat) -> |key, value| {
-      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
       # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
       __kt = encode_json(key)
       if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
@@ -1045,7 +1058,6 @@ parser_vrl: |
   __names = {}
   if __distinct {
       __kept = filter(__flat) -> |key, value| {
-          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
           # A key is kept unless an explicit mapping or transformation consumed it.
           # Do not spill a copy of the raw body.
           value != __raw_body && !contains(__consumed, "," + encode_json(key))
@@ -1079,13 +1091,13 @@ parser_vrl: |
       # Slow path, in source key order: a name already taken gets the next free
       # _2, _3, ... suffix.
       for_each(__flat) -> |key, value| {
+          __token = "," + encode_json(key)
           key = replace(replace(key, "~1", "."), "~0", "~")
           if is_array(value) || is_object(value) {
               value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
                   replace(replace(inner, "~1", "."), "~0", "~")
               }, ["v"])
           }
-          __token = "," + encode_json(key)
           if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")

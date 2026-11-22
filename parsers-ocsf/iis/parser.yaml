@@ -402,6 +402,22 @@ parser_vrl: |
       }
   }
   __consumed = ""
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
   # BEGIN parser-specific transformations
   # c_ip: Parser lowercases addresses and the host header; consume only when the normalized value is emitted.
   # s_ip: Parser lowercases addresses and the host header; consume only when the normalized value is emitted.
@@ -411,7 +427,7 @@ parser_vrl: |
   # CIp: Parser lowercases addresses and the host header; consume only when the normalized value is emitted.
   # CsHost: Parser lowercases addresses and the host header; consume only when the normalized value is emitted.
   # TimeGenerated: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-  for_each(flatten(__source_kv)) -> |key, value| {
+  for_each(__flat) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
         c_ip
@@ -462,28 +478,13 @@ parser_vrl: |
   __decl = "\n\"CIp\"\t[\"src_endpoint.ip\"]\n\"ComputerName\"\t[\"dst_endpoint.hostname\"]\n\"CsBytes\"\t[\"http_request.length\",\"traffic.bytes_out\"]\n\"CsHost\"\t[\"http_request.url.hostname\"]\n\"CsMethod\"\t[\"http_request.http_method\"]\n\"CsUriStem\"\t[\"http_request.url.path\"]\n\"SPort\"\t[\"dst_endpoint.port\",\"http_request.url.port\"]\n\"ScBytes\"\t[\"http_response.length\",\"traffic.bytes_in\"]\n\"ScStatus\"\t[\"http_response.code\",\"status_code\"]\n\"TimeTaken\"\t[\"duration\"]\n\"UserAgent\"\t[\"http_request.user_agent\"]\n\"c-ip\"\t[\"src_endpoint.ip\"]\n\"c_ip\"\t[\"src_endpoint.ip\"]\n\"cs\\u0028User-Agent\\u0029\"\t[\"http_request.user_agent\"]\n\"cs-method\"\t[\"http_request.http_method\"]\n\"cs-uri-query\"\t[\"http_request.url.query_string\"]\n\"cs-uri-stem\"\t[\"http_request.url.path\"]\n\"cs_bytes\"\t[\"http_request.length\",\"traffic.bytes_out\"]\n\"cs_host\"\t[\"http_request.url.hostname\"]\n\"cs_method\"\t[\"http_request.http_method\"]\n\"cs_referer\"\t[\"http_request.referrer\"]\n\"cs_uri_query\"\t[\"http_request.url.query_string\"]\n\"cs_uri_stem\"\t[\"http_request.url.path\"]\n\"cs_user_agent\"\t[\"http_request.user_agent\"]\n\"cs_username\"\t[\"actor.user.name\"]\n\"cs_version\"\t[\"http_request.version\"]\n\"directive\"\t[\"metadata.event_code\"]\n\"fields\"\t[\"metadata.log_format\"]\n\"line\"\t[\"message\"]\n\"s-ip\"\t[\"dst_endpoint.ip\"]\n\"s-port\"\t[\"dst_endpoint.port\",\"http_request.url.port\"]\n\"s_computername\"\t[\"dst_endpoint.hostname\"]\n\"s_ip\"\t[\"dst_endpoint.ip\"]\n\"s_port\"\t[\"dst_endpoint.port\",\"http_request.url.port\"]\n\"s_sitename\"\t[\"dst_endpoint.svc_name\"]\n\"sc-status\"\t[\"http_response.code\",\"status_code\"]\n\"sc_bytes\"\t[\"http_response.length\",\"traffic.bytes_in\"]\n\"sc_status\"\t[\"http_response.code\",\"status_code\"]\n\"time-taken\"\t[\"duration\"]\n\"time_taken\"\t[\"duration\"]\n\"value\"\t[\"message\",\"metadata.log_format\"]\n\"x_forwarded_for\"\t[\"http_request.x_forwarded_for\"]\n"
   __preserve = []
   # END parser-specific transformations
-  # Escape literal dots before flattening so dotted source keys cannot overwrite
-  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
-  # In compact JSON only an object key is followed by ':', so a source whose text
-  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
-  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
-  __escaped = object!(__copy.source)
-  __tilde = false
-  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
-      __escaped = map_keys(__escaped, recursive: true) -> |key| {
-          replace(replace(key, "~", "~0"), ".", "~1")
-      }
-      # Keys without a "~" decode to themselves, including the object keys inside
-      # an array that flatten leaves escaped; encode_json never escapes a "~".
-      __tilde = contains(encode_json(__escaped), "~")
-  }
-  __flat = flatten(__escaped)
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
   # target paths + "\n" per mapped source key (a raw newline never occurs in
   # compact JSON). A key is consumed when its value, or every element of a scalar
-  # array, is at one of its own targets.
+  # array, is at one of its own targets. Keys stay ESCAPED here and in __consumed:
+  # a literal dotted key ("a~1b") and the nested path ("a.b") are different
+  # fields, and mapping one never consumes the other.
   for_each(__flat) -> |key, value| {
-      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
       # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
       __kt = encode_json(key)
       if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
@@ -521,7 +522,6 @@ parser_vrl: |
   __names = {}
   if __distinct {
       __kept = filter(__flat) -> |key, value| {
-          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
           # A key is kept unless an explicit mapping or transformation consumed it.
           # Do not spill a copy of the raw body.
           value != __raw_body && !contains(__consumed, "," + encode_json(key))
@@ -555,13 +555,13 @@ parser_vrl: |
       # Slow path, in source key order: a name already taken gets the next free
       # _2, _3, ... suffix.
       for_each(__flat) -> |key, value| {
+          __token = "," + encode_json(key)
           key = replace(replace(key, "~1", "."), "~0", "~")
           if is_array(value) || is_object(value) {
               value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
                   replace(replace(inner, "~1", "."), "~0", "~")
               }, ["v"])
           }
-          __token = "," + encode_json(key)
           if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")
