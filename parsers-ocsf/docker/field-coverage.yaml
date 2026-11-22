@@ -1,20 +1,31 @@
-source: text
-transforms: []
-consumed_candidates:
-- component
-- container
-- level
-- log
-- log.level
-- log.levelname
-- log.lvl
-- log.message
-- log.msg
-- log.severity
-- msg
-- syslog_app
-- syslog_host
-- time
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+source: mixed
+source_normalize:
+- kind: parse_json_object
+  paths:
+  - log
+  target: log_json
+  reason: A JSON application body in the driver record's `log` is moved, parsed, to log_json so its fields
+    map or spill one by one; the line itself stays in raw_data.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  log:
+  - message
+  time:
+  - metadata.original_time
+  log_json.level:
+  - metadata.log_level
+  log_json.msg:
+  - message
+  level:
+  - metadata.log_level
+  msg:
+  - message
+  syslog_host:
+  - device.hostname
+  component:
+  - metadata.log_name
+  container:
+  - device.container.uid
+  - device.instance_uid

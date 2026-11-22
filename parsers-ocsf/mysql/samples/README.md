@@ -19,4 +19,6 @@ documentation values (192.0.2.0/24, 198.51.100.0/24).
 | `genlog_connect_proxy_user.json` | General log Connect with the proxy clause (`user@host as proxied on db`): https://dev.mysql.com/doc/refman/8.4/en/proxy-users.html |
 | `audit_enterprise_query_data.json` | Enterprise Audit `class: query` record (`query_data`), same format page |
 | `genlog_long_query_truncated.json`, `slowlog_long_query_truncated.json` | Synthetic 12 KB bulk INSERT: query_info.query_string holds the whole statement, never truncated |
+| `slowlog_admin_command_mariadb.json` | MariaDB slow log entry for `# administrator command: Quit;` with `# Schema:`, `Last_errno`, `Killed`, `Rows_affected`, `Bytes_sent` headers (https://mariadb.com/kb/en/slow-query-log-extended-statistics/): every header kept |
+| `empty_message.json` | Empty `message`: raw_data stays the empty string |
 | `junk.json` | Malformed input; must fall back without aborting |

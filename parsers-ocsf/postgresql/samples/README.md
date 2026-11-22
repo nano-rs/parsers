@@ -18,4 +18,7 @@ and users are documentation values (192.0.2.0/24, 198.51.100.0/24).
 | `stderr_est_timezone.json` | `%m` with a named `log_timezone` abbreviation (EST) |
 | `stderr_long_statement_truncated.json` | Synthetic 12 KB bulk INSERT: query_info.query_string and message hold the whole statement, never truncated |
 | `rds_prefix_ipv6_auth_failed.json` | Amazon RDS default prefix with an IPv6 client (`%t:%r:` reads `UTC:2001:db8::1(port):`) |
+| `stderr_multiline_context_query_location.json` | stderr ERROR with tab-continued DETAIL and HINT, CONTEXT, QUERY, STATEMENT and LOCATION lines (elog.c order, https://www.postgresql.org/docs/current/runtime-config-logging.html): each section kept whole, none bleeds into the statement |
+| `csvlog_bare_ipv6_same_db_user.json` | csvlog with a bare IPv6 `connection_from` (no port) and dbname equal to the user: the IP is not split and dbname is kept |
+| `empty_message.json` | Empty `message`: raw_data stays the empty string |
 | `junk.json` | Malformed input; must fall back without aborting |

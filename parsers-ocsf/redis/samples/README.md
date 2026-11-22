@@ -13,4 +13,5 @@ Each file is one input event. Addresses are documentation values
 | `monitor_config_requirepass.json`, `monitor_acl_setuser.json` | MONITOR lines carrying credentials; the full command, arguments included, is query_info.query_string (parsers never mask) |
 | `monitor_long_set.json` | Synthetic 9 KB SET payload: query_info.query_string holds the whole command, never truncated |
 | `monitor_config_primaryauth.json` | Valkey `CONFIG SET primaryauth` (replication password, Valkey `src/config.c`); mapped as-is like any command |
+| `empty_message.json` | Empty `message`: raw_data stays the empty string |
 | `junk.json` | Malformed input; must fall back without aborting |

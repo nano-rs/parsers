@@ -1,52 +1,71 @@
 source: mixed
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
 transforms:
-- source: query_time
-  kind: scale
-  factor: 1000
-  target: duration
-  reason: Slow log Query_time in seconds converted to the OCSF millisecond duration.
 - source: timestamp
   kind: scale
   factor: 1000
   target: time
   reason: Slow log SET timestamp Unix seconds converted to event milliseconds.
-consumed_candidates:
-- account.host
-- account.user
-- argument
-- audit_record.command_class
-- audit_record.connection_id
-- audit_record.db
-- audit_record.ip
-- audit_record.sqltext
-- audit_record.status
-- audit_record.timestamp
-- audit_record.user
-- class
-- connection_data.db
-- connection_data.status
-- connection_id
-- db
-- err_code
-- general_data.query
-- general_data.sql_command
-- general_data.status
-- host
-- id
-- ip
-- label
-- login.ip
-- login.user
-- msg
-- priv_user
-- query_data.query
-- query_data.sql_command
-- query_data.status
-- statement
-- thread
-- time
-- timestamp
-- user
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings:
+  err_code:
+  - status_code
+  label:
+  - metadata.log_level
+  msg:
+  - message
+  thread:
+  - actor.session.uid
+  - session.uid
+  time:
+  - metadata.original_time
+  argument:
+  - database.name
+  - message
+  - query_info.query_string
+  db:
+  - database.name
+  id:
+  - actor.session.uid
+  ip:
+  - src_endpoint.ip
+  priv_user:
+  - actor.user.name
+  statement:
+  - query_info.query_string
+  timestamp:
+  - metadata.original_time
+  user:
+  - actor.user.name
+  connection_data.status:
+  - status_code
+  connection_id:
+  - actor.session.uid
+  - session.uid
+  login.ip:
+  - src_endpoint.ip
+  login.user:
+  - actor.user.name
+  - user.name
+  audit_record.connection_id:
+  - actor.session.uid
+  - session.uid
+  audit_record.db:
+  - database.name
+  audit_record.ip:
+  - src_endpoint.ip
+  audit_record.sqltext:
+  - query_info.query_string
+  audit_record.status:
+  - status_code
+  audit_record.timestamp:
+  - metadata.original_time
+  audit_record.user:
+  - user.name
+  query_data.query:
+  - query_info.query_string
+  general_data.query:
+  - query_info.query_string
+  thread_id:
+  - actor.session.uid
