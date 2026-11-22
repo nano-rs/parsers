@@ -53,6 +53,15 @@ UNVALIDATED=0
 UNVALIDATED_NAMES=""
 UNQUERYABLE=0
 
+# One private scratch directory per run, removed on any exit. The per-parser
+# files live inside it under fixed names. `mktemp` is never given a template
+# with a suffix after the X's (e.g. /tmp/ocsf_vrl_XXXXXXXXXX.vrl): BSD mktemp
+# (macOS) does not fill in such a template, so it created that literal path and
+# the second parser of a run died with "File exists", and two concurrent runs
+# shared the same file. A plain `mktemp -d` template works on GNU and BSD.
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/validate_ocsf.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+
 # ---- work out which parsers to check -------------------------------------
 PARSERS=()
 if [ "$#" -eq 0 ]; then
@@ -125,7 +134,7 @@ for parser_file in "${PARSERS[@]}"; do
         FAIL=$((FAIL + 1))
         continue
     fi
-    vrl_file=$(mktemp /tmp/ocsf_vrl_XXXXXXXXXX.vrl)
+    vrl_file="$WORK/program.vrl"
     printf '%s\n' "$vrl_program" > "$vrl_file"
 
     # ---- samples ----
@@ -141,9 +150,10 @@ for parser_file in "${PARSERS[@]}"; do
             find "$parser_dir/samples" -name '*.json' | sort
         )
     fi
-    inline_dir=""
+    inline_dir="$WORK/inline"
+    rm -rf "$inline_dir"
     if [ "${#samples[@]}" -eq 0 ]; then
-        inline_dir=$(mktemp -d "${TMPDIR:-/tmp}/nano_inline.XXXXXX")
+        mkdir "$inline_dir"
         if python3 "$CHECKS" extract-inline "$parser_file" "$inline_dir" 2>/dev/null; then
             while IFS= read -r s; do samples+=("$s"); done < <(
                 find "$inline_dir" -name '*.json' | sort
@@ -155,17 +165,16 @@ for parser_file in "${PARSERS[@]}"; do
         echo "    UNVALIDATED: no samples — add parsers-ocsf/$(basename "$parser_dir")/samples/*.json or a samples: block"
         UNVALIDATED=$((UNVALIDATED + 1))
         UNVALIDATED_NAMES="${UNVALIDATED_NAMES}${parser_name} "
-        rm -f "$vrl_file"; [ -n "$inline_dir" ] && rm -rf "$inline_dir"
         if [ "$parser_failed" -eq 1 ]; then FAIL=$((FAIL + 1)); fi
         continue
     fi
 
     for sample in "${samples[@]}"; do
         label="$(basename "$sample")"
-        event_file=$(mktemp /tmp/ocsf_event_XXXXXXXXXX.json)
+        event_file="$WORK/event.json"
         python3 "$CHECKS" wrap "$sample" > "$event_file"
 
-        out_file=$(mktemp /tmp/ocsf_out_XXXXXXXXXX.json)
+        out_file="$WORK/out.json"
         # `vector vrl` exits 0 even when the program aborts at runtime, so the
         # exit code is not the signal — an aborted run emits no object at all.
         if ! vector vrl --input "$event_file" --program "$vrl_file" 2>/dev/null \
@@ -194,7 +203,6 @@ for parser_file in "${PARSERS[@]}"; do
                 UNQUERYABLE=$((UNQUERYABLE + 1))
             fi
         fi
-        rm -f "$event_file" "$out_file"
     done
 
     if [ "$parser_failed" -eq 1 ]; then
@@ -204,7 +212,6 @@ for parser_file in "${PARSERS[@]}"; do
         PASS=$((PASS + 1))
         echo "    RESULT: PASS (${#samples[@]} sample(s))"
     fi
-    rm -f "$vrl_file"; [ -n "$inline_dir" ] && rm -rf "$inline_dir"
 done
 
 echo ""
