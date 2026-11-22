@@ -208,7 +208,7 @@ parser_vrl: |
           if mo != "" { off = mo }
           if match(tz, r'^[+-]\d{2}$') { off = tz + "00" }
           if match(tz, r'^[+-]\d{2}:?\d{2}$') { off = replace(tz, ":", "") }
-          t, terr = parse_timestamp((string(tp.d) ?? "") + " " + (string(tp.t) ?? "") + " " + off, "%Y-%m-%d %H:%M:%S%.f %z")
+          t, terr = parse_timestamp((string(tp.d) ?? "") + " " + (string(tp.t) ?? "") + " " + off, "%Y-%m-%d %H:%M:%S%.f %z", timezone: "UTC")
           if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
       }
   }
@@ -494,11 +494,6 @@ parser_vrl: |
       }
   }
   __consumed = ""
-  # BEGIN parser-specific transformations
-  # Declared source -> target mappings (field-coverage.yaml `mappings`).
-  __decl = "\n\"error_severity\"\t[\"metadata.log_level\"]\n\"message\"\t[\"message\"]\n\"pid\"\t[\"actor.process.pid\"]\n\"timestamp\"\t[\"metadata.original_time\"]\n\"dbname\"\t[\"database.name\"]\n\"user\"\t[\"actor.user.name\",\"user.name\"]\n\"detail\"\t[\"status_detail\"]\n\"statement\"\t[\"query_info.query_string\"]\n\"connection_from\"\t[\"src_endpoint.ip\"]\n\"query_id\"\t[\"query_info.uid\"]\n\"session_id\"\t[\"actor.session.uid\",\"metadata.correlation_uid\",\"session.uid\"]\n\"state_code\"\t[\"status_code\"]\n\"application_name\"\t[\"src_endpoint.svc_name\"]\n\"remote_host\"\t[\"src_endpoint.ip\"]\n\"remote_port\"\t[\"src_endpoint.port\"]\n\"syslog_host\"\t[\"device.hostname\"]\n"
-  __preserve = []
-  # END parser-specific transformations
   # Escape literal dots before flattening so dotted source keys cannot overwrite
   # nested paths. Decode for naming, and disambiguate collisions with suffixes.
   # In compact JSON only an object key is followed by ':', so a source whose text
@@ -515,12 +510,18 @@ parser_vrl: |
       __tilde = contains(encode_json(__escaped), "~")
   }
   __flat = flatten(__escaped)
+  # BEGIN parser-specific transformations
+  # Declared source -> target mappings (field-coverage.yaml `mappings`).
+  __decl = "\n\"error_severity\"\t[\"metadata.log_level\"]\n\"message\"\t[\"message\"]\n\"pid\"\t[\"actor.process.pid\"]\n\"timestamp\"\t[\"metadata.original_time\"]\n\"dbname\"\t[\"database.name\"]\n\"user\"\t[\"actor.user.name\",\"user.name\"]\n\"detail\"\t[\"status_detail\"]\n\"statement\"\t[\"query_info.query_string\"]\n\"connection_from\"\t[\"src_endpoint.ip\"]\n\"query_id\"\t[\"query_info.uid\"]\n\"session_id\"\t[\"actor.session.uid\",\"metadata.correlation_uid\",\"session.uid\"]\n\"state_code\"\t[\"status_code\"]\n\"application_name\"\t[\"src_endpoint.svc_name\"]\n\"remote_host\"\t[\"src_endpoint.ip\"]\n\"remote_port\"\t[\"src_endpoint.port\"]\n\"syslog_host\"\t[\"device.hostname\"]\n"
+  __preserve = []
+  # END parser-specific transformations
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
   # target paths + "\n" per mapped source key (a raw newline never occurs in
   # compact JSON). A key is consumed when its value, or every element of a scalar
-  # array, is at one of its own targets.
+  # array, is at one of its own targets. Keys stay ESCAPED here and in __consumed:
+  # a literal dotted key ("a~1b") and the nested path ("a.b") are different
+  # fields, and mapping one never consumes the other.
   for_each(__flat) -> |key, value| {
-      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
       # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
       __kt = encode_json(key)
       if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
@@ -558,7 +559,6 @@ parser_vrl: |
   __names = {}
   if __distinct {
       __kept = filter(__flat) -> |key, value| {
-          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
           # A key is kept unless an explicit mapping or transformation consumed it.
           # Do not spill a copy of the raw body.
           value != __raw_body && !contains(__consumed, "," + encode_json(key))
@@ -592,13 +592,13 @@ parser_vrl: |
       # Slow path, in source key order: a name already taken gets the next free
       # _2, _3, ... suffix.
       for_each(__flat) -> |key, value| {
+          __token = "," + encode_json(key)
           key = replace(replace(key, "~1", "."), "~0", "~")
           if is_array(value) || is_object(value) {
               value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
                   replace(replace(inner, "~1", "."), "~0", "~")
               }, ["v"])
           }
-          __token = "," + encode_json(key)
           if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")

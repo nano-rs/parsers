@@ -156,7 +156,7 @@ parser_vrl: |
   # ---- time ----
   time_ms = 0
   if time_str != "" {
-      t, terr = parse_timestamp(time_str, "%+")
+      t, terr = parse_timestamp(time_str, "%+", timezone: "UTC")
       if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
   }
   if time_ms == 0 { time_ms = to_unix_timestamp(now(), unit: "milliseconds") }
@@ -316,11 +316,6 @@ parser_vrl: |
       }
   }
   __consumed = ""
-  # BEGIN parser-specific transformations
-  # Declared source -> target mappings (field-coverage.yaml `mappings`).
-  __decl = "\n\"log\"\t[\"message\"]\n\"time\"\t[\"metadata.original_time\"]\n\"log_json.level\"\t[\"metadata.log_level\"]\n\"log_json.msg\"\t[\"message\"]\n\"level\"\t[\"metadata.log_level\"]\n\"msg\"\t[\"message\"]\n\"syslog_host\"\t[\"device.hostname\"]\n\"component\"\t[\"metadata.log_name\"]\n\"container\"\t[\"device.container.uid\",\"device.instance_uid\"]\n"
-  __preserve = []
-  # END parser-specific transformations
   # Escape literal dots before flattening so dotted source keys cannot overwrite
   # nested paths. Decode for naming, and disambiguate collisions with suffixes.
   # In compact JSON only an object key is followed by ':', so a source whose text
@@ -337,12 +332,18 @@ parser_vrl: |
       __tilde = contains(encode_json(__escaped), "~")
   }
   __flat = flatten(__escaped)
+  # BEGIN parser-specific transformations
+  # Declared source -> target mappings (field-coverage.yaml `mappings`).
+  __decl = "\n\"log\"\t[\"message\"]\n\"time\"\t[\"metadata.original_time\"]\n\"log_json.level\"\t[\"metadata.log_level\"]\n\"log_json.msg\"\t[\"message\"]\n\"level\"\t[\"metadata.log_level\"]\n\"msg\"\t[\"message\"]\n\"syslog_host\"\t[\"device.hostname\"]\n\"component\"\t[\"metadata.log_name\"]\n\"container\"\t[\"device.container.uid\",\"device.instance_uid\"]\n"
+  __preserve = []
+  # END parser-specific transformations
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
   # target paths + "\n" per mapped source key (a raw newline never occurs in
   # compact JSON). A key is consumed when its value, or every element of a scalar
-  # array, is at one of its own targets.
+  # array, is at one of its own targets. Keys stay ESCAPED here and in __consumed:
+  # a literal dotted key ("a~1b") and the nested path ("a.b") are different
+  # fields, and mapping one never consumes the other.
   for_each(__flat) -> |key, value| {
-      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
       # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
       __kt = encode_json(key)
       if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
@@ -380,7 +381,6 @@ parser_vrl: |
   __names = {}
   if __distinct {
       __kept = filter(__flat) -> |key, value| {
-          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
           # A key is kept unless an explicit mapping or transformation consumed it.
           # Do not spill a copy of the raw body.
           value != __raw_body && !contains(__consumed, "," + encode_json(key))
@@ -414,13 +414,13 @@ parser_vrl: |
       # Slow path, in source key order: a name already taken gets the next free
       # _2, _3, ... suffix.
       for_each(__flat) -> |key, value| {
+          __token = "," + encode_json(key)
           key = replace(replace(key, "~1", "."), "~0", "~")
           if is_array(value) || is_object(value) {
               value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
                   replace(replace(inner, "~1", "."), "~0", "~")
               }, ["v"])
           }
-          __token = "," + encode_json(key)
           if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")
