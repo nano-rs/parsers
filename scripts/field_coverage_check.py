@@ -347,9 +347,25 @@ def vrl_digest(value):
     return vrl_withhold([value])[0]
 
 
+_WITHHELD = {'count': 0}
+
+
 def withheld(digest):
-    """What a withheld value is replaced by (parsers emit the same object)."""
+    """What a withheld value is replaced by (parsers emit the same object).
+
+    The ONE place any step withholds data (withhold, parse_json_object keep, and
+    any future kind): it counts each use, so withholds_data() sees every one.
+    """
+    _WITHHELD['count'] += 1
     return {'withheld': True, 'bytes': digest['bytes'], 'sha256': digest['sha256']}
+
+
+def withholds_data(original, steps, **kwargs):
+    """(normalized source, whether any step withheld data while building it).
+    A sample where data was withheld must keep the raw body as raw_data."""
+    before = _WITHHELD['count']
+    source = normalized_source(original, steps, **kwargs)
+    return source, _WITHHELD['count'] != before
 
 
 def _kv_parts(text, step):
@@ -534,7 +550,16 @@ def inject_probe(original, step):
         if _kv_text(probe, step) is None:
             return None
         kd, fd = step['key_value_delimiter'], step['field_delimiter']
-        probe[step['path']] += ''.join(f'{fd}{k}{kd}"{v}"' for k, v in NORMALIZE_PROBE.items())
+        pairs = ''.join(f'{fd}{k}{kd}"{v}"' for k, v in NORMALIZE_PROBE.items())
+        text = probe[step['path']]
+        head, tail = _kv_parts(text, step)
+        if tail is not MISSING:
+            # Before the tail key, which takes the rest of the line verbatim.
+            marker = fd + step['tail_key'] + kd
+            at = text.find(marker)
+            probe[step['path']] = text[:at] + pairs + text[at:]
+        else:
+            probe[step['path']] = text + pairs
         return probe
     for path in step['paths'] if kind == 'parse_json_object' else [step['path']]:
         value, holder, leaf = _locate(probe, path)
@@ -552,6 +577,9 @@ def inject_probe(original, step):
                 holder[leaf] = base64.b64encode(json.dumps(decoded).encode()).decode()
                 return probe
         elif kind == 'parse_json_object':
+            if step.get('keep') and isinstance(value, dict):
+                value.update(copy.deepcopy(NORMALIZE_PROBE))
+                return probe
             if not isinstance(value, str):
                 continue
             parsed = json_object(value)
@@ -663,7 +691,7 @@ def run_parser(path, supplied=None, output_dir=None):
                   for _, event in samples for s in steps if s['kind'] == 'parse_kv_merge'
                   for text in [_kv_text(json_object(event['message']) or {}, s)] if text is not None])
     # And one more computes the digest of every value a withhold step may see.
-    if any(s['kind'] == 'withhold' for s in steps):
+    if steps:
         seen = []
         def collect(value):
             seen.append(value)
@@ -694,12 +722,11 @@ def run_parser(path, supplied=None, output_dir=None):
                 except json.JSONDecodeError: original = {}
                 if not isinstance(original, dict): original = {}
                 if isinstance(original, dict) and original:
-                    expected = normalized_source(original, steps)
+                    expected, withheld_any = withholds_data(original, steps)
                     assert source == expected, f'{name}: JSON source capture changed fields'
-                    # Whatever a withhold step replaced survives only in raw_data, so
-                    # the event must carry the raw body there, unchanged.
-                    withholds = [s for s in steps if s['kind'] == 'withhold']
-                    if withholds and expected != normalized_source(original, [s for s in steps if s['kind'] != 'withhold']):
+                    # Whatever any step withheld survives only in raw_data, so the
+                    # event must carry the raw body there, unchanged.
+                    if withheld_any:
                         assert output.get('raw_data') == event['message'], f'{name}: a withheld value needs raw_data equal to the raw body'
             try:
                 consumed = []
