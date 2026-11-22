@@ -61,6 +61,7 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Cisco Umbrella](parsers-ocsf/cisco_umbrella) | `cisco_umbrella` | Cisco | CSV | DNS and proxy logs with domain categorization and identity |
 | [Infoblox DHCP](parsers-ocsf/infoblox_dhcp) | `infoblox_dhcp` | Infoblox | Syslog | DISCOVER, OFFER, REQUEST, ACK, RELEASE, NAK, INFORM |
 | [Conduit MITM Proxy](parsers-ocsf/conduit_proxy) | `conduit_proxy` | Conduit | JSON | HTTP/HTTPS requests with TLS interception status, threat scoring, DLP |
+| [AWS Network Firewall](parsers-ocsf/aws_network_firewall) | `aws_network_firewall` | Amazon | JSON (Suricata EVE `event`) | Alert logs as Detection Finding (allowed / blocked / rejected, rule, 5-tuple, HTTP / TLS evidence), netflow logs as Network Activity, TLS engine revocation / SNI errors |
 | [Envoy / Istio](parsers-ocsf/envoy) | `envoy` | Envoy Proxy | Text (Envoy / Istio default) / JSON | Access logs: HTTP requests with response flags and code details, Istio upstream cluster and direction, mTLS peer principals, TCP proxy connections and RBAC denials |
 
 ### Network Security Monitoring
@@ -82,10 +83,12 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [AWS WAF](parsers-ocsf/aws_waf) | `aws_waf` | Amazon | JSON | WAF v2 access logs: rule matches, rate limiting, bot control |
 | [AWS ALB Access Logs](parsers-ocsf/aws_alb) | `aws_alb` | Amazon | Space-delimited | Application Load Balancer request logs with routing details |
 | [AWS S3 Access Logs](parsers-ocsf/aws_s3_access) | `aws_s3_access` | Amazon | Space-delimited | S3 server access logs: bucket operations, requester identity |
+| [Amazon CloudFront](parsers-ocsf/aws_cloudfront) | `aws_cloudfront` | Amazon | Tab-separated W3C / JSON | Standard (legacy) access logs, real-time logs and standard logging v2 JSON as HTTP Activity: viewer, edge, cache result, TLS, geo-blocked requests |
 | [Azure Activity Log](parsers-ocsf/azure_activity) | `azure_activity` | Microsoft | JSON | Operations, status, caller identity, resources |
 | [Azure Sign-in Logs](parsers-ocsf/azure_signin) | `azure_signin` | Microsoft | JSON | Entra ID sign-ins: interactive, non-interactive, service principal |
 | [Azure Monitor diagnostic export](parsers-ocsf/azure_monitor) | `azure_monitor` | Microsoft | JSON (Diagnostic Settings → Event Hubs / storage) | One lane for a mixed hub, dispatched on `category`: Activity Log (all 8 categories; Defender for Cloud alerts as Detection Finding), Entra ID sign-ins (interactive, non-interactive, service principal, managed identity) and Entra ID audit (user / group / role management). Unknown categories kept whole as Base Event. OCSF only |
 | [Azure Firewall](parsers-ocsf/azure_firewall) | `azure_firewall` | Microsoft | JSON | Network rules, application rules, threat intel, DNS proxy |
+| [Microsoft Defender for Cloud](parsers-ocsf/defender_for_cloud) | `defender_for_cloud` | Microsoft | JSON (continuous export / Event Hubs, REST API, Logic App) | Security alerts as Detection Finding with ATT&CK and entities; assessments, sub-assessments and regulatory compliance as Compliance Finding |
 | [GCP Audit Log](parsers-ocsf/gcp_audit) | `gcp_audit` | Google | JSON | IAM changes, API calls, resource operations, authorization |
 | [GCP VPC Flow Logs](parsers-ocsf/gcp_vpc_flow) | `gcp_vpc_flow` | Google | JSON (Cloud Logging LogEntry) | VPC flows (logName `vpc_flows` only): 5-tuple, bytes / packets, VM, VPC, subnet, geo and ASN per side |
 | [Kubernetes Audit](parsers-ocsf/kubernetes_audit) | `kubernetes_audit` | CNCF | JSON | API server audit: resource operations, RBAC, user identity |
