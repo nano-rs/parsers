@@ -440,13 +440,52 @@ class SourceNormalizeTests(unittest.TestCase):
                 validate_config({'source_normalize': [dict(rules[0], reason='r', **bad)]})
 
     def test_parse_kv_merge_tail_key(self):
-        step = dict(KV, tail_key='representation')
+        step = dict(KV, tail_keys=['representation'])
         line = 'operationType=CREATE, realmId=r1, representation={"attributes":{"dn":"cn=a, dc=corp"},"credentials":[{"value":"x"}]}'
         out = normalized_source({'message': line}, [step])
         self.assertEqual(out, {'operationType': 'CREATE', 'realmId': 'r1', 'representation': '{"attributes":{"dn":"cn=a, dc=corp"},"credentials":[{"value":"x"}]}'})
         quoted = 'operationType="CREATE", representation="{\\"a\\":\\"b, c\\"}"'
         self.assertEqual(normalized_source({'message': quoted}, [step])['representation'], '{"a":"b, c"}')
         self.assertEqual(normalized_source({'message': 'type=LOGIN, realmId=r1'}, [step]), {'type': 'LOGIN', 'realmId': 'r1'})
+
+    def test_parse_kv_merge_tail_keys_keycloak_trace(self):
+        # Keycloak TRACE lines end with representation, requestUri, cookies=[...],
+        # stackTrace; each is cut off whole, never split on ", ".
+        step = dict(KV, tail_keys=['representation', 'requestUri', 'cookies', 'stackTrace'])
+        line = ('type=LOGIN, realmId=r1, requestUri=https://sso.example.com/auth?code=nan2421-secret, '
+                'cookies=[KEYCLOAK_IDENTITY=nan2421-secret, AUTH_SESSION_ID=x.node1], stackTrace=a, b')
+        out = normalized_source({'message': line}, [step])
+        self.assertEqual(out, {'type': 'LOGIN', 'realmId': 'r1', 'requestUri': 'https://sso.example.com/auth?code=nan2421-secret',
+                               'cookies': '[KEYCLOAK_IDENTITY=nan2421-secret, AUTH_SESSION_ID=x.node1]', 'stackTrace': 'a, b'})
+        admin = 'operationType=CREATE, realmId=r1, representation={"username":"a, b"}, requestUri=https://h/x, cookies=[K=v]'
+        out = normalized_source({'message': admin}, [step])
+        self.assertEqual(out['representation'], '{"username":"a, b"}')
+        self.assertEqual(out['cookies'], '[K=v]')
+
+    def test_allowlist(self):
+        import hashlib
+        rule = {'kind': 'allowlist', 'keep': ['type', 'realmId', 'requestUri', 'representation'],
+                'nested': {'details': ['username', 'redirect_uri']}, 'urls': ['requestUri', 'redirect_uri']}
+        source = {'type': 'LOGIN', 'realmId': 'r1', 'requestUri': 'https://sso.example.com:8443/realms/p/auth?code=nan2421-secret#f',
+                  'cookies': '[KEYCLOAK_IDENTITY=nan2421-secret]', 'message': {'value': 'nan2421-secret'},
+                  'representation_json': {'value': 'nan2421-secret'}, 'details': {'username': 'u', 'redirect_uri': 'https://app/cb?x=1', 'code': 'c'},
+                  'representation': '{"a": 1}'}
+        out = normalized_source(source, [rule])
+        self.assertEqual(out['requestUri'], 'https://sso.example.com:8443/realms/p/auth')
+        self.assertEqual(out['details'], {'username': 'u', 'redirect_uri': 'https://app/cb'})
+        self.assertEqual(out['representation'], '{"a": 1}')
+        self.assertEqual(set(out), {'type', 'realmId', 'requestUri', 'details', 'representation', 'withheld_fields'})
+        self.assertNotIn('nan2421-secret', json.dumps(out))
+        self.assertTrue(out['withheld_fields']['withheld'])
+        # An unparsable URL is withheld whole; nothing withheld means no withheld_fields.
+        out = normalized_source({'type': 'X', 'requestUri': 'not a url'}, [rule])
+        self.assertEqual(set(out), {'type', 'withheld_fields'})
+        self.assertEqual(normalized_source({'type': 'X'}, [rule]), {'type': 'X'})
+        for bad in ({'keep': []}, {'keep': ['withheld_fields']}, {'keep': ['a'], 'nested': {'d': []}}):
+            with self.subTest(bad=bad), self.assertRaises(AssertionError):
+                validate_config({'source_normalize': [{'kind': 'allowlist', 'reason': 'r', **bad}]})
+        # It withholds, so the raw_data rule applies.
+        self.assertTrue(fcc.withholds_data(source, [rule])[1])
 
     def test_parse_json_object_never_overwrites_target(self):
         rules = [{'kind': 'parse_json_object', 'paths': ['message'], 'target': 'message_json'}]
@@ -552,7 +591,7 @@ class NormalizeProbeTests(unittest.TestCase):
             normalize_probes(samples[:1], steps, fake_kv)
 
     def test_probe_tail_key_and_decoded_keep(self):
-        step = dict(KV, tail_key='representation')
+        step = dict(KV, tail_keys=['representation'])
         samples = [('tail', {'message': json.dumps({'message': 'operationType=CREATE, realmId=r1, representation={"id":"1"}'})})]
         [(_, event)] = normalize_probes(samples, [step], fake_kv)
         planted = json.loads(event['message'])['message']
