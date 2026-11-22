@@ -23,3 +23,7 @@ Account IDs use 123456789012 / 210987654321 and IPs documentation ranges.
 | `forwarder_preexisting_message_json.json` | review regression: an input key `message_json` is kept, never overwritten by the parsed JSON message | constructed |
 | `forwarder_unmovable_json_secret_withheld.json` | review regression: a JSON message that cannot be moved (input `message_json`) carrying a credential is withheld and not echoed in `message` | constructed |
 | `envelope_batch_json_secret_withheld.json` | review regression: a multi-event batch whose events carry a credential is withheld whole (byte length + sha256) | constructed |
+| `envelope_single_json_array_secret.json`, `forwarder_json_array_secret.json`, `export_line_json_array_secret.json` | review regression: a JSON-array message carrying a credential is moved to `message_json` (redacted), never echoed in `message` | constructed |
+| `forwarder_bom_json_secret.json` | review regression: a JSON message behind a UTF-8 BOM is moved and redacted like any other | constructed |
+| `forwarder_bom_unmovable_json_secret_withheld.json` | review regression: a BOM JSON message that cannot be moved (input `message_json`) is withheld | constructed |
+| `forwarder_python_bracket_text.json` | a Python Lambda `[INFO]` line stays text: not mistaken for JSON | constructed |

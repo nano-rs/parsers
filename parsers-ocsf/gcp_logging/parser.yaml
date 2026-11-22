@@ -57,24 +57,32 @@ parser_vrl: |
           dec = decode_base64(pdata) ?? ""
           dj, djerr = parse_json(dec)
           if djerr == null && is_object(dj) {
-              e = object!(dj)
+              de = object!(dj)
               # The decoded LogEntry is the source, so its unmapped fields spill (and
               # are redacted); the wrapper's own fields ride along without the base64 body.
               # A decoded key the wrapper also has would be overwritten, so then the
-              # wrapper is kept as captured (base64 body included) and nothing is lost.
+              # wrapper is kept as captured (its body withheld below) and the record is
+              # not mapped from the unmerged body: it falls back as a non-LogEntry.
               w = p
               __discard = del(w.message.data)
               wkeys = keys(w)
               collide = false
-              for_each(e) -> |k, _v| { if includes(wkeys, k) { collide = true } }
-              if !collide { __source_kv = merge(e, w) }
+              for_each(de) -> |k, _v| { if includes(wkeys, k) { collide = true } }
+              if !collide {
+                  e = de
+                  __source_kv = merge(de, w)
+              }
           }
       }
       # A Pub/Sub body left in place (it did not decode to a LogEntry, or its keys
       # collide with the wrapper) would spill base64 that redaction cannot see
       # into, so it is withheld: only its size and sha256 stay (raw_data keeps it).
-      if is_string(__source_kv.message.data) && match(string!(__source_kv.message.data), r'^[\s\S]') {
-          wt = string!(__source_kv.message.data)
+      # A string or array body is withheld; an object is structured and spills
+      # key-redacted as is.
+      wd = get(__source_kv, ["message", "data"]) ?? null
+      wt = ""
+      if is_string(wd) { wt = string!(wd) } else if is_array(wd) { wt = encode_json(wd) }
+      if match(wt, r'^[\s\S]') {
           __source_kv = set!(__source_kv, ["message", "data"], {"withheld": true, "bytes": length(wt), "sha256": sha2(wt, variant: "SHA-256")})
       }
       is_entry = exists(e.logName) || exists(e.insertId) || exists(e.textPayload) || exists(e.jsonPayload) || exists(e.protoPayload) || (exists(e.resource) && exists(e.timestamp))
@@ -539,19 +547,19 @@ parser_vrl: |
   # Redact at every depth, including objects inside arrays, before serialization.
   # Redaction needs a sensitive word in a key or a name/key value, and encode_json
   # never escapes a letter, so text without one of the words needs no walk.
-  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+  if match(downcase(__safe_json), r'password|secret|authorization|token|credential') {
       __safe = map_values(__safe, recursive: true) -> |value| {
           if is_object(value) {
               # Header/parameter arrays commonly encode sensitive keys as name/value
               # or Key/Value objects instead of using the secret name as an object key.
               __sensitive_pair = false
               for_each(object!(value)) -> |key, child| {
-                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token|credential') {
                       __sensitive_pair = true
                   }
               }
               for_each(object!(value)) -> |key, _child| {
-                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                  if match(downcase(key), r'password|secret|authorization|token|credential') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
                       value = set!(value, [key], "<redacted>")
                   }
               }
@@ -711,7 +719,7 @@ parser_vrl: |
   # conditions run first; the source value set is built on first use.
   __original_values = null
   for_each(flatten(__existing)) -> |key, value| {
-      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token|credential') {
           # Members for the value itself and for to_string(value), as above.
           __json = encode_json(value)
           __as_json = "," + encode_json(__json)

@@ -24,3 +24,5 @@ https://cloud.google.com/logging/docs/reference/v2/rest/v2/LogEntry
 | `malformed.json` | not JSON (fallback) | synthetic |
 | `pubsub_push_wrapper_key_collision.json` | review regression: decoded LogEntry has a key the wrapper also has (`subscription`); the wrapper is kept whole, nothing is overwritten | constructed |
 | `pubsub_push_collision_secret_withheld.json` | review regression: an unmerged Pub/Sub body carrying a credential is withheld (byte length + sha256); the credential appears only in raw_data | constructed |
+| `pubsub_push_collision_textpayload_secret.json` | review regression: a colliding Pub/Sub entry is not mapped from its unmerged body (its credential never reaches `message`); it falls back with the body withheld | constructed |
+| `pubsub_push_object_data_secret.json`, `pubsub_push_array_data_secret.json` | review regression: an already-decoded object `data` spills key-redacted; an array `data` is withheld | constructed |

@@ -30,7 +30,7 @@ import tempfile
 import yaml
 from residual_spill import ROOT, check_rule, update
 
-SECRET = re.compile(r'password|secret|authorization|token', re.I)
+SECRET = re.compile(r'password|secret|authorization|token|credential', re.I)
 MISSING = object()
 # source_normalize step kinds and their required parameters (and types).
 NORMALIZE_KINDS = {
@@ -42,6 +42,8 @@ NORMALIZE_KINDS = {
 }
 # A sample or probe credential: never emitted outside raw_data.
 SECRET_MARKER = 'nan2421-secret'
+# Optional source_normalize parameters (and types).
+NORMALIZE_OPTIONAL = {'parse_json_object': {'arrays': bool}}
 NORMALIZE_UNKNOWN = 'nan2421-normalize-unknown'
 NORMALIZE_PROBE = {'NormalizeProbe': NORMALIZE_UNKNOWN, 'clientSecret': 'nan2421-secret'}
 
@@ -233,10 +235,13 @@ def check_step(step):
     assert isinstance(step, dict) and step.get('kind') in NORMALIZE_KINDS, f'unknown source_normalize step {step!r}'
     kind, params = step['kind'], NORMALIZE_KINDS[step['kind']]
     assert isinstance(step.get('reason'), str) and step['reason'].strip(), f'source_normalize {kind} needs a reason'
-    extra = set(step) - set(params) - {'kind', 'reason'}
+    optional = NORMALIZE_OPTIONAL.get(kind, {})
+    extra = set(step) - set(params) - set(optional) - {'kind', 'reason'}
     assert not extra, f'source_normalize {kind}: unknown parameters {sorted(extra)}'
     for name, typ in params.items():
         assert isinstance(step.get(name), typ) and step[name], f'source_normalize {kind} needs a non-empty {name}'
+    for name, typ in optional.items():
+        assert name not in step or isinstance(step[name], typ), f'source_normalize {kind}: {name} must be {typ.__name__}'
     if kind == 'parse_json_object':
         assert all(isinstance(p, str) and p for p in step['paths']), 'parse_json_object paths are dotted strings'
         assert '.' not in step['target'], 'parse_json_object target is a top-level key'
@@ -262,8 +267,12 @@ def validate_config(config):
         check_rule(rule)
     steps = config.get('source_normalize') or []
     assert isinstance(steps, list), 'source_normalize must be a list'
-    for step in steps:
+    for index, step in enumerate(steps):
         check_step(step)
+        # withhold is a fallback for what an unpack step could not unpack, never
+        # a way to drop a field outright.
+        if step['kind'] == 'withhold':
+            assert any(s['kind'] != 'withhold' for s in steps[:index]), 'withhold must follow an unpack step'
     return rules, steps
 
 
@@ -350,8 +359,8 @@ def normalized_source(original, rules, parse_kv=vrl_kv, digest=vrl_digest):
     - base64_json_merge {path}: a base64 string that decodes to a JSON object is
       removed and the decoded object merged with the remaining keys (a Pub/Sub
       push wrapper's `message.data`); skipped if any top-level key collides.
-    - parse_json_object {paths, target}: the first path holding a string that
-      parses to a JSON object is moved, parsed, to the top-level `target` (a
+    - parse_json_object {paths, target, arrays?}: the first path holding a
+      string that parses to a JSON object (or array, with arrays: true) is moved, parsed, to the top-level `target` (a
       JSON log message passed through for spill and redaction; the raw text is
       removed like the other envelope steps); skipped if `target` exists.
     - parse_kv_merge {path, match, key_value_delimiter, field_delimiter}: a
@@ -359,9 +368,11 @@ def normalized_source(original, rules, parse_kv=vrl_kv, digest=vrl_digest):
       strict) parses to a non-empty object is removed and its pairs merged in
       (Keycloak's JSON log `message`); skipped on a parse error, an empty
       result, or a key colliding with the remaining keys.
-    - withhold {paths, match}: at the first listed path that exists, a value
-      whose text (the string, else its VRL encode_json) matches `match` is
-      replaced by {withheld: true, bytes, sha256} of that text. For text that
+    - withhold {paths, match}: at the first listed path that exists, a string
+      or array whose text (the string, else its VRL encode_json) matches
+      `match` is replaced by {withheld: true, bytes, sha256} of that text. An
+      object or scalar is never withheld, a withhold step must follow an
+      unpack step, and the event must keep the raw body as raw_data. For text that
       may carry credentials and that an earlier step could not unpack (so key
       redaction cannot reach it): it is kept only in raw_data.
     """
@@ -393,10 +404,11 @@ def normalized_source(original, rules, parse_kv=vrl_kv, digest=vrl_digest):
                 value = _get(source, path)
                 if isinstance(value, str):
                     try:
-                        parsed = json.loads(value)
+                        # VRL parse_json skips a leading UTF-8 byte order mark.
+                        parsed = json.loads(value.removeprefix('\ufeff'))
                     except ValueError:
                         break
-                    if isinstance(parsed, dict) and rule['target'] not in source:
+                    if (isinstance(parsed, dict) or (rule.get('arrays') and isinstance(parsed, list))) and rule['target'] not in source:
                         # Moved, not copied: the unredacted JSON text leaves the
                         # source, so only its redacted fields can spill.
                         parent, _, leaf = path.rpartition('.')
@@ -416,6 +428,10 @@ def normalized_source(original, rules, parse_kv=vrl_kv, digest=vrl_digest):
                 value = _get(source, path)
                 if value is MISSING:
                     continue
+                if not isinstance(value, (str, list)):
+                    # An object is structured: the spill key-redacts it, so it is
+                    # never withheld (and neither is a scalar).
+                    break
                 found = digest(value)
                 if re.search(rule['match'], found['t']):
                     parent, _, leaf = path.rpartition('.')
@@ -447,8 +463,6 @@ def inject_probe(original, step):
                 holder[leaf] = value + ' clientSecret="nan2421-secret"'
             elif isinstance(value, list):
                 value.append({'message': 'clientSecret="nan2421-secret"'})
-            elif isinstance(value, dict):
-                value['clientSecret'] = 'nan2421-secret'
             else:
                 return None
             return probe
@@ -617,7 +631,13 @@ def run_parser(path, supplied=None, output_dir=None):
                 except json.JSONDecodeError: original = {}
                 if not isinstance(original, dict): original = {}
                 if isinstance(original, dict) and original:
-                    assert source == normalized_source(original, steps), f'{name}: JSON source capture changed fields'
+                    expected = normalized_source(original, steps)
+                    assert source == expected, f'{name}: JSON source capture changed fields'
+                    # Whatever a withhold step replaced survives only in raw_data, so
+                    # the event must carry the raw body there, unchanged.
+                    withholds = [s for s in steps if s['kind'] == 'withhold']
+                    if withholds and expected != normalized_source(original, [s for s in steps if s['kind'] != 'withhold']):
+                        assert output.get('raw_data') == event['message'], f'{name}: a withheld value needs raw_data equal to the raw body'
             try:
                 consumed = []
                 if config.get('reference') == 'windows_sysmon':
@@ -629,12 +649,11 @@ def run_parser(path, supplied=None, output_dir=None):
                 assert dict(flatten(source)).get(probe['source']) == 'nan2421-text-unknown', 'text probe missing from parsed source'
             if name.startswith('normalize_probe_'):
                 assert NORMALIZE_UNKNOWN in [v for _, v in flatten(source)], f'{name}: unwrapped probe field missing from parsed source'
-            if name != 'text_residual_probe':
-                # SECRET_MARKER, injected by every JSON probe and used by samples for
-                # a credential, may survive only in raw_data (or a message that is
-                # the raw body), never in unmapped or a mapped OCSF attribute.
-                kept = {k: v for k, v in output.items() if k != 'raw_data' and not (k == 'message' and v == event['message'])}
-                assert SECRET_MARKER not in json.dumps(kept), 'secret leaked outside raw_data'
+            # SECRET_MARKER, injected by every probe and used by samples for a
+            # credential, may survive only in raw_data: never in unmapped, never in
+            # a mapped OCSF attribute (a message echoing the raw body included).
+            kept = {k: v for k, v in output.items() if k != 'raw_data'}
+            assert SECRET_MARKER not in json.dumps(kept), 'secret leaked outside raw_data'
             if name in ('residual_probe', 'text_residual_probe') or name.startswith(('normalize_probe_', 'withhold_probe_')):
                 assert 'nan2421-secret' not in json.dumps(output.get('unmapped', {})), 'secret leaked in spill'
             else:
