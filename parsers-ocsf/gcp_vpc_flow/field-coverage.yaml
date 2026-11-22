@@ -4,66 +4,78 @@ transforms:
   kind: epoch_ms
   target: time
   reason: Successful ISO timestamp conversion to the emitted millisecond clock.
-- source: jsonPayload.start_time
-  kind: epoch_ms
-  target: start_time
-  reason: Successful ISO timestamp conversion to the emitted millisecond clock.
-- source: jsonPayload.end_time
-  kind: epoch_ms
-  target: end_time
-  reason: Successful ISO timestamp conversion to the emitted millisecond clock.
-- source: receiveTimestamp
-  kind: epoch_ms
-  target: metadata.logged_time
-  reason: Successful ISO timestamp conversion to the emitted millisecond clock.
 - source: jsonPayload.reporter
   kind: enum
   target: connection_info.direction_id
   values:
     src: 2
     dest: 1
-  reason: The reporting side (SRC / DEST) is normalized to the OCSF direction from that VM's view; consume only when the expected ID is emitted.
-consumed_candidates:
-- insertId
-- jsonPayload.bytes_sent
-- jsonPayload.connection.dest_ip
-- jsonPayload.connection.dest_port
-- jsonPayload.connection.protocol
-- jsonPayload.connection.src_ip
-- jsonPayload.connection.src_port
-- jsonPayload.dest_instance.project_id
-- jsonPayload.dest_instance.region
-- jsonPayload.dest_instance.vm_name
-- jsonPayload.dest_instance.zone
-- jsonPayload.dest_location.asn
-- jsonPayload.dest_location.city
-- jsonPayload.dest_location.continent
-- jsonPayload.dest_location.country
-- jsonPayload.dest_location.region
-- jsonPayload.dest_vpc.project_id
-- jsonPayload.dest_vpc.subnetwork_name
-- jsonPayload.dest_vpc.vpc_name
-- jsonPayload.end_time
-- jsonPayload.packets_sent
-- jsonPayload.reporter
-- jsonPayload.src_instance.project_id
-- jsonPayload.src_instance.region
-- jsonPayload.src_instance.vm_name
-- jsonPayload.src_instance.zone
-- jsonPayload.src_location.asn
-- jsonPayload.src_location.city
-- jsonPayload.src_location.continent
-- jsonPayload.src_location.country
-- jsonPayload.src_location.region
-- jsonPayload.src_vpc.project_id
-- jsonPayload.src_vpc.subnetwork_name
-- jsonPayload.src_vpc.vpc_name
-- jsonPayload.start_time
-- logName
-- receiveTimestamp
-- resource.labels.location
-- resource.labels.project_id
-- timestamp
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+  reason: The reporting side (SRC / DEST) is normalized to the OCSF direction from that VM's view; consume
+    only when the expected ID is emitted.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  insertId:
+  - metadata.uid
+  jsonPayload.bytes_sent:
+  - traffic.bytes
+  - traffic.bytes_out
+  jsonPayload.connection.dest_ip:
+  - dst_endpoint.ip
+  jsonPayload.connection.dest_port:
+  - dst_endpoint.port
+  jsonPayload.connection.protocol:
+  - connection_info.protocol_num
+  jsonPayload.connection.src_ip:
+  - src_endpoint.ip
+  jsonPayload.connection.src_port:
+  - src_endpoint.port
+  jsonPayload.dest_instance.region:
+  - cloud.region
+  jsonPayload.dest_instance.vm_name:
+  - dst_endpoint.hostname
+  - dst_endpoint.name
+  jsonPayload.dest_instance.zone:
+  - dst_endpoint.zone
+  jsonPayload.dest_location.asn:
+  - dst_endpoint.autonomous_system.number
+  jsonPayload.dest_location.continent:
+  - dst_endpoint.location.continent
+  jsonPayload.dest_location.country:
+  - dst_endpoint.location.country
+  jsonPayload.dest_vpc.subnetwork_name:
+  - dst_endpoint.subnet_uid
+  jsonPayload.dest_vpc.vpc_name:
+  - dst_endpoint.vpc_uid
+  jsonPayload.packets_sent:
+  - traffic.packets
+  - traffic.packets_out
+  jsonPayload.src_instance.region:
+  - cloud.region
+  jsonPayload.src_instance.vm_name:
+  - src_endpoint.hostname
+  - src_endpoint.name
+  jsonPayload.src_instance.zone:
+  - src_endpoint.zone
+  jsonPayload.src_location.asn:
+  - src_endpoint.autonomous_system.number
+  jsonPayload.src_location.city:
+  - src_endpoint.location.city
+  jsonPayload.src_location.continent:
+  - src_endpoint.location.continent
+  jsonPayload.src_location.country:
+  - src_endpoint.location.country
+  jsonPayload.src_location.region:
+  - src_endpoint.location.region
+  jsonPayload.src_vpc.subnetwork_name:
+  - src_endpoint.subnet_uid
+  jsonPayload.src_vpc.vpc_name:
+  - src_endpoint.vpc_uid
+  logName:
+  - metadata.log_name
+  resource.labels.location:
+  - cloud.zone
+  resource.labels.project_id:
+  - cloud.account.uid
+  - cloud.project_uid

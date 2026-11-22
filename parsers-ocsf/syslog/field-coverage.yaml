@@ -1,4 +1,8 @@
 source: text
+probe:
+  raw: <34>1 2026-08-18T12:00:00Z host app 42 ID [first@1 known="existing"][residual@2421 ResidualProbe="nan2421-text-unknown"
+    password="nan2421-secret"] message
+  source: structured_data.residual@2421.ResidualProbe
 transforms:
 - source: header.ts
   kind: epoch_ms
@@ -7,42 +11,46 @@ transforms:
   reason: Existing timestamp conversion verified against the emitted millisecond clock.
 - source: PROTO
   kind: lowercase
+  target: connection_info.protocol_name
   reason: Case normalization already performed by the parser; observed at connection_info.protocol_name,
     and checked against the emitted branch.
-probe:
-  raw: <34>1 2026-08-18T12:00:00Z host app 42 ID [first@1 known="existing"][residual@2421
-    ResidualProbe="nan2421-text-unknown" password="nan2421-secret"] message
-  source: structured_data.residual@2421.ResidualProbe
-consumed_candidates:
-- DPT
-- DST
-- MAC
-- PROTO
-- SPT
-- SRC
-- event.app
-- event.command
-- event.hostname
-- event.ip
-- event.method
-- event.msg
-- event.pid
-- event.port
-- event.pwd
-- event.sd
-- event.target_user
-- event.ts
-- event.tty
-- event.user
-- header.app
-- header.body
-- header.hostname
-- header.msgid
-- header.pri
-- header.procid
-- header.remainder
-- header.rest
-- header.ts
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  DPT:
+  - dst_endpoint.port
+  DST:
+  - dst_endpoint.ip
+  SPT:
+  - src_endpoint.port
+  SRC:
+  - src_endpoint.ip
+  event.app:
+  - metadata.log_provider
+  event.command:
+  - actor.process.cmd_line
+  event.hostname:
+  - device.hostname
+  event.ip:
+  - src_endpoint.ip
+  event.pid:
+  - actor.process.pid
+  event.port:
+  - src_endpoint.port
+  event.target_user:
+  - user.name
+  event.tty:
+  - session.terminal
+  event.user:
+  - actor.user.name
+  - user.name
+  header.app:
+  - actor.process.name
+  - metadata.log_provider
+  header.hostname:
+  - device.hostname
+  header.msgid:
+  - metadata.event_code
+  header.procid:
+  - actor.process.pid

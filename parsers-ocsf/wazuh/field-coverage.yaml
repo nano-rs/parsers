@@ -6,27 +6,53 @@ transforms:
   reason: Successful ISO timestamp conversion to the emitted millisecond clock.
 - source: agent.name
   kind: lowercase
+  target: device.hostname
+  reason: Parser lowercases the agent name for device.hostname; the original also lands in device.name.
+- source: agent.name
+  kind: lowercase
+  target: device.name
+  reason: Parser lowercases the agent name for device.hostname; the original also lands in device.name.
+- source: agent.name
+  kind: lowercase
+  target: evidences.device.hostname
+  reason: Parser lowercases the agent name for device.hostname; the original also lands in device.name.
+- source: agent.name
+  kind: lowercase
+  target: evidences.device.name
   reason: Parser lowercases the agent name for device.hostname; the original also lands in device.name.
 - source: manager.name
   kind: lowercase
-  reason: Parser lowercases the manager name for metadata.reporter.hostname; the original also lands in reporter.name.
+  target: metadata.reporter.hostname
+  reason: Parser lowercases the manager name for metadata.reporter.hostname; the original also lands in
+    reporter.name.
+- source: manager.name
+  kind: lowercase
+  target: metadata.reporter.name
+  reason: Parser lowercases the manager name for metadata.reporter.hostname; the original also lands in
+    reporter.name.
 - source: syscheck.md5_after
   kind: lowercase
+  target: file.hashes.value
   reason: Parser lowercases file hashes; consume only when the normalized value is emitted.
 - source: syscheck.sha1_after
   kind: lowercase
+  target: file.hashes.value
   reason: Parser lowercases file hashes; consume only when the normalized value is emitted.
 - source: syscheck.sha256_after
   kind: lowercase
+  target: file.hashes.value
   reason: Parser lowercases file hashes; consume only when the normalized value is emitted.
 - source: syscheck.md5_before
   kind: lowercase
+  target: file.hashes.value
   reason: Parser lowercases file hashes; consume only when the normalized value is emitted.
 - source: syscheck.sha1_before
   kind: lowercase
+  target: file.hashes.value
   reason: Parser lowercases file hashes; consume only when the normalized value is emitted.
 - source: syscheck.sha256_before
   kind: lowercase
+  target: file.hashes.value
   reason: Parser lowercases file hashes; consume only when the normalized value is emitted.
 - source: syscheck.event
   kind: enum
@@ -35,61 +61,117 @@ transforms:
     added: 1
     modified: 3
     deleted: 4
-  reason: The FIM event drives the File System Activity (Create / Update / Delete); consume only when that activity is emitted.
-consumed_candidates:
-- agent.id
-- agent.ip
-- agent.name
-- data.dstip
-- data.dstport
-- data.dstuser
-- data.srcip
-- data.srcport
-- data.srcuser
-- data.win.eventdata.commandLine
-- data.win.eventdata.image
-- data.win.eventdata.processGuid
-- data.win.eventdata.processId
-- data.win.eventdata.targetObject
-- data.win.eventdata.user
-- data.win.eventdata.newProcessId
-- data.win.eventdata.newProcessName
-- data.win.eventdata.subjectUserName
-- data.win.eventdata.parentProcessName
-- decoder.name
-- full_log
-- id
-- location
-- manager.name
-- rule.description
-- rule.firedtimes
-- rule.groups
-- rule.id
-- rule.mitre.id
-- rule.mitre.tactic
-- rule.mitre.technique
-- syscheck.audit.process.cwd
-- syscheck.audit.process.id
-- syscheck.audit.process.name
-- syscheck.audit.process.ppid
-- syscheck.audit.user.id
-- syscheck.audit.user.name
-- syscheck.diff
-- syscheck.inode_after
-- syscheck.inode_before
-- syscheck.md5_after
-- syscheck.md5_before
-- syscheck.path
-- syscheck.sha1_after
-- syscheck.sha1_before
-- syscheck.sha256_after
-- syscheck.sha256_before
-- syscheck.size_after
-- syscheck.size_before
-- syscheck.uid_after
-- syscheck.uid_before
-- syscheck.uname_after
-- syscheck.uname_before
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+  reason: The FIM event drives the File System Activity (Create / Update / Delete); consume only when
+    that activity is emitted.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  agent.id:
+  - device.uid
+  - evidences.device.uid
+  agent.ip:
+  - device.ip
+  - evidences.device.ip
+  agent.name:
+  - device.hostname
+  - device.name
+  - evidences.device.hostname
+  - evidences.device.name
+  data.dstuser:
+  - evidences.user.name
+  data.srcip:
+  - evidences.src_endpoint.ip
+  data.srcport:
+  - evidences.src_endpoint.port
+  data.win.eventdata.commandLine:
+  - evidences.process.cmd_line
+  data.win.eventdata.image:
+  - evidences.process.file.path
+  data.win.eventdata.processGuid:
+  - evidences.process.uid
+  data.win.eventdata.processId:
+  - evidences.process.pid
+  data.win.eventdata.targetObject:
+  - evidences.reg_key.path
+  data.win.eventdata.user:
+  - evidences.process.user.name
+  data.win.eventdata.newProcessName:
+  - evidences.process.file.path
+  data.win.eventdata.subjectUserName:
+  - evidences.process.user.name
+  data.win.eventdata.parentProcessName:
+  - evidences.process.parent_process.file.path
+  decoder.name:
+  - finding_info.analytic.category
+  - metadata.log_format
+  full_log:
+  - finding_info.desc
+  id:
+  - finding_info.uid
+  - metadata.uid
+  location:
+  - actor.app_name
+  - metadata.log_name
+  manager.name:
+  - metadata.reporter.hostname
+  - metadata.reporter.name
+  rule.description:
+  - finding_info.analytic.name
+  - finding_info.title
+  - message
+  rule.firedtimes:
+  - count
+  rule.groups:
+  - finding_info.types
+  - metadata.labels
+  rule.id:
+  - finding_info.analytic.uid
+  - metadata.event_code
+  rule.mitre.id:
+  - attacks.sub_technique.uid
+  - finding_info.attacks.sub_technique.uid
+  - finding_info.attacks.technique.uid
+  rule.mitre.technique:
+  - attacks.sub_technique.name
+  - finding_info.attacks.sub_technique.name
+  - finding_info.attacks.technique.name
+  syscheck.audit.process.cwd:
+  - actor.process.working_directory
+  syscheck.audit.process.id:
+  - actor.process.pid
+  syscheck.audit.process.name:
+  - actor.process.file.path
+  syscheck.audit.process.ppid:
+  - actor.process.parent_process.pid
+  syscheck.audit.user.id:
+  - actor.user.uid
+  syscheck.audit.user.name:
+  - actor.user.name
+  syscheck.inode_after:
+  - file.uid
+  syscheck.md5_after:
+  - file.hashes.value
+  syscheck.md5_before:
+  - file.hashes.value
+  syscheck.path:
+  - evidences.reg_key.path
+  - file.path
+  syscheck.sha1_after:
+  - file.hashes.value
+  syscheck.sha1_before:
+  - file.hashes.value
+  syscheck.sha256_after:
+  - file.hashes.value
+  syscheck.size_after:
+  - file.size
+  syscheck.size_before:
+  - file.size
+  syscheck.uid_after:
+  - file.owner.uid
+  syscheck.uid_before:
+  - file.owner.uid
+  syscheck.uname_after:
+  - file.owner.name
+  syscheck.uname_before:
+  - file.owner.name

@@ -1,31 +1,40 @@
 source: text
-transforms:
-- source: header.ts
-  kind: epoch_ms
-  target: time
-  format: '%+'
-  reason: RFC 5424 syslog timestamp converted to event milliseconds; RFC 3164 clocks carry no year and remain residual.
-consumed_candidates:
-- header.host
-- category
-- level
-- client.ip
-- client.port
-- client.view
-- query.name
-- query.class
-- query.type
-- query.server
-- acl.name
-- acl.class
-- acl.type
-- acl.acl
-- rpz.name
-- rpz.type
-- rpz.class
-- rpz.via
-- rpz.policy
-- message
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  header.host:
+  - device.hostname
+  - dst_endpoint.hostname
+  client.ip:
+  - src_endpoint.ip
+  client.port:
+  - src_endpoint.port
+  client.view:
+  - policy.name
+  query.name:
+  - query.hostname
+  query.class:
+  - query.class
+  query.type:
+  - query.type
+  query.server:
+  - dst_endpoint.ip
+  acl.name:
+  - query.hostname
+  acl.class:
+  - query.class
+  acl.type:
+  - query.type
+  acl.acl:
+  - firewall_rule.name
+  rpz.name:
+  - query.hostname
+  rpz.type:
+  - query.type
+  rpz.class:
+  - query.class
+  rpz.via:
+  - firewall_rule.name
+  message:
+  - message

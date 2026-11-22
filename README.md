@@ -284,6 +284,13 @@ and after a large rewrite. CI runs the check on every PR (job "Parser load budge
   parser concern. Review rejects parser-level redaction.
 - Emit the **complete OCSF object on the root** (`. = ocsf`) so it lands in
   the lake and every canonical path is stored as its own queryable column.
+- **Declare every mapping explicitly.** `field-coverage.yaml` `mappings` lists
+  each source key with the OCSF path(s) it is copied to, and each `transforms`
+  rule names its target. A source field counts as mapped only when its value is
+  at one of its own targets; a value that merely equals some other attribute
+  spills to `unmapped`. `python3 scripts/infer_mappings.py parsers-ocsf/<name>`
+  writes the declarations by perturbing each source value, and
+  `field_coverage_check.py` re-verifies every one the same way.
 - UDM names do not exist in OCSF. `src_ip` is `src_endpoint.ip`, `user` is
   `actor.user.name` (the actor) or `user.name` (the subject, class-dependent),
   `timestamp` is `time`, `id` is `metadata.uid`, `ext.foo` is `unmapped.foo`.

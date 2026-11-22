@@ -54,15 +54,43 @@ def kind_templates():
     return {kind: '\n'.join(lines) for kind, lines in templates.items()}
 
 
+def norm_path(path):
+    """A target path as __repr names it: dotted, array indices dropped."""
+    return '.'.join(part for part in path.split('.') if not part.isdigit())
+
+
+BRACKETS = {char: '\\u%04x' % ord(char) for char in '()[]{}'}
+
+
+def json_text(value):
+    """Compact JSON whose brackets inside strings are \\u escapes: nano's deploy
+    validator counts raw ()[]{} characters across the whole VRL."""
+    text = json.dumps(value, ensure_ascii=False, separators=(',', ':'))
+    out, in_string, escaped = [], False, False
+    for char in text:
+        if in_string and not escaped and char in BRACKETS:
+            out.append(BRACKETS[char].replace('\\\\', '\\'))
+            continue
+        out.append(char)
+        if escaped:
+            escaped = False
+        elif char == '\\':
+            escaped = in_string
+        elif char == '"':
+            in_string = not in_string
+    return ''.join(out)
+
+
+def vrl_text(text):
+    """Any text as a VRL string literal (no raw brackets expected inside)."""
+    return '"' + text.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\t', '\\t') + '"'
+
+
 def rule_body(rule, templates):
     """One rule's body, written against the loop's `key` and `value`."""
-    if isinstance(rule.get('target'), str):
-        # Against __mapped (no raw_data, unmapped, or raw-body message), like
-        # every other piece of coverage evidence.
-        path = '__mapped' + ''.join('.' + vrl_string(part) for part in rule['target'].split('.'))
-        match = path + ' == __expected'
-    else:
-        match = 'contains(__represented, "," + encode_json(encode_json(__expected)))'
+    # Against __repr: the value must be AT the rule's target path of the mapped
+    # event (no raw_data, unmapped, or raw-body message), never just anywhere.
+    match = 'contains(__repr, "," + ' + vrl_text(json_text(norm_path(rule['target']))) + ' + "=" + encode_json(encode_json(__expected)))'
     text = templates[rule['kind']]
     if rule['kind'] == 'epoch_ms':
         fmt = rule.get('format', '%+')
@@ -113,15 +141,33 @@ def key_regex(keys):
     return lines + [")\\z'"]
 
 
-def candidate_regex(candidates):
-    """The candidate set as a whole-key regex literal, one candidate per line.
+def check_target(source, target):
+    assert isinstance(target, str) and target and all(target.split('.')), f'{source}: target must be a dotted path'
+    assert norm_path(target), f'{source}: target must name an attribute'
+    assert target.split('.')[0] not in ('unmapped', 'raw_data'), f'{source}: target may not be under unmapped or raw_data'
 
-    A regex literal compiles once with the program, so a lookup reads no copy
-    of the set (NAN-5351). Verbose mode ignores the layout whitespace.
-    """
-    if not candidates:
-        return ["__candidates = r'\\b\\B'"]  # matches nothing
-    return ["__candidates = r'(?x)"] + key_regex(candidates)
+
+def mappings_of(config):
+    """field-coverage.yaml `mappings`: source key -> list of normalized targets."""
+    assert 'consumed_candidates' not in config, 'consumed_candidates is replaced by `mappings` (source key -> target paths)'
+    raw = config.get('mappings') or {}
+    assert isinstance(raw, dict), 'mappings must map a source key to its target path(s)'
+    out = {}
+    for key, targets in raw.items():
+        assert isinstance(key, str) and key, f'mapping source must be a key: {key!r}'
+        targets = [targets] if isinstance(targets, str) else targets
+        assert isinstance(targets, list) and targets, f'{key}: mapping needs one or more target paths'
+        for target in targets:
+            check_target(key, target)
+        out[key] = list(dict.fromkeys(norm_path(t) for t in targets))
+    return out
+
+
+def decl_literal(mappings):
+    """The declared mappings as one VRL string: "\\n" + key JSON + "\\t" + target
+    array JSON per key, then "\\n". Looked up with find() (NAN-5351)."""
+    text = ''.join('\n' + json_text(key) + '\t' + json_text(targets) for key, targets in mappings.items()) + '\n'
+    return vrl_text(text)
 
 
 def check_rule(rule):
@@ -129,10 +175,9 @@ def check_rule(rule):
     assert isinstance(rule, dict) and isinstance(rule.get('source'), str) and rule['source'], f'transform needs a source: {rule!r}'
     assert isinstance(rule.get('reason'), str) and rule['reason'].strip(), f'every transformation needs a justification: {rule["source"]}'
     assert rule.get('kind') in KINDS, f'{rule["source"]}: unknown transform kind {rule.get("kind")!r}'
-    if 'target' in rule:
-        target = rule['target']
-        assert isinstance(target, str) and target and all(target.split('.')), f'{rule["source"]}: target must be a dotted path'
-        assert target.split('.')[0] not in ('unmapped', 'raw_data'), f'{rule["source"]}: target may not be under unmapped or raw_data'
+    # Every rule names the attribute its converted value lands in: a value found
+    # anywhere else is no evidence (no coincidental consumption).
+    check_target(rule['source'], rule.get('target'))
     if rule['kind'] == 'scale':
         factor = rule.get('factor')
         assert type(factor) in (int, float) and math.isfinite(factor) and factor != 0, f'{rule["source"]}: scale needs a finite, non-zero factor'
@@ -162,7 +207,7 @@ def transformations(config):
         lines.append('}')
     if config.get('reference') == 'windows_sysmon':
         lines += ['# ' + config['reference_reason'], 'for_each(array!(__reference_consumed)) -> |_index, key| {', '    __consumed = __consumed + ("," + encode_json(key))', '}']
-    lines += ['# ' + config.get('consumed_reason', 'Explicit source candidates.')] + candidate_regex(config.get('consumed_candidates', []))
+    lines += ['# Declared source -> target mappings (field-coverage.yaml `mappings`).', '__decl = ' + decl_literal(mappings_of(config))]
     lines += ['__preserve = ' + json.dumps(list(config.get('preserve_unmapped', {})))]
     return '\n'.join(lines)
 

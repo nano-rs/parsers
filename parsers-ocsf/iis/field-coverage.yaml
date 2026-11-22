@@ -2,113 +2,132 @@ source: mixed
 transforms:
 - source: c_ip
   kind: lowercase
-  reason: Parser lowercases addresses and the host header; consume only when the normalized
-    value is emitted.
+  target: src_endpoint.ip
+  reason: Parser lowercases addresses and the host header; consume only when the normalized value is emitted.
 - source: s_ip
   kind: lowercase
-  reason: Parser lowercases addresses and the host header; consume only when the normalized
-    value is emitted.
+  target: dst_endpoint.ip
+  reason: Parser lowercases addresses and the host header; consume only when the normalized value is emitted.
 - source: cs_host
   kind: lowercase
-  reason: Parser lowercases addresses and the host header; consume only when the normalized
-    value is emitted.
+  target: http_request.url.hostname
+  reason: Parser lowercases addresses and the host header; consume only when the normalized value is emitted.
 - source: c-ip
   kind: lowercase
-  reason: Parser lowercases addresses and the host header; consume only when the normalized
-    value is emitted.
+  target: src_endpoint.ip
+  reason: Parser lowercases addresses and the host header; consume only when the normalized value is emitted.
 - source: s-ip
   kind: lowercase
-  reason: Parser lowercases addresses and the host header; consume only when the normalized
-    value is emitted.
-- source: cs-host
-  kind: lowercase
-  reason: Parser lowercases addresses and the host header; consume only when the normalized
-    value is emitted.
+  target: dst_endpoint.ip
+  reason: Parser lowercases addresses and the host header; consume only when the normalized value is emitted.
 - source: CIp
   kind: lowercase
-  reason: Parser lowercases addresses and the host header; consume only when the normalized
-    value is emitted.
-- source: SIp
-  kind: lowercase
-  reason: Parser lowercases addresses and the host header; consume only when the normalized
-    value is emitted.
+  target: src_endpoint.ip
+  reason: Parser lowercases addresses and the host header; consume only when the normalized value is emitted.
 - source: CsHost
   kind: lowercase
-  reason: Parser lowercases addresses and the host header; consume only when the normalized
-    value is emitted.
-- source: timestamp
-  kind: epoch_ms
-  target: time
-  reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  target: http_request.url.hostname
+  reason: Parser lowercases addresses and the host header; consume only when the normalized value is emitted.
 - source: TimeGenerated
   kind: epoch_ms
   target: time
   reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-- source: EventTime
-  kind: epoch_ms
-  target: time
-  reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-consumed_candidates:
-- '#Fields'
-- CIp
-- ComputerName
-- CsBytes
-- CsHost
-- CsMethod
-- CsUriQuery
-- CsUriStem
-- CsUsername
-- EventTime
-- Referer
-- SIp
-- SPort
-- ScBytes
-- ScStatus
-- TimeGenerated
-- TimeTaken
-- UserAgent
-- X-Forwarded-For
-- c-ip
-- c_ip
-- cs(Referer)
-- cs(User-Agent)
-- cs-bytes
-- cs-host
-- cs-method
-- cs-uri-query
-- cs-uri-stem
-- cs-username
-- cs-version
-- cs_bytes
-- cs_host
-- cs_method
-- cs_referer
-- cs_uri_query
-- cs_uri_stem
-- cs_user_agent
-- cs_username
-- cs_version
-- directive
-- fields
-- line
-- log
-- s-computername
-- s-ip
-- s-port
-- s-sitename
-- s_computername
-- s_ip
-- s_port
-- s_sitename
-- sc-bytes
-- sc-status
-- sc_bytes
-- sc_status
-- time-taken
-- time_taken
-- timestamp
-- value
-- x_forwarded_for
-consumed_reason: Only source keys read by this parser are eligible for exact-value consumption;
-  the selected branch must emit the value. Unknown keys always spill, even when their value
-  equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  CIp:
+  - src_endpoint.ip
+  ComputerName:
+  - dst_endpoint.hostname
+  CsBytes:
+  - http_request.length
+  - traffic.bytes_out
+  CsHost:
+  - http_request.url.hostname
+  CsMethod:
+  - http_request.http_method
+  CsUriStem:
+  - http_request.url.path
+  SPort:
+  - dst_endpoint.port
+  - http_request.url.port
+  ScBytes:
+  - http_response.length
+  - traffic.bytes_in
+  ScStatus:
+  - http_response.code
+  - status_code
+  TimeTaken:
+  - duration
+  UserAgent:
+  - http_request.user_agent
+  c-ip:
+  - src_endpoint.ip
+  c_ip:
+  - src_endpoint.ip
+  cs(User-Agent):
+  - http_request.user_agent
+  cs-method:
+  - http_request.http_method
+  cs-uri-query:
+  - http_request.url.query_string
+  cs-uri-stem:
+  - http_request.url.path
+  cs_bytes:
+  - http_request.length
+  - traffic.bytes_out
+  cs_host:
+  - http_request.url.hostname
+  cs_method:
+  - http_request.http_method
+  cs_referer:
+  - http_request.referrer
+  cs_uri_query:
+  - http_request.url.query_string
+  cs_uri_stem:
+  - http_request.url.path
+  cs_user_agent:
+  - http_request.user_agent
+  cs_username:
+  - actor.user.name
+  cs_version:
+  - http_request.version
+  directive:
+  - metadata.event_code
+  fields:
+  - metadata.log_format
+  line:
+  - message
+  s-ip:
+  - dst_endpoint.ip
+  s-port:
+  - dst_endpoint.port
+  - http_request.url.port
+  s_computername:
+  - dst_endpoint.hostname
+  s_ip:
+  - dst_endpoint.ip
+  s_port:
+  - dst_endpoint.port
+  - http_request.url.port
+  s_sitename:
+  - dst_endpoint.svc_name
+  sc-status:
+  - http_response.code
+  - status_code
+  sc_bytes:
+  - http_response.length
+  - traffic.bytes_in
+  sc_status:
+  - http_response.code
+  - status_code
+  time-taken:
+  - duration
+  time_taken:
+  - duration
+  value:
+  - message
+  - metadata.log_format
+  x_forwarded_for:
+  - http_request.x_forwarded_for

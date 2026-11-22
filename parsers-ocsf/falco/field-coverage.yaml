@@ -1,9 +1,5 @@
 source: json
 transforms:
-- source: time
-  kind: epoch_ms
-  target: time
-  reason: Successful RFC 3339 timestamp conversion to the selected event clock in milliseconds.
 - source: priority
   kind: enum
   target: severity_id
@@ -18,38 +14,79 @@ transforms:
     info: 1
     debug: 1
   reason: Falco rule priority normalized to the OCSF severity; consume only when the expected ID is emitted.
-consumed_candidates:
-- hostname
-- output
-- output_fields.container.id
-- output_fields.container.image.id
-- output_fields.container.image.repository
-- output_fields.container.image.tag
-- output_fields.container.name
-- output_fields.evt.type
-- output_fields.fd.name
-- output_fields.k8s.ns.name
-- output_fields.k8s.pod.name
-- output_fields.ka.target.name
-- output_fields.ka.target.namespace
-- output_fields.ka.target.resource
-- output_fields.ka.user.name
-- output_fields.proc.cmdline
-- output_fields.proc.cwd
-- output_fields.proc.exepath
-- output_fields.proc.name
-- output_fields.proc.pcmdline
-- output_fields.proc.pid
-- output_fields.proc.pname
-- output_fields.proc.ppid
-- output_fields.user.name
-- output_fields.user.uid
-- priority
-- rule
-- source
-- tags
-- time
-- uuid
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  hostname:
+  - device.hostname
+  output:
+  - message
+  output_fields.container.id:
+  - evidences.container.uid
+  output_fields.container.image.repository:
+  - evidences.container.image.name
+  - evidences.container.image.uid
+  output_fields.container.image.tag:
+  - evidences.container.image.tag
+  - evidences.container.tag
+  output_fields.container.name:
+  - evidences.container.name
+  output_fields.evt.type:
+  - evidences.name
+  output_fields.fd.name:
+  - evidences.file.path
+  output_fields.k8s.ns.name:
+  - resources.namespace
+  output_fields.k8s.pod.name:
+  - resources.name
+  output_fields.ka.target.name:
+  - resources.name
+  output_fields.ka.target.namespace:
+  - resources.namespace
+  output_fields.ka.target.resource:
+  - resources.type
+  output_fields.ka.user.name:
+  - actor.user.name
+  - evidences.actor.user.name
+  output_fields.proc.cmdline:
+  - actor.process.cmd_line
+  - evidences.process.cmd_line
+  output_fields.proc.exepath:
+  - actor.process.file.path
+  - evidences.process.file.path
+  output_fields.proc.name:
+  - actor.process.name
+  - evidences.process.name
+  output_fields.proc.pcmdline:
+  - actor.process.parent_process.cmd_line
+  - evidences.process.parent_process.cmd_line
+  output_fields.proc.pid:
+  - actor.process.pid
+  - evidences.process.pid
+  output_fields.proc.pname:
+  - actor.process.parent_process.name
+  - evidences.process.parent_process.name
+  output_fields.proc.ppid:
+  - actor.process.parent_process.pid
+  - evidences.process.parent_process.pid
+  output_fields.user.name:
+  - actor.process.user.name
+  - actor.user.name
+  - evidences.process.user.name
+  output_fields.user.uid:
+  - actor.process.user.uid
+  - actor.user.uid
+  - evidences.process.user.uid
+  rule:
+  - finding_info.analytic.name
+  - finding_info.title
+  - message
+  source:
+  - finding_info.data_sources
+  tags:
+  - metadata.labels
+  uuid:
+  - finding_info.uid
+  - metadata.original_event_uid
+  - metadata.uid

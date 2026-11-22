@@ -1,9 +1,5 @@
 source: json
 transforms:
-- source: time
-  kind: epoch_ms
-  target: time
-  reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
 - source: properties.activityDateTime
   kind: epoch_ms
   target: time
@@ -28,48 +24,68 @@ transforms:
     failure: Failure
     timeout: Timeout
   reason: Entra audit result normalized to the OCSF status caption; verify the emitted caption.
-consumed_candidates:
-- activityDateTime
-- activityDisplayName
-- callerIpAddress
-- category
-- correlationId
-- id
-- initiatedBy.app.appId
-- initiatedBy.app.displayName
-- initiatedBy.app.ipAddress
-- initiatedBy.app.servicePrincipalId
-- initiatedBy.app.servicePrincipalName
-- initiatedBy.user.displayName
-- initiatedBy.user.id
-- initiatedBy.user.ipAddress
-- initiatedBy.user.userPrincipalName
-- loggedByService
-- operationName
-- properties
-- properties.activityDateTime
-- properties.activityDisplayName
-- properties.category
-- properties.correlationId
-- properties.id
-- properties.initiatedBy.app.appId
-- properties.initiatedBy.app.displayName
-- properties.initiatedBy.app.ipAddress
-- properties.initiatedBy.app.servicePrincipalId
-- properties.initiatedBy.app.servicePrincipalName
-- properties.initiatedBy.user.displayName
-- properties.initiatedBy.user.id
-- properties.initiatedBy.user.ipAddress
-- properties.initiatedBy.user.userPrincipalName
-- properties.loggedByService
-- properties.result
-- properties.resultReason
-- properties.userAgent
-- result
-- resultReason
-- tenantId
-- time
-- userAgent
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  activityDisplayName:
+  - api.operation
+  - message
+  category:
+  - metadata.event_code
+  correlationId:
+  - metadata.correlation_uid
+  id:
+  - metadata.original_event_uid
+  initiatedBy.app.appId:
+  - actor.app_uid
+  initiatedBy.app.displayName:
+  - actor.app_name
+  - actor.user.name
+  initiatedBy.app.servicePrincipalId:
+  - actor.user.uid
+  initiatedBy.user.displayName:
+  - actor.user.display_name
+  initiatedBy.user.id:
+  - actor.user.uid
+  initiatedBy.user.ipAddress:
+  - src_endpoint.ip
+  initiatedBy.user.userPrincipalName:
+  - actor.user.email_addr
+  - actor.user.name
+  loggedByService:
+  - api.service.name
+  - metadata.log_provider
+  properties.activityDisplayName:
+  - api.operation
+  - message
+  properties.category:
+  - metadata.event_code
+  properties.correlationId:
+  - metadata.correlation_uid
+  properties.id:
+  - metadata.original_event_uid
+  properties.initiatedBy.app.displayName:
+  - actor.app_name
+  - actor.user.name
+  properties.initiatedBy.app.servicePrincipalId:
+  - actor.user.uid
+  properties.initiatedBy.user.displayName:
+  - actor.user.display_name
+  properties.initiatedBy.user.id:
+  - actor.user.uid
+  properties.initiatedBy.user.ipAddress:
+  - src_endpoint.ip
+  properties.initiatedBy.user.userPrincipalName:
+  - actor.user.email_addr
+  - actor.user.name
+  properties.loggedByService:
+  - api.service.name
+  - metadata.log_provider
+  properties.resultReason:
+  - status_detail
+  resultReason:
+  - status_detail
+  tenantId:
+  - cloud.account.uid
+  - cloud.org.uid

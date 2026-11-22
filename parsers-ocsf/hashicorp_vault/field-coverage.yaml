@@ -10,10 +10,13 @@ transforms:
   reason: Successful ISO timestamp conversion to the emitted millisecond clock.
 - source: auth.token_issue_time
   kind: epoch_ms
+  target: actor.session.created_time
   reason: The token issue time becomes the session's created_time; consume only when that clock is emitted.
 - source: response.auth.token_issue_time
   kind: epoch_ms
-  reason: The issued token's issue time becomes the login session's created_time; consume only when that clock is emitted.
+  target: session.created_time
+  reason: The issued token's issue time becomes the login session's created_time; consume only when that
+    clock is emitted.
 - source: request.operation
   kind: enum
   target: activity_id
@@ -32,40 +35,65 @@ transforms:
     request: request
     response: response
   reason: The entry type is metadata.type (lowercased); consume only when emitted.
-consumed_candidates:
-- auth.accessor
-- auth.client_token
-- auth.display_name
-- auth.entity_id
-- auth.metadata.email
-- auth.metadata.username
-- auth.policies
-- auth.policy_results.granting_policies
-- error
-- forwarded_from
-- request.headers.user-agent
-- request.id
-- request.mount_accessor
-- request.mount_point
-- request.mount_running_version
-- request.mount_type
-- request.namespace.id
-- request.namespace.path
-- request.operation
-- request.path
-- request.remote_address
-- request.remote_port
-- response.auth.accessor
-- response.auth.client_token
-- response.auth.display_name
-- response.auth.entity_id
-- response.auth.metadata.email
-- response.auth.metadata.username
-- response.auth.policies
-- response.mount_accessor
-- response.mount_point
-- response.mount_type
-- type
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  auth.accessor:
+  - actor.session.uid
+  auth.client_token:
+  - actor.session.credential_uid
+  auth.display_name:
+  - actor.user.name
+  auth.entity_id:
+  - actor.user.uid
+  auth.metadata.email:
+  - actor.user.email_addr
+  auth.metadata.username:
+  - actor.user.display_name
+  auth.policies:
+  - actor.authorizations.policy.name
+  error:
+  - api.response.error
+  - status_detail
+  request.headers.user-agent:
+  - http_request.user_agent
+  request.id:
+  - api.request.uid
+  - metadata.correlation_uid
+  request.mount_accessor:
+  - api.service.uid
+  - service.uid
+  request.mount_point:
+  - api.service.name
+  - service.name
+  request.mount_running_version:
+  - metadata.product.version
+  request.mount_type:
+  - api.service.name
+  - auth_protocol
+  - resources.type
+  request.namespace.id:
+  - metadata.tenant_uid
+  - resources.namespace
+  request.namespace.path:
+  - metadata.tenant_uid
+  request.operation:
+  - api.operation
+  request.path:
+  - resources.name
+  - resources.uid
+  request.remote_address:
+  - src_endpoint.ip
+  request.remote_port:
+  - src_endpoint.port
+  response.auth.accessor:
+  - session.uid
+  response.auth.client_token:
+  - session.credential_uid
+  response.auth.display_name:
+  - user.name
+  response.auth.entity_id:
+  - user.uid
+  response.auth.metadata.username:
+  - user.display_name
