@@ -45,6 +45,8 @@ NORMALIZE_KINDS = {
 # Optional source_normalize parameters (and types).
 NORMALIZE_OPTIONAL = {'parse_json_object': {'arrays': bool}, 'parse_kv_merge': {'tail_keys': list}}
 NORMALIZE_UNKNOWN = 'nan2421-normalize-unknown'
+# The value text and JSON probes give credential-named keys; it must survive unaltered.
+PROBE_SECRET = 'nan2421-secret'
 NORMALIZE_PROBE = {'NormalizeProbe': NORMALIZE_UNKNOWN}
 
 
@@ -572,8 +574,17 @@ def run_parser(path, supplied=None, output_dir=None):
                 count += check(source, output, event['message'], rules, consumed, config['consumed_candidates'])
             except AssertionError as error:
                 raise AssertionError(f'{path.parent.name}/{name}: {error}') from error
+            # raw_data, when emitted, is the untouched original (never masked,
+            # trimmed or rewritten).
+            assert 'raw_data' not in output or output['raw_data'] == event['message'], f'{path.parent.name}/{name}: raw_data is not the original input'
             if name == 'text_residual_probe':
+                leaves = [v for _, v in flatten(source)]
                 assert dict(flatten(source)).get(probe['source']) == 'nan2421-text-unknown', 'text probe missing from parsed source'
+                # A credential-named probe field (password=...) is captured
+                # unaltered like any other; check() then requires it mapped or
+                # spilled with that exact value.
+                if PROBE_SECRET in event['message']:
+                    assert PROBE_SECRET in leaves, 'text probe credential value missing or altered in parsed source'
             if name.startswith('normalize_probe_'):
                 assert NORMALIZE_UNKNOWN in [v for _, v in flatten(source)], f'{name}: unwrapped probe field missing from parsed source'
             if name not in ('residual_probe', 'text_residual_probe') and not name.startswith('normalize_probe_'):
