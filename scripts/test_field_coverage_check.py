@@ -104,6 +104,75 @@ class ResidualTests(unittest.TestCase):
             check({'Query': '1' + 'x' * 50}, {'status_id': 1, 'metadata': {'is_truncated': True}, 'raw_data': 'raw input'}, 'raw input', untargeted)
 
 
+class CredentialRedactionTests(unittest.TestCase):
+    def test_credential_keys_redacted(self):
+        # Keycloak CredentialRepresentation: credentials[].value, credentialData
+        # and secretData never spill.
+        rep = {'username': 'u', 'credentials': [{'type': 'password', 'value': 'nan2421-secret', 'temporary': False}],
+               'credentialData': '{"hashIterations":27500}', 'secretData': '{"value":"nan2421-secret"}'}
+        self.assertEqual(fcc.redact(rep), {'username': 'u', 'credentials': '<redacted>', 'credentialData': '<redacted>', 'secretData': '<redacted>'})
+        program = '__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'transforms': [], 'consumed_candidates': []})
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp/'p.vrl').write_text(program)
+            (tmp/'events.json').write_text(json.dumps({'source': {'representation_json': rep}, 'output': {}})+'\n')
+            run = subprocess.run(['vector', 'vrl', '--program', str(tmp/'p.vrl'), '--input', str(tmp/'events.json')], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            [output] = [json.loads(l) for l in run.stdout.splitlines() if l.startswith('{')]
+        self.assertNotIn('nan2421-secret', json.dumps(output))
+        self.assertEqual(output['unmapped']['representation_json.credentials'], '<redacted>')
+
+
+PROBE_PARSER = r'''
+raw_log = to_string(.message) ?? ""
+__raw_body = raw_log
+__source_kv = object(parse_json(raw_log) ?? {}) ?? {}
+if is_string(__source_kv.details) {
+    d, derr = parse_json(string!(__source_kv.details))
+    if derr == null && is_object(d) {
+        __discard = del(__source_kv.details)
+        __source_kv.details_json = d
+    } else {
+        wt = string!(__source_kv.details)
+        __source_kv.details = {"withheld": true, "bytes": length(wt), "sha256": sha2(wt, variant: "SHA-256")}
+    }
+}
+. = {"class_uid": 0, "raw_data": RAW, "message": MESSAGE}
+'''
+
+
+class RunParserTests(unittest.TestCase):
+    """End to end: withhold needs the raw body in raw_data; no secret outside it."""
+
+    def run_parser(self, raw_data='raw_log', message='"ok"'):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'probe'/'parser.yaml'
+            path.parent.mkdir()
+            (path.parent/'field-coverage.yaml').write_text(json.dumps({
+                'source': 'json', 'consumed_candidates': [],
+                'source_normalize': [
+                    {'kind': 'parse_json_object', 'paths': ['details'], 'target': 'details_json', 'reason': 'r'},
+                    {'kind': 'withhold', 'paths': ['details'], 'match': '.', 'reason': 'r'}]}))
+            program = PROBE_PARSER.replace('RAW', raw_data).replace('MESSAGE', message)
+            samples = [{'raw': json.dumps({'user': 'a', 'details': '{"x": 1}'})},
+                       {'raw': json.dumps({'user': 'b', 'details': 'not json'})}]
+            body = ''.join('  ' + line + '\n' if line else '\n' for line in program.strip().splitlines())
+            path.write_text('parser_vrl: |\n' + body + 'samples: ' + json.dumps(samples) + '\n')
+            residual_spill.update(path)
+            fcc.run_parser(path)
+
+    def test_lossless(self):
+        self.run_parser()
+
+    def test_withhold_without_raw_data_fails(self):
+        with self.assertRaisesRegex(AssertionError, 'raw_data equal to the raw body'):
+            self.run_parser(raw_data='"DROPPED_NO_RAW_COPY"')
+
+    def test_secret_in_message_echo_fails(self):
+        with self.assertRaisesRegex(AssertionError, 'secret leaked outside raw_data'):
+            self.run_parser(message='raw_log')
+
+
 class TargetEvidenceTests(unittest.TestCase):
     """A targeted rule is satisfied only by the mapped event (spill.vrl __mapped)."""
 
@@ -195,6 +264,21 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             validate_config(self.truncate(target='unmapped.sql_short'))
 
+    def test_transform_parameters(self):
+        base = {'source': 'S', 'reason': 'r'}
+        for rule in ({'kind': 'scale', 'factor': 0}, {'kind': 'scale'}, {'kind': 'scale', 'factor': float('inf')},
+                     {'kind': 'scale', 'factor': '2'}, {'kind': 'enum', 'values': {}}, {'kind': 'enum'},
+                     {'kind': 'epoch_ms', 'format': ''}, {'kind': 'epoch_ms', 'format': 5}):
+            with self.subTest(rule=rule), self.assertRaises(AssertionError):
+                validate_config({'transforms': [{**base, **rule}]})
+        validate_config({'transforms': [{**base, 'kind': 'scale', 'factor': 0.001}, {**base, 'kind': 'enum', 'values': {'a': 1}}, {**base, 'kind': 'epoch_ms'}]})
+
+    def test_withhold_must_follow_an_unpack_step(self):
+        withhold = {'kind': 'withhold', 'paths': ['details'], 'match': '.', 'reason': 'r'}
+        with self.assertRaises(AssertionError):
+            validate_config({'source_normalize': [withhold]})
+        validate_config({'source_normalize': [{'kind': 'parse_json_object', 'paths': ['details'], 'target': 'details_json', 'reason': 'r'}, withhold]})
+
     def test_json_envelope_retired(self):
         with self.assertRaises(AssertionError):
             validate_config({'json_envelope': 'message'})
@@ -266,6 +350,14 @@ class SourceNormalizeTests(unittest.TestCase):
         listed = {'message': '[1, 2]'}
         self.assertEqual(normalized_source(listed, rules), listed)
 
+    def test_parse_json_object_arrays(self):
+        rules = [{'kind': 'parse_json_object', 'paths': ['representation'], 'target': 'representation_json', 'arrays': True}]
+        listed = {'representation': '[{"name": "realm-admin"}]'}
+        self.assertEqual(normalized_source(listed, rules), {'representation_json': [{'name': 'realm-admin'}]})
+        self.assertEqual(normalized_source(listed, [dict(rules[0], arrays=False)]), listed)
+        with self.assertRaises(AssertionError):
+            validate_config({'source_normalize': [dict(rules[0], arrays='yes', reason='r')]})
+
     def test_parse_json_object_never_overwrites_target(self):
         rules = [{'kind': 'parse_json_object', 'paths': ['message'], 'target': 'message_json'}]
         original = {'message': '{"a": 1}', 'message_json': 'PRE_EXISTING_VALUE'}
@@ -315,6 +407,9 @@ class SourceNormalizeTests(unittest.TestCase):
         out = normalized_source(batch, [{'kind': 'withhold', 'paths': ['logEvents'], 'match': r'^\[[^\]]'}])
         encoded = '[{"id":"2","message":"b"},{"id":"1","message":"a"}]'
         self.assertEqual(out['logEvents']['sha256'], hashlib.sha256(encoded.encode()).hexdigest())
+        # Structured objects and scalars are never withheld: the spill key-redacts them.
+        for value in ({'important_action': 'delete_prod_db'}, 7, None, True):
+            self.assertEqual(normalized_source({'details': value}, [{'kind': 'withhold', 'paths': ['details'], 'match': '.'}]), {'details': value})
         empty = {'logEvents': []}
         self.assertEqual(normalized_source(empty, [{'kind': 'withhold', 'paths': ['logEvents'], 'match': r'^\[[^\]]'}]), empty)
 

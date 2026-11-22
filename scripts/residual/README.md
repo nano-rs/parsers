@@ -55,8 +55,9 @@ capture must equal the input after exactly those steps (`normalized_source` in
   object (a CloudWatch Logs `logEvents`).
 - `base64_json_merge` `{path}`: a base64 JSON object is decoded and merged
   with the remaining keys (a Pub/Sub push `message.data`).
-- `parse_json_object` `{paths, target}`: the first listed path holding a
-  JSON-object string is moved, parsed, to the top-level `target`, so a JSON
+- `parse_json_object` `{paths, target, arrays?}`: the first listed path holding a
+  JSON-object string (or, with `arrays: true`, a JSON-array string) is moved,
+  parsed, to the top-level `target`, so a JSON
   log message spills field by field and is redacted; its raw text is removed
   from the source like the other envelope steps (it stays only in `raw_data`).
 - `parse_kv_merge` `{path, match, key_value_delimiter, field_delimiter}`: a
@@ -92,7 +93,7 @@ before flattening, then decoded for naming. Collisions receive `_2`, `_3`, etc.
 Scalar arrays retain their type/order; arrays containing objects or arrays use
 JSON strings. Fully represented scalar arrays are consumed. Partially mapped arrays remain
 intact to preserve their order and repeated elements. Secret-bearing keys
-(`password`, `secret`, `authorization`, `token`, case-insensitive) are redacted
+(`password`, `secret`, `authorization`, `token`, `credential`, case-insensitive) are redacted
 recursively before encoding; a sensitive object key redacts its whole value.
 Name/value and Key/Value header or parameter objects redact the payload when
 the name identifies a sensitive field.
