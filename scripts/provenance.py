@@ -139,6 +139,13 @@ def _number(value, factor=None):
     step = max(1, math.ceil(1 / abs(factor))) if factor else 1
     delta = RNG.randint(1000, 9999) * step
     if isinstance(value, float):
+        if factor:
+            # A whole number: value * factor is then exact in both Python and
+            # VRL (a random fraction can round differently).
+            return float(math.floor(value) + delta)
+        if 0 <= value <= 1:
+            # A probability or ratio stays in range.
+            return round(RNG.uniform(0.001, 0.999), 6)
         return value + delta + RNG.randint(1, 99) / 100
     return value + delta if value >= 0 else value - delta
 
@@ -160,7 +167,7 @@ def sentinels(value, kind=None, factor=None):
             return list(dict.fromkeys(v for v in (RNG.randint(1, 65535), RNG.randint(1, 65535)) if v != value))
         return [_number(value, factor)]
     if isinstance(value, float):
-        return [_number(value, factor)]
+        return list(dict.fromkeys(v for v in (_number(value, factor), _number(value, factor)) if v != value))
     if not isinstance(value, str) or not value:
         return []
     out = []
@@ -172,6 +179,7 @@ def sentinels(value, kind=None, factor=None):
         decimals = len(num.group(1) or '')
         new = _number(float(value) if decimals else int(value), factor)
         out.append(f'{new:.{decimals}f}' if decimals else str(new))
+        out.append(f'{_number(float(value) if decimals else int(value), factor):.{decimals}f}' if decimals else str(_number(int(value), factor)))
     if kind == 'scale':
         # Only a whole-number move is certain to move the scaled result.
         return list(dict.fromkeys(v for v in out if v != value))
