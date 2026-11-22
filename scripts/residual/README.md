@@ -29,6 +29,9 @@ not consumed unless its value actually appears in the selected branch.
 
 Every additional normalization has a per-parser `field-coverage.yaml` entry:
 source path, transform kind, optional destination path, and a one-line reason.
+A destination is looked up in the mapped event only (`__mapped`; never
+`unmapped`, `raw_data`, or a `message` equal to the raw body), and a target
+under `unmapped` or `raw_data` is rejected.
 The `truncate` kind (with `length` and a required `target`) covers a bounded
 copy: the source counts as consumed when the target holds its first `length`
 characters and, for a longer value, the event sets `metadata.is_truncated` and
@@ -53,8 +56,9 @@ capture must equal the input after exactly those steps (`normalized_source` in
 - `base64_json_merge` `{path}`: a base64 JSON object is decoded and merged
   with the remaining keys (a Pub/Sub push `message.data`).
 - `parse_json_object` `{paths, target}`: the first listed path holding a
-  JSON-object string is copied, parsed, to the top-level `target`, so a JSON
-  log message spills field by field and is redacted.
+  JSON-object string is moved, parsed, to the top-level `target`, so a JSON
+  log message spills field by field and is redacted; its raw text is removed
+  from the source like the other envelope steps (it stays only in `raw_data`).
 - `parse_kv_merge` `{path, match, key_value_delimiter, field_delimiter}`: a
   top-level string matching `match` is parsed with VRL `parse_key_value`
   (whitespace strict; the checker calls Vector for the exact result), removed,
@@ -66,7 +70,9 @@ captured as it was, and the parser must do the same. A parse error or an empty
 result also skips the step. Nothing else may differ. Each declared step is
 probed: the checker plants an unknown field and a secret inside the payload
 the step unwraps in a real sample, and requires the field to be captured and
-spilled and the secret redacted. A step no sample exercises fails the check.
+spilled and the secret redacted, and the secret may not appear anywhere in the
+event outside `raw_data` (the same holds for the JSON residual probe). A step
+no sample exercises fails the check.
 `transforms` and `source_normalize` are the only opt-ins; both are validated
 (`validate_config`) before any sample runs.
 

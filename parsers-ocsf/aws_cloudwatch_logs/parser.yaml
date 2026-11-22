@@ -16,8 +16,9 @@ description: >
   (class_uid 0, cloud profile): the message text on `message`, the event
   timestamp on `time`, ingestionTime on metadata.logged_time, the event id on
   metadata.uid, the log group on metadata.log_name, the owner account on
-  cloud.account.uid. A JSON message is passed through whole
-  under `unmapped.message_json.*` (arrays kept, secret keys redacted) and a
+  cloud.account.uid. A JSON message is passed through field by field
+  under `unmapped.message_json.*` (arrays kept, secret keys redacted; its own
+  `message` / `msg` text, if any, is the event message) and a
   `level` / `severity` key drives severity. Lambda's tab-delimited runtime lines also map their level.
   One input record is one event: nano's parser lane cannot fan out, so a
   multi-event envelope must be split upstream (Vector
@@ -127,12 +128,20 @@ parser_vrl: |
       level = ""
       mj, mjerr = parse_json(inner)
       mobj = {}
+      event_message = inner
       if mjerr == null && is_object(mj) {
           mobj = object!(mj)
-          # A JSON message passes through as source, so the residual spill keeps every
-          # field (arrays too, and values equal to a mapped value), redacting secrets.
-          # An input that already has a message_json key keeps it: never overwrite.
-          if !exists(__source_kv.message_json) { __source_kv = set!(__source_kv, ["message_json"], mobj) }
+          # A JSON message is MOVED into the source as message_json, so the residual
+          # spill keeps every field (arrays too, and values equal to a mapped value)
+          # with secret keys redacted, and its unredacted text is not kept outside
+          # raw_data. An input that already has a message_json key keeps it (and its
+          # message): never overwrite.
+          if !exists(__source_kv.message_json) {
+              if form == "envelope" || form == "unnested" { __discard = del(__source_kv.logEvents.message) } else { __discard = del(__source_kv.message) }
+              __source_kv = set!(__source_kv, ["message_json"], mobj)
+              # The event's message is the JSON log's own message text, if any.
+              event_message = string(mobj.message) ?? string(mobj.msg) ?? string(mobj.errorMessage) ?? ""
+          }
           level = string(mobj.level) ?? string(mobj.severity) ?? string(mobj.log_level) ?? string(mobj.levelname) ?? ""
       } else {
           lm = parse_regex(inner, r'^\S+\t\S+\t(?P<level>TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\t') ?? {}
@@ -163,10 +172,11 @@ parser_vrl: |
           "status": "Unknown",
           "time": time_ms,
           "raw_data": raw_log,
-          "message": inner,
+          "message": event_message,
           "metadata": metadata,
           "cloud": cloud
       }
+      if event_message == "" { __discard = del(ocsf.message) }
       # Lambda REPORT lines carry the invocation duration.
       rm = parse_regex(inner, r'^REPORT RequestId: \S+\s+Duration: (?P<d>[0-9.]+) ms') ?? {}
       rd = to_float(rm.d) ?? -1.0
@@ -307,7 +317,7 @@ parser_vrl: |
           __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              if __mapped."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
           }
       }
   }
@@ -325,6 +335,9 @@ parser_vrl: |
   | logGroup
   | logGroupName
   | message
+  | message_json\.errorMessage
+  | message_json\.message
+  | message_json\.msg
   | owner
   | timestamp
   )\z'
