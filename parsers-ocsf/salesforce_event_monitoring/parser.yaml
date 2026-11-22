@@ -216,14 +216,17 @@ parser_vrl: |
           rtype = ""
           if is_object(r.attributes) { rtype = string(r.attributes.type) ?? "" }
           if rtype == "" {
-              if exists(r.ReportId) { rtype = "ReportEvent" }
-              if exists(r.PageUrl) { rtype = "LightningUriEvent" }
-              if exists(r.Query) || (exists(r.QueriedEntities) && exists(r.ApiType)) { rtype = "ApiEvent" }
+              # A schema-normalized collector may send every field, absent ones as
+              # null or "", so a field signals a type only when it holds a value.
+              if (string(r.ReportId) ?? "") != "" { rtype = "ReportEvent" }
+              if (string(r.PageUrl) ?? "") != "" { rtype = "LightningUriEvent" }
+              if (string(r.Query) ?? "") != "" || (exists(r.QueriedEntities) && exists(r.ApiType)) { rtype = "ApiEvent" }
               if rtype == "" && (exists(r.LoginType) || exists(r.LoginUrl)) { rtype = "LoginEvent" }
               # Streamed (Pub/Sub) deliveries carry no attributes.type: an admin
-              # login-as carries DelegatedUsername, and a logout is a session
-              # record with no operation, query, page or login details.
-              if exists(r.DelegatedUsername) { rtype = "LoginAsEvent" }
+              # login-as carries a DelegatedUsername (and never outranks a report,
+              # page or API event), and a logout is a session record with no
+              # operation, query, page or login details.
+              if (rtype == "" || rtype == "LoginEvent") && (string(r.DelegatedUsername) ?? "") != "" { rtype = "LoginAsEvent" }
               if rtype == "" && exists(r.SessionKey) && !exists(r.Operation) && !exists(r.ApiType) && !exists(r.Status) { rtype = "LogoutEvent" }
           }
           et = rtype
@@ -530,13 +533,14 @@ parser_vrl: |
           # A bounded copy (the first 4096 characters, as truncate() counts them)
           # consumes its source, so an over-long value is not stored a second time in
           # unmapped: raw_data stays its one lossless copy. An over-bound value counts
-          # only when the event says so in metadata.is_truncated.
+          # only when the event says so in metadata.is_truncated and keeps the raw body
+          # as raw_data.
           __value = value
           if is_string(__value) {
               __expected = string!(__value)
               __over = strlen(__expected) > 4096
               if __over { __expected = truncate(__expected, 4096) }
-              if (!__over || .metadata.is_truncated == true) && ."query_info"."query_string" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              if (!__over || (.metadata.is_truncated == true && .raw_data == __raw_body)) && ."query_info"."query_string" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
           }
       }
   }
@@ -1054,4 +1058,17 @@ samples:
   - raw: "{\"message\":{\"foo\":\"bar\"}}"
     expect:
       "class_uid": 0
+      "metadata.version": "1.9.0"
+  # review: streamed LoginEvent from a schema-normalized collector (DelegatedUsername null): a plain Logon, never a login-as
+  - raw: "{\"EventDate\":\"2026-08-18T14:00:00.000Z\",\"EventIdentifier\":\"7c5b3d3e-0000-4000-8000-000000000006\",\"Username\":\"jdoe@example.com\",\"UserId\":\"005000000000789AAA\",\"DelegatedUsername\":null,\"LoginType\":\"Application\",\"LoginUrl\":\"login.salesforce.com\",\"Status\":\"Success\",\"SessionKey\":\"vMASKIU6AxEr+Op7\",\"SourceIp\":\"203.0.113.12\"}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "severity_id": 1
+      "metadata.version": "1.9.0"
+  # review: streamed ApiEvent run by a delegated admin (and ReportId null): stays Datastore Activity with its query
+  - raw: "{\"EventDate\":\"2026-08-18T14:05:00.000Z\",\"EventIdentifier\":\"7c5b3d3e-0000-4000-8000-000000000007\",\"Username\":\"jdoe@example.com\",\"UserId\":\"005000000000789AAA\",\"DelegatedUsername\":\"admin.user@example.com\",\"ReportId\":null,\"Query\":\"SELECT Id FROM Account\",\"QueriedEntities\":\"Account\",\"ApiType\":\"REST\",\"SessionKey\":\"vMASKIU6AxEr+Op7\",\"SourceIp\":\"203.0.113.12\"}"
+    expect:
+      "class_uid": 6005
+      "query_info.query_string": "SELECT Id FROM Account"
       "metadata.version": "1.9.0"

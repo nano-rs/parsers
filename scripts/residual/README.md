@@ -29,14 +29,46 @@ not consumed unless its value actually appears in the selected branch.
 
 Every additional normalization has a per-parser `field-coverage.yaml` entry:
 source path, transform kind, optional destination path, and a one-line reason.
-The `truncate` kind (with `length`) covers a bounded copy: the source counts
-as consumed when the destination holds its first `length` characters and,
-for a longer value, the event sets `metadata.is_truncated`, so an over-long
-value is kept once in `raw_data` rather than repeated in `unmapped`.
+The `truncate` kind (with `length` and a required `target`) covers a bounded
+copy: the source counts as consumed when the target holds its first `length`
+characters and, for a longer value, the event sets `metadata.is_truncated` and
+keeps the raw body as `raw_data`, so an over-long value is kept once there
+rather than repeated in `unmapped`. `length` is an integer of at least
+`TRUNCATE_MIN_LENGTH` (256, `residual_spill.py`). The source may be any
+dotted path of the captured JSON (an SQL statement bounded at 8192 characters
+in a database audit log works the same way); the capture itself stays exact.
 Rules are conditional: the transformed value must actually match emitted
 output. Malformed timestamps, unsupported enums, and unused fallback values
 remain residual. These are executable expectations, not unconditional waivers.
 No missing source is accepted just because a path is listed.
+
+For a JSON input the checker requires `__source_kv` to equal the parsed input.
+A parser that unwraps a known envelope declares each step, with a one-line
+`reason`, in its `field-coverage.yaml` under `source_normalize`, and the
+capture must equal the input after exactly those steps (`normalized_source` in
+`field_coverage_check.py`):
+
+- `unwrap_single` `{path}`: a one-element array of an object becomes the
+  object (a CloudWatch Logs `logEvents`).
+- `base64_json_merge` `{path}`: a base64 JSON object is decoded and merged
+  with the remaining keys (a Pub/Sub push `message.data`).
+- `parse_json_object` `{paths, target}`: the first listed path holding a
+  JSON-object string is copied, parsed, to the top-level `target`, so a JSON
+  log message spills field by field and is redacted.
+- `parse_kv_merge` `{path, match, key_value_delimiter, field_delimiter}`: a
+  top-level string matching `match` is parsed with VRL `parse_key_value`
+  (whitespace strict; the checker calls Vector for the exact result), removed,
+  and its pairs merged in (Keycloak's JSON log `message`).
+
+No step ever overwrites a key: on a collision (a decoded or parsed key that
+already exists, or an existing `target`) the step is skipped and the input is
+captured as it was, and the parser must do the same. A parse error or an empty
+result also skips the step. Nothing else may differ. Each declared step is
+probed: the checker plants an unknown field and a secret inside the payload
+the step unwraps in a real sample, and requires the field to be captured and
+spilled and the secret redacted. A step no sample exercises fails the check.
+`transforms` and `source_normalize` are the only opt-ins; both are validated
+(`validate_config`) before any sample runs.
 
 Residual objects flatten into dotted snake_case paths. Literal dots are escaped
 before flattening, then decoded for naming. Collisions receive `_2`, `_3`, etc.
