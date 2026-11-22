@@ -39,6 +39,7 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Moat](parsers-ocsf/moat_edr) | `moat_edr` | Omarchy | JSON (NDJSON envelope) | Supply-chain sensor: alerts with correlation chains and AI triage, alert updates, package-install receipts, shipper heartbeat, plus the opt-in process / network / file telemetry classes. OCSF only |
 | [macOS Unified Log](parsers-ocsf/macos_unified_log) | `macos_unified_log` | Apple | JSON (`log show --style ndjson`) | sshd, sudo, loginwindow, opendirectoryd and authd authentication; TCC permission changes; Gatekeeper / XProtect rejections and malware verdicts; every other entry kept as Base Event |
 | [Fail2ban](parsers-ocsf/fail2ban) | `fail2ban` | Fail2ban | fail2ban.log / syslog / journal | Ban, Reban, Restore Ban, already banned, Unban and Found as Detection Findings keyed on jail and address; server and jail lines kept |
+| [Wazuh](parsers-ocsf/wazuh) | `wazuh` | Wazuh | JSON (alerts.json) | Rule level, groups, MITRE, agent, decoder and decoded data as Detection Finding; syscheck / FIM file alerts (added, modified, deleted, whodata) as File System Activity. OCSF only |
 
 ### Network & Firewall
 
@@ -98,6 +99,7 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Kubernetes Audit](parsers-ocsf/kubernetes_audit) | `kubernetes_audit` | CNCF | JSON | API server audit: resource operations, RBAC, user identity |
 | [Microsoft 365](parsers-ocsf/microsoft_365) | `microsoft_365` | Microsoft | JSON | Exchange, SharePoint, Azure AD, DLP, Teams audit events |
 | [Google Workspace Audit](parsers-ocsf/google_workspace) | `gws_login` | Google | JSON | Admin SDK Reports: login, admin console, OAuth token, Drive activity |
+| [Wiz](parsers-ocsf/wiz) | `wiz` | Wiz | JSON (API + webhooks) | Issues and Detections / Threats as Detection Finding, vulnerability findings as Vulnerability Finding, cloud configuration findings as Compliance Finding. OCSF only |
 
 ### Security & IAM
 
@@ -113,6 +115,7 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Netskope](parsers-ocsf/netskope) | `netskope` | Netskope | JSON | CASB/SSE: app activity, alerts, DLP, network events |
 | [F5 BIG-IP ASM](parsers-ocsf/f5_waf) | `f5_waf` | F5 | JSON | Web application firewall: attacks, violations, security events |
 | [HashiCorp Vault](parsers-ocsf/hashicorp_vault) | `hashicorp_vault` | HashiCorp | JSON (audit device) | Request / response audit entries as API Activity, login paths as Authentication; HMAC values kept as written. OCSF only |
+| [Teleport](parsers-ocsf/teleport) | `teleport` | Teleport | JSON (audit log) | Logins and session start / end, exec and session commands, scp / sftp, user and access-request changes, role changes, cert and API events. OCSF only |
 
 ### Vulnerability Management
 
@@ -120,6 +123,7 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 |--------|-------------|--------|--------|-------------|
 | [Qualys](parsers-ocsf/qualys) | `qualys` | Qualys | JSON | Host detections, knowledge base, WAS findings, compliance |
 | [Rapid7 InsightVM](parsers-ocsf/rapid7_insightvm) | `rapid7_insightvm` | Rapid7 | JSON | Vulnerability findings, asset data, remediation events |
+| [Tenable](parsers-ocsf/tenable) | `tenable` | Tenable | JSON | Vulnerability Management export, Security Center analysis and Nessus API findings as Vulnerability Finding: CVEs, CVSS v2 / v3 / v4, plugin, asset, port, state (open, reopened, fixed). OCSF only |
 
 ### Email Security
 
