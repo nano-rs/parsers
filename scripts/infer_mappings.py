@@ -31,7 +31,7 @@ def infer(path, all_keys=False):
     config = yaml.safe_load(text)
     doc = yaml.safe_load(path.read_text())
     samples = [(n, e) for n, e in samples_for(path, doc, None) if n not in PROBES]
-    runs = provenance.run_vrl(doc['parser_vrl'], [e['message'] for _, e in samples])
+    runs = provenance.run_vrl(doc['parser_vrl'], [e for _, e in samples])
     outputs = [o for o, _ in runs]
     sources = [s for _, s in runs]
     if all_keys:
