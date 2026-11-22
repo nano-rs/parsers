@@ -37,6 +37,8 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [systemd-journald](parsers-ocsf/linux_journald) | `linux_journald` | systemd | JSON (journalctl -o json) | Priority, facility, unit, originating process, transport; sshd, sudo and netfilter sub-parsing |
 | [LimaCharlie EDR](parsers-ocsf/limacharlie) | `limacharlie` | LimaCharlie | JSON | Sensor telemetry: process, network, DNS, file, module, registry, auth, detections |
 | [Moat](parsers-ocsf/moat_edr) | `moat_edr` | Omarchy | JSON (NDJSON envelope) | Supply-chain sensor: alerts with correlation chains and AI triage, alert updates, package-install receipts, shipper heartbeat, plus the opt-in process / network / file telemetry classes. OCSF only |
+| [macOS Unified Log](parsers-ocsf/macos_unified_log) | `macos_unified_log` | Apple | JSON (`log show --style ndjson`) | sshd, sudo, loginwindow, opendirectoryd and authd authentication; TCC permission changes; Gatekeeper / XProtect rejections and malware verdicts; every other entry kept as Base Event |
+| [Fail2ban](parsers-ocsf/fail2ban) | `fail2ban` | Fail2ban | fail2ban.log / syslog / journal | Ban, Reban, Restore Ban, already banned, Unban and Found as Detection Findings keyed on jail and address; server and jail lines kept |
 
 ### Network & Firewall
 
@@ -50,6 +52,8 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Juniper SRX](parsers-ocsf/juniper_srx) | `juniper_srx` | Juniper | RFC 5424 structured data | RT_FLOW sessions, RT_IDP attacks, RT_UTM events |
 | [Cisco Meraki](parsers-ocsf/meraki) | `meraki` | Cisco | Syslog | MX firewall flows, IDS alerts, URL filtering, wireless, VPN |
 | [MikroTik RouterOS](parsers-ocsf/routeros) | `routeros` | MikroTik | RFC 3164 syslog | DNS queries/answers, user login/logout/failure, firewall flows, DHCP leases |
+| [Cisco IOS / IOS-XE](parsers-ocsf/cisco_ios) | `cisco_ios` | Cisco | Syslog %FACILITY-SEV-MNEMONIC | SEC_LOGIN / SSH / AAA logins, CONFIG_I and archive-logged commands, ACL logs (IPv4, IPv6, FMANFP, IOS-XR), interface up/down |
+| [Juniper Junos](parsers-ocsf/juniper_junos) | `juniper_junos` | Juniper | BSD syslog / RFC 5424 structured data | UI_LOGIN / UI_AUTH / UI_LOGOUT, login failures, UI_COMMIT and CLI commands, SNMP link traps. General device logs; SRX flow logs use `juniper_srx` |
 | [SonicWall](parsers-ocsf/sonicwall) | `sonicwall` | SonicWall | key=value syslog | Connections, IPS detection, content filtering, user auth |
 | [Zscaler ZIA](parsers-ocsf/zscaler_zia) | `zscaler_zia` | Zscaler | JSON envelope | Web, firewall, DNS, tunnel, DLP, audit log types |
 | [Broadcom ProxySG](parsers-ocsf/broadcom_proxy) | `broadcom_proxy` | Broadcom | ELFF space-delimited | Web proxy access logs with URL reconstruction |
