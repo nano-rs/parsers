@@ -16,11 +16,16 @@ description: >
   metadata.correlation_uid; entry labels and the other resource labels stay
   in `unmapped.labels.*` / `unmapped.resource.*`. The trace id lands on
   trace.uid for the HTTP and API classes (Base Event has no trace
-  attribute, so there it stays in unmapped). Classes follow the payload shape. An entry with `httpRequest`
-  (load balancer, Cloud Run, App Engine request logs) is "HTTP Activity"
-  (class_uid 4002). An AuditLog protoPayload that reaches this lane is "API
-  Activity" (class_uid 6003) with the core fields mapped; route audit logs
-  to the gcp_audit parser for the full mapping. Everything else
+  attribute, so there it stays in unmapped). Classes follow the payload shape. An AuditLog protoPayload that reaches this lane is "API
+  Activity" (class_uid 6003) with the core fields mapped, even when it also
+  carries `httpRequest` (IAP, API Gateway), whose request then lands on
+  http_request; route audit logs to the gcp_audit parser for the full
+  mapping. Any other entry with `httpRequest` (load balancer, Cloud Run,
+  App Engine request logs) is "HTTP Activity" (class_uid 4002); a bare IPv6
+  remoteIp / serverIp is kept whole, a port is read only from `[v6]:port`
+  or `v4:port`. With the push wrapper, the decoded LogEntry is the parsed
+  source, so its unmapped fields spill (redacted) and the base64 body does
+  not. Everything else
   (textPayload, jsonPayload, other protoPayloads) is "Base Event"
   (class_uid 0): textPayload or jsonPayload.message is the message and the
   rest of jsonPayload passes through under `unmapped.json_payload.*`.
@@ -51,7 +56,14 @@ parser_vrl: |
       if pdata != "" {
           dec = decode_base64(pdata) ?? ""
           dj, djerr = parse_json(dec)
-          if djerr == null && is_object(dj) { e = object!(dj) }
+          if djerr == null && is_object(dj) {
+              e = object!(dj)
+              # The decoded LogEntry is the source, so its unmapped fields spill (and
+              # are redacted); the wrapper's own fields ride along without the base64 body.
+              w = p
+              __discard = del(w.message.data)
+              __source_kv = merge(e, w)
+          }
       }
       is_entry = exists(e.logName) || exists(e.insertId) || exists(e.textPayload) || exists(e.jsonPayload) || exists(e.protoPayload) || (exists(e.resource) && exists(e.timestamp))
   }
@@ -129,108 +141,95 @@ parser_vrl: |
 
       is_audit = ends_with(string(get(pp, ["@type"]) ?? null) ?? "", "google.cloud.audit.AuditLog")
 
+      # ---- httpRequest endpoints: a bare IPv4/IPv6 address is taken as is; a
+      # host:port form needs IPv6 in brackets, so a bare IPv6 is never split.
+      hr_src = {}
+      rip = string(hr.remoteIp) ?? ""
+      rport = 0
+      if !is_ipv4(rip) && !is_ipv6(rip) {
+          rmm = parse_regex(rip, r'^(?:\x5B(?P<ip6>[^\x5D]+)\x5D|(?P<ip4>[^:\x5B\x5D]+)):(?P<port>\d+)$') ?? {}
+          rip = string(rmm.ip6) ?? string(rmm.ip4) ?? ""
+          rport = to_int(rmm.port) ?? 0
+      }
+      if is_ipv4(rip) || is_ipv6(rip) {
+          hr_src = { "ip": downcase(rip) }
+          if rport > 0 { hr_src.port = rport }
+      }
+      hr_dst = {}
+      sip = string(hr.serverIp) ?? ""
+      sport = 0
+      if !is_ipv4(sip) && !is_ipv6(sip) {
+          smm = parse_regex(sip, r'^(?:\x5B(?P<ip6>[^\x5D]+)\x5D|(?P<ip4>[^:\x5B\x5D]+)):(?P<port>\d+)$') ?? {}
+          sip = string(smm.ip6) ?? string(smm.ip4) ?? ""
+          sport = to_int(smm.port) ?? 0
+      }
+      if is_ipv4(sip) || is_ipv6(sip) {
+          hr_dst = { "ip": downcase(sip) }
+          if sport > 0 { hr_dst.port = sport }
+      }
+
+      # ---- httpRequest -> http_request / http_response (shared by 4002 and 6003) ----
+      method = upcase(string(hr.requestMethod) ?? "")
+      http_activity_id = 99
+      http_activity_name = "Other"
+      if method == "CONNECT" { http_activity_id = 1; http_activity_name = "Connect" }
+      if method == "DELETE"  { http_activity_id = 2; http_activity_name = "Delete" }
+      if method == "GET"     { http_activity_id = 3; http_activity_name = "Get" }
+      if method == "HEAD"    { http_activity_id = 4; http_activity_name = "Head" }
+      if method == "OPTIONS" { http_activity_id = 5; http_activity_name = "Options" }
+      if method == "POST"    { http_activity_id = 6; http_activity_name = "Post" }
+      if method == "PUT"     { http_activity_id = 7; http_activity_name = "Put" }
+      if method == "TRACE"   { http_activity_id = 8; http_activity_name = "Trace" }
+      if method == "PATCH"   { http_activity_id = 9; http_activity_name = "Patch" }
+
+      url_obj = {}
+      req_url = string(hr.requestUrl) ?? ""
+      if req_url != "" {
+          u, uerr = parse_url(req_url)
+          if uerr == null {
+              url_obj.url_string = req_url
+              if u.scheme != "" { url_obj.scheme = u.scheme }
+              uh = string(u.host) ?? ""
+              if uh != "" { url_obj.hostname = downcase(uh) }
+              if u.path != "" { url_obj.path = u.path }
+              up = to_int(u.port)
+              if up > 0 { url_obj.port = up }
+              qs = split(req_url, "?", limit: 2)
+              if length(qs) == 2 && (string(qs[1]) ?? "") != "" { url_obj.query_string = string(qs[1]) ?? "" }
+          } else {
+              qs = split(req_url, "?", limit: 2)
+              url_obj.path = string(qs[0]) ?? "/"
+              if length(qs) == 2 && (string(qs[1]) ?? "") != "" { url_obj.query_string = string(qs[1]) ?? "" }
+          }
+      }
+      if !exists(url_obj.path) && !exists(url_obj.url_string) { url_obj.path = "/" }
+
+      code = to_int(hr.status) ?? 0
+      http_status_id = 0
+      http_status_str = "Unknown"
+      if code >= 100 && code < 400 { http_status_id = 1; http_status_str = "Success" }
+      if code >= 400 { http_status_id = 2; http_status_str = "Failure" }
+
+      http_request = { "url": url_obj }
+      if method != "" { http_request.http_method = method }
+      ua = string(hr.userAgent) ?? ""
+      if ua != "" { http_request.user_agent = ua }
+      ref = string(hr.referer) ?? ""
+      if ref != "" { http_request.referrer = ref }
+      proto = string(hr.protocol) ?? ""
+      if proto != "" { http_request.version = proto }
+      req_size = to_int(hr.requestSize) ?? 0
+      if req_size > 0 { http_request.length = req_size }
+
+      resp_size = to_int(hr.responseSize) ?? 0
+      http_response = { "code": code }
+      if code > 0 { http_response.status = http_status_str }
+      if resp_size > 0 { http_response.length = resp_size }
+      status_details = string(jp.statusDetails) ?? ""
+      if status_details != "" { http_response.message = status_details }
+
       ocsf = {}
-      if length(hr) > 0 {
-          # ---------------- HTTP Activity (4002) ----------------
-          method = upcase(string(hr.requestMethod) ?? "")
-          activity_id = 99
-          activity_name = "Other"
-          if method == "CONNECT" { activity_id = 1; activity_name = "Connect" }
-          if method == "DELETE"  { activity_id = 2; activity_name = "Delete" }
-          if method == "GET"     { activity_id = 3; activity_name = "Get" }
-          if method == "HEAD"    { activity_id = 4; activity_name = "Head" }
-          if method == "OPTIONS" { activity_id = 5; activity_name = "Options" }
-          if method == "POST"    { activity_id = 6; activity_name = "Post" }
-          if method == "PUT"     { activity_id = 7; activity_name = "Put" }
-          if method == "TRACE"   { activity_id = 8; activity_name = "Trace" }
-          if method == "PATCH"   { activity_id = 9; activity_name = "Patch" }
-
-          url_obj = {}
-          req_url = string(hr.requestUrl) ?? ""
-          if req_url != "" {
-              u, uerr = parse_url(req_url)
-              if uerr == null {
-                  url_obj.url_string = req_url
-                  if u.scheme != "" { url_obj.scheme = u.scheme }
-                  uh = string(u.host) ?? ""
-                  if uh != "" { url_obj.hostname = downcase(uh) }
-                  if u.path != "" { url_obj.path = u.path }
-                  up = to_int(u.port)
-                  if up > 0 { url_obj.port = up }
-                  qs = split(req_url, "?", limit: 2)
-                  if length(qs) == 2 && (string(qs[1]) ?? "") != "" { url_obj.query_string = string(qs[1]) ?? "" }
-              } else {
-                  qs = split(req_url, "?", limit: 2)
-                  url_obj.path = string(qs[0]) ?? "/"
-                  if length(qs) == 2 && (string(qs[1]) ?? "") != "" { url_obj.query_string = string(qs[1]) ?? "" }
-              }
-          }
-          if !exists(url_obj.path) && !exists(url_obj.url_string) { url_obj.path = "/" }
-
-          code = to_int(hr.status) ?? 0
-          status_id = 0
-          status_str = "Unknown"
-          if code >= 100 && code < 400 { status_id = 1; status_str = "Success" }
-          if code >= 400 { status_id = 2; status_str = "Failure" }
-
-          http_request = { "url": url_obj }
-          if method != "" { http_request.http_method = method }
-          ua = string(hr.userAgent) ?? ""
-          if ua != "" { http_request.user_agent = ua }
-          ref = string(hr.referer) ?? ""
-          if ref != "" { http_request.referrer = ref }
-          proto = string(hr.protocol) ?? ""
-          if proto != "" { http_request.version = proto }
-          req_size = to_int(hr.requestSize) ?? 0
-          if req_size > 0 { http_request.length = req_size }
-
-          resp_size = to_int(hr.responseSize) ?? 0
-          http_response = { "code": code }
-          if code > 0 { http_response.status = status_str }
-          if resp_size > 0 { http_response.length = resp_size }
-          status_details = string(jp.statusDetails) ?? ""
-          if status_details != "" { http_response.message = status_details }
-
-          ocsf = {
-              "class_uid": 4002,
-              "class_name": "HTTP Activity",
-              "category_uid": 4,
-              "category_name": "Network Activity",
-              "activity_id": activity_id,
-              "activity_name": activity_name,
-              "type_uid": 400200 + activity_id,
-              "status_id": status_id,
-              "status": status_str,
-              "http_request": http_request,
-              "http_response": http_response
-          }
-          # latency is a protobuf Duration string ("0.005250797s").
-          lat = string(hr.latency) ?? ""
-          lm2 = parse_regex(lat, r'^(?P<s>[0-9.]+)s$') ?? {}
-          if exists(lm2.s) { ocsf.duration = to_int(round((to_float(lm2.s) ?? 0.0) * 1000.0)) }
-          # OCSF 1.9 network_traffic: bytes_in = destination -> source (response to the client).
-          if resp_size > 0 || req_size > 0 {
-              ocsf.traffic = {}
-              if resp_size > 0 { ocsf.traffic.bytes_in = resp_size }
-              if req_size > 0 { ocsf.traffic.bytes_out = req_size }
-          }
-          rip = string(hr.remoteIp) ?? ""
-          rmm = parse_regex(rip, r'^\x5B?(?P<ip>[^\x5D]*?)\x5D?:(?P<port>\d+)$') ?? {}
-          rip_ip = string(rmm.ip) ?? rip
-          if is_ipv4(rip_ip) || is_ipv6(rip_ip) {
-              ocsf.src_endpoint = { "ip": downcase(rip_ip) }
-              rport = to_int(rmm.port) ?? 0
-              if rport > 0 { ocsf.src_endpoint.port = rport }
-          }
-          sip = string(hr.serverIp) ?? ""
-          smm = parse_regex(sip, r'^\x5B?(?P<ip>[^\x5D]*?)\x5D?:(?P<port>\d+)$') ?? {}
-          sip_ip = string(smm.ip) ?? sip
-          if is_ipv4(sip_ip) || is_ipv6(sip_ip) {
-              ocsf.dst_endpoint = { "ip": downcase(sip_ip) }
-              sport = to_int(smm.port) ?? 0
-              if sport > 0 { ocsf.dst_endpoint.port = sport }
-          }
-      } else if is_audit {
+      if is_audit {
           # ---------------- API Activity (6003): AuditLog on the generic lane ----------------
           method_name = string(pp.methodName) ?? ""
           mparts = split(method_name, ".")
@@ -242,10 +241,13 @@ parser_vrl: |
           if starts_with(verb, "update") || starts_with(verb, "patch") || starts_with(verb, "set") { activity_id = 3; activity_name = "Update" }
           if starts_with(verb, "delete") || starts_with(verb, "remove") { activity_id = 4; activity_name = "Delete" }
 
+          # Outcome as gcp_audit reads it: a non-zero status.code, or a first
+          # authorizationInfo entry with granted == false, is a failure.
           scode = to_int(get(pp, ["status", "code"]) ?? 0) ?? 0
           status_id = 1
           status_str = "Success"
-          if scode > 0 { status_id = 2; status_str = "Failure" }
+          granted = get(pp, ["authorizationInfo", 0, "granted"]) ?? null
+          if scode > 0 || granted == false { status_id = 2; status_str = "Failure" }
 
           principal = string(get(pp, ["authenticationInfo", "principalEmail"]) ?? null) ?? ""
           user = { "name": "unknown" }
@@ -255,7 +257,7 @@ parser_vrl: |
           }
           caller_ip = string(get(pp, ["requestMetadata", "callerIp"]) ?? null) ?? ""
           src = { "ip": "0.0.0.0" }
-          if is_ipv4(caller_ip) || is_ipv6(caller_ip) { src = { "ip": downcase(caller_ip) } } else if caller_ip != "" { src = { "ip": "0.0.0.0", "hostname": caller_ip } }
+          if is_ipv4(caller_ip) || is_ipv6(caller_ip) { src = { "ip": downcase(caller_ip) } } else if caller_ip != "" { src = { "ip": "0.0.0.0", "hostname": caller_ip } } else if length(hr_src) > 0 { src = hr_src }
           api_obj = { "operation": method_name, "service": { "name": string(pp.serviceName) ?? "unknown" } }
           if method_name == "" { api_obj.operation = "Unknown" }
 
@@ -284,7 +286,40 @@ parser_vrl: |
               ocsf.resources = [res]
           }
           cua = string(get(pp, ["requestMetadata", "callerSuppliedUserAgent"]) ?? null) ?? ""
-          if cua != "" { ocsf.http_request = { "user_agent": cua } }
+          # An audit entry that also carries httpRequest (IAP, API Gateway, Data Access)
+          # keeps its request on http_request; the class stays API Activity.
+          if length(hr) > 0 {
+              ocsf.http_request = http_request
+              if length(hr_dst) > 0 { ocsf.dst_endpoint = hr_dst }
+          }
+          if cua != "" { ocsf.http_request = set!(object(ocsf.http_request) ?? {}, ["user_agent"], cua) }
+      } else if length(hr) > 0 {
+          # ---------------- HTTP Activity (4002) ----------------
+          ocsf = {
+              "class_uid": 4002,
+              "class_name": "HTTP Activity",
+              "category_uid": 4,
+              "category_name": "Network Activity",
+              "activity_id": http_activity_id,
+              "activity_name": http_activity_name,
+              "type_uid": 400200 + http_activity_id,
+              "status_id": http_status_id,
+              "status": http_status_str,
+              "http_request": http_request,
+              "http_response": http_response
+          }
+          # latency is a protobuf Duration string ("0.005250797s").
+          lat = string(hr.latency) ?? ""
+          lm2 = parse_regex(lat, r'^(?P<s>[0-9.]+)s$') ?? {}
+          if exists(lm2.s) { ocsf.duration = to_int(round((to_float(lm2.s) ?? 0.0) * 1000.0)) }
+          # OCSF 1.9 network_traffic: bytes_in = destination -> source (response to the client).
+          if resp_size > 0 || req_size > 0 {
+              ocsf.traffic = {}
+              if resp_size > 0 { ocsf.traffic.bytes_in = resp_size }
+              if req_size > 0 { ocsf.traffic.bytes_out = req_size }
+          }
+          if length(hr_src) > 0 { ocsf.src_endpoint = hr_src }
+          if length(hr_dst) > 0 { ocsf.dst_endpoint = hr_dst }
       } else {
           # ---------------- Base Event (0) ----------------
           ocsf = {
@@ -724,6 +759,22 @@ samples:
       class_uid: 0
       severity_id: 3
       message: "Wed Apr 15 20:40:51 CEST 2015 Hello, world!"
+  # Bare IPv6 remoteIp / serverIp are never split at their last colon.
+  - raw: '{"insertId":"v6-0001","httpRequest":{"requestMethod":"GET","requestUrl":"https://www.example.com/","status":200,"remoteIp":"2001:db8::1","serverIp":"2001:db8::2:8080"},"resource":{"type":"http_load_balancer","labels":{"project_id":"example-project"}},"timestamp":"2026-11-21T10:10:00Z","severity":"INFO","logName":"projects/example-project/logs/requests"}'
+    expect:
+      class_uid: 4002
+      "src_endpoint.ip": "2001:db8::1"
+      "src_endpoint.port": "<missing>"
+      "dst_endpoint.ip": "2001:db8::2:8080"
+      "dst_endpoint.port": "<missing>"
+  # An AuditLog with httpRequest stays API Activity; a first authorizationInfo with granted false fails.
+  - raw: '{"protoPayload":{"@type":"type.googleapis.com/google.cloud.audit.AuditLog","authenticationInfo":{"principalEmail":"bob@example.com"},"serviceName":"iap.googleapis.com","methodName":"AuthorizeUser","authorizationInfo":[{"resource":"projects/example-project/iap_web/compute/services/web","permission":"iap.webServiceVersions.accessViaIAP","granted":false}],"resourceName":"projects/example-project/iap_web/compute/services/web"},"httpRequest":{"requestMethod":"GET","requestUrl":"https://app.example.com/admin","remoteIp":"203.0.113.21","userAgent":"Mozilla/5.0"},"insertId":"iap-0001","resource":{"type":"gce_backend_service","labels":{"project_id":"example-project"}},"timestamp":"2026-11-21T10:11:00Z","severity":"INFO","logName":"projects/example-project/logs/cloudaudit.googleapis.com%2Fdata_access"}'
+    expect:
+      class_uid: 6003
+      status_id: 2
+      "actor.user.name": "bob@example.com"
+      "src_endpoint.ip": "203.0.113.21"
+      "http_request.http_method": "GET"
   - raw: 'not a log entry'
     expect:
       class_uid: 0

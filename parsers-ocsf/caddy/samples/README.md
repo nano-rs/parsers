@@ -21,4 +21,6 @@ source value.
 | `tls_served_challenge_cert.json` | `tls` logger | https://caddy.community/t/error-obtaining-certificate-after-caddy-restart/11335 |
 | `tls_obtain_success.json` | `tls.obtain` success | message as reported in Caddy community threads (e.g. the one above) |
 | `reverse_proxy_aborting_error.json` | `http.handlers.reverse_proxy` error | https://caddy.community/t/debugging-aborting-with-incomplete-response/15312 |
+| `access_remote_addr_bracketed_ipv6.json` | pre-2.5 `remote_addr` as `[v6]:port` | constructed from the 18685 thread shape |
+| `json_unrelated_object_fallback.json` | review regression: JSON with no zap keys is a fallback | synthetic |
 | `malformed.json` | not JSON (Base Event fallback) | synthetic |

@@ -7,6 +7,8 @@ SAMPLES is a sidecar directory or file; by default check inline AND sidecar samp
 Transformed values require a justified field-coverage.yaml rule and actual output.
 """
 import argparse
+import base64
+import binascii
 import copy
 import datetime as dt
 import json
@@ -164,6 +166,68 @@ def reference_consumed(source, output):
     return consumed
 
 
+def _get(obj, path):
+    for part in path.split('.'):
+        if not isinstance(obj, dict) or part not in obj:
+            return MISSING
+        obj = obj[part]
+    return obj
+
+
+def normalized_source(original, rules):
+    """The source a parser is expected to capture for a JSON input.
+
+    By default that is the parsed input itself. A parser that unwraps a known
+    envelope declares each step in `source_normalize` (field-coverage.yaml), and
+    its `__source_kv` must equal the input after exactly these steps:
+
+    - unwrap_single  {path}: a one-element array of an object becomes the object
+      (a CloudWatch Logs envelope carrying one logEvent).
+    - base64_json_merge {path}: a base64 string that decodes to a JSON object is
+      removed and the decoded object merged UNDER the remaining keys, which win
+      (a Pub/Sub push wrapper's `message.data`).
+    - parse_json_object {paths, target}: the first path holding a string that
+      parses to a JSON object is copied, parsed, to the top-level `target`
+      (a JSON log message passed through for spill and redaction).
+    """
+    source = copy.deepcopy(original)
+    for rule in rules or ():
+        kind = rule['kind']
+        if kind == 'unwrap_single':
+            parent, _, leaf = rule['path'].rpartition('.')
+            holder = _get(source, parent) if parent else source
+            value = holder.get(leaf, MISSING) if isinstance(holder, dict) else MISSING
+            if isinstance(value, list) and len(value) == 1 and isinstance(value[0], dict):
+                holder[leaf] = value[0]
+        elif kind == 'base64_json_merge':
+            parent, _, leaf = rule['path'].rpartition('.')
+            holder = _get(source, parent) if parent else source
+            value = holder.get(leaf, MISSING) if isinstance(holder, dict) else MISSING
+            if not isinstance(value, str) or not value:
+                continue
+            try:
+                decoded = json.loads(base64.b64decode(value, validate=True).decode('utf-8'))
+            except (binascii.Error, ValueError, UnicodeDecodeError):
+                continue
+            if isinstance(decoded, dict):
+                del holder[leaf]
+                source = {**decoded, **source}
+        elif kind == 'parse_json_object':
+            for path in rule['paths']:
+                value = _get(source, path)
+                if isinstance(value, str):
+                    try:
+                        parsed = json.loads(value)
+                    except ValueError:
+                        break
+                    if isinstance(parsed, dict):
+                        source[rule['target']] = parsed
+                    break
+        else:
+            raise AssertionError(f'unknown source_normalize kind {kind}')
+    return source
+
+
 def envelope(raw):
     try:
         obj = json.loads(raw)
@@ -249,7 +313,7 @@ def run_parser(path, supplied=None, output_dir=None):
                 except json.JSONDecodeError: original = {}
                 if not isinstance(original, dict): original = {}
                 if isinstance(original, dict) and original:
-                    assert source == original, f'{name}: JSON source capture changed fields'
+                    assert source == normalized_source(original, config.get('source_normalize')), f'{name}: JSON source capture changed fields'
             try:
                 consumed = []
                 if config.get('reference') == 'windows_sysmon':

@@ -16,9 +16,9 @@ description: >
   (class_uid 0, cloud profile): the message text on `message`, the event
   timestamp on `time`, ingestionTime on metadata.logged_time, the event id on
   metadata.uid, the log group on metadata.log_name, the owner account on
-  cloud.account.uid. A JSON message is passed through: its scalar fields land
-  under `unmapped.message_json.*` and a `level` / `severity` key drives
-  severity. Lambda's tab-delimited runtime lines also map their level.
+  cloud.account.uid. A JSON message is passed through whole
+  under `unmapped.message_json.*` (arrays kept, secret keys redacted) and a
+  `level` / `severity` key drives severity. Lambda's tab-delimited runtime lines also map their level.
   One input record is one event: nano's parser lane cannot fan out, so a
   multi-event envelope must be split upstream (Vector
   `. = unnest!(.logEvents)`, or a Firehose processor). An envelope that still
@@ -52,9 +52,15 @@ parser_vrl: |
           if is_array(p.logEvents) {
               arr = array!(p.logEvents)
               batch_size = length(arr)
-              if batch_size == 1 {
-                  ev = object(arr[0]) ?? {}
+              if batch_size == 1 && is_object(arr[0]) {
+                  ev = object!(arr[0])
                   form = "envelope"
+                  # The source is this one event: logEvents holds the object, as after
+                  # an upstream unnest, so it is consumed like the unnested form and
+                  # not spilled a second time as a JSON-encoded array.
+                  __source_kv = set!(p, ["logEvents"], ev)
+              } else if batch_size == 0 {
+                  form = "empty"
               } else {
                   form = "batch"
               }
@@ -123,6 +129,9 @@ parser_vrl: |
       mobj = {}
       if mjerr == null && is_object(mj) {
           mobj = object!(mj)
+          # A JSON message passes through as source, so the residual spill keeps every
+          # field (arrays too, and values equal to a mapped value), redacting secrets.
+          __source_kv = set!(__source_kv, ["message_json"], mobj)
           level = string(mobj.level) ?? string(mobj.severity) ?? string(mobj.log_level) ?? string(mobj.levelname) ?? ""
       } else {
           lm = parse_regex(inner, r'^\S+\t\S+\t(?P<level>TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\t') ?? {}
@@ -161,10 +170,8 @@ parser_vrl: |
       rm = parse_regex(inner, r'^REPORT RequestId: \S+\s+Duration: (?P<d>[0-9.]+) ms') ?? {}
       rd = to_float(rm.d) ?? -1.0
       if exists(rm.d) && rd >= 0.0 { ocsf.duration = to_int(round(rd)) }
-      # A JSON message passes through; its scalar fields surface under unmapped.message_json.*.
-      if length(mobj) > 0 { ocsf.unmapped = { "message_json": mobj } }
       . = ocsf
-  } else if form == "batch" {
+  } else if form == "batch" || form == "empty" {
       # ---- several logEvents in one record: kept whole, never dropped ----
       first_ts = to_int(get(env, ["logEvents", 0, "timestamp"]) ?? 0) ?? 0
       . = {
@@ -181,12 +188,16 @@ parser_vrl: |
           "status": "Unknown",
           "time": first_ts,
           "raw_data": raw_log,
-          "message": "CloudWatch Logs envelope with " + to_string(batch_size) + " log events; split logEvents upstream",
+          "message": "CloudWatch Logs envelope with " + to_string(batch_size) + " log events",
           "metadata": metadata,
           "cloud": cloud
       }
       # NAN-5264: explicit fallback marker; nano parser health counts it.
-      . = set!(., ["unmapped", "parse_fallback"], "multi-event envelope; unnest logEvents upstream")
+      if form == "empty" {
+          . = set!(., ["unmapped", "parse_fallback"], "envelope without log events")
+      } else {
+          . = set!(., ["unmapped", "parse_fallback"], "multi-event envelope; unnest logEvents upstream")
+      }
   } else {
       # ---- not a CloudWatch Logs shape: keep the body ----
       . = {
@@ -547,6 +558,8 @@ samples:
       time: 1795255201120
       "cloud.account.uid": "123456789012"
       "metadata.log_name": "/aws/lambda/orders-api"
+      # A one-event envelope is consumed as that event, never re-spilled whole.
+      "unmapped.log_events": "<missing>"
   - raw: '2026-11-21T10:00:01.120Z START RequestId: 6bc28136-xmpl-4365-b021-0ce6b2e64ab0 Version: $LATEST'
     expect:
       class_uid: 0

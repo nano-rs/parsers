@@ -34,6 +34,17 @@ output. Malformed timestamps, unsupported enums, and unused fallback values
 remain residual. These are executable expectations, not unconditional waivers.
 No missing source is accepted just because a path is listed.
 
+For a JSON input the checker requires `__source_kv` to equal the parsed input.
+A parser that unwraps a known envelope declares each step in its
+`field-coverage.yaml` under `source_normalize`, and the capture must equal the
+input after exactly those steps (`normalized_source` in
+`field_coverage_check.py`): `unwrap_single` (a one-element array of an object
+becomes the object, e.g. a CloudWatch Logs `logEvents`), `base64_json_merge`
+(a base64 JSON object is decoded and merged under the remaining keys, e.g. a
+Pub/Sub push `message.data`), and `parse_json_object` (the first listed path
+holding a JSON-object string is copied, parsed, to a top-level key, so a JSON
+log message spills field by field and is redacted). Nothing else may differ.
+
 Residual objects flatten into dotted snake_case paths. Literal dots are escaped
 before flattening, then decoded for naming. Collisions receive `_2`, `_3`, etc.
 Scalar arrays retain their type/order; arrays containing objects or arrays use

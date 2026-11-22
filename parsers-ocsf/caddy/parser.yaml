@@ -16,7 +16,8 @@ description: >
   request (admin, tls.obtain, http.auto_https, reverse_proxy health, config
   load) are not HTTP transactions and become "Base Event" (class_uid 0). The
   zap level drives severity and `ts` (epoch seconds or RFC 3339) drives time.
-  Non-JSON input becomes Base Event with the raw line kept and
+  Non-JSON input, and JSON that carries none of the zap keys (ts, level,
+  msg, logger, request), becomes Base Event with the raw line kept and
   `unmapped.parse_fallback` set. The whole OCSF object is emitted on the root.
 match_values:
   - caddy
@@ -33,9 +34,12 @@ parser_vrl: |
   uid = sha2("caddy|raw|" + raw_log, variant: "SHA-256")
 
   j, jerr = parse_json(raw_log)
-  if jerr == null && is_object(j) {
-      p = object!(j)
-      __source_kv = p
+  p = object(j) ?? {}
+  __source_kv = p
+  # Only a zap entry is a Caddy log: any other JSON object takes the fallback
+  # branch, so a misrouted source shows up in parser health.
+  is_caddy = jerr == null && (exists(p.ts) || exists(p.level) || exists(p.msg) || exists(p.logger) || exists(p.request))
+  if is_caddy {
 
       # ---- zap level -> severity ----
       level = downcase(string(p.level) ?? "")
@@ -82,9 +86,15 @@ parser_vrl: |
           cip = string(req.client_ip) ?? string(req.remote_ip) ?? ""
           cport = to_int(req.remote_port) ?? 0
           if cip == "" {
-              ra = parse_regex(string(req.remote_addr) ?? "", r'^\x5B?(?P<ip>[^\x5D]*?)\x5D?:(?P<port>\d+)$') ?? {}
-              cip = string(ra.ip) ?? ""
-              cport = to_int(ra.port) ?? 0
+              # A bare address is taken as is; host:port needs IPv6 in brackets.
+              raddr = string(req.remote_addr) ?? ""
+              if is_ipv4(raddr) || is_ipv6(raddr) {
+                  cip = raddr
+              } else {
+                  ra = parse_regex(raddr, r'^(?:\x5B(?P<ip6>[^\x5D]+)\x5D|(?P<ip4>[^:\x5B\x5D]+)):(?P<port>\d+)$') ?? {}
+                  cip = string(ra.ip6) ?? string(ra.ip4) ?? ""
+                  cport = to_int(ra.port) ?? 0
+              }
           }
           if is_ipv4(cip) || is_ipv6(cip) {
               src_endpoint.ip = downcase(cip)
@@ -666,6 +676,16 @@ samples:
     expect:
       class_uid: 0
       message: "admin endpoint started"
+  # JSON with no zap keys is not a Caddy log.
+  - raw: '{"foo":"bar"}'
+    expect:
+      class_uid: 0
+      "unmapped.parse_fallback": "unparsable input"
+  # Pre-2.5 remote_addr with a bracketed IPv6 client.
+  - raw: '{"level":"info","ts":1763719201.5,"logger":"http.log.access","msg":"handled request","request":{"remote_addr":"[2001:db8::44]:41234","proto":"HTTP/1.1","method":"GET","host":"www.example.com","uri":"/"},"duration":0.001,"size":5,"status":200}'
+    expect:
+      "src_endpoint.ip": "2001:db8::44"
+      "src_endpoint.port": 41234
   - raw: 'not json'
     expect:
       class_uid: 0

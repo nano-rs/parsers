@@ -17,4 +17,6 @@ Account IDs use 123456789012 / 210987654321 and IPs documentation ranges.
 | `forwarder_flat_warn_json.json` | flat forwarder form (logGroup, logStream, id, timestamp, message) | derived from the envelope fields |
 | `export_line_s3_nginx.json` | S3 export line (`<RFC 3339> <message>`) | export layout: https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/S3Export.html |
 | `export_line_s3_json.json` | S3 export line with a JSON message | same |
+| `envelope_single_json_secret_array_zero.json` | review regression: one-event envelope with a JSON message holding a secret key, arrays and values equal to mapped ones (`0`, `4`, `"AWS"`); no `unmapped.log_events`, every field under `unmapped.message_json.*`, the secret redacted | constructed |
+| `envelope_empty_log_events.json` | review regression: `logEvents: []` (fallback "envelope without log events") | constructed |
 | `malformed.json` | not a CloudWatch shape (Base Event fallback) | synthetic |

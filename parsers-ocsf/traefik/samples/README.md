@@ -25,4 +25,7 @@ sizes and durations are as published.
 | `app_json_v2_info.json` | v2 logrus JSON application log | message from https://community.traefik.io/t/provider-connection-error-context-deadline-exceeded/20568, rendered in the JSON layout |
 | `app_logfmt_v2_error.json` | v2 `common` (logfmt) application log | https://community.traefik.io/t/provider-connection-error-context-deadline-exceeded/20568 |
 | `app_console_v3_warn.json` | v3 console application log | derived from the v3 JSON line above, in the console layout |
+| `json_bare_ipv6_service_addr.json` | review regression: bare IPv6 ServiceAddr kept whole | constructed from the field list |
+| `json_bracketed_ipv6_service_url_no_clienthost.json` | bare IPv6 ClientAddr, ServiceURL with `[v6]:port` | constructed |
+| `json_unrelated_object_fallback.json` | review regression: JSON with no Traefik keys is a fallback | synthetic |
 | `malformed.json` | garbage (Base Event fallback) | synthetic |

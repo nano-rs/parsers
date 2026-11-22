@@ -13,7 +13,10 @@ description: >
   http_response.latency, TLS details on tls and trace_id / span_id on trace.
   Traefik's own application log (JSON from v2 logrus or v3 zerolog, the v2
   logfmt `common` form and the v3 console form) is not an HTTP transaction and
-  becomes "Base Event" (class_uid 0) with the level mapped to severity.
+  becomes "Base Event" (class_uid 0) with the level mapped to severity. A
+  bare IPv6 ServiceAddr / ClientAddr is kept whole; a port is read only from
+  `[v6]:port` or `v4:port`. JSON without access-log or application-log keys
+  takes the fallback branch.
   Unrecognized lines become Base Event with the raw line kept and
   `unmapped.parse_fallback` set. The whole OCSF object is emitted on the root.
 match_values:
@@ -35,9 +38,11 @@ parser_vrl: |
       __source_kv = a
       if exists(a.RequestMethod) || exists(a.DownstreamStatus) || exists(a.ClientAddr) {
           kind = "access_json"
-      } else {
+      } else if exists(a.level) || exists(a.msg) || exists(a.message) || exists(a.time) {
           kind = "app"
       }
+      # Any other JSON object is not a Traefik log: it takes the fallback branch,
+      # so a misrouted source shows up in parser health instead of passing silently.
   } else {
       c = parse_regex(raw_log, r'^(?P<client_host>\S+) \S+ (?P<client_username>\S+) \[(?P<start_local>[^\x5D]+)\] "(?P<request_method>\S+) (?P<request_path>\S+) (?P<request_protocol>[^"]*)" (?P<downstream_status>\d{3}|-) (?P<downstream_content_size>\d+|-)(?: (?:"(?P<request_referer>[^"]*)"|-) (?:"(?P<request_user_agent>[^"]*)"|-)(?: (?P<request_count>\d+|-) (?:"(?P<router_name>[^"]*)"|-) (?:"(?P<service_url>[^"]*)"|-) (?P<duration>\d+)ms)?)?\s*$') ?? {}
       if length(c) > 0 {
@@ -118,10 +123,16 @@ parser_vrl: |
       client_ip = string(a.ClientHost) ?? string(a.client_host) ?? ""
       client_port = to_int(a.ClientPort) ?? 0
       if client_ip == "" {
+          # A bare address is taken as is; host:port needs IPv6 in brackets, so a
+          # bare IPv6 is never split at its last colon.
           caddr = string(a.ClientAddr) ?? ""
-          cm = parse_regex(caddr, r'^\x5B?(?P<ip>[^\x5D]*?)\x5D?:(?P<port>\d+)$') ?? {}
-          client_ip = string(cm.ip) ?? ""
-          client_port = to_int(cm.port) ?? 0
+          if is_ipv4(caddr) || is_ipv6(caddr) {
+              client_ip = caddr
+          } else {
+              cm = parse_regex(caddr, r'^(?:\x5B(?P<ip6>[^\x5D]+)\x5D|(?P<ip4>[^:\x5B\x5D]+)):(?P<port>\d+)$') ?? {}
+              client_ip = string(cm.ip6) ?? string(cm.ip4) ?? ""
+              client_port = to_int(cm.port) ?? 0
+          }
       }
       src_endpoint = {}
       if is_ipv4(client_ip) || is_ipv6(client_ip) {
@@ -141,13 +152,20 @@ parser_vrl: |
           if suerr == null {
               suh = string(su.host) ?? ""
               sup = to_int(su.port)
-              if suh != "" { svc_addr = suh + ":" + to_string(sup) }
+              if suh != "" && sup > 0 { svc_addr = suh + ":" + to_string(sup) } else if suh != "" { svc_addr = suh }
           }
       }
       if svc_addr != "" {
-          sm = parse_regex(svc_addr, r'^\x5B?(?P<ip>[^\x5D]*?)\x5D?:(?P<port>\d+)$') ?? {}
-          sip = string(sm.ip) ?? svc_addr
-          sport = to_int(sm.port) ?? 0
+          sip = ""
+          sport = 0
+          if is_ipv4(svc_addr) || is_ipv6(svc_addr) {
+              sip = svc_addr
+          } else {
+              sm = parse_regex(svc_addr, r'^(?:\x5B(?P<ip6>[^\x5D]+)\x5D|(?P<host>[^:\x5B\x5D]+)):(?P<port>\d+)$') ?? {}
+              sip = string(sm.ip6) ?? string(sm.host) ?? ""
+              sport = to_int(sm.port) ?? 0
+              if sip == "" && !contains(svc_addr, ":") { sip = svc_addr }
+          }
           if is_ipv4(sip) || is_ipv6(sip) { dst_endpoint.ip = downcase(sip) } else if sip != "" { dst_endpoint.hostname = downcase(sip) }
           if sport > 0 { dst_endpoint.port = sport }
       }
@@ -756,6 +774,19 @@ samples:
     expect:
       class_uid: 0
       severity_id: 4
+  # Bare IPv6 ServiceAddr is never split into a different address plus a port.
+  - raw: '{"ClientAddr":"[2001:db8::30]:51544","DownstreamStatus":200,"Duration":1000000,"RequestMethod":"GET","RequestPath":"/","RequestProtocol":"HTTP/1.1","ServiceAddr":"2001:db8::2:8080","StartUTC":"2026-11-21T10:00:00Z","level":"info","msg":""}'
+    expect:
+      "src_endpoint.ip": "2001:db8::30"
+      "src_endpoint.port": 51544
+      "dst_endpoint.ip": "2001:db8::2:8080"
+      "dst_endpoint.port": "<missing>"
+      "dst_endpoint.hostname": "<missing>"
+  # JSON that is neither an access log nor an application log is a fallback.
+  - raw: '{"foo":"bar"}'
+    expect:
+      class_uid: 0
+      "unmapped.parse_fallback": "unparsable input"
   - raw: 'not a traefik line'
     expect:
       class_uid: 0

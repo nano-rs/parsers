@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Focused regression checks for residual preservation and checker rejection."""
+import base64
 import copy
 import json
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from field_coverage_check import check
+from field_coverage_check import check, normalized_source
 from residual_spill import generated
 
 
@@ -51,6 +52,51 @@ class ResidualTests(unittest.TestCase):
                         del broken['unmapped'][next(iter(expected))]
                         with self.assertRaises(AssertionError):
                             check(source, broken, 'raw input', rules, candidates=['Known', 'KnownList', 'Name'])
+
+
+class SourceNormalizeTests(unittest.TestCase):
+    """field-coverage.yaml `source_normalize`: the declared envelope steps, nothing more."""
+
+    def test_no_rules_is_identity(self):
+        original = {'a': [1], 'b': {'c': 'd'}}
+        self.assertEqual(normalized_source(original, None), original)
+
+    def test_unwrap_single(self):
+        rules = [{'kind': 'unwrap_single', 'path': 'logEvents'}]
+        one = {'logGroup': 'g', 'logEvents': [{'id': '1', 'message': 'm'}]}
+        self.assertEqual(normalized_source(one, rules), {'logGroup': 'g', 'logEvents': {'id': '1', 'message': 'm'}})
+        many = {'logEvents': [{'id': '1'}, {'id': '2'}]}
+        self.assertEqual(normalized_source(many, rules), many)
+        scalar = {'logEvents': ['x']}
+        self.assertEqual(normalized_source(scalar, rules), scalar)
+        self.assertEqual(one['logEvents'], [{'id': '1', 'message': 'm'}], 'input must not be mutated')
+
+    def test_base64_json_merge(self):
+        rules = [{'kind': 'base64_json_merge', 'path': 'message.data'}]
+        entry = {'insertId': 'x', 'textPayload': 't'}
+        data = base64.b64encode(json.dumps(entry).encode()).decode()
+        wrapper = {'message': {'data': data, 'messageId': '7'}, 'subscription': 's'}
+        self.assertEqual(normalized_source(wrapper, rules), {'insertId': 'x', 'textPayload': 't', 'message': {'messageId': '7'}, 'subscription': 's'})
+        for bad in ('!!!', base64.b64encode(b'[1]').decode(), ''):
+            raw = {'message': {'data': bad}}
+            self.assertEqual(normalized_source(raw, rules), raw)
+
+    def test_parse_json_object(self):
+        rules = [{'kind': 'unwrap_single', 'path': 'logEvents'},
+                 {'kind': 'parse_json_object', 'paths': ['logEvents.message', 'message'], 'target': 'message_json'}]
+        inner = {'level': 'ERROR', 'tags': ['a'], 'status': 0}
+        env = {'logEvents': [{'message': json.dumps(inner)}]}
+        self.assertEqual(normalized_source(env, rules)['message_json'], inner)
+        flat = {'message': json.dumps(inner)}
+        self.assertEqual(normalized_source(flat, rules)['message_json'], inner)
+        text = {'message': 'START RequestId: x'}
+        self.assertEqual(normalized_source(text, rules), text)
+        listed = {'message': '[1, 2]'}
+        self.assertEqual(normalized_source(listed, rules), listed)
+
+    def test_unknown_kind_fails(self):
+        with self.assertRaises(AssertionError):
+            normalized_source({}, [{'kind': 'nope'}])
 
 
 if __name__ == '__main__':
