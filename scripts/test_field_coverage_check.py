@@ -327,5 +327,47 @@ class NormalizeProbeTests(unittest.TestCase):
         check(expected, output, event['message'], [])
 
 
+TEXT_PARSER = r"""
+raw_log = to_string(.message) ?? ""
+__raw_body = raw_log
+kv = parse_key_value(raw_log, key_value_delimiter: "=", field_delimiter: " ") ?? {}
+MASK
+__source_kv = kv
+. = {"class_uid": 0, "raw_data": RAW, "message": to_string(kv.msg) ?? ""}
+"""
+
+
+class RunParserFidelityTests(unittest.TestCase):
+    """End to end: raw_data is the original, and a probe password survives."""
+
+    def run_parser(self, mask='', raw='raw_log'):
+        import residual_spill
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'probe'/'parser.yaml'
+            path.parent.mkdir()
+            (path.parent/'field-coverage.yaml').write_text(json.dumps({
+                'source': 'text', 'consumed_candidates': ['msg'],
+                'probe': {'mode': 'after', 'require': 'msg=', 'source': 'ResidualProbe',
+                          'text': ' ResidualProbe=nan2421-text-unknown password=nan2421-secret'}}))
+            program = TEXT_PARSER.replace('MASK', mask).replace('RAW', raw)
+            body = ''.join('  ' + line + '\n' if line else '\n' for line in program.strip().splitlines())
+            path.write_text('parser_vrl: |\n' + body + 'samples: ' + json.dumps([{'raw': 'msg=hello user=alice'}]) + '\n')
+            residual_spill.update(path)
+            fcc.run_parser(path)
+
+    def test_faithful_passes(self):
+        self.run_parser()
+
+    def test_masked_probe_password_fails(self):
+        for mask in ('if exists(kv.password) { kv.password = "<redacted>" }', '__d = del(kv.password)'):
+            with self.subTest(mask=mask), self.assertRaisesRegex(AssertionError, 'credential value'):
+                self.run_parser(mask=mask)
+
+    def test_rewritten_raw_data_fails(self):
+        for raw in ('"MASKED"', 'strip_whitespace(raw_log) + "!"'):
+            with self.subTest(raw=raw), self.assertRaisesRegex(AssertionError, 'raw_data is not the original'):
+                self.run_parser(raw=raw)
+
+
 if __name__ == '__main__':
     unittest.main()
