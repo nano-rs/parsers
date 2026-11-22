@@ -648,6 +648,9 @@ parser_vrl: |
                       rty = to_string(row.ResourceType) ?? ""
                       if rty != "" { res.type = rty }
                       ev.resources = [res]
+                      # resources does not satisfy the OCSF evidences at_least_one
+                      # constraint; data carries the compact resource identity.
+                      if length(keys(ev)) <= 2 { ev.data = res }
                       top_resources = push(top_resources, res)
                   }
                   if length(keys(ev)) <= 1 { ev.data = { "EntityType": et } }
@@ -1229,3 +1232,11 @@ samples:
       "actor.process.pid": 4242
       "actor.process.uid": "<missing>"
       "evidences.0.process.name": "powershell.exe"
+  # Review fix: an AlertEvidence cloud-resource row satisfies the OCSF evidences
+  # at_least_one constraint through data (resources is not in that list).
+  - raw: "{\"time\": \"2026-10-05T11:20:07.1234567Z\", \"tenantId\": \"00000000-0000-0000-0000-000000000000\", \"operationName\": \"Publish\", \"category\": \"AdvancedHunting-AlertEvidence\", \"properties\": {\"Timestamp\": \"2026-10-05T11:19:40.0000000Z\", \"AlertId\": \"fd638638000000000004_3\", \"Title\": \"Suspicious secret access on key vault\", \"Categories\": \"[\\\"CredentialAccess\\\"]\", \"ServiceSource\": \"Microsoft Defender for Cloud\", \"DetectionSource\": \"Microsoft Defender for Key Vault\", \"EntityType\": \"CloudResource\", \"EvidenceRole\": \"Impacted\", \"CloudResource\": \"prod-kv-01\", \"ResourceID\": \"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg1/providers/Microsoft.KeyVault/vaults/prod-kv-01\", \"ResourceType\": \"Microsoft.KeyVault/vaults\", \"Severity\": \"High\"}}"
+    expect:
+      "evidences.0.data.name": "prod-kv-01"
+      "evidences.0.resources.0.type": "Microsoft.KeyVault/vaults"
+      "resources.0.name": "prod-kv-01"
+      "severity_id": 4
