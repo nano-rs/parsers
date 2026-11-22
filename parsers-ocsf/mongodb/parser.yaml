@@ -87,8 +87,8 @@ parser_vrl: |
       if shape == "audit" { tval = get(e, ["ts", "$date"]) ?? null }
       time_ms = 0
       if is_string(tval) {
-          tp, tperr = parse_timestamp(string!(tval), "%+")
-          if tperr != null { tp, tperr = parse_timestamp(string!(tval), "%Y-%m-%dT%H:%M:%S%.f%z") }
+          tp, tperr = parse_timestamp(string!(tval), "%+", timezone: "UTC")
+          if tperr != null { tp, tperr = parse_timestamp(string!(tval), "%Y-%m-%dT%H:%M:%S%.f%z", timezone: "UTC") }
           if tperr == null { time_ms = to_unix_timestamp(tp, unit: "milliseconds") }
       } else if is_object(tval) {
           time_ms = to_int(get(tval, ["$numberLong"]) ?? 0) ?? 0
@@ -492,7 +492,7 @@ parser_vrl: |
       | ts\.\$date
       )\z') {
           __value = value
-          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
               if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }

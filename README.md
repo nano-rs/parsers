@@ -295,6 +295,10 @@ and after a large rewrite. CI runs the check on every PR (job "Parser load budge
   spills to `unmapped`. `python3 scripts/infer_mappings.py parsers-ocsf/<name>`
   writes the declarations by perturbing each source value, and
   `field_coverage_check.py` re-verifies every one the same way.
+- **Every `parse_timestamp` names its timezone** (`timezone: "UTC"` unless the
+  source says otherwise). Without it VRL reads a clock that has no offset in
+  the Vector host's timezone, so one line gets a different time on every
+  host; `field_coverage_check.py` rejects such a call.
 - UDM names do not exist in OCSF. `src_ip` is `src_endpoint.ip`, `user` is
   `actor.user.name` (the actor) or `user.name` (the subject, class-dependent),
   `timestamp` is `time`, `id` is `metadata.uid`, `ext.foo` is `unmapped.foo`.

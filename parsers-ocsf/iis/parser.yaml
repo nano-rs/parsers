@@ -188,7 +188,7 @@ parser_vrl: |
       tm = to_string(get(f, ["time"]) ?? null) ?? ""
       if d != "" && tm != "" { iso_time = d + "T" + tm + "Z" }
       if iso_time != "" {
-          ts, tserr = parse_timestamp(iso_time, "%+")
+          ts, tserr = parse_timestamp(iso_time, "%+", timezone: "UTC")
           if tserr == null { time_ms = to_unix_timestamp(ts, unit: "milliseconds") }
       }
       if shape == "positional" {
@@ -334,7 +334,7 @@ parser_vrl: |
           .message = directive_value
           if directive == "Fields" { .metadata.log_format = directive_value }
           if directive == "Date" {
-              dts, dterr = parse_timestamp(directive_value, "%Y-%m-%d %H:%M:%S")
+              dts, dterr = parse_timestamp(directive_value, "%Y-%m-%d %H:%M:%S", timezone: "UTC")
               if dterr == null { .time = to_unix_timestamp(dts, unit: "milliseconds") }
           }
       } else {
@@ -451,7 +451,7 @@ parser_vrl: |
         TimeGenerated
       )\z') {
           __value = value
-          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
               if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
