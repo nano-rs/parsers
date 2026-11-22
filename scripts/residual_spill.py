@@ -2,6 +2,7 @@
 """Generate/check inlined residual VRL from the shared template and justified rules."""
 import argparse
 import decimal
+import math
 import json
 from pathlib import Path
 import re
@@ -56,7 +57,9 @@ def kind_templates():
 def rule_body(rule, templates):
     """One rule's body, written against the loop's `key` and `value`."""
     if isinstance(rule.get('target'), str):
-        path = ''.join('.' + vrl_string(part) for part in rule['target'].split('.'))
+        # Against __mapped (no raw_data, unmapped, or raw-body message), like
+        # every other piece of coverage evidence.
+        path = '__mapped' + ''.join('.' + vrl_string(part) for part in rule['target'].split('.'))
         match = path + ' == __expected'
     else:
         match = 'contains(__represented, "," + encode_json(encode_json(__expected)))'
@@ -121,11 +124,29 @@ def candidate_regex(candidates):
     return ["__candidates = r'(?x)"] + key_regex(candidates)
 
 
+def check_rule(rule):
+    """One `transforms` rule: a source, a known kind, its parameters, a reason."""
+    assert isinstance(rule, dict) and isinstance(rule.get('source'), str) and rule['source'], f'transform needs a source: {rule!r}'
+    assert isinstance(rule.get('reason'), str) and rule['reason'].strip(), f'every transformation needs a justification: {rule["source"]}'
+    assert rule.get('kind') in KINDS, f'{rule["source"]}: unknown transform kind {rule.get("kind")!r}'
+    if 'target' in rule:
+        target = rule['target']
+        assert isinstance(target, str) and target and all(target.split('.')), f'{rule["source"]}: target must be a dotted path'
+        assert target.split('.')[0] not in ('unmapped', 'raw_data'), f'{rule["source"]}: target may not be under unmapped or raw_data'
+    if rule['kind'] == 'scale':
+        factor = rule.get('factor')
+        assert type(factor) in (int, float) and math.isfinite(factor) and factor != 0, f'{rule["source"]}: scale needs a finite, non-zero factor'
+    if rule['kind'] == 'enum':
+        values = rule.get('values')
+        assert isinstance(values, dict) and values, f'{rule["source"]}: enum needs a non-empty values mapping'
+    if rule['kind'] == 'epoch_ms':
+        assert 'format' not in rule or (isinstance(rule['format'], str) and rule['format']), f'{rule["source"]}: epoch_ms format must be a non-empty string'
+
+
 def transformations(config):
     rules = config.get('transforms', [])
     for rule in rules:
-        assert rule.get('reason'), rule
-        assert rule['kind'] in KINDS, rule
+        check_rule(rule)
     templates = kind_templates()
     lines = ['# ' + rule['source'] + ': ' + rule['reason'] for rule in rules]
     groups = grouped(rules, templates)
