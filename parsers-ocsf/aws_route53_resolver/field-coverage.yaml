@@ -1,0 +1,38 @@
+source: json
+transforms:
+- source: query_timestamp
+  kind: epoch_ms
+  target: time
+  reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+- source: transport
+  kind: lowercase
+  target: connection_info.protocol_name
+  reason: Parser lowercases the transport name; consume only when the normalized value is emitted.
+- source: firewall_rule_action
+  kind: enum
+  target: disposition_id
+  values:
+    block: 2
+    alert: 19
+    allow: 1
+  reason: DNS Firewall verdict normalized to the OCSF disposition; consume only when the expected ID is emitted.
+consumed_candidates:
+- account_id
+- answers
+- firewall_rule_group_id
+- query_class
+- query_name
+- query_timestamp
+- query_type
+- rcode
+- region
+- srcaddr
+- srcids.instance
+- srcids.resolver_endpoint
+- srcport
+- transport
+- version
+- vpc_id
+consumed_reason: Only source keys read by this parser are eligible for exact-value
+  consumption; the selected branch must emit the value. Unknown keys always spill,
+  even when their value equals an OCSF default.
