@@ -64,7 +64,7 @@ parser_vrl: |
           # are accepted by %+), then zone-less ISO / space-separated forms with
           # optional fractional seconds (a `,` fraction is normalised to `.`).
           # A zone-less clock is read as UTC, not the collector's local zone.
-          t, terr = parse_timestamp(ts_val, "%+")
+          t, terr = parse_timestamp(ts_val, "%+", timezone: "UTC")
           if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") } else {
               ts_dot = replace(ts_val, ",", ".")
               t2, t2err = parse_timestamp(ts_dot, "%Y-%m-%dT%H:%M:%S%.f", timezone: "UTC")
@@ -396,7 +396,7 @@ parser_vrl: |
       | timestamp
       )\z') {
           __value = value
-          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
               if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
