@@ -5,30 +5,32 @@ source_normalize:
   match: ^(type|operationType)=
   key_value_delimiter: '='
   field_delimiter: ', '
+  tail_key: representation
   reason: A Keycloak JSON log record carries the event line in `message`; the parser
-    replaces that key with the pairs parsed from it, so its details spill as redacted
-    keys. Skipped on a parse error, an empty result or a key the record already has.
+    replaces that key with the pairs parsed from it (`representation=` takes the rest
+    of the line, never split), so its details spill as redacted keys. Skipped on a
+    parse error, an empty result or a key the record already has.
 - kind: withhold
   paths:
   - message
-  match: ^(type|operationType)=
-  reason: An event line that could not be unpacked (parse error, empty, or a key the
-    record already has) may carry credentials key redaction cannot reach, so only its
+  match: '^[\s\S]'
+  reason: Any message left after the unpack (not a clean event line, or one that could
+    not be unpacked) may carry credentials key redaction cannot reach, so only its
     byte length and sha256 stay (raw_data keeps it).
 - kind: parse_json_object
   paths:
   - representation
   target: representation_json
-  arrays: true
-  reason: An admin event's representation is JSON text (a user with credentials, a client
-    with its secret); moved and parsed, every secret-named key in it is redacted at any
-    depth before it spills.
+  keep: [id, username, email, firstName, lastName, enabled, clientId, name, realm, type]
+  reason: An admin event's representation can hold secrets with no secret-looking key
+    (CredentialRepresentation value, private keys), so it is cut to non-secret scalar
+    fields; every other field is withheld together.
 - kind: withhold
   paths:
   - representation
   match: '^[\s\S]'
-  reason: A representation that is not a JSON object or array cannot be key-redacted, so
-    only its byte length and sha256 stay (raw_data keeps it).
+  reason: A representation that is not a JSON object (an array, not JSON) cannot be
+    filtered, so only its byte length and sha256 stay (raw_data keeps it).
 transforms:
 - source: '@timestamp'
   kind: epoch_ms
@@ -56,6 +58,8 @@ consumed_candidates:
 - representation_json.email
 - representation_json.name
 - representation_json.username
+- representation_json.id
+- representation_json.clientId
 - authDetails.clientId
 - authDetails.ipAddress
 - authDetails.realmId

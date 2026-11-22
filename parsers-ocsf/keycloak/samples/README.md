@@ -40,3 +40,20 @@ Sources:
 
 UUIDs are replaced with `00000000-0000-…` values, addresses with documentation
 ranges, users with example.com addresses.
+- Round-4 review regressions (each carries `nan2421-secret`, which may appear
+  only in `raw_data`): `json_admin_reset_password_credential`,
+  `json_admin_reset_password_untyped_credential` and
+  `json_admin_client_secret_regenerated` (CredentialRepresentation
+  `{type, value}`), `json_admin_client_certificate_private_key`,
+  `json_admin_saml_client_private_key_attribute` and
+  `json_admin_rsa_key_provider_component` (private keys),
+  `json_admin_credential_array_representation` and
+  `json_admin_string_array_representation` (array representations, withheld
+  whole), `text_admin_unquoted_representation_dn_split` and
+  `json_log_admin_unquoted_representation_spaced` (an unquoted representation
+  holding `, ` is taken whole, never split), and
+  `json_log_leading_space_event_secret_withheld`,
+  `json_log_prefixed_event_secret_withheld`, `json_log_error_text_secret_withheld`
+  (a JSON log message that is not a clean event line is withheld). Shapes per
+  Keycloak's CredentialRepresentation, CertificateRepresentation and
+  StripSecretsUtils.

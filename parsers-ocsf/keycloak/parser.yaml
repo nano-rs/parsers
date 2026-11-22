@@ -51,13 +51,33 @@ parser_vrl: |
           # It is unpacked only when it parses to a non-empty set of pairs none of
           # which the record already has (source_normalize parse_kv_merge in
           # field-coverage.yaml); otherwise the record is kept whole.
-          jkv, jkverr = parse_key_value(string!(pj.message), key_value_delimiter: "=", field_delimiter: ", ", whitespace: "strict")
+          # `, representation=` takes the rest of the line verbatim (its JSON may
+          # hold ", "): split it off before the key=value parse (tail_key).
+          jbody = string!(pj.message)
+          jtail = null
+          # find() is null when absent.
+          jif = find(jbody, ", representation=")
+          ji = -1
+          if is_integer(jif) { ji = to_int!(jif) }
+          if ji > 0 {
+              jtail = slice!(jbody, ji + 17)
+              jbody = slice!(jbody, 0, ji)
+              if starts_with(string!(jtail), "\"") {
+                  ju, juerr = parse_json(string!(jtail))
+                  if juerr == null && is_string(ju) { jtail = ju }
+              }
+          }
+          jkv, jkverr = parse_key_value(jbody, key_value_delimiter: "=", field_delimiter: ", ", whitespace: "strict")
+          jtail_collides = false
+          if jtail != null {
+              if exists(jkv.representation) { jtail_collides = true } else { jkv.representation = jtail }
+          }
           jrest = pj
           __discard = del(jrest.message)
           jrest_keys = keys(jrest)
           jcollide = false
           for_each(jkv) -> |k, _v| { if includes(jrest_keys, k) { jcollide = true } }
-          if jkverr == null && length(jkv) > 0 && !jcollide {
+          if jkverr == null && length(jkv) > 0 && !jcollide && !jtail_collides {
               shape = "json_log"
               kv_body = string!(pj.message)
               # ECS layout (@timestamp, log.level) or Keycloak's native Quarkus
@@ -69,13 +89,7 @@ parser_vrl: |
           }
           # A colliding or unparsable event line is never read as a REST event
           # (those carry no `type=` message): it takes the explicit fallback, and
-          # the line itself is withheld (source_normalize withhold): key redaction
-          # cannot reach inside unparsed text, so only its byte length and sha256
-          # stay outside raw_data.
-          if shape != "json_log" {
-              wt = string!(pj.message)
-              __source_kv.message = {"withheld": true, "bytes": length(wt), "sha256": sha2(wt, variant: "SHA-256")}
-          }
+          # its message is withheld below.
       } else if exists(pj.type) || exists(pj.operationType) {
           shape = "json"
           e = pj
@@ -96,7 +110,24 @@ parser_vrl: |
 
   kv = {}
   if kv_body != "" {
-      kv, kverr = parse_key_value(kv_body, key_value_delimiter: "=", field_delimiter: ", ", whitespace: "strict")
+      kbody = kv_body
+      ktail = null
+      # find() is null when absent.
+      kif = find(kbody, ", representation=")
+      ki = -1
+      if is_integer(kif) { ki = to_int!(kif) }
+      if ki > 0 {
+          ktail = slice!(kbody, ki + 17)
+          kbody = slice!(kbody, 0, ki)
+          if starts_with(string!(ktail), "\"") {
+              ku, kuerr = parse_json(string!(ktail))
+              if kuerr == null && is_string(ku) { ktail = ku }
+          }
+      }
+      kv, kverr = parse_key_value(kbody, key_value_delimiter: "=", field_delimiter: ", ", whitespace: "strict")
+      if kverr == null && ktail != null {
+          if exists(kv.representation) { kverr = "representation given twice" } else { kv.representation = ktail }
+      }
       # A line that does not parse (or parses to nothing) is not an event: it
       # takes the explicit fallback with its source kept whole, never a
       # Success with empty fields.
@@ -123,28 +154,52 @@ parser_vrl: |
       e.details = details
   }
 
+  # ---- unparsed message text (source_normalize withhold) ----
+  # Any message left in the source (a JSON log line that is not a clean event
+  # line, or did not unpack) may carry credentials redaction cannot reach inside
+  # text: only its byte length and sha256 stay outside raw_data.
+  if is_string(__source_kv.message) || is_array(__source_kv.message) {
+      mw = __source_kv.message
+      mt = if is_string(mw) { string!(mw) } else { encode_json(mw) }
+      if match(mt, r'^[\s\S]') { __source_kv.message = {"withheld": true, "bytes": length(mt), "sha256": sha2(mt, variant: "SHA-256")} }
+  }
+
   # ---- admin-event representation (source_normalize in field-coverage.yaml) ----
-  # The representation is a JSON string (a user with credentials, a client with its
-  # secret, ...). Parsed, it moves to representation_json, where the spill redacts
-  # every secret-named key at any depth (credentials, credentialData, secretData,
-  # secret, password, ...). A string or array left there (not JSON, a JSON scalar, or
-  # an input that already has representation_json) is withheld: only its byte length
-  # and sha256 stay; an object is already structured and key-redacted as is.
+  # The representation is JSON (a user with credentials, a client with its secret,
+  # a CredentialRepresentation {type, value}, a key provider's private key, ...).
+  # Fail closed: a parsed object moves to representation_json cut to an allowlist
+  # of non-secret scalar fields; every other field is withheld together as
+  # withheld_fields (byte length and sha256). Anything else left (an array, not
+  # JSON, or an input that already has representation_json) is withheld whole.
   # Mapping reads only named fields (username, email, name).
-  if exists(__source_kv.representation) {
+  if exists(__source_kv.representation) && !exists(__source_kv.representation_json) {
       rv = __source_kv.representation
-      if is_string(rv) {
-          rp, rperr = parse_json(string!(rv))
-          if rperr == null && (is_object(rp) || is_array(rp)) && !exists(__source_kv.representation_json) {
-              __discard = del(__source_kv.representation)
-              __source_kv.representation_json = rp
+      rp = null
+      if is_object(rv) {
+          rp = rv
+      } else if is_string(rv) {
+          rpp, rperr = parse_json(string!(rv))
+          if rperr == null && is_object(rpp) { rp = rpp }
+      }
+      if is_object(rp) {
+          rkeep = ["id", "username", "email", "firstName", "lastName", "enabled", "clientId", "name", "realm", "type"]
+          rkept = {}
+          rrest = {}
+          for_each(object!(rp)) -> |k, v| {
+              if includes(rkeep, k) && !is_object(v) && !is_array(v) { rkept = set!(rkept, [k], v) } else { rrest = set!(rrest, [k], v) }
           }
+          if length(rrest) > 0 {
+              rrt = encode_json(rrest)
+              rkept.withheld_fields = {"withheld": true, "bytes": length(rrt), "sha256": sha2(rrt, variant: "SHA-256")}
+          }
+          __discard = del(__source_kv.representation)
+          __source_kv.representation_json = rkept
       }
-      if is_string(__source_kv.representation) || is_array(__source_kv.representation) {
-          rw = __source_kv.representation
-          rt = if is_string(rw) { string!(rw) } else { encode_json(rw) }
-          if match(rt, r'^[\s\S]') { __source_kv.representation = {"withheld": true, "bytes": length(rt), "sha256": sha2(rt, variant: "SHA-256")} }
-      }
+  }
+  if is_string(__source_kv.representation) || is_array(__source_kv.representation) {
+      rw = __source_kv.representation
+      rt = if is_string(rw) { string!(rw) } else { encode_json(rw) }
+      if match(rt, r'^[\s\S]') { __source_kv.representation = {"withheld": true, "bytes": length(rt), "sha256": sha2(rt, variant: "SHA-256")} }
   }
 
   if shape == "" {
@@ -537,6 +592,8 @@ parser_vrl: |
     representation_json\.email
   | representation_json\.name
   | representation_json\.username
+  | representation_json\.id
+  | representation_json\.clientId
   | authDetails\.clientId
   | authDetails\.ipAddress
   | authDetails\.realmId
@@ -570,7 +627,13 @@ parser_vrl: |
   # END parser-specific transformations
   # Redact at every depth, including objects inside arrays, before serialization.
   # Redaction needs a sensitive word in a key or a name/key value, and encode_json
-  # never escapes a letter, so text without one of the words needs no walk.
+  # never escapes a letter, so text without one of the words needs no walk (the
+  # test here is a superset of the key list). A key is sensitive when it holds a
+  # secret value: password, secret, authorization, token, or a credential VALUE
+  # key (credential, credentials, client_credential, credential_data / _value /
+  # _hash / _key / _blob, credentialData). Descriptive credential keys such as
+  # credential_type, credential_id, credential_name, credential_provider or
+  # credential_reads are telemetry and never redacted.
   if match(downcase(__safe_json), r'password|secret|authorization|token|credential') {
       __safe = map_values(__safe, recursive: true) -> |value| {
           if is_object(value) {
@@ -578,12 +641,12 @@ parser_vrl: |
               # or Key/Value objects instead of using the secret name as an object key.
               __sensitive_pair = false
               for_each(object!(value)) -> |key, child| {
-                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token|credential') {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token|(?:^|[^a-z0-9\s]|client)credentials?(?:$|[^a-z0-9_\s])|credential_?(?:data|value|val|blob|hash|key)(?:$|[^a-z0-9_\s])') {
                       __sensitive_pair = true
                   }
               }
               for_each(object!(value)) -> |key, _child| {
-                  if match(downcase(key), r'password|secret|authorization|token|credential') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                  if match(downcase(key), r'password|secret|authorization|token|(?:^|[^a-z0-9\s]|client)credentials?(?:$|[^a-z0-9_\s])|credential_?(?:data|value|val|blob|hash|key)(?:$|[^a-z0-9_\s])') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
                       value = set!(value, [key], "<redacted>")
                   }
               }
@@ -743,7 +806,7 @@ parser_vrl: |
   # conditions run first; the source value set is built on first use.
   __original_values = null
   for_each(flatten(__existing)) -> |key, value| {
-      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token|credential') {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token|(?:^|[^a-z0-9\s]|client)credentials?(?:$|[^a-z0-9_\s])|credential_?(?:data|value|val|blob|hash|key)(?:$|[^a-z0-9_\s])') {
           # Members for the value itself and for to_string(value), as above.
           __json = encode_json(value)
           __as_json = "," + encode_json(__json)

@@ -534,7 +534,13 @@ parser_vrl: |
   # END parser-specific transformations
   # Redact at every depth, including objects inside arrays, before serialization.
   # Redaction needs a sensitive word in a key or a name/key value, and encode_json
-  # never escapes a letter, so text without one of the words needs no walk.
+  # never escapes a letter, so text without one of the words needs no walk (the
+  # test here is a superset of the key list). A key is sensitive when it holds a
+  # secret value: password, secret, authorization, token, or a credential VALUE
+  # key (credential, credentials, client_credential, credential_data / _value /
+  # _hash / _key / _blob, credentialData). Descriptive credential keys such as
+  # credential_type, credential_id, credential_name, credential_provider or
+  # credential_reads are telemetry and never redacted.
   if match(downcase(__safe_json), r'password|secret|authorization|token|credential') {
       __safe = map_values(__safe, recursive: true) -> |value| {
           if is_object(value) {
@@ -542,12 +548,12 @@ parser_vrl: |
               # or Key/Value objects instead of using the secret name as an object key.
               __sensitive_pair = false
               for_each(object!(value)) -> |key, child| {
-                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token|credential') {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token|(?:^|[^a-z0-9\s]|client)credentials?(?:$|[^a-z0-9_\s])|credential_?(?:data|value|val|blob|hash|key)(?:$|[^a-z0-9_\s])') {
                       __sensitive_pair = true
                   }
               }
               for_each(object!(value)) -> |key, _child| {
-                  if match(downcase(key), r'password|secret|authorization|token|credential') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                  if match(downcase(key), r'password|secret|authorization|token|(?:^|[^a-z0-9\s]|client)credentials?(?:$|[^a-z0-9_\s])|credential_?(?:data|value|val|blob|hash|key)(?:$|[^a-z0-9_\s])') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
                       value = set!(value, [key], "<redacted>")
                   }
               }
@@ -707,7 +713,7 @@ parser_vrl: |
   # conditions run first; the source value set is built on first use.
   __original_values = null
   for_each(flatten(__existing)) -> |key, value| {
-      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token|credential') {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token|(?:^|[^a-z0-9\s]|client)credentials?(?:$|[^a-z0-9_\s])|credential_?(?:data|value|val|blob|hash|key)(?:$|[^a-z0-9_\s])') {
           # Members for the value itself and for to_string(value), as above.
           __json = encode_json(value)
           __as_json = "," + encode_json(__json)
