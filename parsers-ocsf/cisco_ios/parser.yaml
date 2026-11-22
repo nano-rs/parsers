@@ -239,11 +239,22 @@ parser_vrl: |
           route = "api"
           api_op = "configure " + string!(cm.method)
           # "by console" names the line, "by <user> on vty0" names the user
-          if cm.line != null { user_name = string!(cm.by); terminal = string!(cm.line) } else { terminal = string!(cm.by) }
+          # "by console" / "by vty0" names the line; "by admin on vty0" (or
+          # "by admin" alone) names the user
+          by = string!(cm.by)
+          if cm.line != null {
+              user_name = by; terminal = string!(cm.line)
+          } else if match(by, r'^(?i)(?:console|con\d*|vty\d*|aux\d*|tty\d*)$') {
+              terminal = by
+          } else {
+              user_name = by
+              method = string!(cm.method)
+              if match(method, r'^(?i)(?:console|con\d*|vty\d*|aux\d*|tty\d*)$') { terminal = method }
+          }
           if cm.src_ip != null { src.ip = cm.src_ip } else { src.name = terminal }
       }
   } else if tagged && facility == "PARSER" && mnemonic == "CFGLOG_LOGGEDCMD" {
-      gm, ge = parse_regex(msg, r'^User:\s*(?P<user>\S+)\s+logged command:\s*(?P<command>.*?)\s*$')
+      gm, ge = parse_regex(msg, r'^User:\s*(?P<user>.+?)\s+logged command:\s*(?P<command>.*?)\s*$')
       if ge == null {
           ev = object!(gm)
           route = "api"
@@ -323,6 +334,8 @@ parser_vrl: |
   if tagged { __source_kv.message = msg }
 
   if route == "auth" {
+      # an empty [user: ] still is an authentication attempt
+      if strip_whitespace(user_name) == "" { user_name = "unknown" }
       if status_id == 2 && severity_id < 3 { severity_id = 3; severity = "Medium" }
       . = merge(base, {
           "class_uid": 3002, "class_name": "Authentication",
@@ -927,6 +940,30 @@ samples:
       class_uid: 6003
       api.operation: interface GigabitEthernet0/1
       actor.user.name: admin
+  # archive log with no AAA user name
+  - raw: '<189>2162: rtr01: Mar 26 16:13:02.101 UTC: %PARSER-5-CFGLOG_LOGGEDCMD: User:unknown user  logged command:interface GigabitEthernet0/1'
+    expect:
+      class_uid: 6003
+      actor.user.name: unknown user
+      api.operation: interface GigabitEthernet0/1
+  # CONFIG_I without "on <line>": the user is the "by" token, the line is the "from" token
+  - raw: '<189>31: test-ztp: May 23 13:58:01.002: %SYS-5-CONFIG_I: Configured from vty0 by admin (198.51.100.20)'
+    expect:
+      class_uid: 6003
+      actor.user.name: admin
+      actor.session.terminal: vty0
+      src_endpoint.ip: 198.51.100.20
+  - raw: '<189>32: test-ztp: May 23 13:59:44.410: %SYS-5-CONFIG_I: Configured from console by vty0 (198.51.100.21)'
+    expect:
+      class_uid: 6003
+      actor.session.terminal: vty0
+      actor.user.name: <missing>
+  # empty user field
+  - raw: '<180>1235: rtr01: *Mar  1 00:12:50.004: %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: ] [Source: 198.51.100.78] [localport: 22] [Reason: Login Authentication Failed] at 00:12:50 UTC Fri Mar 1 2024'
+    expect:
+      class_uid: 3002
+      status_id: 2
+      user.name: unknown
   # Interface state (test-asr920.log, napalm-logs, test-syslog.log)
   - raw: '<165>2029: ASR920: Aug 3 08:11:02.204: %LINEPROTO-5-UPDOWN: Line protocol on Interface GigabitEthernet0/0/7, changed state to up'
     expect:

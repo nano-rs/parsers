@@ -6,9 +6,9 @@ description: >
   Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
   Parses the Fail2ban server log (fail2ban.log, or the same lines forwarded
   through syslog or the systemd journal) into OCSF 1.9.0. Every jail verdict
-  becomes a Detection Finding (2004) keyed on the jail and the offending
-  address: Ban, Reban and Restore Ban are activity Create with action Denied
-  (disposition Blocked), "already banned" is activity Update, Unban is
+  becomes a Detection Finding (2004) keyed on the host, the jail and the
+  offending address: Ban, Reban and Restore Ban are activity Create with action Denied
+  (disposition Blocked), Increase Ban and "already banned" are activity Update, Unban is
   activity Close with status Resolved, and a filter Found match is a separate
   Low severity finding (activity Create, action Observed) keyed on the
   line itself. The jail is finding_info.analytic.name and the
@@ -36,7 +36,7 @@ parser_vrl: |
   msg = raw_log
 
   # ---- header: ISO clock (fail2ban.log), BSD syslog or the short journal form ----
-  hm, he = parse_regex(raw_log, r'^(?:<(?P<pri>\d{1,3})>)?(?:(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[,.]\d{1,6})?)\s+|(?P<syslog_ts>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(?P<host>[^\s\x5B]+)\s+|(?P<jhost>[A-Za-z0-9._-]+)\s+(?P<jdaemon>fail2ban(?:-server)?)\x5B(?P<jpid>\d+)\x5D:\s+)?(?:(?P<daemon>fail2ban(?:-server)?)(?:\x5B(?P<daemon_pid>\d+)\x5D)?:\s+)?(?:(?P<logger>fail2ban\.[A-Za-z0-9_.]+)\s*(?:\x5B(?P<pid>\d+)\x5D)?:\s+(?P<level>[A-Z]+)\s+)?(?P<msg>.*)$')
+  hm, he = parse_regex(raw_log, r'^(?:<(?P<pri>\d{1,3})>)?(?:(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[,.]\d{1,9})?(?:Z|[+-]\d{2}:?\d{2})?)\s+|(?P<syslog_ts>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(?P<host>[^\s\x5B]+)\s+|(?P<jhost>[A-Za-z0-9._-]+)\s+(?P<jdaemon>fail2ban(?:-server)?)\x5B(?P<jpid>\d+)\x5D:\s+)?(?:(?P<daemon>fail2ban(?:-server)?)(?:\x5B(?P<daemon_pid>\d+)\x5D)?:\s+)?(?:(?P<logger>fail2ban\.[A-Za-z0-9_.]+)\s*(?:\x5B(?P<pid>\d+)\x5D)?:\s+(?P<level>[A-Z]+)\s+)?(?P<msg>.*)$')
   if he == null {
       hdr = compact(object!(hm), string: true, null: true)
       __d = del(hdr.msg)
@@ -50,7 +50,10 @@ parser_vrl: |
           level = string(hm.level) ?? ""
           if hm.ts != null {
               ts_str = replace(string!(hm.ts), ",", ".")
-              t1, t1e = parse_timestamp(ts_str, "%Y-%m-%d %H:%M:%S%.f", timezone: "UTC")
+              # RFC 3339 with an offset (a forwarder's clock) first, then the
+              # offset-less fail2ban.log clock read as UTC
+              t1, t1e = parse_timestamp(ts_str, "%+")
+              if t1e != null { t1, t1e = parse_timestamp(ts_str, "%Y-%m-%d %H:%M:%S%.f", timezone: "UTC") }
               if t1e != null { t1, t1e = parse_timestamp(ts_str, "%Y-%m-%dT%H:%M:%S%.f", timezone: "UTC") }
               if t1e == null { time_ms = to_unix_timestamp(t1, unit: "milliseconds") }
           } else if hm.syslog_ts != null {
@@ -76,7 +79,7 @@ parser_vrl: |
   ip = ""
   found_time = ""
   if header_ok {
-      vm, ve = parse_regex(msg, r'^\x5B(?P<jail>[^\x5D]+)\x5D\s+(?P<verb>Restore Ban|Reban|Ban|Unban|Found)\s+(?P<ip>[0-9A-Fa-f.:]+)(?:\s+-\s+(?P<found_time>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}))?(?:,\s+action\s+\x27(?P<ban_action>[^\x27]*)\x27)?\s*$')
+      vm, ve = parse_regex(msg, r'^\x5B(?P<jail>[^\x5D]+)\x5D\s+(?P<verb>Increase Ban|Restore Ban|Reban|Ban|Unban|Found)\s+(?P<ip>[0-9A-Fa-f.:]+)(?:\s+-\s+(?P<found_time>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}))?(?:\s+\x28(?P<ban_count>\d+)\s+#\s+(?P<ban_time>[^\x29]*?)\s+->\s+(?P<ban_until>[^\x29]*)\x29)?(?:,\s+action\s+\x27(?P<ban_action>[^\x27]*)\x27)?\s*$')
       if ve == null {
           route = "finding"
           __source_kv.jail_event = compact(object!(vm), string: true, null: true)
@@ -122,12 +125,18 @@ parser_vrl: |
       status_str = "New"
       fseverity_id = 3
       fseverity = "Medium"
-      finding_uid = sha2("fail2ban|" + jail + "|" + ip, variant: "SHA-256")
+      # one finding per host, jail and address: Ban / Update / Unban correlate
+      # on the host that banned, never across a fleet
+      finding_uid = sha2("fail2ban|" + host + "|" + jail + "|" + ip, variant: "SHA-256")
       title = "fail2ban banned " + ip + " in jail " + jail
       if verb == "Restore Ban" {
           title = "fail2ban restored the ban on " + ip + " in jail " + jail
       } else if verb == "Reban" {
           title = "fail2ban rebanned " + ip + " in jail " + jail
+      } else if verb == "Increase Ban" {
+          activity_id = 2; activity_name = "Update"
+          status_id = 2; status_str = "In Progress"
+          title = "fail2ban increased the ban on " + ip + " in jail " + jail
       } else if verb == "already banned" {
           activity_id = 2; activity_name = "Update"
           status_id = 2; status_str = "In Progress"
@@ -186,7 +195,10 @@ parser_vrl: |
           . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
       }
   }
-  if host != "" { .device = { "hostname": host, "type_id": 1, "type": "Server" } }
+  if host != "" {
+      .device = { "hostname": host, "type_id": 1, "type": "Server" }
+      .metadata.profiles = push(array(.metadata.profiles) ?? [], "host")
+  }
 
   .
 
@@ -258,6 +270,20 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
+  # header.ts: RFC 3339 header clock with an offset converted to event milliseconds; the offset-less fail2ban.log clock remains residual.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        header\.ts
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
   __candidates = r'(?x)
   \A(?:
@@ -571,6 +597,45 @@ samples:
       class_uid: 2004
       evidences.0.src_endpoint.ip: 192.0.2.3
       device.hostname: host1
+  # bantime.increment (observer.py "[%s] Increase Ban %s (%d # %s -> %s)")
+  #   https://github.com/fail2ban/fail2ban/blob/master/fail2ban/server/observer.py
+  - raw: '2026-03-02 18:50:02,114 fail2ban.observer       [1234]: NOTICE  [sshd] Increase Ban 192.0.2.10 (2 # 12:00:00 -> 2026-03-03 06:50:02)'
+    expect:
+      class_uid: 2004
+      activity_id: 2
+      metadata.event_code: Increase Ban
+      evidences.0.src_endpoint.ip: 192.0.2.10
+  # RFC 3339 clock with an offset (forwarder-rewritten header)
+  - raw: '2024-01-15T10:23:45.123Z fail2ban.actions        [1234]: NOTICE  [sshd] Ban 192.0.2.11'
+    expect:
+      class_uid: 2004
+      time: 1705314225123
+  - raw: '2024-01-15T12:23:45+02:00 fail2ban.actions        [1234]: NOTICE  [sshd] Ban 192.0.2.12'
+    expect:
+      class_uid: 2004
+      time: 1705314225000
+  # same jail and address on two hosts: two different findings, so an Unban on
+  # web-02 never closes the ban on web-01
+  - raw: 'Sep 16 00:44:55 web-01.example.com fail2ban.actions: NOTICE [sshd] Ban 198.51.100.7'
+    expect:
+      class_uid: 2004
+      finding_info.uid: 9aaa7606926fd51f0998bed816fc4f19fcf34ad7bc43e821aa5c34056287f052
+  - raw: 'Sep 16 00:50:10 web-02.example.com fail2ban.actions: NOTICE [sshd] Unban 198.51.100.7'
+    expect:
+      class_uid: 2004
+      activity_id: 3
+      finding_info.uid: 2cca3cd0f7e5ab73783c6cd684ec23d70ae09e6cbf20c2602249cbdda0caf8f5
+  - raw: 'Sep 16 00:50:10 web-01.example.com fail2ban.actions: NOTICE [sshd] Unban 198.51.100.7'
+    expect:
+      class_uid: 2004
+      activity_id: 3
+      finding_info.uid: 9aaa7606926fd51f0998bed816fc4f19fcf34ad7bc43e821aa5c34056287f052
+  # Base Event with a device carries the host profile
+  - raw: 'Sep 16 00:44:55 web-01.example.com fail2ban.server: INFO Starting Fail2ban v1.0.2'
+    expect:
+      class_uid: 0
+      device.hostname: web-01.example.com
+      metadata.profiles.0: host
   # Ignore and server lines -> Base Event
   - raw: '2024-01-15 10:23:41,000 fail2ban.filter         [1234]: INFO    [sshd] Ignore 192.0.2.1 by ip'
     expect:

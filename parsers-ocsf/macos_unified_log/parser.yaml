@@ -15,16 +15,17 @@ description: >
   failure -> Authentication (3002) Account Switch with the command on
   actor.process.cmd_line; loginwindow doLogin -> Authentication Logon;
   opendirectoryd "Failed to authenticate user" -> Logon failure; authd right
-  authorization (Succeeded authorizing / Failed to authorize) ->
-  Authentication activity Other with the right in service.name; TCC
+  authorization (Succeeded authorizing / Failed to authorize / Sandbox
+  denied) -> Authentication activity Other with the right in service.name,
+  the requesting client as actor.process and authd as logon_process; TCC
   "Update Access Record" permission changes -> Entity Management (3004)
   Update with the TCC service and client; Gatekeeper / syspolicyd /
   XProtect verdicts that reject, block or report malware -> Detection
   Finding (2004) with the file path as evidence. Every other entry is a Base
   Event (0) with all fields kept. The JSON array that `log show --style
   json` writes is not split here (send ndjson); an array or a line that is
-  not a JSON object is kept whole as a Base Event marked with
-  unmapped.parse_fallback.
+  not a JSON object, or a JSON object with none of the unified log keys,
+  is kept whole as a Base Event marked with unmapped.parse_fallback.
 match_values:
   - macos_unified_log
 category: endpoint
@@ -51,9 +52,16 @@ parser_vrl: |
       }
   }
 
+  # A JSON object is a unified log entry only if it carries one of the keys
+  # `log --style ndjson` always writes; anything else is a misrouted stream.
+  if decoded && !(exists(entry.eventMessage) || exists(entry.subsystem) || exists(entry.processImagePath) || exists(entry.messageType) || exists(entry.eventType) || exists(entry.timestamp)) {
+      decoded = false
+  }
+
   msg_text = to_string(entry.eventMessage) ?? ""
   subsystem = to_string(entry.subsystem) ?? ""
   category = to_string(entry.category) ?? ""
+  cl = downcase(category)
   msg_type = to_string(entry.messageType) ?? ""
   image_path = to_string(entry.processImagePath) ?? ""
   proc_name = to_string(entry.process) ?? ""
@@ -92,6 +100,11 @@ parser_vrl: |
   disposition_id = 0
   disposition = "Unknown"
   user_name = ""
+  login_uid = ""
+  client_path = ""
+  client_pid = 0
+  auth_creator = ""
+  is_authd = false
   actor_user = ""
   src_ip = ""
   src_port = 0
@@ -139,7 +152,7 @@ parser_vrl: |
           }
       }
   } else if pl == "sudo" && msg_text != "" {
-      dm, de = parse_regex(msg_text, r'^\s*(?P<user>\S+)\s*:\s+(?:(?P<reason>[^;]*?)\s*;\s+)?TTY=(?P<tty>\S+)\s*;\s*PWD=(?P<pwd>.*?)\s*;\s*USER=(?P<target>\S+)\s*;\s*COMMAND=(?P<command>.*?)\s*$')
+      dm, de = parse_regex(msg_text, r'^\s*(?P<user>\S+)\s*:\s+(?:(?P<reason>[^;]*?)\s*;\s+)?TTY=(?P<tty>\S+)\s*;\s*PWD=(?P<pwd>.*?)\s*;\s*USER=(?P<target>\S+)(?P<extra>(?:\s*;\s*[A-Z_]+=[^;]*?)*)\s*;\s*COMMAND=(?P<command>.*?)\s*$')
       if de == null {
           route = "auth"
           actor_user = string!(dm.user)
@@ -161,6 +174,7 @@ parser_vrl: |
       if le == null {
           route = "auth"
           user_name = string!(lm.user)
+          login_uid = string!(lm.uid)
           activity_id = 1; activity_name = "Logon"
           status_id = 1; status_str = "Success"
           service_name = "loginwindow"
@@ -181,6 +195,11 @@ parser_vrl: |
       if ae == null {
           route = "auth"
           service_name = string!(am.right)
+          # the requesting client is the actor; authd itself is the logon process
+          client_path = string!(am.client)
+          client_pid = to_int(am.client_pid) ?? 0
+          if am.creator != null { auth_creator = string!(am.creator) }
+          is_authd = true
           activity_id = 99; activity_name = "Other"
           if am.result == "Succeeded authorizing" {
               status_id = 1; status_str = "Success"
@@ -199,10 +218,13 @@ parser_vrl: |
           tcc_client = string!(tm.client)
           tcc_value = string!(tm.value)
       }
-  } else if (contains(sl, "systempolicy") || contains(sl, "xprotect") || pl == "syspolicyd" || contains(pl, "xprotect") || category == "gatekeeper" || category == "xprotect") && msg_text != "" {
-      if match(msg_text, r'(?i)\bmalware\b|\b(?:rejected|blocked|denied|not allowed|quarantin\w*)\b') && !match(msg_text, r'(?i)result:\s*allowed|\ballowed\s*$') {
+  } else if (contains(sl, "systempolicy") || contains(sl, "xprotect") || pl == "syspolicyd" || contains(pl, "xprotect") || cl == "gatekeeper" || cl == "xprotect") && msg_text != "" {
+      # an "allowed" verdict is not a finding, but "not allowed" is a block
+      negative = match(msg_text, r'(?i)\bmalware\b|\b(?:rejected|blocked|denied|not allowed|quarantin\w*)\b')
+      allowed_verdict = match(msg_text, r'(?i)result:\s*allowed|\ballowed\s*$') && !match(msg_text, r'(?i)\bnot\s+allowed\b')
+      if negative && !allowed_verdict {
           route = "finding"
-          analytic = if contains(sl, "xprotect") || contains(pl, "xprotect") || category == "xprotect" { "XProtect" } else { "Gatekeeper" }
+          analytic = if contains(sl, "xprotect") || contains(pl, "xprotect") || cl == "xprotect" { "XProtect" } else { "Gatekeeper" }
           # an app bundle path may contain spaces; any other path ends at whitespace
           fm, fe = parse_regex(msg_text, r'(?P<path>/[^:,\x28\x29]*?\.app)\b')
           if fe != null { fm, fe = parse_regex(msg_text, r'(?P<path>/[^\s:,\x28\x29]+)') }
@@ -250,8 +272,10 @@ parser_vrl: |
 
   if route == "auth" {
       if status_id == 2 && severity_id < 3 { severity_id = 3; severity = "Medium" }
+      # authd names no subject user (entry.userID is authd's own uid)
+      if user_name == "" { user_name = "unknown" }
       subject = { "name": user_name }
-      if user_name == "" && uid != "" { subject = { "uid": uid } }
+      if login_uid != "" { subject.uid = login_uid }
       . = merge(base, {
           "class_uid": 3002, "class_name": "Authentication",
           "category_uid": 3, "category_name": "Identity & Access Management",
@@ -275,6 +299,15 @@ parser_vrl: |
           if src_port > 0 { .src_endpoint.port = src_port }
       }
       if activity_id == 7 { .account_switch_type_id = 99; .account_switch_type = "sudo" }
+      if is_authd {
+          cproc = { "path": client_path }
+          cn, cne = parse_regex(client_path, r'(?P<name>[^/]+)$')
+          if cne == null { cproc.name = cn.name }
+          if client_pid > 0 { cproc.pid = client_pid }
+          actor = { "process": cproc }
+          if pid > 0 { .logon_process = proc }
+          if auth_creator != "" { . = set!(., ["unmapped", "authorization_created_by"], auth_creator) }
+      }
   } else if route == "tcc" {
       . = merge(base, {
           "class_uid": 3004, "class_name": "Entity Management",
@@ -286,7 +319,8 @@ parser_vrl: |
       })
       if severity_id < 2 { .severity_id = 2; .severity = "Low" }
   } else if route == "finding" {
-      ev = { "process": proc }
+      ev = {}
+      if length(proc) > 0 { ev.process = proc }
       if file_path != "" {
           fnm, fne = parse_regex(file_path, r'(?P<name>[^/]+)/?$')
           fobj = { "path": file_path, "type_id": 1, "type": "Regular File" }
@@ -661,6 +695,7 @@ samples:
       class_uid: 3002
       activity_id: 1
       user.name: "_mbsetupuser"
+      user.uid: "248"
       actor.process.name: "loginwindow"
       actor.process.pid: 100
       time: 1758868356119
@@ -750,7 +785,10 @@ samples:
       activity_id: 99
       status_id: 1
       service.name: "system.preferences.security"
-      user.uid: "0"
+      user.name: "unknown"
+      actor.process.name: "System Settings.app"
+      actor.process.pid: 811
+      logon_process.name: "authd"
   # authd right denied
   - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%{public}s\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.Authorization\", \"category\": \"authd\", \"threadID\": 871, \"senderImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"backtrace\": {\"frames\": [{\"imageOffset\": 0, \"imageUUID\": \"00000000-0000-0000-0000-000000000000\"}]}, \"bootUUID\": \"00000000-0000-0000-0000-000000000000\", \"processImagePath\": \"/System/Library/Frameworks/Security.framework/Versions/A/XPCServices/authd.xpc/Contents/MacOS/authd\", \"senderImagePath\": \"/System/Library/Frameworks/Security.framework/Versions/A/XPCServices/authd.xpc/Contents/MacOS/authd\", \"timestamp\": \"2026-11-02 08:21:00.000100-0700\", \"machTimestamp\": 0, \"eventMessage\": \"Failed to authorize right 'system.privilege.admin' by client '/usr/libexec/UserAccountUpdater' [920] for authorization created by '/usr/libexec/UserAccountUpdater' [920] (3,0) (-60005) (engine 413)\", \"processImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"traceID\": 0, \"processID\": 290, \"senderProgramCounter\": 0, \"parentActivityIdentifier\": 0}"
     expect:
@@ -784,6 +822,39 @@ samples:
       class_uid: 3002
       device.hostname: "mac01.example.com"
       device.os.type_id: 300
+  # Gatekeeper block ending in "not allowed" stays a finding
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"Gatekeeper assessment for %{public}@ result: %{public}@\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.systempolicy\", \"category\": \"gatekeeper\", \"threadID\": 90123, \"senderImageUUID\": \"A7B8C9D0-E1F2-3456-ABCD-567890123456\", \"backtrace\": {\"frames\": [{\"imageOffset\": 78901, \"imageUUID\": \"A7B8C9D0-E1F2-3456-ABCD-567890123456\"}]}, \"bootUUID\": \"218031E6-E47F-4A77-B7FC-5A57B049F4BC\", \"processImagePath\": \"/usr/libexec/syspolicyd\", \"senderImagePath\": \"/System/Library/PrivateFrameworks/SystemPolicy.framework/Versions/A/SystemPolicy\", \"timestamp\": \"2025-10-15 16:25:30.987654+0530\", \"machTimestamp\": 739361987654321, \"eventMessage\": \"Execution of /Users/jdoe/Downloads/Evil.app is not allowed\", \"processImageUUID\": \"CD58B635-1F96-38BD-BF3B-DBA7CA293E28\", \"traceID\": 405718141415784453, \"processID\": 205, \"senderProgramCounter\": 78901, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 2004
+      evidences.0.file.path: "/Users/jdoe/Downloads/Evil.app"
+  # capitalized category from securityd
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"Gatekeeper assessment for %{public}@ result: %{public}@\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.security\", \"category\": \"Gatekeeper\", \"threadID\": 90123, \"senderImageUUID\": \"A7B8C9D0-E1F2-3456-ABCD-567890123456\", \"backtrace\": {\"frames\": [{\"imageOffset\": 78901, \"imageUUID\": \"A7B8C9D0-E1F2-3456-ABCD-567890123456\"}]}, \"bootUUID\": \"218031E6-E47F-4A77-B7FC-5A57B049F4BC\", \"processImagePath\": \"/usr/libexec/securityd\", \"senderImagePath\": \"/usr/libexec/securityd\", \"timestamp\": \"2025-10-15 16:25:30.987654+0530\", \"machTimestamp\": 739361987654321, \"eventMessage\": \"Gatekeeper assessment for /Applications/Tool.app result: rejected (no usable signature)\", \"processImageUUID\": \"CD58B635-1F96-38BD-BF3B-DBA7CA293E28\", \"traceID\": 405718141415784453, \"processID\": 205, \"senderProgramCounter\": 78901, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 2004
+      finding_info.analytic.name: "Gatekeeper"
+  # XProtect verdict without process fields: no empty evidence process
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Error\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%{public}s\", \"activityIdentifier\": 0, \"subsystem\": \"com.apple.xprotect\", \"category\": \"xprotect\", \"senderImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"backtrace\": {\"frames\": [{\"imageOffset\": 0, \"imageUUID\": \"00000000-0000-0000-0000-000000000000\"}]}, \"bootUUID\": \"00000000-0000-0000-0000-000000000000\", \"timestamp\": \"2026-11-02 09:14:55.120334-0700\", \"machTimestamp\": 0, \"eventMessage\": \"XProtect detected malware OSX.Example.A in /Users/jdoe/Downloads/update.dmg\", \"processImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"traceID\": 0, \"senderProgramCounter\": 0, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 2004
+      evidences.0.process: "<missing>"
+      evidences.0.file.name: "update.dmg"
+  # sudo with GROUP= and TSID= between USER= and COMMAND=
+  - raw: "{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%{public}s\", \"userID\": 501, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.sudo\", \"category\": \"\", \"threadID\": 12604, \"senderImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"backtrace\": {\"frames\": [{\"imageOffset\": 0, \"imageUUID\": \"00000000-0000-0000-0000-000000000000\"}]}, \"bootUUID\": \"00000000-0000-0000-0000-000000000000\", \"processImagePath\": \"/usr/bin/sudo\", \"senderImagePath\": \"/usr/bin/sudo\", \"timestamp\": \"2026-11-02 08:10:00.100000-0700\", \"machTimestamp\": 0, \"eventMessage\": \"  jdoe : TTY=ttys001 ; PWD=/Users/jdoe ; USER=root ; GROUP=wheel ; TSID=000001 ; COMMAND=/usr/bin/id\", \"processImageUUID\": \"00000000-0000-0000-0000-000000000000\", \"traceID\": 0, \"processID\": 4201, \"senderProgramCounter\": 0, \"parentActivityIdentifier\": 0}"
+    expect:
+      class_uid: 3002
+      activity_id: 7
+      user.name: "root"
+      actor.process.cmd_line: "/usr/bin/id"
+  # JSON objects that are not unified log entries are flagged, not silently classified
+  - raw: '{}'
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: "not a unified log ndjson object"
+  - raw: '{"foo": "bar"}'
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: "not a unified log ndjson object"
+      unmapped.foo: "bar"
   # log show --style json writes an array: not split here
   - raw: "[{\"timezoneName\": \"\", \"messageType\": \"Default\", \"eventType\": \"logEvent\", \"source\": null, \"formatString\": \"%s | enter\", \"userID\": 0, \"activityIdentifier\": 0, \"subsystem\": \"com.apple.loginwindow.logging\", \"category\": \"Standard\", \"threadID\": 13692, \"senderImageUUID\": \"2F16B6B6-41B5-34D4-88A1-06CAFCE952EF\", \"backtrace\": {\"frames\": [{\"imageOffset\": 75080, \"imageUUID\": \"2F16B6B6-41B5-34D4-88A1-06CAFCE952EF\"}]}, \"bootUUID\": \"218031E6-E47F-4A77-B7FC-5A57B049F4BC\", \"processImagePath\": \"/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow\", \"senderImagePath\": \"/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow\", \"timestamp\": \"2025-09-25 23:46:06.773373-0700\", \"machTimestamp\": 1001013698208, \"eventMessage\": \"-[Login1 isGuestAccount] | enter\", \"processImageUUID\": \"2F16B6B6-41B5-34D4-88A1-06CAFCE952EF\", \"traceID\": 3412540596027396, \"processID\": 1062, \"senderProgramCounter\": 75080, \"parentActivityIdentifier\": 0}]"
     expect:

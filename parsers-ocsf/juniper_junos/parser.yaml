@@ -10,11 +10,13 @@ description: >
   structured-data form (RFC 5424 with [junos@2636 ...] parameters). Routing:
   UI_LOGIN_EVENT and UI_AUTH_EVENT -> Authentication (3002) Logon success,
   UI_LOGOUT_EVENT -> Logoff; LOGIN_FAILED, SSHD_LOGIN_FAILED,
-  LOGIN_PAM_MAX_RETRIES and sshd "Failed password" -> Logon failure, sshd
-  "Accepted" -> Logon success; UI_COMMIT, UI_COMMIT_COMPLETED,
+  LOGIN_PAM_MAX_RETRIES sshd "Failed password" and "Invalid user" -> Logon failure, sshd
+  "Accepted" -> Logon success (a failure whose user is unreadable keeps
+  user.name "unknown"); UI_COMMIT, UI_COMMIT_COMPLETED,
   UI_LOAD_EVENT, UI_DBASE_LOGIN_EVENT / LOGOUT_EVENT and UI_CMDLINE_READ_LINE
   -> API Activity (6003) with the operation or CLI command in api.operation
-  (commit and load are Update, show commands are Read); SNMP_TRAP_LINK_DOWN
+  (commit, load and set / rollback CLI commands are Update, delete is
+  Delete, show is Read); SNMP_TRAP_LINK_DOWN
   / UP, LACP_INTF_DOWN and other link state tags -> Base Event (0) with the
   interface in device.network_interfaces. Every other tag (SNMPD_AUTH_FAILURE,
   RPD_*, CHASSISD_*, ...) is a Base Event with the tag in metadata.event_code.
@@ -118,6 +120,7 @@ parser_vrl: |
   dst_ip = ""
   dst_port = 0
   priv = ""
+  status_detail = ""
   client_mode = ""
   api_op = ""
   iface = ""
@@ -167,7 +170,7 @@ parser_vrl: |
       status_id = 1; status_str = "Success"
   } else if tag == "LOGIN_FAILED" || tag == "SSHD_LOGIN_FAILED" || tag == "LOGIN_PAM_MAX_RETRIES" {
       route = "auth"
-      fm, fe = parse_regex(msg, r'(?:Login failed for user|authenticating user)\s+\x27?(?P<user>[^\x27\s]+)\x27?(?:\s+from host\s+\x27?(?P<src>[^\x27\s]+)\x27?)?')
+      fm, fe = parse_regex(msg, r'(?:Login failed for user|authenticating user|attempts exceeded for (?:user)?|authentication failures for (?:user)?)\s*\x27?(?P<user>[^\x27\s]+)\x27?(?:\s+from host\s+\x27?(?P<src>[^\x27\s]+)\x27?)?')
       if fe == null {
           ev = compact(object!(fm), string: true, null: true)
           user_name = string!(fm.user)
@@ -192,6 +195,19 @@ parser_vrl: |
               action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed"
           } else {
               status_id = 2; status_str = "Failure"
+              action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
+          }
+      } else {
+          vm, ve = parse_regex(msg, r'^Invalid user\s+(?P<user>\S*)\s+from\s+(?P<src_ip>[0-9A-Fa-f.:]+)(?:\s+port\s+(?P<src_port>\d+))?')
+          if ve == null {
+              route = "auth"
+              ev = compact(object!(vm), string: true, null: true)
+              user_name = string!(vm.user)
+              src_ip = string!(vm.src_ip)
+              src_port = to_int(vm.src_port) ?? 0
+              dst_port = 22
+              activity_id = 1; activity_name = "Logon"
+              status_id = 2; status_str = "Failure"; status_detail = "Invalid user"
               action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
           }
       }
@@ -225,7 +241,11 @@ parser_vrl: |
       rm, re = parse_regex(msg, r'^User\s+\x27(?P<user>[^\x27]*)\x27,\s+command\s+\x27(?P<command>.*?)\s*\x27\s*$')
       if re == null { ev = object!(rm); user_name = string!(rm.user); api_op = strip_whitespace(string!(rm.command)) }
       if api_op == "" { api_op = string(sd.command) ?? "" }
-      if starts_with(api_op, "show") { activity_id = 2; activity_name = "Read" }
+      # show reads; set / delete / rollback / load / ... change the candidate config
+      verb0 = downcase(string(get(split(api_op, " "), [0]) ?? "") ?? "")
+      if verb0 == "show" { activity_id = 2; activity_name = "Read" }
+      if includes(["set", "rollback", "load", "commit", "activate", "deactivate", "rename", "insert", "replace", "annotate", "copy", "protect", "unprotect", "wildcard"], verb0) { activity_id = 3; activity_name = "Update" }
+      if verb0 == "delete" { activity_id = 4; activity_name = "Delete" }
   } else if match(tag, r'LINK_(?:DOWN|UP)$|INTF_(?:DOWN|UP)$') {
       im, ie = parse_regex(msg, r'ifIndex\s+(?P<if_index>\d+),\s+ifAdminStatus\s+(?P<admin_status>[^,]+),\s+ifOperStatus\s+(?P<oper_status>[^,]+),\s+ifName\s+(?P<interface>\S+)')
       if ie == null {
@@ -263,7 +283,9 @@ parser_vrl: |
       __source_kv.message = msg
   }
 
-  if route == "auth" && user_name != "" {
+  # an authentication line whose user could not be read is still one
+  if route == "auth" && user_name == "" { user_name = "unknown" }
+  if route == "auth" {
       if status_id == 2 && severity_id < 3 { severity_id = 3; severity = "Medium" }
       . = merge(base, {
           "class_uid": 3002, "class_name": "Authentication",
@@ -281,6 +303,7 @@ parser_vrl: |
           .metadata.profiles = ["security_control"]
       }
       if priv != "" { .user.groups = [{ "name": priv }] }
+      if status_detail != "" { .status_detail = status_detail }
       if client_mode != "" { .logon_type = client_mode; .logon_type_id = 99 }
       src = {}
       if src_ip != "" { src.ip = src_ip; .is_remote = true }
@@ -697,6 +720,15 @@ samples:
       activity_id: 2
       api.operation: show interfaces terse
       actor.user.name: op
+  - raw: "Dec 20 23:19:30 bilbo mgd[16648]: UI_CMDLINE_READ_LINE: User 'op', command 'set system login user rogue class super-user '"
+    expect:
+      class_uid: 6003
+      activity_id: 3
+      api.operation: set system login user rogue class super-user
+  - raw: "Dec 20 23:19:45 bilbo mgd[16648]: UI_CMDLINE_READ_LINE: User 'op', command 'delete system syslog host 192.0.2.50 '"
+    expect:
+      class_uid: 6003
+      activity_id: 4
   - raw: "Dec 20 23:21:02 bilbo mgd[16648]: UI_LOGOUT_EVENT: User 'op' logout"
     expect:
       class_uid: 3002
@@ -730,6 +762,28 @@ samples:
       status_id: 2
       user.name: jdoe
       src_endpoint.ip: 198.51.100.33
+  # PAM lockout and sshd user enumeration (Juniper System Log Explorer LOGIN_PAM_MAX_RETRIES)
+  - raw: '<36>Mar  4 11:03:10 rtr01 login[4130]: LOGIN_PAM_MAX_RETRIES: Maximum number of authentication attempts exceeded for user admin'
+    expect:
+      class_uid: 3002
+      status_id: 2
+      user.name: admin
+      severity_id: 3
+  - raw: '<36>Mar  4 11:03:20 rtr01 sshd[4131]: LOGIN_PAM_MAX_RETRIES: Too many retries while authenticating user oper'
+    expect:
+      class_uid: 3002
+      user.name: oper
+  - raw: '<36>Mar  4 11:03:30 rtr01 login[4132]: LOGIN_PAM_MAX_RETRIES: maximum retries reached'
+    expect:
+      class_uid: 3002
+      status_id: 2
+      user.name: unknown
+  - raw: '<38>Dec 20 23:16:40 bilbo sshd[16639]: Invalid user oracle from 203.0.113.9 port 52044'
+    expect:
+      class_uid: 3002
+      status_id: 2
+      status_detail: Invalid user
+      src_endpoint.ip: 203.0.113.9
   # configuration (napalm-logs CONFIGURATION_* and USER_ENTER_CONFIG_MODE)
   - raw: "<189>Jul 20 21:44:00 vmx01 mgd[7729]: UI_COMMIT: User 'luke' requested 'commit synchronize' operation (comment: hello)"
     expect:
