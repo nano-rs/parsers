@@ -11,6 +11,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+import residual_spill
 from residual_spill import decl_literal, generated
 
 BRACKETS = '()[]{}'
@@ -35,7 +36,7 @@ class DeclTests(unittest.TestCase):
         cases = [({key: 'v'}, {'target': 'v'}, {}) for key in keys]
         cases += [({key: 'v'}, {'target': 'v'}, {key_name(key): 'v'}) for key in near]
         cases += [({'plain': 'v'}, {'other': 'v'}, {'plain': 'v'})]
-        program = '__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'mappings': mappings})
+        program = residual_spill.prelude() + '\n__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'mappings': mappings})
         with tempfile.TemporaryDirectory(prefix='decl-') as tmp:
             tmp = Path(tmp)
             (tmp/'p.vrl').write_text(program)
