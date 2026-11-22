@@ -9,7 +9,8 @@ description: >
   and the Suricata EVE-style `event`) into complete OCSF 1.9.0 records:
     event_type alert               -> Detection Finding 2004 (security_control:
                                       alert.action allowed -> Allowed, blocked /
-                                      rejected -> Denied + Blocked; Suricata
+                                      rejected -> Denied + Blocked, dropped ->
+                                      Denied + Dropped; Suricata
                                       severity 1/2/3 -> High/Medium/Low; the rule
                                       on finding_info.analytic and firewall_rule;
                                       the 5-tuple, HTTP and TLS on evidences[])
@@ -17,7 +18,8 @@ description: >
                                       packets/bytes on traffic.*_out, flow start/end)
     TLS engine (tls_error,
     revocation_check)              -> Network Activity 4001 Fail / Refuse
-  The firewall is metadata.reporter, the zone and its region land on cloud.
+  A null netflow counter is left out, never written as 0. The firewall is
+  metadata.reporter, the zone and its region land on cloud.
   Anything that is not a Network Firewall record is kept whole as a Base Event
   with unmapped.parse_fallback. Samples come from the AWS "Contents of an AWS
   Network Firewall log" examples and the Elastic aws.firewall_logs pipeline
@@ -44,7 +46,9 @@ parser_vrl: |
   if err == null && is_object(parsed) {
       p = object!(parsed)
       ev = object(p.event) ?? {}
-      ok = length(ev) > 0
+      # Any JSON with an `event` object is not a Network Firewall record: it
+      # needs the firewall name or a Suricata / TLS-engine event key.
+      ok = length(ev) > 0 && (exists(p.firewall_name) || exists(ev.event_type) || exists(ev.src_ip) || exists(ev.tls_error) || exists(ev.revocation_check))
   }
   __source_kv = p
 
@@ -206,8 +210,11 @@ parser_vrl: |
           action = "Unknown"
           disposition_id = 0
           disposition = "Unknown"
-          if al_action == "allowed" { action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed" }
-          if al_action == "blocked" || al_action == "rejected" { action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked" }
+          # Older records may carry only the engine verdict.
+          if al_action == "" { al_action = downcase(to_string(get(ev, ["verdict", "action"]) ?? null) ?? "") }
+          if al_action == "allowed" || al_action == "accept" { action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed" }
+          if al_action == "blocked" || al_action == "rejected" || al_action == "reject" { action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked" }
+          if al_action == "dropped" || al_action == "drop" { action_id = 2; action = "Denied"; disposition_id = 6; disposition = "Dropped" }
 
           title = sig
           if title == "" { title = "Network Firewall alert (sid " + sid + ")" }
@@ -286,12 +293,13 @@ parser_vrl: |
               log_name = "AWS Network Firewall flow"
               # netflow is uni-directional: every packet went source -> destination.
               # Suricata's bidirectional flow form splits the counters by side.
-              if exists(nf.pkts) { traffic.packets_out = to_int(nf.pkts) ?? 0 }
-              if exists(nf.bytes) { traffic.bytes_out = to_int(nf.bytes) ?? 0 }
-              if exists(nf.pkts_toserver) { traffic.packets_out = to_int(nf.pkts_toserver) ?? 0 }
-              if exists(nf.pkts_toclient) { traffic.packets_in = to_int(nf.pkts_toclient) ?? 0 }
-              if exists(nf.bytes_toserver) { traffic.bytes_out = to_int(nf.bytes_toserver) ?? 0 }
-              if exists(nf.bytes_toclient) { traffic.bytes_in = to_int(nf.bytes_toclient) ?? 0 }
+              # A null counter is absent, never zero.
+              if nf.pkts != null { traffic.packets_out = to_int(nf.pkts) ?? 0 }
+              if nf.bytes != null { traffic.bytes_out = to_int(nf.bytes) ?? 0 }
+              if nf.pkts_toserver != null { traffic.packets_out = to_int(nf.pkts_toserver) ?? 0 }
+              if nf.pkts_toclient != null { traffic.packets_in = to_int(nf.pkts_toclient) ?? 0 }
+              if nf.bytes_toserver != null { traffic.bytes_out = to_int(nf.bytes_toserver) ?? 0 }
+              if nf.bytes_toclient != null { traffic.bytes_in = to_int(nf.bytes_toclient) ?? 0 }
               st = to_string(nf.start) ?? ""
               if st != "" {
                   s1, s1err = parse_timestamp(st, "%+")
@@ -507,7 +515,7 @@ parser_vrl: |
       )\z') {
           __value = value
           if __value != null {
-              __expected = get!({"allowed": 1, "blocked": 2, "rejected": 2}, [downcase(to_string(__value) ?? "")])
+              __expected = get!({"allowed": 1, "blocked": 2, "rejected": 2, "dropped": 2, "drop": 2}, [downcase(to_string(__value) ?? "")])
               if __expected != null {
                   if ."action_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
               }
@@ -840,6 +848,27 @@ samples:
       "severity_id": "3"
       "action_id": "2"
       "finding_info.analytic.category": "Policy Violation"
+  # neon review #78: JSON with an unrelated event object is not Network Activity.
+  # source: https://docs.aws.amazon.com/network-firewall/latest/developerguide/firewall-logging-contents.html
+  - raw: "{\"source\":\"app\",\"event\":{\"foo\":\"bar\",\"level\":\"info\"}}"
+    expect:
+      "class_uid": "0"
+      "unmapped.parse_fallback": "not a Network Firewall log record"
+  # neon review #78: null netflow counters are absent, never zero (no traffic object).
+  # source: https://docs.aws.amazon.com/network-firewall/latest/developerguide/firewall-logging-contents.html
+  - raw: "{\"firewall_name\":\"inspection-fw\",\"availability_zone\":\"eu-central-1a\",\"event_timestamp\":\"1762070460\",\"event\":{\"timestamp\":\"2026-11-02T08:01:00.100200+0000\",\"flow_id\":994411223344552,\"event_type\":\"netflow\",\"src_ip\":\"10.0.12.35\",\"src_port\":40001,\"dest_ip\":\"198.51.100.80\",\"dest_port\":443,\"proto\":\"TCP\",\"netflow\":{\"pkts\":null,\"bytes\":null,\"start\":\"2026-11-02T08:00:59.000000+0000\",\"end\":\"2026-11-02T08:01:00.000000+0000\",\"age\":1}}}"
+    expect:
+      "class_uid": "4001"
+      "activity_id": "6"
+      "start_time": "1793606459000"
+  # neon review #78: alert.action dropped maps to Denied / Dropped.
+  # source: https://docs.suricata.io/en/latest/output/eve/eve-json-format.html (alert.action)
+  - raw: "{\"firewall_name\":\"test-firewall\",\"availability_zone\":\"us-east-1b\",\"event_timestamp\":\"1762075000\",\"event\":{\"timestamp\":\"2026-11-02T09:16:40.552110+0000\",\"flow_id\":661122334455668,\"event_type\":\"alert\",\"src_ip\":\"10.0.100.56\",\"src_port\":51515,\"dest_ip\":\"198.51.100.66\",\"dest_port\":4444,\"proto\":\"TCP\",\"alert\":{\"action\":\"dropped\",\"signature_id\":3100001,\"rev\":2,\"signature\":\"Drop outbound to known C2 port\",\"category\":\"A Network Trojan was detected\",\"severity\":1},\"aws_metadata\":{\"resource_arn\":\"arn:aws:network-firewall:us-east-1:123456789012:stateful-rulegroup/c2-block\"}}}"
+    expect:
+      "class_uid": "2004"
+      "action_id": "2"
+      "disposition_id": "6"
+      "severity_id": "4"
   # NAN-3702: an unparseable record gets the deterministic sha256("aws_network_firewall|raw|" + raw) uid.
   - raw: "NAN-3702 determinism probe: not a aws_network_firewall record"
     expect:

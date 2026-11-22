@@ -8,19 +8,23 @@ description: >
   "Authentication" (class_uid 3002) records. Two wire forms: the pipe-delimited
   audit.log written by the default log4j2 pattern (`%d| trackingid| event|
   subject| ip | app| connectionid| protocol| host| role| status| adapterid|
-  description| responsetime`, with or without transactionid after trackingid)
+  description| responsetime`, with or without transactionid after trackingid;
+  the layout is chosen by where the status column sits, so a description that
+  holds `|` keeps every column in place)
   and the CEF form of the syslog / SIEM appender (`CEF:0|Ping Identity|
   PingFederate|...` with duid, src, msg, cs1 to cs6, dvchost, externalId), with
-  or without a syslog header. SSO, OAuth, AUTHN_ATTEMPT, AUTHN_REQUEST and
+  or without a syslog header; CEF from another vendor is kept whole as a Base
+  Event. SSO, OAuth, AUTHN_ATTEMPT, AUTHN_REQUEST and
   AUTHN_SESSION_CREATED / _USED are Logon, SLO and AUTHN_SESSION_DELETED are
   Logoff, other event types (SRI_REVOKED, ...) are Other. Status success /
   failure / inprogress maps to Success / Failure / Other ("In Progress"); a
   failure is Low severity with the failure description on status_detail. The
-  subject is user, the client IP src_endpoint, the PingFederate node
+  subject is user (also user.email_addr when it is an address; "unknown" when
+  an attempt has not named one yet), the client IP src_endpoint, the PingFederate node
   dst_endpoint, the partner connection id service, SAML / OAuth / OIDC the auth
   protocol, the tracking id metadata.correlation_uid, the transaction id
-  metadata.uid, and responsetime the duration. Timestamps carry no zone and are
-  read as UTC. Anything else (for example a PingFederate server.log line) is
+  metadata.uid, and responsetime the duration. Timestamps without a zone are read as
+  UTC; ISO 8601 with a zone and epoch seconds or milliseconds are honored. Anything else (for example a PingFederate server.log line) is
   kept whole as a Base Event with unmapped.parse_fallback. Distinct from the
   PingOne cloud parser. Samples follow the PingFederate "Security audit
   logging" field reference and the Elastic ping_federate audit pipeline
@@ -46,35 +50,64 @@ parser_vrl: |
   f = {}
   form = ""
 
-  if contains(raw_log, "CEF:") {
-      # A syslog header may precede the CEF body.
-      cef_at = to_int(find(raw_log, "CEF:"))
-      c, cerr = parse_cef(slice!(raw_log, cef_at))
+  fallback = "not a PingFederate audit record"
+
+  # CEF only when a real CEF header starts the body (a syslog header may precede
+  # it); "CEF:" elsewhere, say inside a pipe line's description, is just text.
+  cm, cm_err = parse_regex(raw_log, r'(?:^|\s)(?P<cef>CEF:\d+\|.*)$')
+  if cm_err == null {
+      c, cerr = parse_cef(string!(cm.cef))
       if cerr == null {
-          form = "cef"
           co = object!(c)
-          __source_kv = object(parse_json!(encode_json(co))) ?? {}
-          f.event = string(co.name) ?? string(co.deviceEventClassId) ?? ""
-          f.subject = string(co.duid) ?? string(co.suser) ?? ""
-          f.ip = string(co.src) ?? ""
-          f.status = string(co.msg) ?? ""
-          f.app = string(co.cs1) ?? ""
-          f.connectionid = string(co.cs2) ?? ""
-          f.protocol = string(co.cs3) ?? ""
-          f.role = string(co.cs4) ?? ""
-          f.host = string(co.dvchost) ?? ""
-          f.trackingid = string(co.externalId) ?? ""
-          f.timestamp = string(co.rt) ?? ""
-          f.version = string(co.deviceVersion) ?? ""
+          vendor = downcase(string(co.deviceVendor) ?? "")
+          product = downcase(string(co.deviceProduct) ?? "")
+          if contains(vendor, "ping") || contains(product, "pingfederate") {
+              form = "cef"
+              __source_kv = object(parse_json!(encode_json(co))) ?? {}
+              f.event = string(co.name) ?? string(co.deviceEventClassId) ?? ""
+              f.subject = string(co.duid) ?? string(co.suser) ?? ""
+              f.ip = string(co.src) ?? ""
+              f.status = string(co.msg) ?? ""
+              f.app = string(co.cs1) ?? ""
+              f.connectionid = string(co.cs2) ?? ""
+              f.protocol = string(co.cs3) ?? ""
+              f.role = string(co.cs4) ?? ""
+              f.host = string(co.dvchost) ?? ""
+              f.trackingid = string(co.externalId) ?? ""
+              f.timestamp = string(co.rt) ?? ""
+              f.version = string(co.deviceVersion) ?? ""
+          } else {
+              # Another product's CEF routed here: keep it whole, never guess.
+              fallback = "CEF from another product"
+          }
       }
-  } else {
-      m, merr = parse_regex(raw_log, r'(?P<timestamp>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}[,.]\d{3})\s*\|(?P<rest>.*)$')
+  }
+
+  if form == "" && fallback == "not a PingFederate audit record" {
+      m, merr = parse_regex(raw_log, r'(?P<timestamp>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[,.]\d{1,9})?(?:Z|[+-]\d{2}:?\d{2})?)\s*\|(?P<rest>.*)$')
       if merr == null {
           parts = map_values(split(string!(m.rest), "|")) -> |v| { strip_whitespace(string!(v)) }
           n = length(parts)
+          # The 14-field pattern has status at column 9 (0-based, after %d), the
+          # 15-field one (transactionid after trackingid) at column 10. Column
+          # counts alone cannot tell them apart once a description holds '|', so
+          # the layout is chosen by where the status value sits.
+          statuses = ["success", "failure", "failed", "inprogress", "in progress"]
+          st9 = downcase(string(get(parts, [9]) ?? "") ?? "")
+          st10 = downcase(string(get(parts, [10]) ?? "") ?? "")
+          base = 0
+          if n >= 14 && includes(statuses, st10) {
+              base = 14
+          } else if n >= 13 && includes(statuses, st9) {
+              base = 13
+          } else if n == 13 {
+              base = 13
+          } else if n >= 14 {
+              base = 14
+          }
           names = []
-          if n == 13 { names = ["trackingid", "event", "subject", "ip", "app", "connectionid", "protocol", "host", "role", "status", "adapterid", "description", "responsetime"] }
-          if n >= 14 { names = ["trackingid", "transactionid", "event", "subject", "ip", "app", "connectionid", "protocol", "host", "role", "status", "adapterid", "description", "responsetime"] }
+          if base == 13 { names = ["trackingid", "event", "subject", "ip", "app", "connectionid", "protocol", "host", "role", "status", "adapterid", "description", "responsetime"] }
+          if base == 14 { names = ["trackingid", "transactionid", "event", "subject", "ip", "app", "connectionid", "protocol", "host", "role", "status", "adapterid", "description", "responsetime"] }
           if length(names) > 0 {
               form = "pipe"
               f.timestamp = string!(m.timestamp)
@@ -82,9 +115,9 @@ parser_vrl: |
                   v = string(get(parts, [i]) ?? "") ?? ""
                   if v != "" { f = set!(f, [string!(name)], v) }
               }
-              if n > 14 {
+              if n > base {
                   # A description that itself holds '|' spans the extra columns.
-                  desc = join!(slice!(parts, 12, n - 1), "|")
+                  desc = join!(slice!(parts, base - 2, n - 1), "|")
                   if desc != "" { f.description = desc } else { f = remove!(f, ["description"]) }
                   last = string(get(parts, [n - 1]) ?? "") ?? ""
                   if last != "" { f.responsetime = last } else { f = remove!(f, ["responsetime"]) }
@@ -120,26 +153,32 @@ parser_vrl: |
           }
       }
       # NAN-5264: explicit fallback marker; nano parser health counts it.
-      . = set!(., ["unmapped", "parse_fallback"], "not a PingFederate audit record")
+      . = set!(., ["unmapped", "parse_fallback"], fallback)
   } else {
       event = upcase(string(f.event) ?? "")
       st = downcase(replace(string(f.status) ?? "", " ", ""))
 
-      # ---- time: log4j %d / CEF rt carry no zone; read them as UTC ----
+      # ---- time: ISO 8601 with a zone, else log4j %d / CEF rt read as UTC
+      # (neither carries a zone), else epoch seconds or milliseconds ----
       time_ms = 0
       ts = string(f.timestamp) ?? ""
       if ts != "" {
-          tsn = replace(replace(ts, ",", "."), "T", " ")
-          t1, t1err = parse_timestamp(tsn, "%Y-%m-%d %H:%M:%S%.3f", timezone: "UTC")
-          if t1err == null {
-              time_ms = to_unix_timestamp(t1, unit: "milliseconds")
+          tsn = replace(ts, ",", ".")
+          if match(ts, r'^\d{9,13}$') {
+              ep = to_int(ts) ?? 0
+              if ep < 100000000000 { time_ms = ep * 1000 } else { time_ms = ep }
+          } else if match(tsn, r'(?:Z|[+-]\d{2}:?\d{2})$') {
+              t0, t0err = parse_timestamp(tsn, "%+")
+              if t0err != null { t0, t0err = parse_timestamp(tsn, "%Y-%m-%dT%H:%M:%S%.f%z") }
+              if t0err == null { time_ms = to_unix_timestamp(t0, unit: "milliseconds") }
           } else {
-              t2, t2err = parse_timestamp(ts, "%b %d %Y %H:%M:%S%.3f", timezone: "UTC")
-              if t2err == null {
-                  time_ms = to_unix_timestamp(t2, unit: "milliseconds")
+              t1, t1err = parse_timestamp(replace(tsn, "T", " "), "%Y-%m-%d %H:%M:%S%.f", timezone: "UTC")
+              if t1err == null {
+                  time_ms = to_unix_timestamp(t1, unit: "milliseconds")
               } else {
-                  ep = to_int(ts) ?? 0
-                  if ep > 0 { time_ms = ep }
+                  t2, t2err = parse_timestamp(ts, "%b %d %Y %H:%M:%S%.f", timezone: "UTC")
+                  if t2err != null { t2, t2err = parse_timestamp(ts, "%b %d %Y %H:%M:%S", timezone: "UTC") }
+                  if t2err == null { time_ms = to_unix_timestamp(t2, unit: "milliseconds") }
               }
           }
       }
@@ -177,7 +216,9 @@ parser_vrl: |
       # ---- who / where ----
       subject = string(f.subject) ?? ""
       user = {}
-      if subject != "" { user.name = subject } else { user.name = "" }
+      # OCSF requires user; an attempt that has not named a subject yet is "unknown".
+      if subject != "" { user.name = subject } else { user.name = "unknown" }
+      if match(subject, r'^[^@\s]+@[^@\s]+\.[^@\s]+$') { user.email_addr = subject }
       src_endpoint = {}
       ip = string(f.ip) ?? ""
       if ip != "" { src_endpoint.ip = downcase(ip) }
@@ -695,6 +736,61 @@ samples:
     expect:
       "class_uid": "0"
       "unmapped.parse_fallback": "not a PingFederate audit record"
+  # neon review #78: 14-field line whose description holds '|' keeps its columns.
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html
+  - raw: "2026-11-02 14:12:20,315| tid:Pp4Df6GhJ8kLz0XcExample06| SSO| alice@example.com| 192.0.2.1 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| reason A|reason B| 42"
+    expect:
+      "activity_id": "1"
+      "status_id": "2"
+      "severity_id": "2"
+      "user.name": "alice@example.com"
+      "user.email_addr": "alice@example.com"
+      "src_endpoint.ip": "192.0.2.1"
+      "status_detail": "reason A|reason B"
+      "duration": "42"
+  # neon review #78: 15-field (transactionid) line whose description holds '|'.
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html
+  - raw: "2026-11-02 14:13:05,902| tid:Ww3Ee5Rr7Tt9YyUuExample07| a1b2c3d4-0000-4000-8000-000000000003| AUTHN_ATTEMPT| dave| 198.51.100.12 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| step 1 ok|step 2 denied| 18"
+    expect:
+      "status_id": "2"
+      "user.name": "dave"
+      "metadata.uid": "a1b2c3d4-0000-4000-8000-000000000003"
+      "status_detail": "step 1 ok|step 2 denied"
+      "duration": "18"
+  # neon review #78: 'CEF:' inside a pipe description is text, not a CEF header.
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html
+  - raw: "2026-11-02 14:14:41,077| tid:Aa1Ss2Dd3Ff4Gg5HhExample08| AUTHN_ATTEMPT| erin| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| Blocked by CEF:rule 7| 5"
+    expect:
+      "class_uid": "3002"
+      "status_id": "2"
+      "status_detail": "Blocked by CEF:rule 7"
+  # neon review #78: ISO 8601 %d with a zone.
+  # source: https://docs.pingidentity.com/pingfederate/latest/administrators_reference_guide/pf_security_audit_logging.html
+  - raw: "2026-11-02T14:15:02.640Z| tid:Zz9Xx8Cc7Vv6Bb5NnExample09| SSO| frank@example.com| 192.0.2.55 | | sp:cloud:saml2| SAML20| pf02.example.com| IdP| success| HTMLFormAdapter| | 77"
+    expect:
+      "class_uid": "3002"
+      "time": "1793628902640"
+      "user.email_addr": "frank@example.com"
+  # neon review #78: epoch-second rt is scaled to milliseconds.
+  # source: https://www.ibm.com/docs/en/SS42VS_DSM/com.ibm.dsm.doc/c_dsm_guide_PingFederate_sample_event_msg.html
+  - raw: "CEF:0|Ping Identity|PingFederate|12.1|SSO|SSO|0|rt=1793628195 duid=grace@example.com src=192.0.2.60 msg=success cs2Label=Connection ID cs2=sp:cloud:saml2 cs3Label=Protocol cs3=SAML20 dvchost=pf01.example.com cs4Label=Role cs4=IdP externalId=tid:Qq1Ww2Ee3Rr4Tt5YyExample10"
+    expect:
+      "class_uid": "3002"
+      "time": "1793628195000"
+      "status_id": "1"
+  # neon review #78: ISO 8601 rt.
+  # source: https://www.ibm.com/docs/en/SS42VS_DSM/com.ibm.dsm.doc/c_dsm_guide_PingFederate_sample_event_msg.html
+  - raw: "CEF:0|Ping Identity|PingFederate|12.1|AUTHN_ATTEMPT|AUTHN_ATTEMPT|0|rt=2026-11-02T14:16:30Z duid=heidi src=198.51.100.61 msg=failure cs2Label=Connection ID cs2=sp:cloud:saml2 cs3Label=Protocol cs3=SAML20 dvchost=pf01.example.com cs4Label=Role cs4=IdP externalId=tid:Uu1Ii2Oo3Pp4Aa5SsExample11"
+    expect:
+      "time": "1793628990000"
+      "status_id": "2"
+      "severity_id": "2"
+  # neon review #78: another product's CEF is kept whole, not mapped to Authentication.
+  # source: https://docs.paloaltonetworks.com/pan-os/11-1/pan-os-admin/monitoring/use-syslog-for-monitoring/syslog-field-descriptions (CEF shape)
+  - raw: "<14>Nov  2 14:17:00 fw01 CEF:0|Palo Alto Networks|PAN-OS|11.1|end|TRAFFIC|1|rt=Nov 02 2026 14:17:00 src=192.0.2.9 dst=198.51.100.9 suser=alice"
+    expect:
+      "class_uid": "0"
+      "unmapped.parse_fallback": "CEF from another product"
   # NAN-3702: an unparseable record gets the deterministic sha256("pingfederate|raw|" + raw) uid.
   - raw: "NAN-3702 determinism probe: not a pingfederate record"
     expect:

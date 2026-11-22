@@ -20,7 +20,10 @@ description: >
   Blocked. The W3C "#Version" / "#Fields" directives become a Base Event with
   log_level info. A real-time record whose field selection is not in the
   documented order cannot be read positionally, so it is kept whole as a Base
-  Event with unmapped.parse_fallback rather than guessed. Samples are drawn from
+  Event with unmapped.parse_fallback rather than guessed; the closed-set fields
+  (cs-protocol, cs-protocol-version, c-ip-version, c-port, result types, c-country)
+  are checked so a configuration that omits a middle field falls back too. A JSON
+  object without CloudFront fields is not HTTP Activity. Samples are drawn from
   the Elastic aws.cloudfront_logs pipeline fixtures and the AWS CloudFront
   standard and real-time log references, with documentation addresses.
 match_values:
@@ -61,6 +64,11 @@ parser_vrl: |
           }
           # "-" is the access log's empty value.
           f = filter(f) -> |_k, v| { v != "-" && v != "" && v != null }
+          # Any JSON object is not a CloudFront record: require a v2 field.
+          if !(exists(f.c_ip) || exists(f.cs_method) || exists(f.sc_status) || exists(f.cs_uri_stem) || exists(f.x_edge_request_id) || exists(f.distributionid)) {
+              form = ""
+              fallback = "JSON is not a CloudFront v2 log record"
+          }
       } else {
           fallback = "unparsable JSON"
       }
@@ -111,10 +119,28 @@ parser_vrl: |
 
   method = upcase(string(f.cs_method) ?? "")
   code = to_int(f.sc_status) ?? 0
-  if form == "realtime" && (code < 100 || code > 599 || !match(method, r'^[A-Z]+$')) {
+  if form == "realtime" {
       # A real-time configuration that does not select the documented field
       # order cannot be read positionally; keep every column, do not guess.
-      fallback = "real-time field selection not in the documented order"
+      # Omitting a middle field shifts every later column, so the fields with a
+      # closed value set are checked wherever they land.
+      proto_rt = string(f.cs_protocol) ?? ""
+      pver_rt = string(f.cs_protocol_version) ?? ""
+      ipver_rt = string(f.c_ip_version) ?? ""
+      port_rt = string(f.c_port) ?? ""
+      result_rt = string(f.x_edge_result_type) ?? ""
+      resp_rt = string(f.x_edge_response_result_type) ?? ""
+      country_rt = string(f.c_country) ?? ""
+      results = ["Hit", "RefreshHit", "Miss", "LimitExceeded", "CapacityExceeded", "Error", "Redirect", "LambdaExecutionError", "OriginShieldHit", "MissGeneratedResponse", "FunctionGeneratedResponse", "FunctionExecutionError", "FunctionThrottledError"]
+      aligned = code >= 100 && code <= 599 && match(method, r'^[A-Z]+$')
+      aligned = aligned && (proto_rt == "" || includes(["http", "https", "ws", "wss", "grpcs"], downcase(proto_rt)))
+      aligned = aligned && (pver_rt == "" || starts_with(pver_rt, "HTTP/"))
+      aligned = aligned && (ipver_rt == "" || ipver_rt == "IPv4" || ipver_rt == "IPv6")
+      aligned = aligned && (port_rt == "" || match(port_rt, r'^\d{1,5}$'))
+      aligned = aligned && (result_rt == "" || includes(results, result_rt))
+      aligned = aligned && (resp_rt == "" || includes(results, resp_rt))
+      aligned = aligned && (country_rt == "" || match(country_rt, r'^[A-Z]{2}$'))
+      if !aligned { fallback = "real-time field selection not in the documented order" }
   }
 
   if is_header || fallback != "" || form == "" {
@@ -804,6 +830,18 @@ samples:
       "src_endpoint.autonomous_system.number": "64500"
       "http_response.code": "404"
       "http_request.url.path": "/wp-login.php"
+  # neon review #78: a real-time record missing a middle field (cs-cookie) falls back instead of shifting columns.
+  # source: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/real-time-logs.html
+  - raw: "1762067709.123\t198.51.100.23\t192.0.2.200\t0.002\t200\t1650\tGET\thttps\td111111abcdef8.cloudfront.net\t/images/logo.png\t356\tIAD89-C1\trTmExampleReqId0001xYz==\twww.example.com\t0.004\tHTTP/2.0\tIPv4\tMozilla/5.0%20(Macintosh;%20Intel%20Mac%20OS%20X%2014_5)\thttps://www.example.com/\tv=2\tHit\t-\tTLSv1.3\tTLS_AES_128_GCM_SHA256\tHit\t-\t-\timage/png\t1302\t-\t-\t52110\tHit\tUS\tgzip,%20br\timage/avif,image/webp,*/*\t/images/*\t-\t-"
+    expect:
+      "class_uid": "0"
+      "unmapped.parse_fallback": "real-time field selection not in the documented order"
+  # neon review #78: a JSON object without CloudFront fields is not HTTP Activity.
+  # source: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/standard-logs-reference.html
+  - raw: "{\"foo\":\"bar\",\"level\":\"info\"}"
+    expect:
+      "class_uid": "0"
+      "unmapped.parse_fallback": "JSON is not a CloudFront v2 log record"
   # NAN-3702: an unparseable record gets the deterministic sha256("aws_cloudfront|raw|" + raw) uid.
   - raw: "NAN-3702 determinism probe: not a aws_cloudfront record"
     expect:
