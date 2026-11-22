@@ -26,8 +26,19 @@ class ResidualTests(unittest.TestCase):
             ({'Password': 'private', 'Nested': {'clientSecret': 'private'}}, {}, {'password': 'private', 'nested.client_secret': 'private'}),
             ({'Name': 'UPPER'}, {'user': {'name': 'upper'}}, {}),
             ({'Name': 'UPPER'}, {}, {'name': 'UPPER'}),
-            ({'KnownList': ['one', 2]}, {'a': 'one', 'b': 2}, {}),
-            ({'KnownList': ['one', 'unseen']}, {'a': 'one'}, {'known_list': ['one', 'unseen']}),
+            # No coincidental consumption: a value equal to an attribute that is
+            # not the key's declared target (or the rule's target) still spills.
+            ({'Known': 'mapped'}, {'other': 'mapped'}, {'known': 'mapped'}),
+            ({'Known': 1}, {'activity_id': 1, 'message': 2}, {'known': 1}),
+            ({'Name': 'UPPER'}, {'actor': {'user': {'name': 'upper'}}}, {'name': 'UPPER'}),
+            ({'Known': '42'}, {'message': 42}, {}),
+            ({'KnownList': ['one', 2]}, {'a': ['one', 2]}, {}),
+            ({'KnownList': ['one', 2]}, {'a': 'one', 'b': 2}, {'known_list': ['one', 2]}),
+            ({'KnownList': ['one', 'unseen']}, {'a': ['one']}, {'known_list': ['one', 'unseen']}),
+            # A target inside an array of objects (indices dropped).
+            ({'Res': 'r1'}, {'resources': [{'uid': 'x'}, {'uid': 'r1'}]}, {}),
+            ({'Res': 'r1'}, {'resources': [{'name': 'r1'}]}, {'res': 'r1'}),
+            ({'cs(Host)': 'h'}, {'http_request': {'url': {'hostname': 'h'}}}, {}),
             ({'DéjàVu': 'unicode', 'HTTPStatus200': 'code'}, {}, {'déjà_vu': 'unicode', 'http_status_200': 'code'}),
             ({}, {'unmapped': {'empty': ''}}, {}),
             ({'Headers': [{'Name': 'Authorization', 'Value': 'private'}]}, {}, {'headers': '[{"Name":"Authorization","Value":"private"}]'}),
@@ -37,8 +48,9 @@ class ResidualTests(unittest.TestCase):
             # NAN-3604: dotted keys inside objects inside arrays keep their dots.
             ({'Records': [{'http://a.example/claims/upn': 'u@example.com', 'x.y': {'p.q~r': 1}}]}, {}, {'records': '[{"http://a.example/claims/upn":"u@example.com","x.y":{"p.q~r":1}}]'}),
         ]
-        rules = [{'source': 'Name', 'kind': 'lowercase', 'reason': 'Test normalization must exist in emitted branch.'}]
-        program = '__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'transforms': rules, 'consumed_candidates': ['Known', 'KnownList', 'Name']})
+        rules = [{'source': 'Name', 'kind': 'lowercase', 'target': 'user.name', 'reason': 'Test normalization must exist in emitted branch.'}]
+        mappings = {'Known': ['message'], 'KnownList': ['a'], 'Res': ['resources.uid'], 'cs(Host)': ['http_request.url.hostname']}
+        program = '__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'transforms': rules, 'mappings': mappings})
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             (tmp/'p.vrl').write_text(program)
@@ -50,12 +62,12 @@ class ResidualTests(unittest.TestCase):
             for (source, mapped, expected), output in zip(cases, outputs):
                 with self.subTest(source=source):
                     self.assertEqual(output.get('unmapped', {}), expected)
-                    check(source, output, 'raw input', rules, candidates=['Known', 'KnownList', 'Name'])
+                    check(source, output, 'raw input', rules, mappings=mappings)
                     if expected:
                         broken = copy.deepcopy(output)
                         del broken['unmapped'][next(iter(expected))]
                         with self.assertRaises(AssertionError):
-                            check(source, broken, 'raw input', rules, candidates=['Known', 'KnownList', 'Name'])
+                            check(source, broken, 'raw input', rules, mappings=mappings)
 
 
 class TargetEvidenceTests(unittest.TestCase):
@@ -74,7 +86,7 @@ class TargetEvidenceTests(unittest.TestCase):
         rules = [{'source': 'Name', 'kind': 'lowercase', 'target': 'message', 'reason': 'r'}]
         cases = [({'Name': 'RAW INPUT'}, {'message': 'raw input'}, {'name': 'RAW INPUT'}),
                  ({'Name': 'HELLO'}, {'message': 'hello'}, {})]
-        program = '__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'transforms': rules, 'consumed_candidates': []})
+        program = '__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'transforms': rules})
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             (tmp/'p.vrl').write_text(program)
@@ -136,13 +148,25 @@ class ConfigTests(unittest.TestCase):
                     generated({'transforms': [rule]})
 
     def test_transform_parameters(self):
-        base = {'source': 'S', 'reason': 'r'}
+        base = {'source': 'S', 'target': 't', 'reason': 'r'}
         for rule in ({'kind': 'scale', 'factor': 0}, {'kind': 'scale'}, {'kind': 'scale', 'factor': float('inf')},
                      {'kind': 'scale', 'factor': '2'}, {'kind': 'enum', 'values': {}}, {'kind': 'enum'},
                      {'kind': 'epoch_ms', 'format': ''}, {'kind': 'epoch_ms', 'format': 5}):
             with self.subTest(rule=rule), self.assertRaises(AssertionError):
                 validate_config({'transforms': [{**base, **rule}]})
         validate_config({'transforms': [{**base, 'kind': 'scale', 'factor': 0.001}, {**base, 'kind': 'enum', 'values': {'a': 1}}, {**base, 'kind': 'epoch_ms'}]})
+
+    def test_explicit_targets_required(self):
+        # No coincidental consumption: a rule without a target, or the old
+        # value-anywhere candidate list, is rejected.
+        with self.assertRaises(AssertionError):
+            validate_config({'transforms': [{'source': 'S', 'kind': 'lowercase', 'reason': 'r'}]})
+        with self.assertRaises(AssertionError):
+            generated({'consumed_candidates': ['a']})
+        for bad in ({'a': []}, {'a': 'unmapped.a'}, {'a': ['raw_data']}, {'a': ''}, {'': 'x'}, ['a']):
+            with self.subTest(bad=bad), self.assertRaises(AssertionError):
+                generated({'mappings': bad})
+        self.assertIn('resources.uid', generated({'mappings': {'a': 'resources.0.uid'}}))
 
     def test_json_envelope_retired(self):
         with self.assertRaises(AssertionError):
@@ -340,18 +364,18 @@ __source_kv = kv
 class RunParserFidelityTests(unittest.TestCase):
     """End to end: raw_data is the original, and a probe password survives."""
 
-    def run_parser(self, mask='', raw='raw_log'):
+    def run_parser(self, mask='', raw='raw_log', mappings=None, sample='msg=hello user=alice'):
         import residual_spill
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)/'probe'/'parser.yaml'
             path.parent.mkdir()
             (path.parent/'field-coverage.yaml').write_text(json.dumps({
-                'source': 'text', 'consumed_candidates': ['msg'],
+                'source': 'text', 'mappings': mappings or {'msg': 'message'},
                 'probe': {'mode': 'after', 'require': 'msg=', 'source': 'ResidualProbe',
                           'text': ' ResidualProbe=nan2421-text-unknown password=nan2421-secret'}}))
             program = TEXT_PARSER.replace('MASK', mask).replace('RAW', raw)
             body = ''.join('  ' + line + '\n' if line else '\n' for line in program.strip().splitlines())
-            path.write_text('parser_vrl: |\n' + body + 'samples: ' + json.dumps([{'raw': 'msg=hello user=alice'}]) + '\n')
+            path.write_text('parser_vrl: |\n' + body + 'samples: ' + json.dumps([{'raw': sample}]) + '\n')
             residual_spill.update(path)
             fcc.run_parser(path)
 
@@ -362,6 +386,13 @@ class RunParserFidelityTests(unittest.TestCase):
         for mask in ('if exists(kv.password) { kv.password = "<redacted>" }', '__d = del(kv.password)'):
             with self.subTest(mask=mask), self.assertRaisesRegex(AssertionError, 'credential value'):
                 self.run_parser(mask=mask)
+
+    def test_coincidental_mapping_fails_provenance(self):
+        # user=alice is declared to map to message, but message carries msg:
+        # a sample where both equal would consume user by coincidence. The
+        # perturbation check finds no provenance and fails the parser.
+        with self.assertRaisesRegex(AssertionError, 'without provenance'):
+            self.run_parser(mappings={'msg': 'message', 'user': 'message'}, sample='msg=alice user=alice')
 
     def test_rewritten_raw_data_fails(self):
         for raw in ('"MASKED"', 'strip_whitespace(raw_log) + "!"'):

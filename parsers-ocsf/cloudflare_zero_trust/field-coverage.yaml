@@ -9,11 +9,6 @@ transforms:
   factor: 1000
   target: time
   reason: Unix-seconds Logpush clock converted to event milliseconds.
-- source: Datetime
-  kind: scale
-  factor: 1.0e-06
-  target: time
-  reason: Unix-nanoseconds Logpush clock converted to event milliseconds.
 - source: CreatedAt
   kind: epoch_ms
   target: time
@@ -23,23 +18,22 @@ transforms:
   factor: 1000
   target: time
   reason: Unix-seconds Access clock converted to event milliseconds.
-- source: CreatedAt
-  kind: scale
-  factor: 1.0e-06
-  target: time
-  reason: Unix-nanoseconds Access clock converted to event milliseconds.
 - source: QueryName
   kind: lowercase
+  target: query.hostname
   reason: Query name lowercased into query.hostname.
 - source: HTTPHost
   kind: lowercase
+  target: dst_endpoint.hostname
+  reason: Host lowercased into http_request.url.hostname and dst_endpoint.hostname.
+- source: HTTPHost
+  kind: lowercase
+  target: http_request.url.hostname
   reason: Host lowercased into http_request.url.hostname and dst_endpoint.hostname.
 - source: SNI
   kind: lowercase
+  target: dst_endpoint.hostname
   reason: SNI lowercased into dst_endpoint.hostname.
-- source: HTTPMethod
-  kind: lowercase
-  reason: Method is upper case on the wire; the parser upcases it, so a lower-case source is the only transformed form.
 - source: Action
   kind: enum
   target: action_id
@@ -48,7 +42,8 @@ transforms:
     allowedonnorulematch: 1
     block: 2
     login: 1
-  reason: Gateway / Access verdict normalized to the OCSF action; consume only when the expected ID is emitted.
+  reason: Gateway / Access verdict normalized to the OCSF action; consume only when the expected ID is
+    emitted.
 - source: ResolverDecision
   kind: enum
   target: action_id
@@ -68,51 +63,101 @@ transforms:
     udp: 17
     icmp: 1
   reason: Transport name normalized to the IANA protocol number.
-consumed_candidates:
-- AccountID
-- AppDomain
-- AppUUID
-- BlockedFileHash
-- BlockedFileName
-- BlockedFileSize
-- DestinationIP
-- DestinationIPCountryCode
-- DestinationPort
-- DeviceID
-- DeviceName
-- DstIP
-- DstPort
-- Email
-- HTTPHost
-- HTTPMethod
-- HTTPStatusCode
-- HTTPVersion
-- IPAddress
-- PolicyID
-- PolicyName
-- Policy
-- Protocol
-- QueryName
-- QuerySize
-- QueryTypeName
-- RCode
-- RayID
-- Referer
-- RequestID
-- ResolvedIPs
-- SNI
-- SessionID
-- SourceIP
-- SourceIPCountryCode
-- SourceInternalIP
-- SourcePort
-- SrcIP
-- SrcPort
-- Transport
-- URL
-- UserAgent
-- UserID
-- UserUID
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  AccountID:
+  - metadata.tenant_uid
+  AppDomain:
+  - dst_endpoint.hostname
+  - service.name
+  AppUUID:
+  - service.uid
+  BlockedFileHash:
+  - file.hashes.value
+  BlockedFileName:
+  - file.name
+  BlockedFileSize:
+  - file.size
+  DestinationIP:
+  - dst_endpoint.ip
+  DestinationIPCountryCode:
+  - dst_endpoint.location.country
+  DestinationPort:
+  - dst_endpoint.port
+  DeviceID:
+  - device.uid
+  DeviceName:
+  - device.hostname
+  - device.name
+  - src_endpoint.hostname
+  DstIP:
+  - dst_endpoint.ip
+  DstPort:
+  - dst_endpoint.port
+  Email:
+  - actor.user.email_addr
+  - actor.user.name
+  - user.email_addr
+  - user.name
+  HTTPHost:
+  - dst_endpoint.hostname
+  - http_request.url.hostname
+  HTTPMethod:
+  - http_request.http_method
+  HTTPStatusCode:
+  - http_response.code
+  - http_status
+  HTTPVersion:
+  - http_request.version
+  IPAddress:
+  - src_endpoint.ip
+  PolicyID:
+  - firewall_rule.uid
+  PolicyName:
+  - firewall_rule.name
+  Policy:
+  - firewall_rule.name
+  Protocol:
+  - app_name
+  QueryName:
+  - query.hostname
+  QuerySize:
+  - traffic.bytes_out
+  QueryTypeName:
+  - query.type
+  RCode:
+  - rcode_id
+  RayID:
+  - metadata.correlation_uid
+  Referer:
+  - http_request.referrer
+  RequestID:
+  - http_request.uid
+  - metadata.correlation_uid
+  ResolvedIPs:
+  - answers.rdata
+  SNI:
+  - dst_endpoint.hostname
+  SessionID:
+  - connection_info.uid
+  - metadata.correlation_uid
+  SourceIP:
+  - src_endpoint.ip
+  SourceIPCountryCode:
+  - src_endpoint.location.country
+  SourceInternalIP:
+  - device.ip
+  SourcePort:
+  - src_endpoint.port
+  SrcIP:
+  - src_endpoint.ip
+  URL:
+  - http_request.url.url_string
+  UserAgent:
+  - http_request.user_agent
+  UserID:
+  - actor.user.uid
+  UserUID:
+  - user.uid

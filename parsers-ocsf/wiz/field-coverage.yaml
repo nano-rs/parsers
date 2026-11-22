@@ -1,0 +1,291 @@
+source: json
+transforms:
+- source: createdAt
+  kind: epoch_ms
+  target: finding_info.created_time
+  reason: Successful ISO timestamp conversion to the emitted millisecond clock.
+- source: issue.created
+  kind: epoch_ms
+  target: finding_info.created_time
+  reason: Successful ISO timestamp conversion to the emitted millisecond clock.
+- source: updatedAt
+  kind: epoch_ms
+  target: finding_info.modified_time
+  reason: Successful ISO timestamp conversion to the emitted millisecond clock.
+- source: timeframe.start
+  kind: epoch_ms
+  target: finding_info.first_seen_time
+  reason: Successful ISO timestamp conversion to the emitted millisecond clock.
+- source: lastDetectedAt
+  kind: epoch_ms
+  target: finding_info.last_seen_time
+  reason: Successful ISO timestamp conversion to the emitted millisecond clock.
+- source: timeframe.end
+  kind: epoch_ms
+  target: finding_info.last_seen_time
+  reason: Successful ISO timestamp conversion to the emitted millisecond clock.
+- source: severity
+  kind: enum
+  target: severity_id
+  values: &id001
+    informational: 1
+    info: 1
+    none: 1
+    low: 2
+    medium: 3
+    high: 4
+    critical: 5
+  reason: The Wiz severity normalized to the OCSF severity; consume only when the expected ID is emitted.
+- source: issue.severity
+  kind: enum
+  target: severity_id
+  values: *id001
+  reason: The webhook issue severity normalized to the OCSF severity; consume only when the expected ID
+    is emitted.
+- source: status
+  kind: enum
+  target: status_id
+  values: &id002
+    open: 1
+    in_progress: 2
+    rejected: 3
+    ignored: 3
+    resolved: 4
+    fixed: 4
+  reason: The Wiz status normalized to the OCSF finding status; consume only when the expected ID is emitted.
+- source: issue.status
+  kind: enum
+  target: status_id
+  values: *id002
+  reason: The webhook issue status normalized to the OCSF finding status; consume only when the expected
+    ID is emitted.
+- source: trigger.type
+  kind: enum
+  target: activity_id
+  values:
+    created: 1
+    updated: 2
+    reopened: 2
+    resolved: 3
+  reason: The webhook trigger type drives the OCSF activity; consume only when that activity is emitted.
+- source: result
+  kind: enum
+  target: compliance.status_id
+  values:
+    pass: 1
+    fail: 3
+  reason: The configuration check result normalized to the OCSF compliance status; consume only when the
+    expected ID is emitted.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  CVEDescription:
+  - vulnerabilities.cve.desc
+  control.description:
+  - finding_info.desc
+  control.id:
+  - finding_info.analytic.uid
+  control.name:
+  - finding_info.analytic.name
+  - finding_info.title
+  - message
+  control.resolutionRecommendation:
+  - remediation.desc
+  dataSourceName:
+  - finding_info.data_sources
+  description:
+  - finding_info.desc
+  - vulnerabilities.desc
+  entitySnapshot.cloudPlatform:
+  - cloud.provider
+  - resources.provider
+  entitySnapshot.id:
+  - resources.uid
+  entitySnapshot.name:
+  - resources.name
+  entitySnapshot.providerId:
+  - resources.uid_alt
+  entitySnapshot.region:
+  - cloud.region
+  - resources.region
+  entitySnapshot.subscriptionExternalId:
+  - cloud.account.uid
+  entitySnapshot.subscriptionName:
+  - cloud.account.name
+  entitySnapshot.type:
+  - resources.type
+  epssPercentile:
+  - vulnerabilities.cve.epss.percentile
+  epssProbability:
+  - vulnerabilities.cve.epss.score
+  hasExploit:
+  - vulnerabilities.is_exploit_available
+  id:
+  - finding_info.uid
+  - metadata.original_event_uid
+  - metadata.uid
+  - resource.uid
+  - resources.uid
+  issue.id:
+  - finding_info.uid
+  - metadata.original_event_uid
+  - metadata.uid
+  link:
+  - vulnerabilities.references
+  mitreTactics:
+  - finding_info.attacks.tactic.uid
+  mitreTechniques:
+  - finding_info.attacks.sub_technique.uid
+  name:
+  - finding_info.title
+  - message
+  - vulnerabilities.cve.uid
+  - vulnerabilities.title
+  origins:
+  - finding_info.data_sources
+  portalUrl:
+  - finding_info.src_url
+  primaryActor.email:
+  - actor.user.email_addr
+  primaryActor.id:
+  - actor.user.uid
+  primaryActor.name:
+  - actor.user.name
+  primaryResource.cloudAccount.cloudPlatform:
+  - cloud.provider
+  - resources.provider
+  primaryResource.cloudAccount.externalId:
+  - cloud.account.uid
+  primaryResource.externalId:
+  - resources.uid_alt
+  primaryResource.id:
+  - resources.uid
+  primaryResource.kubernetesNamespaceName:
+  - resources.namespace
+  primaryResource.name:
+  - resources.name
+  primaryResource.providerUniqueId:
+  - resources.uid_alt
+  primaryResource.region:
+  - cloud.region
+  - resources.region
+  primaryResource.type:
+  - resources.type
+  remediation:
+  - remediation.desc
+  - vulnerabilities.remediation.desc
+  resource.cloudPlatform:
+  - cloud.provider
+  - resources.provider
+  resource.externalId:
+  - resources.uid_alt
+  resource.id:
+  - resource.uid
+  - resources.uid
+  resource.name:
+  - resource.name
+  - resources.name
+  resource.providerId:
+  - resource.uid_alt
+  - resources.uid_alt
+  resource.region:
+  - cloud.region
+  - resources.region
+  resource.subscription.cloudProvider:
+  - cloud.provider
+  - resource.provider
+  - resources.provider
+  resource.subscription.externalId:
+  - cloud.account.uid
+  resource.subscription.name:
+  - cloud.account.name
+  resource.subscriptionId:
+  - cloud.account.uid
+  resource.subscriptionName:
+  - cloud.account.name
+  resource.type:
+  - resource.type
+  - resources.type
+  result:
+  - compliance.status
+  rule.description:
+  - finding_info.desc
+  rule.id:
+  - finding_info.analytic.uid
+  rule.name:
+  - finding_info.analytic.name
+  - finding_info.title
+  - message
+  rule.remediationInstructions:
+  - remediation.desc
+  rule.shortId:
+  - compliance.control
+  ruleMatch.rule.id:
+  - finding_info.analytic.uid
+  ruleMatch.rule.name:
+  - finding_info.analytic.name
+  - finding_info.title
+  - message
+  tdrId:
+  - finding_info.analytic.uid
+  tdrSource:
+  - finding_info.data_sources
+  threatId:
+  - finding_info.uid_alt
+  threatURL:
+  - finding_info.src_url
+  title:
+  - finding_info.analytic.name
+  - finding_info.title
+  - message
+  trigger.ruleName:
+  - metadata.product.feature.name
+  triggeringEvent.actorIP:
+  - evidences.src_endpoint.ip
+  triggeringEvent.actorIPMeta.autonomousSystemNumber:
+  - evidences.src_endpoint.autonomous_system.number
+  triggeringEvent.actorIPMeta.autonomousSystemOrganization:
+  - evidences.src_endpoint.autonomous_system.name
+  triggeringEvent.actorIPMeta.country:
+  - evidences.src_endpoint.location.country
+  triggeringEvent.id:
+  - evidences.uid
+  triggeringEvent.name:
+  - evidences.name
+  type:
+  - finding_info.types
+  vendorSeverity:
+  - vulnerabilities.severity
+  vulnerableAsset.cloudPlatform:
+  - cloud.provider
+  - resource.provider
+  - resources.provider
+  vulnerableAsset.id:
+  - device.uid
+  - resource.uid
+  - resources.uid
+  vulnerableAsset.ipAddresses:
+  - device.ip
+  - resource.ip
+  - resources.ip
+  vulnerableAsset.name:
+  - device.name
+  - resource.name
+  - resources.name
+  vulnerableAsset.operatingSystem:
+  - device.os.name
+  vulnerableAsset.providerUniqueId:
+  - resource.uid_alt
+  - resources.uid_alt
+  vulnerableAsset.region:
+  - cloud.region
+  - resource.region
+  - resources.region
+  vulnerableAsset.subscriptionExternalId:
+  - cloud.account.uid
+  vulnerableAsset.subscriptionName:
+  - cloud.account.name
+  vulnerableAsset.type:
+  - resource.type
+  - resources.type

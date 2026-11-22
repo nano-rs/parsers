@@ -1,0 +1,818 @@
+name: wazuh_ocsf
+display_name: Wazuh Alerts (OCSF)
+version: "1.1.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Wazuh manager alerts (alerts.json, one JSON alert per line, or the
+  same alert as a wazuh-alerts-* indexer document) into OCSF 1.9.0 with the
+  host and security_control profiles. A syscheck / FIM alert on a file (not
+  a registry key or value: [x64] HKEY_..., short hives such as HKLM\, or a
+  syscheck_registry rule) is a
+  "File System Activity" (1001): syscheck.event added / modified / deleted is
+  Create / Update / Delete, the file carries path, parent folder, size, MD5 /
+  SHA-1 / SHA-256 and owner (the _after values, or _before for a deletion),
+  and whodata (syscheck.audit) names the actor user and process. Every other
+  alert, including registry FIM, is a "Detection Finding" (2004) with the
+  rule as the analytic (uid = rule.id, name = rule.description, category =
+  decoder), rule.groups as finding types and metadata.labels, full_log as the
+  finding description and the decoded data (srcip / srcport, dstip /
+  dstport, dstuser / srcuser, Windows eventdata image or newProcessName,
+  decimal or hex processId / newProcessId, targetObject) as evidences. rule.level 0-15 maps to severity_id the way
+  Wazuh's own OCSF converter does (15 Critical, 11-14 High, 8-10 Medium, 4-7
+  Low, 0-3 Informational; no level is Unknown); rule.mitre id / tactic / technique become attacks
+  with sub-techniques split out; rule.firedtimes is count; the agent is the
+  device and the manager the reporter; location is metadata.log_name.
+  Compliance mappings (pci_dss, gdpr, hipaa, nist_800_53, tsc, gpg13) are kept
+  under unmapped. Anything that is not an alert falls back to Base Event with
+  the raw record kept.
+match_values:
+  - wazuh
+category: security
+vendor: "Wazuh"
+product: "Wazuh"
+parser_vrl: |
+  # Wazuh alerts.json -> OCSF 1.9.0 Detection Finding (2004), File System
+  # Activity (1001) for syscheck / FIM file alerts, or Base Event (0)
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
+
+  parsed, err = parse_json(raw_log)
+  __source_kv = object(parsed) ?? {}
+  e = object(parsed) ?? {}
+  rule = object(e.rule) ?? {}
+  alert_id = to_string(e.id) ?? ""
+
+  if err != null || !is_object(parsed) || length(rule) == 0 || alert_id == "" {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": "Unrecognized Wazuh record",
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("wazuh|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "alerts",
+              "product": { "name": "Wazuh", "vendor_name": "Wazuh" }
+          }
+      }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+  } else {
+      # ---- time ----
+      time_ms = 0
+      ts = to_string(e.timestamp) ?? ""
+      if ts != "" {
+          t, terr = parse_timestamp(ts, "%+")
+          if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+      }
+
+      # ---- severity: rule.level 0-15, normalized as Wazuh's own OCSF
+      # converter does (15 Critical, 11-14 High, 8-10 Medium, 4-7 Low, 0-3 Info)
+      # to_int(null) is 0, so an alert without a level stays Unknown.
+      level = -1
+      if rule.level != null { level = to_int(rule.level) ?? -1 }
+      severity_id = 0
+      severity = "Unknown"
+      if level >= 0 { severity_id = 1; severity = "Informational" }
+      if level >= 4 { severity_id = 2; severity = "Low" }
+      if level >= 8 { severity_id = 3; severity = "Medium" }
+      if level >= 11 { severity_id = 4; severity = "High" }
+      if level >= 15 { severity_id = 5; severity = "Critical" }
+
+      rule_id = to_string(rule.id) ?? ""
+      rule_desc = to_string(rule.description) ?? ""
+      groups = []
+      for_each(array(rule.groups) ?? []) -> |_i, g| {
+          gs = to_string(g) ?? ""
+          if gs != "" { groups = push(groups, gs) }
+      }
+
+      # ---- MITRE ATT&CK: rule.mitre.id[] with tactic[] / technique[] ----
+      mitre = object(rule.mitre) ?? {}
+      tactic_objs = []
+      for_each(array(mitre.tactic) ?? []) -> |_i, tn| {
+          tns = to_string(tn) ?? ""
+          if tns != "" { tactic_objs = push(tactic_objs, { "name": tns }) }
+      }
+      tech_names = array(mitre.technique) ?? []
+      attacks = []
+      for_each(array(mitre.id) ?? []) -> |i, mid| {
+          ids = to_string(mid) ?? ""
+          if ids != "" {
+              atk = {}
+              tname = to_string(get(tech_names, [i]) ?? "") ?? ""
+              if contains(ids, ".") {
+                  atk.technique = { "uid": to_string(get(split(ids, "."), [0]) ?? ids) ?? ids }
+                  atk.sub_technique = { "uid": ids }
+                  if tname != "" { atk.sub_technique.name = tname }
+              } else {
+                  atk.technique = { "uid": ids }
+                  if tname != "" { atk.technique.name = tname }
+              }
+              if length(tactic_objs) > 0 { atk.tactics = tactic_objs }
+              attacks = push(attacks, atk)
+          }
+      }
+      if length(attacks) == 0 && length(tactic_objs) > 0 { attacks = [{ "tactics": tactic_objs }] }
+
+      # ---- the agent (or manager) the alert is about ----
+      agent = object(e.agent) ?? {}
+      manager = to_string(get(e, ["manager", "name"]) ?? "") ?? ""
+      dev = { "type_id": 0, "type": "Unknown" }
+      aid = to_string(agent.id) ?? ""
+      if aid != "" { dev.uid = aid }
+      aname = to_string(agent.name) ?? ""
+      if aname != "" { dev.name = aname; dev.hostname = downcase(aname) }
+      aip = to_string(agent.ip) ?? ""
+      if match(aip, ip_re) { dev.ip = aip }
+      if !exists(dev.name) && !exists(dev.uid) && !exists(dev.ip) && manager != "" { dev.name = manager; dev.hostname = downcase(manager) }
+
+      location = to_string(e.location) ?? ""
+      decoder = to_string(get(e, ["decoder", "name"]) ?? "") ?? ""
+      full_log = to_string(e.full_log) ?? ""
+      count = to_int(rule.firedtimes) ?? 0
+
+      metadata = {
+          "version": "1.9.0",
+          "profiles": ["host", "security_control"],
+          "uid": alert_id,
+          "log_name": "alerts",
+          "product": { "name": "Wazuh", "vendor_name": "Wazuh" }
+      }
+      if location != "" { metadata.log_name = location }
+      if decoder != "" { metadata.log_format = decoder }
+      if rule_id != "" { metadata.event_code = rule_id }
+      if length(groups) > 0 { metadata.labels = groups }
+      if manager != "" { metadata.reporter = { "name": manager, "hostname": downcase(manager) } }
+
+      sc = object(e.syscheck) ?? {}
+      fim_path = to_string(sc.path) ?? ""
+      fim_event = downcase(to_string(sc.event) ?? "")
+      # Registry FIM ([x64] HKEY_..., HKLM\..., or a syscheck_registry rule)
+      # stays a Detection Finding; only file paths are File System Activity.
+      is_registry = includes(groups, "syscheck_registry") || includes(groups, "syscheck_registry_value") || includes(groups, "syscheck_registry_key") || sc.value_name != null || sc.value_type != null || match(upcase(fim_path), r'^(?:\x5BX(?:32|64)\x5D\s*)?(?:HKEY_|HK(?:LM|CU|CR|U|CC)(?:\\|$))')
+      is_file = fim_path != "" && !is_registry
+
+      if is_file {
+          # ---- File System Activity for a syscheck file alert ----
+          activity_id = 99
+          activity_name = "Other"
+          if fim_event == "added" { activity_id = 1; activity_name = "Create" }
+          if fim_event == "modified" { activity_id = 3; activity_name = "Update" }
+          if fim_event == "deleted" { activity_id = 4; activity_name = "Delete" }
+          suffix = "_after"
+          if fim_event == "deleted" { suffix = "_before" }
+          pparts = split(fim_path, r'[/\\]')
+          fname = to_string(get(pparts, [length(pparts) - 1]) ?? "") ?? ""
+          if fname == "" { fname = fim_path }
+          file = { "path": fim_path, "name": fname, "type_id": 1, "type": "Regular File" }
+          folder = replace(fim_path, r'[/\\][^/\\]*$', "")
+          if folder != "" && folder != fim_path { file.parent_folder = folder }
+          fsize_raw = get(sc, ["size" + suffix]) ?? null
+          fsize = to_int(fsize_raw) ?? -1
+          if fsize_raw != null && fsize >= 0 { file.size = fsize }
+          hashes = []
+          md5 = to_string(get(sc, ["md5" + suffix]) ?? "") ?? ""
+          if md5 != "" { hashes = push(hashes, { "algorithm_id": 1, "algorithm": "MD5", "value": downcase(md5) }) }
+          sha1 = to_string(get(sc, ["sha1" + suffix]) ?? "") ?? ""
+          if sha1 != "" { hashes = push(hashes, { "algorithm_id": 2, "algorithm": "SHA-1", "value": downcase(sha1) }) }
+          sha256 = to_string(get(sc, ["sha256" + suffix]) ?? "") ?? ""
+          if sha256 != "" { hashes = push(hashes, { "algorithm_id": 3, "algorithm": "SHA-256", "value": downcase(sha256) }) }
+          if length(hashes) > 0 { file.hashes = hashes }
+          uname = to_string(get(sc, ["uname" + suffix]) ?? "") ?? ""
+          fuid = to_string(get(sc, ["uid" + suffix]) ?? "") ?? ""
+          if uname != "" || fuid != "" {
+              owner = {}
+              if uname != "" { owner.name = uname }
+              if fuid != "" { owner.uid = fuid }
+              file.owner = owner
+          }
+          finode = to_string(get(sc, ["inode" + suffix]) ?? "") ?? ""
+          if finode != "" { file.uid = finode }
+
+          # whodata names the user and process behind the change
+          actor = {}
+          au = object(get(sc, ["audit", "user"]) ?? {}) ?? {}
+          au_name = to_string(au.name) ?? ""
+          au_id = to_string(au.id) ?? ""
+          if au_name != "" || au_id != "" {
+              actor.user = {}
+              if au_name != "" { actor.user.name = au_name }
+              if au_id != "" { actor.user.uid = au_id }
+          }
+          ap = object(get(sc, ["audit", "process"]) ?? {}) ?? {}
+          ap_name = to_string(ap.name) ?? ""
+          ap_pid = to_int(ap.id) ?? 0
+          if ap_name != "" || ap.id != null {
+              proc = { "pid": ap_pid }
+              if ap_name != "" {
+                  pp = split(ap_name, r'[/\\]')
+                  pbase = to_string(get(pp, [length(pp) - 1]) ?? "") ?? ""
+                  if pbase == "" { pbase = ap_name }
+                  proc.name = pbase
+                  proc.file = { "path": ap_name, "name": pbase, "type_id": 1, "type": "Regular File" }
+              }
+              ppid = to_int(ap.ppid) ?? 0
+              if ppid > 0 { proc.parent_process = { "pid": ppid } }
+              cwd = to_string(ap.cwd) ?? ""
+              if cwd != "" { proc.working_directory = cwd }
+              actor.process = proc
+          }
+          if length(actor) == 0 {
+              actor.app_name = location
+              if location == "" { actor.app_name = "syscheck" }
+          }
+
+          ocsf = {
+              "class_uid": 1001,
+              "class_name": "File System Activity",
+              "category_uid": 1,
+              "category_name": "System Activity",
+              "activity_id": activity_id,
+              "activity_name": activity_name,
+              "type_uid": 100100 + activity_id,
+              "severity_id": severity_id,
+              "severity": severity,
+              "status_id": 1,
+              "status": "Success",
+              "time": time_ms,
+              "message": rule_desc,
+              "raw_data": raw_log,
+              "metadata": metadata,
+              "actor": actor,
+              "device": dev,
+              "file": file,
+              "is_alert": true
+          }
+          diff = to_string(sc.diff) ?? ""
+          if diff != "" { ocsf.file_diff = diff }
+          if length(attacks) > 0 { ocsf.attacks = attacks }
+          if count > 0 { ocsf.count = count }
+          . = ocsf
+      } else {
+          # ---- Detection Finding for every other alert ----
+          d = object(e.data) ?? {}
+          ev = {}
+          sip = to_string(d.srcip) ?? ""
+          if match(sip, ip_re) {
+              ev.src_endpoint = { "ip": sip }
+              sport = to_int(d.srcport) ?? 0
+              if sport > 0 { ev.src_endpoint.port = sport }
+          }
+          dip = to_string(d.dstip) ?? ""
+          if match(dip, ip_re) {
+              ev.dst_endpoint = { "ip": dip }
+              dport = to_int(d.dstport) ?? 0
+              if dport > 0 { ev.dst_endpoint.port = dport }
+          }
+          tuser = to_string(d.dstuser) ?? ""
+          if tuser == "" { tuser = to_string(d.srcuser) ?? "" }
+          if tuser != "" { ev.user = { "name": tuser } }
+          wed = object(get(d, ["win", "eventdata"]) ?? {}) ?? {}
+          image = to_string(wed.image) ?? ""
+          if image == "" { image = to_string(wed.newProcessName) ?? "" }
+          if image != "" {
+              ip_parts = split(image, r'[/\\]')
+              ibase = to_string(get(ip_parts, [length(ip_parts) - 1]) ?? "") ?? ""
+              if ibase == "" { ibase = image }
+              # Sysmon writes decimal pids, Security events hex (0x2d0).
+              # In a 4688, newProcessId is the new process and processId its creator.
+              wpid_s = downcase(to_string(wed.processId) ?? "")
+              ppid_s = ""
+              if wed.newProcessId != null {
+                  ppid_s = wpid_s
+                  wpid_s = downcase(to_string(wed.newProcessId) ?? "")
+              }
+              wpid = null
+              if starts_with(wpid_s, "0x") { wpid = parse_int(slice!(wpid_s, 2), base: 16) ?? null } else if match(wpid_s, r'^\d+$') { wpid = to_int(wpid_s) ?? null }
+              proc = { "name": ibase, "file": { "path": image, "name": ibase, "type_id": 1, "type": "Regular File" } }
+              if wpid != null { proc.pid = wpid }
+              wppid = null
+              if starts_with(ppid_s, "0x") { wppid = parse_int(slice!(ppid_s, 2), base: 16) ?? null } else if match(ppid_s, r'^\d+$') { wppid = to_int(ppid_s) ?? null }
+              if wppid != null {
+                  proc.parent_process = { "pid": wppid }
+                  pname = to_string(wed.parentProcessName) ?? ""
+                  if pname != "" {
+                      pnp = split(pname, r'[/\\]')
+                      pnb = to_string(get(pnp, [length(pnp) - 1]) ?? "") ?? ""
+                      if pnb == "" { pnb = pname }
+                      proc.parent_process.name = pnb
+                      proc.parent_process.file = { "path": pname, "name": pnb, "type_id": 1, "type": "Regular File" }
+                  }
+              }
+              pguid = to_string(wed.processGuid) ?? ""
+              if pguid != "" { proc.uid = pguid }
+              # The OCSF process needs a pid or uid; neither known means an
+              # event-scoped uid rather than a fabricated pid 0.
+              if !exists(proc.pid) && !exists(proc.uid) { proc.uid = "wazuh|" + alert_id + "|" + image }
+              puser = to_string(wed.user) ?? ""
+              if puser != "" { proc.user = { "name": puser } }
+              if !exists(proc.user) {
+                  suser = to_string(wed.subjectUserName) ?? ""
+                  if suser != "" { proc.user = { "name": suser } }
+              }
+              pcmd = to_string(wed.commandLine) ?? ""
+              if pcmd != "" { proc.cmd_line = pcmd }
+              ev.process = proc
+          }
+          target = to_string(wed.targetObject) ?? ""
+          if target != "" { ev.reg_key = { "path": target } }
+          if is_object(e.syscheck) && fim_path != "" { ev.reg_key = { "path": fim_path } }
+          if length(ev) == 0 { ev.device = dev }
+
+          finding_info = { "uid": alert_id, "title": rule_desc }
+          if rule_desc == "" { finding_info.title = "Wazuh rule " + rule_id }
+          if full_log != "" { finding_info.desc = full_log }
+          if length(groups) > 0 { finding_info.types = groups }
+          if rule_id != "" {
+              finding_info.analytic = { "uid": rule_id, "name": finding_info.title, "type_id": 1, "type": "Rule" }
+              if decoder != "" { finding_info.analytic.category = decoder }
+          }
+          if time_ms > 0 { finding_info.created_time = time_ms }
+          if length(attacks) > 0 { finding_info.attacks = attacks }
+          finding_info.data_sources = ["Wazuh"]
+
+          ocsf = {
+              "class_uid": 2004,
+              "class_name": "Detection Finding",
+              "category_uid": 2,
+              "category_name": "Findings",
+              "activity_id": 1,
+              "activity_name": "Create",
+              "type_uid": 200401,
+              "severity_id": severity_id,
+              "severity": severity,
+              "status_id": 1,
+              "status": "New",
+              "time": time_ms,
+              "message": finding_info.title,
+              "raw_data": raw_log,
+              "metadata": metadata,
+              "finding_info": finding_info,
+              "evidences": [ev],
+              "device": dev,
+              "is_alert": true
+          }
+          if count > 0 { ocsf.count = count }
+          . = ocsf
+      }
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # Values spill exactly as parsed: a parser never masks, redacts or withholds
+  # anything (masking is an opt-in pipeline step, never a parser concern).
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # A source field is consumed ONLY by an explicit mapping: a field-coverage.yaml
+  # `mappings` entry (source key -> target paths) or a `transforms` rule with a
+  # target, whose value is found AT THAT TARGET PATH of the selected branch. A
+  # value that merely appears somewhere else in the event never consumes a field
+  # (no coincidental consumption); everything else spills.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The sets below are strings instead
+  # (a read shares the buffer). __repr holds one member per mapped leaf:
+  # "," + encode_json(path) + "=" + encode_json(encode_json(value)), plus the
+  # to_string form for a string or a float, so a numeric string is represented by
+  # its typed scalar. Every part is a JSON text, inside which a '"' is always
+  # escaped, so a member is matched exactly. Paths drop array indices
+  # (resources.0.uid is resources.uid); arrays are walked two levels deep, and a
+  # leaf deeper than that is simply not mapping evidence (it can only spill more).
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped = object!(parse_json!(encode_json(__mapped)))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __copy = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __repr = ""
+  for_each(flatten(__mapped)) -> |path, value| {
+      __p = encode_json(path)
+      if is_array(value) {
+          for_each(array!(value)) -> |_i, item| {
+              if is_object(item) {
+                  for_each(flatten(object!(item))) -> |sub, leaf| {
+                      __q = encode_json(path + "." + sub)
+                      if is_array(leaf) {
+                          for_each(array!(leaf)) -> |_j, x| {
+                              if !is_object(x) && !is_array(x) {
+                                  __repr = __repr + ("," + __q + "=" + encode_json(encode_json(x)))
+                                  if is_string(x) || is_float(x) { __repr = __repr + ("," + __q + "=" + encode_json(to_string!(x))) }
+                              }
+                          }
+                      } else {
+                          __repr = __repr + ("," + __q + "=" + encode_json(encode_json(leaf)))
+                          if is_string(leaf) || is_float(leaf) { __repr = __repr + ("," + __q + "=" + encode_json(to_string!(leaf))) }
+                      }
+                  }
+              } else if !is_array(item) {
+                  __repr = __repr + ("," + __p + "=" + encode_json(encode_json(item)))
+                  if is_string(item) || is_float(item) { __repr = __repr + ("," + __p + "=" + encode_json(to_string!(item))) }
+              }
+          }
+      } else {
+          __repr = __repr + ("," + __p + "=" + encode_json(encode_json(value)))
+          if is_string(value) || is_float(value) { __repr = __repr + ("," + __p + "=" + encode_json(to_string!(value))) }
+      }
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # timestamp: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # agent.name: Parser lowercases the agent name for device.hostname; the original also lands in device.name.
+  # agent.name: Parser lowercases the agent name for device.hostname; the original also lands in device.name.
+  # agent.name: Parser lowercases the agent name for device.hostname; the original also lands in device.name.
+  # agent.name: Parser lowercases the agent name for device.hostname; the original also lands in device.name.
+  # manager.name: Parser lowercases the manager name for metadata.reporter.hostname; the original also lands in reporter.name.
+  # manager.name: Parser lowercases the manager name for metadata.reporter.hostname; the original also lands in reporter.name.
+  # syscheck.md5_after: Parser lowercases file hashes; consume only when the normalized value is emitted.
+  # syscheck.sha1_after: Parser lowercases file hashes; consume only when the normalized value is emitted.
+  # syscheck.sha256_after: Parser lowercases file hashes; consume only when the normalized value is emitted.
+  # syscheck.md5_before: Parser lowercases file hashes; consume only when the normalized value is emitted.
+  # syscheck.sha1_before: Parser lowercases file hashes; consume only when the normalized value is emitted.
+  # syscheck.sha256_before: Parser lowercases file hashes; consume only when the normalized value is emitted.
+  # syscheck.event: The FIM event drives the File System Activity (Create / Update / Delete); consume only when that activity is emitted.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        timestamp
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        agent\.name
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__repr, "," + "\"device.hostname\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        agent\.name
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__repr, "," + "\"device.name\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        agent\.name
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__repr, "," + "\"evidences.device.hostname\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        agent\.name
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__repr, "," + "\"evidences.device.name\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        manager\.name
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__repr, "," + "\"metadata.reporter.hostname\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        manager\.name
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__repr, "," + "\"metadata.reporter.name\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        syscheck\.md5_after
+      | syscheck\.sha1_after
+      | syscheck\.sha256_after
+      | syscheck\.md5_before
+      | syscheck\.sha1_before
+      | syscheck\.sha256_before
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__repr, "," + "\"file.hashes.value\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        syscheck\.event
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"added": 1, "modified": 3, "deleted": 4}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if contains(__repr, "," + "\"activity_id\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+  }
+  # Declared source -> target mappings (field-coverage.yaml `mappings`).
+  __decl = "\n\"agent.id\"\t[\"device.uid\",\"evidences.device.uid\"]\n\"agent.ip\"\t[\"device.ip\",\"evidences.device.ip\"]\n\"agent.name\"\t[\"device.hostname\",\"device.name\",\"evidences.device.hostname\",\"evidences.device.name\"]\n\"data.dstuser\"\t[\"evidences.user.name\"]\n\"data.srcip\"\t[\"evidences.src_endpoint.ip\"]\n\"data.srcport\"\t[\"evidences.src_endpoint.port\"]\n\"data.win.eventdata.commandLine\"\t[\"evidences.process.cmd_line\"]\n\"data.win.eventdata.image\"\t[\"evidences.process.file.path\"]\n\"data.win.eventdata.processGuid\"\t[\"evidences.process.uid\"]\n\"data.win.eventdata.processId\"\t[\"evidences.process.pid\"]\n\"data.win.eventdata.targetObject\"\t[\"evidences.reg_key.path\"]\n\"data.win.eventdata.user\"\t[\"evidences.process.user.name\"]\n\"data.win.eventdata.newProcessName\"\t[\"evidences.process.file.path\"]\n\"data.win.eventdata.subjectUserName\"\t[\"evidences.process.user.name\"]\n\"data.win.eventdata.parentProcessName\"\t[\"evidences.process.parent_process.file.path\"]\n\"decoder.name\"\t[\"finding_info.analytic.category\",\"metadata.log_format\"]\n\"full_log\"\t[\"finding_info.desc\"]\n\"id\"\t[\"finding_info.uid\",\"metadata.uid\"]\n\"location\"\t[\"actor.app_name\",\"metadata.log_name\"]\n\"manager.name\"\t[\"metadata.reporter.hostname\",\"metadata.reporter.name\"]\n\"rule.description\"\t[\"finding_info.analytic.name\",\"finding_info.title\",\"message\"]\n\"rule.firedtimes\"\t[\"count\"]\n\"rule.groups\"\t[\"finding_info.types\",\"metadata.labels\"]\n\"rule.id\"\t[\"finding_info.analytic.uid\",\"metadata.event_code\"]\n\"rule.mitre.id\"\t[\"attacks.sub_technique.uid\",\"finding_info.attacks.sub_technique.uid\",\"finding_info.attacks.technique.uid\"]\n\"rule.mitre.technique\"\t[\"attacks.sub_technique.name\",\"finding_info.attacks.sub_technique.name\",\"finding_info.attacks.technique.name\"]\n\"syscheck.audit.process.cwd\"\t[\"actor.process.working_directory\"]\n\"syscheck.audit.process.id\"\t[\"actor.process.pid\"]\n\"syscheck.audit.process.name\"\t[\"actor.process.file.path\"]\n\"syscheck.audit.process.ppid\"\t[\"actor.process.parent_process.pid\"]\n\"syscheck.audit.user.id\"\t[\"actor.user.uid\"]\n\"syscheck.audit.user.name\"\t[\"actor.user.name\"]\n\"syscheck.inode_after\"\t[\"file.uid\"]\n\"syscheck.md5_after\"\t[\"file.hashes.value\"]\n\"syscheck.md5_before\"\t[\"file.hashes.value\"]\n\"syscheck.path\"\t[\"evidences.reg_key.path\",\"file.path\"]\n\"syscheck.sha1_after\"\t[\"file.hashes.value\"]\n\"syscheck.sha1_before\"\t[\"file.hashes.value\"]\n\"syscheck.sha256_after\"\t[\"file.hashes.value\"]\n\"syscheck.size_after\"\t[\"file.size\"]\n\"syscheck.size_before\"\t[\"file.size\"]\n\"syscheck.uid_after\"\t[\"file.owner.uid\"]\n\"syscheck.uid_before\"\t[\"file.owner.uid\"]\n\"syscheck.uname_after\"\t[\"file.owner.name\"]\n\"syscheck.uname_before\"\t[\"file.owner.name\"]\n"
+  __preserve = []
+  # END parser-specific transformations
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
+  # target paths + "\n" per mapped source key (a raw newline never occurs in
+  # compact JSON). A key is consumed when its value, or every element of a scalar
+  # array, is at one of its own targets.
+  for_each(__flat) -> |key, value| {
+      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+      # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
+      __kt = encode_json(key)
+      if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
+          __kt = replace(replace(replace(replace(replace(replace(__kt, r'\x28', "\\u0028"), r'\x29', "\\u0029"), r'\x5B', "\\u005b"), r'\x5D', "\\u005d"), r'\x7B', "\\u007b"), r'\x7D', "\\u007d")
+      }
+      __at = find(__decl, "\n" + __kt + "\t")
+      if is_integer(__at) && !is_object(value) {
+          __rest = slice!(__decl, int!(__at) + strlen(__kt) + 2)
+          __hit = false
+          for_each(array!(parse_json!(slice!(__rest, 0, int!(find(__rest, "\n")))))) -> |_i, target| {
+              __tok = "," + encode_json(target) + "="
+              if !__hit && is_array(value) {
+                  __all = !is_empty(array!(value))
+                  for_each(array!(value)) -> |_j, item| {
+                      if __all {
+                          __all = !is_object(item) && !is_array(item) && (contains(__repr, __tok + encode_json(encode_json(item))) || ((is_string(item) || is_float(item)) && contains(__repr, __tok + encode_json(to_string!(item)))))
+                      }
+                  }
+                  __hit = __all
+              } else if !__hit {
+                  __hit = contains(__repr, __tok + encode_json(encode_json(value))) || ((is_string(value) || is_float(value)) && contains(__repr, __tok + encode_json(to_string!(value))))
+              }
+          }
+          if __hit { __consumed = __consumed + ("," + encode_json(key)) }
+      }
+  }
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless an explicit mapping or transformation consumed it.
+          # Do not spill a copy of the raw body.
+          value != __raw_body && !contains(__consumed, "," + encode_json(key))
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a name already taken gets the next free
+      # _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __token = "," + encode_json(key)
+          if !contains(__consumed, __token) && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and copies of a
+  # source value (that value is mapped or spilled above under its source path).
+  # A value merely equal to some mapped attribute is kept: equality with an
+  # unrelated attribute is no evidence that it is represented.
+  # The canonical source spill above is the authoritative representation of
+  # containers. The cheap conditions run first; the source value set is built on
+  # first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, as-is. These
+  # entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__copy.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+# Sample provenance (sidecar samples/ directory). Agent, source and label IPs
+# and MACs are replaced with documentation values.
+#   wazuh_sshd_login_success_journald.json, wazuh_cron_root_exec.json,
+#   wazuh_docker_container_start.json: Wazuh documentation, journald log
+#     collection alerts
+#     https://github.com/wazuh/wazuh-documentation/blob/main/source/user-manual/capabilities/log-data-collection/journald.rst
+#   wazuh_sshd_auth_failures_mitre.json: Wazuh documentation, agent labels
+#     example alert (_source of the indexed alert)
+#     https://github.com/wazuh/wazuh-documentation/blob/main/source/user-manual/agent/agent-management/labels.rst
+#   wazuh_sysmon_psexec_service.json: Wazuh documentation, MITRE ATT&CK
+#     example alert (doubled backslash escaping from the page undone;
+#     CRLF in data.win.system.message shortened to LF)
+#     https://github.com/wazuh/wazuh-documentation/blob/main/source/user-manual/ruleset/mitre.rst
+#   wazuh_syscheck_modified_agentless.json: Wazuh documentation, agentless
+#     integrity monitoring alert
+#     https://github.com/wazuh/wazuh-documentation/blob/main/source/user-manual/capabilities/agentless-monitoring/visualization.rst
+#   wazuh_syscheck_added_whodata.json, wazuh_syscheck_deleted.json: FIM alerts
+#     built from the syscheck alert field set (rules 554 / 553, whodata audit)
+#     https://github.com/wazuh/wazuh-dashboard-plugins/blob/main/plugins/main/server/lib/generate-alerts/sample-data/integrity-monitoring.js
+#     https://documentation.wazuh.com/current/user-manual/capabilities/file-integrity/index.html
+#   wazuh_win_security_4688_hex_pid.json, wazuh_syscheck_registry_short_hive.json:
+#     alerts built from the Windows eventchannel and registry FIM field sets
+#     (newProcessId as hex, a short-hive HKLM\ path with syscheck_registry)
+#     https://documentation.wazuh.com/current/user-manual/capabilities/file-integrity/windows-registry-monitoring.html
+#     https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4688
+#   junk.json: a wazuh-analysisd log line, Base Event fallback
+#   severity normalization: https://github.com/wazuh/wazuh-indexer/blob/4.10.6/integrations/amazon-security-lake/src/wazuh_ocsf_converter.py
+samples:
+  - raw: '{"timestamp":"2024-07-12T15:59:43.612+0300","rule":{"level":10,"description":"syslog: User missed the password more than one time","id":"2502","firedtimes":1,"mail":false,"groups":["syslog","access_control","authentication_failed"],"mitre":{"id":["T1110"],"tactic":["Credential Access"],"technique":["Brute Force"]}},"agent":{"id":"004","name":"Ubuntu-24.04","ip":"192.0.2.128"},"manager":{"name":"wazuh-virtual-machine"},"id":"1720789183.17423","full_log":"Jul 12 15:59:42 ubuntu sshd[16051]: PAM 2 more authentication failures; logname= uid=0 euid=0 tty=ssh ruser= rhost=198.51.100.1  user=wazuh","decoder":{"parent":"sshd","name":"sshd"},"data":{"srcip":"198.51.100.1","dstuser":"wazuh"},"location":"/var/log/auth.log"}'
+    expect:
+      class_uid: 2004
+      type_uid: 200401
+      severity_id: 3
+      time: 1720789183612
+      finding_info.analytic.uid: "2502"
+      finding_info.attacks.0.technique.uid: T1110
+      finding_info.attacks.0.tactics.0.name: Credential Access
+      evidences.0.src_endpoint.ip: 198.51.100.1
+      evidences.0.user.name: wazuh
+      device.ip: 192.0.2.128
+      metadata.log_name: /var/log/auth.log
+  - raw: '{"timestamp":"2024-03-04T11:02:44.006+0000","rule":{"level":7,"description":"File deleted.","id":"553","firedtimes":1,"mail":false,"groups":["ossec","syscheck","syscheck_entry_deleted","syscheck_file"],"mitre":{"id":["T1070.004"],"tactic":["Defense Evasion"],"technique":["File Deletion"]}},"agent":{"id":"001","name":"web-01","ip":"192.0.2.21"},"manager":{"name":"wazuh-manager"},"id":"1709550164.118830","syscheck":{"path":"/var/log/auth.log","mode":"realtime","size_before":"28417","uname_before":"syslog","uid_before":"0","md5_before":"0c4a1d41c26c3e0c5e0a3c4cfa8c2a51","event":"deleted"},"decoder":{"name":"syscheck_deleted"},"location":"syscheck"}'
+    expect:
+      class_uid: 1001
+      activity_id: 4
+      type_uid: 100104
+      severity_id: 2
+      file.path: /var/log/auth.log
+      file.name: auth.log
+      file.parent_folder: /var/log
+      file.size: 28417
+      file.hashes.0.algorithm_id: 1
+      file.owner.name: syslog
+      actor.app_name: syscheck
+      attacks.0.sub_technique.uid: T1070.004
+  - raw: '{"timestamp":"2024-03-04T10:21:07.412+0000","rule":{"level":5,"description":"File added to the system.","id":"554","groups":["ossec","syscheck"]},"agent":{"id":"001","name":"web-01"},"id":"1709547667.104522","syscheck":{"path":"/etc/cron.d/backdoor","event":"added","sha256_after":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","audit":{"user":{"id":"0","name":"root"},"process":{"id":"48213","name":"/usr/bin/cp","ppid":"48190"}}},"decoder":{"name":"syscheck_new_entry"},"location":"syscheck"}'
+    expect:
+      class_uid: 1001
+      activity_id: 1
+      file.hashes.0.algorithm_id: 3
+      actor.user.name: root
+      actor.process.pid: 48213
+      actor.process.name: cp
+  - raw: '{"timestamp":"2024-05-20T12:00:54.149+0000","rule":{"level":12,"description":"System user successfully logged to the system.","id":"40101","groups":["syslog","attacks","invalid_login"]},"agent":{"id":"001","name":"ubuntulab2204","ip":"192.0.2.67"},"id":"1716206454.722325","data":{"srcip":"198.51.100.190","srcport":"55348","dstuser":"user"},"location":"journald"}'
+    expect:
+      class_uid: 2004
+      severity_id: 4
+      evidences.0.src_endpoint.port: 55348
+  - raw: '{"timestamp":"2024-02-12T09:14:22.318+0000","rule":{"level":3,"description":"A process was created.","id":"67027","groups":["windows","windows_security"]},"agent":{"id":"005","name":"WIN-SRV-01"},"id":"1707729262.4482211","data":{"win":{"eventdata":{"subjectUserName":"alice","newProcessId":"0x2d0","newProcessName":"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe","commandLine":"powershell.exe -NoProfile"}}},"location":"EventChannel"}'
+    expect:
+      class_uid: 2004
+      evidences.0.process.pid: 720
+      evidences.0.process.name: powershell.exe
+      evidences.0.process.user.name: alice
+      evidences.0.process.parent_process: <missing>
+  - raw: '{"timestamp":"2024-02-12T09:20:01.004+0000","rule":{"level":5,"description":"Registry Value Integrity Checksum Changed","id":"750","groups":["ossec","syscheck","syscheck_registry"]},"agent":{"id":"005","name":"WIN-SRV-01"},"id":"1707729601.4490102","syscheck":{"path":"HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run","value_name":"Updater","event":"modified"},"location":"syscheck"}'
+    expect:
+      class_uid: 2004
+      evidences.0.reg_key.path: HKLM\Software\Microsoft\Windows\CurrentVersion\Run
+  - raw: '{"timestamp":"2024-03-04T11:02:44.006+0000","rule":{"description":"File deleted.","id":"553","groups":["ossec","syscheck"]},"agent":{"id":"001","name":"web-01"},"id":"1709550164.118831","syscheck":{"path":"/tmp/x.bin","event":"deleted","sha256_before":"E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"},"location":"syscheck"}'
+    expect:
+      class_uid: 1001
+      status_id: 1
+      severity_id: 0
+      file.hashes.0.value: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+  - raw: "2024/03/04 10:21:07 wazuh-analysisd: INFO: not an alert"
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: unparsable input

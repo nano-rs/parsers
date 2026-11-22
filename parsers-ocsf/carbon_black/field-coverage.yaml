@@ -2,43 +2,52 @@ source: json
 transforms:
 - source: device_name
   kind: lowercase
-  reason: Parser lowercases this hostname, address, identity or hash; consume only
-    if the normalized value is emitted.
+  target: device.hostname
+  reason: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value
+    is emitted.
+- source: device_name
+  kind: lowercase
+  target: evidences.device.hostname
+  reason: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value
+    is emitted.
 - source: device_internal_ip
   kind: lowercase
-  reason: Parser lowercases this hostname, address, identity or hash; consume only
-    if the normalized value is emitted.
+  target: device.ip
+  reason: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value
+    is emitted.
+- source: device_internal_ip
+  kind: lowercase
+  target: evidences.device.ip
+  reason: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value
+    is emitted.
 - source: process_sha256
   kind: lowercase
-  reason: Parser lowercases this hostname, address, identity or hash; consume only
-    if the normalized value is emitted.
-- source: parent_sha256
+  target: actor.process.file.hashes.value
+  reason: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value
+    is emitted.
+- source: process_sha256
   kind: lowercase
-  reason: Parser lowercases this hostname, address, identity or hash; consume only
-    if the normalized value is emitted.
+  target: process.file.hashes.value
+  reason: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value
+    is emitted.
 - source: device_username
   kind: lowercase
-  reason: Parser lowercases this hostname, address, identity or hash; consume only
-    if the normalized value is emitted.
+  target: actor.user.name
+  reason: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value
+    is emitted.
 - source: process_username
   kind: lowercase
-  reason: Parser lowercases this hostname, address, identity or hash; consume only
-    if the normalized value is emitted.
+  target: actor.user.name
+  reason: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value
+    is emitted.
 - source: backend_timestamp
   kind: epoch_ms
   target: time
-  reason: ISO clock converted to epoch milliseconds; only the selected successful
-    clock is consumed.
-- source: first_event_timestamp
-  kind: epoch_ms
-  target: time
-  reason: ISO clock converted to epoch milliseconds; only the selected successful
-    clock is consumed.
+  reason: ISO clock converted to epoch milliseconds; only the selected successful clock is consumed.
 - source: create_time
   kind: epoch_ms
   target: time
-  reason: ISO clock converted to epoch milliseconds; only the selected successful
-    clock is consumed.
+  reason: ISO clock converted to epoch milliseconds; only the selected successful clock is consumed.
 - source: sensor_action
   target: disposition_id
   kind: enum
@@ -94,58 +103,58 @@ transforms:
     '9': 5
     '10': 5
   reason: Vendor severity is normalized to the OCSF severity enumeration.
-consumed_candidates:
-- alert_url
-- backend_timestamp
-- create_time
-- device_external_ip
-- device_id
-- device_internal_ip
-- device_location
-- device_name
-- device_os
-- device_os_version
-- device_username
-- first_event_timestamp
-- id
-- ioc_hit
-- ioc_id
-- ml_classification_final_verdict
-- ml_classification_global_prevalence
-- org_key
-- parent_cmdline
-- parent_guid
-- parent_name
-- parent_path
-- parent_pid
-- parent_sha256
-- policy_id
-- policy_name
-- process_cmdline
-- process_guid
-- process_name
-- process_path
-- process_pid
-- process_sha256
-- process_username
-- reason
-- reason_code
-- report.id
-- report.name
-- report.severity
-- report.tags
-- report_id
-- report_name
-- run_state
-- sensor_action
-- severity
-- target_value
-- threat_id
-- ttps
-- type
-- watchlists
-- workflow.remediation
-- workflow.state
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  device_internal_ip:
+  - device.ip
+  - evidences.device.ip
+  id:
+  - finding_info.uid
+  - metadata.original_event_uid
+  - metadata.uid
+  parent_cmdline:
+  - evidences.actor.process.cmd_line
+  parent_guid:
+  - actor.process.uid
+  - evidences.actor.process.uid
+  parent_name:
+  - actor.process.file.path
+  - evidences.actor.process.file.path
+  parent_pid:
+  - actor.process.pid
+  - evidences.actor.process.pid
+  process_cmdline:
+  - actor.process.cmd_line
+  - evidences.process.cmd_line
+  - process.cmd_line
+  process_guid:
+  - actor.process.uid
+  - evidences.process.uid
+  - metadata.original_event_uid
+  - process.uid
+  process_name:
+  - actor.process.file.path
+  - evidences.process.file.path
+  - process.file.path
+  process_pid:
+  - actor.process.pid
+  - evidences.process.pid
+  - process.pid
+  reason:
+  - finding_info.title
+  reason_code:
+  - status_detail
+  report.id:
+  - finding_info.analytic.uid
+  report.name:
+  - finding_info.analytic.name
+  - finding_info.title
+  report_id:
+  - finding_info.analytic.uid
+  report_name:
+  - finding_info.analytic.name
+  type:
+  - finding_info.types
+  - metadata.event_code
