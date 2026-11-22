@@ -107,6 +107,12 @@ def represented(value, mapped):
         for item in value)
 
 
+def mapped_view(output, raw):
+    """The event as coverage evidence: never raw_data, unmapped, or a message
+    that is just the raw body (spill.vrl's __mapped)."""
+    return {k: v for k, v in output.items() if k not in ('unmapped', 'raw_data') and not (k == 'message' and v == raw)}
+
+
 def transformed(rule, value, output, mapped, raw=MISSING):
     try:
         kind = rule['kind']
@@ -138,7 +144,9 @@ def transformed(rule, value, output, mapped, raw=MISSING):
     except (ValueError, TypeError, AttributeError, OverflowError):
         return False
     if 'target' in rule:
-        actual = output
+        # The target is looked up in the mapped event only, so a rule can never
+        # be satisfied by unmapped, raw_data or a message equal to the raw body.
+        actual = mapped_view(output, raw)
         for part in rule['target'].split('.'):
             if not isinstance(actual, dict) or part not in actual: return False
             actual = actual[part]
@@ -151,7 +159,7 @@ def check(source, output, raw, rules, consumed=(), candidates=None):
     residual = output.get('unmapped', {})
     assert isinstance(residual, dict), 'unmapped must be an object'
     assert 'unmapped' not in output or residual, 'empty unmapped'
-    mapped_event = {k: v for k, v in output.items() if k not in ('unmapped', 'raw_data') and not (k == 'message' and v == raw)}
+    mapped_event = mapped_view(output, raw)
     mapped = list(values(mapped_event))
     safe = list(flatten(redact(source)))
     used = set()
@@ -229,6 +237,7 @@ def check_step(step):
     if kind == 'parse_json_object':
         assert all(isinstance(p, str) and p for p in step['paths']), 'parse_json_object paths are dotted strings'
         assert '.' not in step['target'], 'parse_json_object target is a top-level key'
+        assert step['target'] not in step['paths'], 'parse_json_object target is not one of its paths'
     if kind == 'parse_kv_merge':
         assert '.' not in step['path'], 'parse_kv_merge unpacks a top-level key'
         re.compile(step['match'])
@@ -298,9 +307,9 @@ def normalized_source(original, rules, parse_kv=vrl_kv):
       removed and the decoded object merged with the remaining keys (a Pub/Sub
       push wrapper's `message.data`); skipped if any top-level key collides.
     - parse_json_object {paths, target}: the first path holding a string that
-      parses to a JSON object is copied, parsed, to the top-level `target`
-      (a JSON log message passed through for spill and redaction); skipped if
-      `target` already exists.
+      parses to a JSON object is moved, parsed, to the top-level `target` (a
+      JSON log message passed through for spill and redaction; the raw text is
+      removed like the other envelope steps); skipped if `target` exists.
     - parse_kv_merge {path, match, key_value_delimiter, field_delimiter}: a
       top-level string matching `match` that VRL parse_key_value (whitespace
       strict) parses to a non-empty object is removed and its pairs merged in
@@ -339,6 +348,10 @@ def normalized_source(original, rules, parse_kv=vrl_kv):
                     except ValueError:
                         break
                     if isinstance(parsed, dict) and rule['target'] not in source:
+                        # Moved, not copied: the unredacted JSON text leaves the
+                        # source, so only its redacted fields can spill.
+                        parent, _, leaf = path.rpartition('.')
+                        del (_get(source, parent) if parent else source)[leaf]
                         source[rule['target']] = parsed
                     break
         elif kind == 'parse_kv_merge':
@@ -520,6 +533,10 @@ def run_parser(path, supplied=None, output_dir=None):
                 assert NORMALIZE_UNKNOWN in [v for _, v in flatten(source)], f'{name}: unwrapped probe field missing from parsed source'
             if name in ('residual_probe', 'text_residual_probe') or name.startswith('normalize_probe_'):
                 assert 'nan2421-secret' not in json.dumps(output.get('unmapped', {})), 'secret leaked in spill'
+            if name == 'residual_probe' or name.startswith('normalize_probe_'):
+                # An injected secret may survive only in raw_data, never in a
+                # mapped OCSF attribute either.
+                assert 'nan2421-secret' not in json.dumps({k: v for k, v in output.items() if k != 'raw_data'}), 'secret leaked outside raw_data'
             else:
                 spill_keys.update(output.get('unmapped', {}))
             if output_dir:

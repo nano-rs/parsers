@@ -104,6 +104,38 @@ class ResidualTests(unittest.TestCase):
             check({'Query': '1' + 'x' * 50}, {'status_id': 1, 'metadata': {'is_truncated': True}, 'raw_data': 'raw input'}, 'raw input', untargeted)
 
 
+class TargetEvidenceTests(unittest.TestCase):
+    """A targeted rule is satisfied only by the mapped event (spill.vrl __mapped)."""
+
+    def test_checker_ignores_unmapped_raw_data_and_raw_message(self):
+        sql = 'select ' + 'x' * 400
+        rule = [{'source': 'Sql', 'kind': 'truncate', 'target': 'unmapped.sql_short', 'length': 256, 'reason': 'r'}]
+        output = {'metadata': {'is_truncated': True}, 'raw_data': 'raw input', 'unmapped': {'sql_short': sql[:256]}}
+        with self.assertRaises(AssertionError):
+            check({'Sql': sql}, output, 'raw input', rule)
+        for target, output in (('raw_data', {'raw_data': 'raw input'}), ('message', {'message': 'raw input', 'raw_data': 'raw input'})):
+            lower = [{'source': 'Name', 'kind': 'lowercase', 'target': target, 'reason': 'r'}]
+            with self.subTest(target=target), self.assertRaises(AssertionError):
+                check({'Name': 'RAW INPUT'}, output, 'raw input', lower)
+        # A message that is not the raw body is evidence.
+        lower = [{'source': 'Name', 'kind': 'lowercase', 'target': 'message', 'reason': 'r'}]
+        check({'Name': 'HELLO'}, {'message': 'hello', 'raw_data': 'raw input'}, 'raw input', lower)
+
+    def test_vrl_matches_against_mapped(self):
+        rules = [{'source': 'Name', 'kind': 'lowercase', 'target': 'message', 'reason': 'r'}]
+        cases = [({'Name': 'RAW INPUT'}, {'message': 'raw input'}, {'name': 'RAW INPUT'}),
+                 ({'Name': 'HELLO'}, {'message': 'hello'}, {})]
+        program = '__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'transforms': rules, 'consumed_candidates': []})
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp/'p.vrl').write_text(program)
+            (tmp/'events.json').write_text(''.join(json.dumps({'source': s, 'output': o})+'\n' for s, o, _ in cases))
+            run = subprocess.run(['vector', 'vrl', '--program', str(tmp/'p.vrl'), '--input', str(tmp/'events.json')], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            outputs = [json.loads(l) for l in run.stdout.splitlines() if l.startswith('{')]
+        self.assertEqual([o.get('unmapped', {}) for o in outputs], [c[2] for c in cases])
+
+
 class ConfigTests(unittest.TestCase):
     """validate_config: the two opt-in lists, each entry justified and well formed."""
 
@@ -146,6 +178,18 @@ class ConfigTests(unittest.TestCase):
         for step in bad:
             with self.subTest(step=step), self.assertRaises(AssertionError):
                 validate_config({'source_normalize': [step]})
+
+    def test_target_guardrails(self):
+        # A target is mapped-event evidence: never unmapped, raw_data or empty.
+        for target in ('unmapped.sql_short', 'unmapped', 'raw_data', 'raw_data.x', '', 'a..b', 7):
+            rule = {'source': 'Sql', 'kind': 'lowercase', 'target': target, 'reason': 'r'}
+            with self.subTest(target=target):
+                with self.assertRaises(AssertionError):
+                    validate_config({'transforms': [rule]})
+                with self.assertRaises(AssertionError):
+                    generated({'transforms': [rule]})
+        with self.assertRaises(AssertionError):
+            validate_config(self.truncate(target='unmapped.sql_short'))
 
     def test_json_envelope_retired(self):
         with self.assertRaises(AssertionError):
@@ -209,8 +253,10 @@ class SourceNormalizeTests(unittest.TestCase):
         inner = {'level': 'ERROR', 'tags': ['a'], 'status': 0}
         env = {'logEvents': [{'message': json.dumps(inner)}]}
         self.assertEqual(normalized_source(env, rules)['message_json'], inner)
-        flat = {'message': json.dumps(inner)}
-        self.assertEqual(normalized_source(flat, rules)['message_json'], inner)
+        flat = {'message': json.dumps(inner), 'logGroup': 'g'}
+        # Moved, not copied: the unredacted JSON text leaves the source.
+        self.assertEqual(normalized_source(flat, rules), {'message_json': inner, 'logGroup': 'g'})
+        self.assertEqual(normalized_source(env, rules), {'logEvents': {}, 'message_json': inner})
         text = {'message': 'START RequestId: x'}
         self.assertEqual(normalized_source(text, rules), text)
         listed = {'message': '[1, 2]'}
