@@ -11,8 +11,11 @@ description: >
   (`/auditLogs/directoryAudits`). Routing:
     * user lifecycle, password change / reset, enable / disable, security info
       (MFA method) registration and removal, directory role membership,
-      service principal credential add / remove   -> User Management 3007
-    * group lifecycle and membership               -> Group Management 3006
+      service principal credential add / remove,
+      app role assignment to a user                -> User Management 3007
+    * group lifecycle and membership, app role
+      assignment to a group, a role-assignable
+      group added to / removed from a role         -> Group Management 3006
     * everything else (application consent, app and service principal
       changes, policies, devices, directory)       -> API Activity 6003
   The initiator is `actor` (user or app / service principal) and the target is
@@ -161,6 +164,7 @@ parser_vrl: |
       subj_sp = {}
       role_name = ""
       role_uid = ""
+      app_role = ""
       resources = []
       for_each(targets) -> |_i, target| {
           tg = object(target) ?? {}
@@ -192,11 +196,16 @@ parser_vrl: |
               role_name = label
               role_uid = t_id
           }
-          # Role membership changes carry the role as a modified property of the user target.
-          if role_name == "" {
-              for_each(array(tg.modifiedProperties) ?? []) -> |_j, mp| {
+          # Role membership changes carry the role as a modified property of the
+          # user / group target; app role assignments carry AppRole.Value.
+          for_each(array(tg.modifiedProperties) ?? []) -> |_j, mp| {
                   mpo = object(mp) ?? {}
                   mp_name = to_string(mpo.displayName) ?? ""
+                  if mp_name == "AppRole.Value" && app_role == "" {
+                      av = to_string(mpo.newValue) ?? ""
+                      if av == "" { av = to_string(mpo.oldValue) ?? "" }
+                      app_role = strip_whitespace(replace(av, "\"", ""))
+                  }
                   if mp_name == "Role.ObjectID" && role_uid == "" {
                       role_uid = strip_whitespace(replace(to_string(mpo.newValue) ?? "", "\"", ""))
                   }
@@ -205,7 +214,6 @@ parser_vrl: |
                       if rv == "" { rv = to_string(mpo.oldValue) ?? "" }
                       role_name = strip_whitespace(replace(rv, "\"", ""))
                   }
-              }
           }
       }
       have_user = length(keys(subj_user)) > 0
@@ -219,8 +227,21 @@ parser_vrl: |
       is_role = contains(act_l, "member to role") || contains(act_l, "member from role")
       is_cred = act_l == "add service principal credentials" || act_l == "remove service principal credentials"
       is_secinfo = contains(act_l, "security info")
+      # App role assignments are logged under ApplicationManagement, so they are
+      # routed by activity name, not by audit category.
+      is_app_role = starts_with(act_l, "add app role assignment") || starts_with(act_l, "remove app role assignment")
+      app_role_to_group = is_app_role && have_group && (ends_with(act_l, " group") || contains(act_l, " to group") || contains(act_l, " from group"))
+      app_role_to_user = is_app_role && have_user && (contains(act_l, " to user") || contains(act_l, " from user"))
+      # A role-assignable group added to / removed from a directory role.
+      group_role = is_role && have_group && !have_user && !have_sp
       user_cat = audit_cat_l == "usermanagement" || audit_cat_l == "rolemanagement" || audit_cat_l == "userauthenticationmethod" || logged_by == "Authentication Methods" || logged_by == "Self-service Password Management"
-      if (have_user && (user_cat || is_role)) || (have_sp && (is_role || is_cred)) {
+      if app_role_to_group || group_role {
+          class_uid = 3006
+          if starts_with(act_l, "add app role assignment") { activity_id = 1; activity_name = "Assign Privileges" }
+          if starts_with(act_l, "remove app role assignment") { activity_id = 2; activity_name = "Revoke Privileges" }
+          if group_role && starts_with(act_l, "add") { activity_id = 12; activity_name = "Assign Roles" }
+          if group_role && starts_with(act_l, "remove") { activity_id = 13; activity_name = "Remove Roles" }
+      } else if (have_user && (user_cat || is_role || app_role_to_user)) || (have_sp && (is_role || is_cred)) {
           class_uid = 3007
           if act_l == "add user" || act_l == "create user" || act_l == "invite external user" { activity_id = 1; activity_name = "Create" }
           if act_l == "update user" || act_l == "change user license" || act_l == "user changed default security info" { activity_id = 2; activity_name = "Update" }
@@ -298,6 +319,7 @@ parser_vrl: |
               if role_uid != "" { role.uid = role_uid }
               ocsf.iam_roles = [role]
           }
+          if app_role != "" && (activity_id == 14 || activity_id == 15) { ocsf.privileges = [app_role] }
           if activity_id == 12 || activity_id == 13 {
               # The registered method is only named in resultReason ("User registered Mobile Phone SMS").
               rr = downcase(to_string(a.resultReason) ?? "")
@@ -317,6 +339,12 @@ parser_vrl: |
           ocsf.class_name = "Group Management"
           ocsf.group = subj_group
           if have_user { ocsf.user = subj_user }
+          if role_name != "" {
+              grole = { "name": role_name }
+              if role_uid != "" { grole.uid = role_uid }
+              ocsf.iam_roles = [grole]
+          }
+          if app_role != "" && (activity_id == 1 || activity_id == 2) { ocsf.privileges = [app_role] }
       } else {
           ocsf.class_name = "API Activity"
           ocsf.category_uid = 6
@@ -776,3 +804,25 @@ samples:
     expect:
       class_uid: 0
       "unmapped.parse_fallback": "unparsable input"
+  # Review fix: app role assignments (ApplicationManagement) route to 3007 / 3006.
+  - raw: "{\"time\":\"2026-11-20T14:05:11.1234567Z\",\"resourceId\":\"/tenants/00000000-0000-0000-0000-000000000000/providers/Microsoft.aadiam\",\"operationName\":\"Add app role assignment grant to user\",\"operationVersion\":\"1.0\",\"category\":\"AuditLogs\",\"tenantId\":\"00000000-0000-0000-0000-000000000000\",\"resultSignature\":\"None\",\"durationMs\":0,\"callerIpAddress\":\"192.0.2.10\",\"correlationId\":\"aaaaaaaa-0000-0000-0000-000000000011\",\"Level\":4,\"properties\":{\"id\":\"Directory_aaaaaaaa-0000-0000-0000-000000000011_ABCDE_11\",\"category\":\"ApplicationManagement\",\"correlationId\":\"aaaaaaaa-0000-0000-0000-000000000011\",\"result\":\"success\",\"resultReason\":\"\",\"activityDisplayName\":\"Add app role assignment grant to user\",\"activityDateTime\":\"2026-11-20T14:05:11.1234567+00:00\",\"loggedByService\":\"Core Directory\",\"operationType\":\"Assign\",\"initiatedBy\":{\"user\":{\"id\":\"11111111-1111-1111-1111-111111111111\",\"displayName\":null,\"userPrincipalName\":\"admin@example.com\",\"ipAddress\":\"192.0.2.10\",\"roles\":[]}},\"targetResources\":[{\"id\":\"55555555-5555-5555-5555-555555555555\",\"displayName\":\"Contoso HR Portal\",\"type\":\"ServicePrincipal\",\"modifiedProperties\":[{\"displayName\":\"AppRole.Id\",\"oldValue\":null,\"newValue\":\"\\\"aaaaaaaa-1111-1111-1111-111111111111\\\"\"},{\"displayName\":\"AppRole.Value\",\"oldValue\":null,\"newValue\":\"\\\"HR.Admin\\\"\"},{\"displayName\":\"AppRole.DisplayName\",\"oldValue\":null,\"newValue\":\"\\\"HR Administrator\\\"\"}]},{\"id\":\"22222222-2222-2222-2222-222222222222\",\"displayName\":null,\"type\":\"User\",\"userPrincipalName\":\"bob@example.com\",\"modifiedProperties\":[]}],\"additionalDetails\":[{\"key\":\"User-Agent\",\"value\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0\"}]}}"
+    expect:
+      class_uid: 3007
+      activity_id: 14
+      "user.name": "bob@example.com"
+      "privileges.0": "HR.Admin"
+  - raw: "{\"time\":\"2026-11-20T14:05:11.1234567Z\",\"resourceId\":\"/tenants/00000000-0000-0000-0000-000000000000/providers/Microsoft.aadiam\",\"operationName\":\"Add app role assignment to group\",\"operationVersion\":\"1.0\",\"category\":\"AuditLogs\",\"tenantId\":\"00000000-0000-0000-0000-000000000000\",\"resultSignature\":\"None\",\"durationMs\":0,\"callerIpAddress\":\"192.0.2.10\",\"correlationId\":\"aaaaaaaa-0000-0000-0000-000000000012\",\"Level\":4,\"properties\":{\"id\":\"Directory_aaaaaaaa-0000-0000-0000-000000000012_ABCDE_12\",\"category\":\"ApplicationManagement\",\"correlationId\":\"aaaaaaaa-0000-0000-0000-000000000012\",\"result\":\"success\",\"resultReason\":\"\",\"activityDisplayName\":\"Add app role assignment to group\",\"activityDateTime\":\"2026-11-20T14:05:11.1234567+00:00\",\"loggedByService\":\"Core Directory\",\"operationType\":\"Assign\",\"initiatedBy\":{\"user\":{\"id\":\"11111111-1111-1111-1111-111111111111\",\"displayName\":null,\"userPrincipalName\":\"admin@example.com\",\"ipAddress\":\"192.0.2.10\",\"roles\":[]}},\"targetResources\":[{\"id\":\"55555555-5555-5555-5555-555555555555\",\"displayName\":\"Contoso HR Portal\",\"type\":\"ServicePrincipal\",\"modifiedProperties\":[{\"displayName\":\"AppRole.Id\",\"oldValue\":null,\"newValue\":\"\\\"aaaaaaaa-1111-1111-1111-111111111111\\\"\"},{\"displayName\":\"AppRole.Value\",\"oldValue\":null,\"newValue\":\"\\\"HR.Admin\\\"\"},{\"displayName\":\"AppRole.DisplayName\",\"oldValue\":null,\"newValue\":\"\\\"HR Administrator\\\"\"}]},{\"id\":\"44444444-4444-4444-4444-444444444444\",\"displayName\":\"Finance-Admins\",\"type\":\"Group\",\"modifiedProperties\":[]}],\"additionalDetails\":[{\"key\":\"User-Agent\",\"value\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0\"}]}}"
+    expect:
+      class_uid: 3006
+      activity_id: 1
+      "group.name": "Finance-Admins"
+      "privileges.0": "HR.Admin"
+  # Review fix: a role-assignable group added to a directory role.
+  - raw: "{\"time\":\"2026-11-20T14:05:11.1234567Z\",\"resourceId\":\"/tenants/00000000-0000-0000-0000-000000000000/providers/Microsoft.aadiam\",\"operationName\":\"Add member to role\",\"operationVersion\":\"1.0\",\"category\":\"AuditLogs\",\"tenantId\":\"00000000-0000-0000-0000-000000000000\",\"resultSignature\":\"None\",\"durationMs\":0,\"callerIpAddress\":\"192.0.2.10\",\"correlationId\":\"aaaaaaaa-0000-0000-0000-000000000013\",\"Level\":4,\"properties\":{\"id\":\"Directory_aaaaaaaa-0000-0000-0000-000000000013_ABCDE_13\",\"category\":\"RoleManagement\",\"correlationId\":\"aaaaaaaa-0000-0000-0000-000000000013\",\"result\":\"success\",\"resultReason\":\"\",\"activityDisplayName\":\"Add member to role\",\"activityDateTime\":\"2026-11-20T14:05:11.1234567+00:00\",\"loggedByService\":\"Core Directory\",\"operationType\":\"Assign\",\"initiatedBy\":{\"user\":{\"id\":\"11111111-1111-1111-1111-111111111111\",\"displayName\":null,\"userPrincipalName\":\"admin@example.com\",\"ipAddress\":\"192.0.2.10\",\"roles\":[]}},\"targetResources\":[{\"id\":\"44444444-4444-4444-4444-444444444445\",\"displayName\":\"Tier0-Admins\",\"type\":\"Group\",\"modifiedProperties\":[{\"displayName\":\"Role.ObjectID\",\"oldValue\":null,\"newValue\":\"\\\"33333333-3333-3333-3333-333333333334\\\"\"},{\"displayName\":\"Role.DisplayName\",\"oldValue\":null,\"newValue\":\"\\\"Privileged Role Administrator\\\"\"}]}],\"additionalDetails\":[{\"key\":\"User-Agent\",\"value\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0\"}]}}"
+    expect:
+      class_uid: 3006
+      activity_id: 12
+      "group.name": "Tier0-Admins"
+      "iam_roles.0.name": "Privileged Role Administrator"
+      "iam_roles.0.uid": "33333333-3333-3333-3333-333333333334"
+      severity_id: 3

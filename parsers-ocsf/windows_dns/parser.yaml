@@ -82,7 +82,7 @@ parser_vrl: |
 
   if fmt == "unknown" {
       # ---- DNS debug log PACKET line ----
-      m, merr = parse_regex(raw_log, r'^(?P<datetime>\d{1,4}[/.-]\d{1,2}[/.-]\d{1,4} \d{1,2}:\d{2}:\d{2}(?: [AP]M)?)\s+(?P<thread_id>[0-9A-Fa-f]+)\s+(?P<context>PACKET)\s+(?P<packet_id>[0-9A-Fa-f]+)\s+(?P<protocol>UDP|TCP)\s+(?P<direction>Snd|Rcv)\s+(?P<remote_ip>[0-9A-Fa-f.:]+)\s+(?P<xid>[0-9A-Fa-f]{1,4})\s+(?P<qr>R)?\s*(?P<opcode>[QNU?])\s+\x5B(?P<flags_hex>[0-9A-Fa-f]{4})\s+(?:(?P<flags_char>[ATDR]+)\s+)?(?P<rcode>[A-Z]+)\x5D\s+(?P<qtype>\S+)\s+(?P<qname>\S+)\s*$')
+      m, merr = parse_regex(raw_log, r'^(?P<datetime>\d{1,4}[/.-]\d{1,2}[/.-]\d{1,4} \d{1,2}:\d{2}:\d{2}(?: [AP]M)?)\s+(?P<thread_id>[0-9A-Fa-f]+)\s+(?P<context>PACKET)\s+(?P<packet_id>[0-9A-Fa-f]+)\s+(?P<protocol>UDP|TCP)\s+(?P<direction>Snd|Rcv)\s+(?P<remote_ip>[0-9A-Fa-f.:]+)\s+(?P<xid>[0-9A-Fa-f]{1,4})\s+(?P<qr>R)?\s*(?P<opcode>[QNU?])\s+\x5B(?P<flags_hex>[0-9A-Fa-f]{4})\s+(?:(?P<flags_char>[ATDR](?:[ATDR ]*[ATDR])?)\s+)?(?P<rcode>[A-Z]+)\x5D\s+(?P<qtype>\S+)\s+(?P<qname>\S+)\s*$')
       if merr == null {
           __source_kv = compact(m)
           fmt = "packet"
@@ -105,6 +105,9 @@ parser_vrl: |
           if eerr == null {
               __source_kv = compact(e)
               fmt = "debug_event"
+              # A PACKET line the packet regex could not read is a degraded parse,
+              # not an ordinary EVENT line: flag it so source health sees the loss.
+              if to_string(e.context) == "PACKET" { fmt = "packet_unparsed" }
               dt_str = to_string(e.datetime)
               message = to_string(e.detail)
           } else if match(raw_log, r'(?i)\A(?:\s|-{2,}|\z|dns server log|log file wrap|message logging key|field\s*#)') {
@@ -331,7 +334,7 @@ parser_vrl: |
       # ---- Base Event: audit / debug EVENT lines / header lines / fallback ----
       base_activity = 0
       base_activity_name = "Unknown"
-      if fmt == "audit" || fmt == "debug_event" { base_activity = 99; base_activity_name = "Other" }
+      if fmt == "audit" || fmt == "debug_event" || fmt == "packet_unparsed" { base_activity = 99; base_activity_name = "Other" }
       ocsf = {
           "class_uid": 0,
           "class_name": "Base Event",
@@ -359,6 +362,8 @@ parser_vrl: |
           . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
       } else if fmt == "json" {
           . = set!(., ["unmapped", "parse_fallback"], "JSON record is not a Windows DNS Server event")
+      } else if fmt == "packet_unparsed" {
+          . = set!(., ["unmapped", "parse_fallback"], "unrecognized debug log PACKET layout")
       }
   }
 
@@ -1005,3 +1010,28 @@ samples:
     expect:
       class_uid: "0"
       unmapped.parse_fallback: unparsable input
+  # Review fix: authoritative AD DC replies write spaced flag slots ("A DR", "A  R").
+  - raw: "11/21/2026 2:16:02 PM 0B4C PACKET  000001D4C2A1B2F0 UDP Snd 192.0.2.10      3c4d R Q [8580 A DR NOERROR] A      (4)dc01(4)corp(7)example(3)com(0)"
+    expect:
+      class_uid: 4003
+      activity_id: 2
+      rcode_id: 0
+      "query.hostname": "dc01.corp.example.com"
+      "flag_ids.0": 1
+      "flag_ids.2": 4
+  - raw: "11/21/2026 2:16:05 PM 0B4C PACKET  000001D4C2A1B300 UDP Snd 192.0.2.11      3c4e R Q [8583 A DR NXDOMAIN] A      (7)missing(4)corp(7)example(3)com(0)"
+    expect:
+      class_uid: 4003
+      rcode_id: 3
+      "query.hostname": "missing.corp.example.com"
+  - raw: "11/21/2026 2:16:09 PM 0B4C PACKET  000001D4C2A1B310 UDP Snd 192.0.2.12      3c4f R Q [8480 A  R NOERROR] SRV    (6)_ldap(4)_tcp(4)corp(7)example(3)com(0)"
+    expect:
+      class_uid: 4003
+      "query.type": "SRV"
+      "flag_ids.0": 1
+      "flag_ids.1": 4
+  # A PACKET line in an unknown layout is a Base Event marked as a degraded parse.
+  - raw: "11/21/2026 2:16:12 PM 0B4C PACKET  000001D4C2A1B320 UDP Snd 192.0.2.13 truncated-line"
+    expect:
+      class_uid: 0
+      "unmapped.parse_fallback": "unrecognized debug log PACKET layout"

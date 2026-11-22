@@ -169,7 +169,9 @@ parser_vrl: |
       f0 = string(f[0]) ?? ""
       f7 = upcase(string(f[7]) ?? "")
       f8 = upcase(string(f[8]) ?? "")
-      vnet_style = f8 == "X" || starts_with(f8, "NX")
+      # The envelope (flowLogVersion >= 4, FlowLogFlowEvent, flowRecords) is
+      # authoritative; the encryption column only decides for a bare tuple.
+      vnet_style = fmt == "vnet" || f8 == "X" || starts_with(f8, "NX")
       if fmt == "" { fmt = if vnet_style { "vnet" } else { "nsg" } }
 
       decision = ""
@@ -200,12 +202,15 @@ parser_vrl: |
 
       # ---- time: NSG tuples carry epoch seconds, VNet tuples epoch milliseconds ----
       ts = to_int(f0) ?? 0
+      if ts < 0 { ts = 0 }
       time_ms = ts
       if ts > 0 && ts < 100000000000 { time_ms = ts * 1000 }
       if time_ms == 0 && rec_time != "" {
           rt, rterr = parse_timestamp(rec_time, "%+")
           if rterr == null { time_ms = to_unix_timestamp(rt, unit: "milliseconds") }
       }
+      # Never emit 1970: an absent or unreadable clock falls back to ingest time.
+      if time_ms <= 0 { time_ms = to_unix_timestamp(now(), unit: "milliseconds") }
 
       src_ip = downcase(string(f[1]) ?? "")
       dst_ip = downcase(string(f[2]) ?? "")
@@ -761,3 +766,11 @@ samples:
     expect:
       class_uid: 0
       unmapped.parse_fallback: unparsable input
+  # Review fix: a VNet record whose encryption column is empty keeps VNet column
+  # positions (the envelope decides), so C is Traffic and the flow is allowed.
+  - raw: "{\"time\":\"2022-09-14T09:00:52.5625085Z\",\"flowLogVersion\":4,\"flowLogGUID\":\"00000000-0000-0000-0000-000000000000\",\"macAddress\":\"112233445566\",\"category\":\"FlowLogFlowEvent\",\"flowLogResourceID\":\"/SUBSCRIPTIONS/00000000-0000-0000-0000-000000000000/RESOURCEGROUPS/NETWORKWATCHERRG/PROVIDERS/MICROSOFT.NETWORK/NETWORKWATCHERS/NETWORKWATCHER_EASTUS2/FLOWLOGS/VNETFLOWLOG\",\"targetResourceID\":\"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/myResourceGroup/providers/Microsoft.Network/virtualNetworks/myVNet\",\"operationName\":\"FlowLogFlowEvent\",\"flowRecords\":{\"flows\":[{\"aclID\":\"00aa00aa-bb11-cc22-dd33-44ee44ee44ee\",\"flowGroups\":[{\"rule\":\"DefaultRule_AllowInternetOutBound\",\"flowTuples\":[\"1663146003606,10.0.0.6,192.0.2.180,23956,443,6,O,C,,3,767,2,1580\"]}]}]}}"
+    expect:
+      class_uid: 4001
+      activity_id: 6
+      disposition_id: 1
+      action_id: 1

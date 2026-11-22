@@ -222,8 +222,19 @@ parser_vrl: |
       if stem == "" { stem = "/" }
       url = { "path": stem }
       if query != "" { url.query_string = query }
+      # cs-host is the Host header verbatim, so a non-default port rides along
+      # ("app.example.com:8443", "[2001:db8::1]:8443"). Hostname columns get the
+      # bare host; url_string keeps the header as sent.
+      host_name = host
+      hm, hmerr = parse_regex(host, r'^\x5B(?P<h>[0-9A-Fa-f:.]+)\x5D(?::\d+)?$')
+      if hmerr == null {
+          host_name = to_string(hm.h)
+      } else {
+          hm2, hm2err = parse_regex(host, r'^(?P<h>[^:]+):\d+$')
+          if hm2err == null { host_name = to_string(hm2.h) }
+      }
       if host != "" {
-          url.hostname = downcase(host)
+          url.hostname = downcase(host_name)
           url.scheme = scheme
           url.url_string = scheme + "://" + host + stem
           if query != "" { url.url_string = url.url_string + "?" + query }
@@ -240,6 +251,14 @@ parser_vrl: |
           xs = []
           for_each(split(xff, ",")) -> |_i, part| {
               ip = strip_whitespace(replace(to_string(part), "+", ""))
+              # Proxies (Application Gateway, ARR, F5) often append the client port.
+              xm, xmerr = parse_regex(ip, r'^(?P<ip>(?:[0-9]{1,3}\.){3}[0-9]{1,3}):\d+$')
+              if xmerr == null {
+                  ip = to_string(xm.ip)
+              } else {
+                  xm6, xm6err = parse_regex(ip, r'^\x5B(?P<ip>[0-9A-Fa-f:]+)\x5D(?::\d+)?$')
+                  if xm6err == null { ip = to_string(xm6.ip) }
+              }
               if match(ip, ip_re) { xs = push(xs, downcase(ip)) }
           }
           if length(xs) > 0 { http_request.x_forwarded_for = xs }
@@ -257,7 +276,7 @@ parser_vrl: |
       if comp != "" { dst_endpoint.hostname = comp }
       site = to_string(get(f, ["s_sitename"]) ?? null) ?? ""
       if site != "" { dst_endpoint.svc_name = site }
-      if comp == "" && host != "" { dst_endpoint.hostname = downcase(host) }
+      if comp == "" && host_name != "" { dst_endpoint.hostname = downcase(host_name) }
 
       ocsf = {
           "class_uid": 4002,
@@ -759,3 +778,16 @@ samples:
     expect:
       class_uid: 0
       unmapped.parse_fallback: unparsable input
+  # Review fix: cs-host with a port and X-Forwarded-For entries with client ports.
+  - raw: "2026-11-20 11:02:44 W3SVC3 WEB02 192.0.2.10 GET /api/orders id=42 8443 - 198.51.100.40 HTTP/1.1 Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64) - - app.example.com:8443 200 0 0 5120 610 31 198.51.100.77:54321"
+    expect:
+      class_uid: 4002
+      "http_request.url.hostname": "app.example.com"
+      "http_request.url.url_string": "http://app.example.com:8443/api/orders?id=42"
+      "http_request.x_forwarded_for.0": "198.51.100.77"
+      "dst_endpoint.hostname": "WEB02"
+  - raw: "2026-11-20 11:03:10 W3SVC3 - 192.0.2.10 GET /health - 8443 - 198.51.100.41 HTTP/1.1 kube-probe/1.29 - - [2001:db8::10]:8443 200 0 0 2 180 1 [2001:db8::77]:50123"
+    expect:
+      "http_request.url.hostname": "2001:db8::10"
+      "dst_endpoint.hostname": "2001:db8::10"
+      "http_request.x_forwarded_for.0": "2001:db8::77"

@@ -27,6 +27,11 @@ description: >
   metadata.uid is deterministic (sha256 of the natural id plus last update
   time) so a replay dedupes in the lake. Distinct from defender_edr, which
   parses Defender for Endpoint device telemetry.
+  The primary process and user evidence (Graph evidence[] or an AlertEvidence
+  row, including ProcessCommandLine) is also promoted to actor.process /
+  actor.user (host profile), and Azure resource evidence to top-level
+  resources, where nano's unified hunt columns read them. A missing clock
+  falls back to ingest time, never 1970.
   Sample sources:
     https://learn.microsoft.com/en-us/graph/api/security-alert-get?view=graph-rest-1.0
     https://learn.microsoft.com/en-us/graph/api/resources/security-alert?view=graph-rest-1.0
@@ -116,7 +121,9 @@ parser_vrl: |
       . = set!(., ["unmapped", "parse_fallback"], reason)
   } else {
       # ---- common: severity ----
-      sev_l = downcase(to_string(row.severity) ?? to_string(row.Severity) ?? "")
+      # to_string(null) is "" (it does not fail), so each fallback is an explicit empty check.
+      sev_l = downcase(to_string(row.severity) ?? "")
+      if sev_l == "" { sev_l = downcase(to_string(row.Severity) ?? "") }
       severity_id = 0
       severity = "Unknown"
       if sev_l == "informational" { severity_id = 1; severity = "Informational" }
@@ -124,7 +131,8 @@ parser_vrl: |
       if sev_l == "medium" { severity_id = 3; severity = "Medium" }
       if sev_l == "high" { severity_id = 4; severity = "High" }
 
-      tenant_id = to_string(p.tenantId) ?? to_string(row.tenantId) ?? ""
+      tenant_id = to_string(p.tenantId) ?? ""
+      if tenant_id == "" { tenant_id = to_string(row.tenantId) ?? "" }
       meta = base_meta
       if tenant_id != "" { meta.tenant_uid = tenant_id }
 
@@ -226,6 +234,7 @@ parser_vrl: |
           if inc_id != "" { meta.correlation_uid = inc_id }
           meta.profiles = ["cloud", "incident"]
           inc_ms = if updated_ms > 0 { updated_ms } else { created_ms }
+          if inc_ms <= 0 { inc_ms = to_unix_timestamp(now(), unit: "milliseconds") }
           ocsf = {
               "class_uid": 2005,
               "class_name": "Incident Finding",
@@ -270,6 +279,11 @@ parser_vrl: |
           finding_info = {}
           time_ms = 0
           first_ms = 0
+          # Primary entities promoted to the top level (actor / resources), where
+          # nano's unified hunt columns read them; evidences[] keeps every entity.
+          actor_process = {}
+          actor_user = {}
+          top_resources = []
           last_ms = 0
 
           if shape == "alert" {
@@ -353,8 +367,9 @@ parser_vrl: |
                   if etype == "deviceEvidence" {
                       dv = { "type_id": 0, "type": "Unknown" }
                       hn = to_string(e.hostName) ?? ""
-                      if hn != "" { dv.hostname = hn }
                       dns = to_string(e.deviceDnsName) ?? ""
+                      if hn == "" { hn = dns }
+                      if hn != "" { dv.hostname = hn }
                       if dns != "" { dv.name = dns }
                       did = to_string(e.mdeDeviceId) ?? ""
                       if did != "" { dv.uid = did }
@@ -398,12 +413,14 @@ parser_vrl: |
                               pr.user = pu
                           }
                           ev.process = pr
+                          if length(keys(actor_process)) == 0 { actor_process = pr }
                       } else if fname != "" {
                           ev.file = fobj
                       }
                   } else if etype == "userEvidence" {
                       ua = object(e.userAccount) ?? {}
-                      un = to_string(ua.accountName) ?? to_string(ua.userPrincipalName) ?? ""
+                      un = to_string(ua.accountName) ?? ""
+                      if un == "" { un = to_string(ua.userPrincipalName) ?? "" }
                       if un != "" {
                           us = { "name": un }
                           upn = to_string(ua.userPrincipalName) ?? ""
@@ -417,6 +434,19 @@ parser_vrl: |
                           disp = to_string(ua.displayName) ?? ""
                           if disp != "" { us.display_name = disp }
                           ev.user = us
+                          if length(keys(actor_user)) == 0 { actor_user = us }
+                      }
+                  } else if etype == "azureResourceEvidence" {
+                      arid = to_string(e.resourceId) ?? ""
+                      arn = to_string(e.resourceName) ?? ""
+                      if arid != "" || arn != "" {
+                          res = {}
+                          if arn != "" { res.name = arn }
+                          if arid != "" { res.uid = arid }
+                          arty = to_string(e.resourceType) ?? ""
+                          if arty != "" { res.type = arty }
+                          ev.resources = [res]
+                          top_resources = push(top_resources, res)
                       }
                   } else if etype == "ipEvidence" {
                       ip = to_string(e.ipAddress) ?? ""
@@ -496,7 +526,9 @@ parser_vrl: |
 
               if shape == "alertinfo" {
                   meta.log_name = "AlertInfo"
-                  meta.uid = sha2("defender_xdr|alertinfo|" + alert_uid + "|" + (to_string(row.Timestamp) ?? raw_log), variant: "SHA-256")
+                  ts_key = to_string(row.Timestamp) ?? ""
+                  if ts_key == "" { ts_key = raw_log }
+                  meta.uid = sha2("defender_xdr|alertinfo|" + alert_uid + "|" + ts_key, variant: "SHA-256")
               } else {
                   # One AlertEvidence row adds one entity to an existing alert.
                   activity_id = 2
@@ -523,6 +555,21 @@ parser_vrl: |
                       if length(hashes) > 0 { fobj.hashes = hashes }
                       ev.file = fobj
                   }
+                  pcl = to_string(row.ProcessCommandLine) ?? ""
+                  if pcl != "" {
+                      pr = { "cmd_line": pcl }
+                      if fname != "" { pr.name = fname; pr.file = ev.file }
+                      # OCSF requires pid, uid or cpid on a process. AlertEvidence has
+                      # no process id column, so a stable uid is derived from the
+                      # alert, device and command line (one value per entity).
+                      ppid_ = to_int(row.ProcessId) ?? -1
+                      if ppid_ >= 0 {
+                          pr.pid = ppid_
+                      } else {
+                          pr.uid = sha2("defender_xdr|process|" + (to_string(row.AlertId) ?? "") + "|" + (to_string(row.DeviceId) ?? "") + "|" + pcl, variant: "SHA-256")
+                      }
+                      ev.process = pr
+                  }
                   dname = to_string(row.DeviceName) ?? ""
                   did = to_string(row.DeviceId) ?? ""
                   if dname != "" || did != "" {
@@ -547,6 +594,11 @@ parser_vrl: |
                       if asid != "" { us.uid = asid }
                       if aoid != "" { us.uid_alt = aoid }
                       ev.user = us
+                      actor_user = us
+                  }
+                  if exists(ev.process) {
+                      if exists(ev.user) { ev.process.user = ev.user }
+                      actor_process = object(ev.process) ?? {}
                   }
                   rip = to_string(row.RemoteIP) ?? ""
                   if rip != "" {
@@ -573,6 +625,7 @@ parser_vrl: |
                       rty = to_string(row.ResourceType) ?? ""
                       if rty != "" { res.type = rty }
                       ev.resources = [res]
+                      top_resources = push(top_resources, res)
                   }
                   if length(keys(ev)) <= 1 { ev.data = { "EntityType": et } }
                   evidences = [ev]
@@ -581,6 +634,18 @@ parser_vrl: |
 
           if length(attacks) > 0 { finding_info.attacks = attacks }
           meta.profiles = ["cloud", "incident"]
+          actor = {}
+          if length(keys(actor_process)) > 0 {
+              actor.process = actor_process
+              if length(keys(actor_user)) == 0 && exists(actor_process.user) { actor_user = object(actor_process.user) ?? {} }
+          }
+          if length(keys(actor_user)) > 0 { actor.user = actor_user }
+          if length(keys(actor)) > 0 {
+              ocsf.actor = actor
+              meta.profiles = ["cloud", "incident", "host"]
+          }
+          if length(top_resources) > 0 { ocsf.resources = top_resources }
+          if time_ms <= 0 { time_ms = to_unix_timestamp(now(), unit: "milliseconds") }
           ocsf.class_uid = 2004
           ocsf.class_name = "Detection Finding"
           ocsf.category_uid = 2
@@ -779,6 +844,8 @@ parser_vrl: |
   | EntityType
   | EvidenceDirection
   | FileName
+  | ProcessCommandLine
+  | ProcessId
   | FileSize
   | FolderPath
   | LocalIP
@@ -827,6 +894,8 @@ parser_vrl: |
   | properties\.EntityType
   | properties\.EvidenceDirection
   | properties\.FileName
+  | properties\.ProcessCommandLine
+  | properties\.ProcessId
   | properties\.FileSize
   | properties\.FolderPath
   | properties\.LocalIP
@@ -1093,3 +1162,31 @@ samples:
       "status_id": 4
       "verdict_id": 2
       "severity_id": 4
+  # Review fix: AlertInfo carries PascalCase Severity (to_string(null) never fell back).
+  - raw: "{\"Timestamp\": \"2026-10-05T12:00:00Z\", \"AlertId\": \"ed638638000000000001_1\", \"Title\": \"Possible attempt to access Primary Refresh Token (PRT)\", \"Category\": \"CredentialAccess\", \"Severity\": \"High\", \"ServiceSource\": \"Microsoft Defender for Endpoint\", \"DetectionSource\": \"EDR\", \"AttackTechniques\": \"[\\\"Steal Application Access Token (T1528)\\\"]\"}"
+    expect:
+      "class_uid": 2004
+      "severity_id": 4
+      "severity": "High"
+  # Review fix: AlertEvidence ProcessCommandLine promoted to actor.process (host profile).
+  - raw: "{\"time\": \"2026-10-05T11:20:07.1234567Z\", \"tenantId\": \"00000000-0000-0000-0000-000000000000\", \"operationName\": \"Publish\", \"category\": \"AdvancedHunting-AlertEvidence\", \"_TimeReceivedBySvc\": \"2026-10-05T11:19:59.0000000Z\", \"properties\": {\"Timestamp\": \"2026-10-05T11:19:40.0000000Z\", \"AlertId\": \"da638638123456789012_-1234567890\", \"Title\": \"Suspicious process injection observed\", \"Categories\": \"[\\\"DefenseEvasion\\\"]\", \"AttackTechniques\": \"[\\\"Process Injection (T1055)\\\"]\", \"ServiceSource\": \"Microsoft Defender for Endpoint\", \"DetectionSource\": \"EDR\", \"EntityType\": \"File\", \"EvidenceRole\": \"Impacted\", \"EvidenceDirection\": \"\", \"FileName\": \"rundll32.exe\", \"FolderPath\": \"C:\\\\Windows\\\\System32\\\\rundll32.exe\", \"SHA1\": \"a0aa8e3b6e1d7f8a8f6a0f0e5c5b1d0c7e0a1b2c\", \"SHA256\": \"\", \"FileSize\": 71680, \"ThreatFamily\": \"\", \"RemoteIP\": \"\", \"RemoteUrl\": \"\", \"AccountName\": \"\", \"AccountDomain\": \"\", \"AccountSid\": \"\", \"AccountObjectId\": \"\", \"AccountUpn\": \"\", \"DeviceId\": \"2222222222222222222222222222222222222222\", \"DeviceName\": \"wks-02.corp.example.com\", \"LocalIP\": \"\", \"NetworkMessageId\": \"\", \"EmailSubject\": \"\", \"ApplicationId\": null, \"Application\": \"\", \"ProcessCommandLine\": \"rundll32.exe C:\\\\Users\\\\Public\\\\x.dll,Start\", \"AdditionalFields\": \"{\\\"Host\\\":\\\"wks-02\\\"}\", \"RegistryKey\": \"\", \"RegistryValueName\": \"\", \"RegistryValueData\": \"\", \"Severity\": \"Medium\"}}"
+    expect:
+      "severity_id": 3
+      "actor.process.cmd_line": "rundll32.exe C:\\Users\\Public\\x.dll,Start"
+      "evidences.0.process.cmd_line": "rundll32.exe C:\\Users\\Public\\x.dll,Start"
+      "metadata.profiles.2": "host"
+      "device.hostname": "wks-02.corp.example.com"
+  # Review fix: cloud-only userEvidence (accountName null), deviceDnsName-only device,
+  # azureResourceEvidence promoted to top-level resources.
+  - raw: "{\"@odata.type\": \"#microsoft.graph.security.alert\", \"id\": \"da00000000-0000-4000-8000-000000000042\", \"providerAlertId\": \"aa00000000-0000-4000-8000-000000000042\", \"incidentId\": \"4242\", \"status\": \"new\", \"severity\": \"medium\", \"classification\": null, \"determination\": null, \"serviceSource\": \"microsoftDefenderForCloud\", \"detectionSource\": \"microsoftDefenderForCloud\", \"productName\": \"Microsoft Defender for Cloud\", \"detectorId\": \"K8S_ExposedDashboard\", \"tenantId\": \"00000000-0000-0000-0000-000000000000\", \"title\": \"Suspicious sign-in followed by storage key listing\", \"description\": \"A cloud-only account listed storage account keys from an unusual location.\", \"category\": \"CredentialAccess\", \"assignedTo\": null, \"alertWebUrl\": \"https://security.microsoft.com/alerts/da00000000-0000-4000-8000-000000000042\", \"mitreTechniques\": [\"T1552.001\"], \"createdDateTime\": \"2026-11-02T08:00:00.000Z\", \"lastUpdateDateTime\": \"2026-11-02T08:05:00.000Z\", \"firstActivityDateTime\": \"2026-11-02T07:55:00.000Z\", \"lastActivityDateTime\": \"2026-11-02T07:58:00.000Z\", \"comments\": [], \"evidence\": [{\"@odata.type\": \"#microsoft.graph.security.userEvidence\", \"createdDateTime\": \"2026-11-02T08:00:00.000Z\", \"verdict\": \"suspicious\", \"remediationStatus\": \"none\", \"roles\": [\"compromised\"], \"userAccount\": {\"accountName\": null, \"domainName\": null, \"userSid\": null, \"azureAdUserId\": \"00000000-0000-0000-0000-000000000001\", \"userPrincipalName\": \"cloudonly@example.com\", \"displayName\": \"Cloud Only\"}}, {\"@odata.type\": \"#microsoft.graph.security.deviceEvidence\", \"createdDateTime\": \"2026-11-02T08:00:00.000Z\", \"verdict\": \"unknown\", \"remediationStatus\": \"none\", \"hostName\": null, \"deviceDnsName\": \"vm-web-01.example.com\", \"mdeDeviceId\": \"3333333333333333333333333333333333333333\", \"azureAdDeviceId\": null, \"dnsDomain\": \"example.com\", \"ipInterfaces\": [\"192.0.2.30\"]}, {\"@odata.type\": \"#microsoft.graph.security.azureResourceEvidence\", \"createdDateTime\": \"2026-11-02T08:00:00.000Z\", \"verdict\": \"unknown\", \"remediationStatus\": \"none\", \"resourceId\": \"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-prod/providers/Microsoft.Storage/storageAccounts/stprod01\", \"resourceName\": \"stprod01\", \"resourceType\": \"Storage Accounts\"}]}"
+    expect:
+      "evidences.0.user.name": "cloudonly@example.com"
+      "actor.user.name": "cloudonly@example.com"
+      "device.hostname": "vm-web-01.example.com"
+      "resources.0.name": "stprod01"
+      "metadata.tenant_uid": "00000000-0000-0000-0000-000000000000"
+  # Review fix: AlertEvidence user row lands on actor.user and its Severity maps.
+  - raw: "{\"Timestamp\": \"2026-10-05T12:00:00Z\", \"AlertId\": \"ca638638000000000002_7\", \"Title\": \"Atypical travel\", \"Categories\": \"[\\\"InitialAccess\\\"]\", \"ServiceSource\": \"Microsoft Entra ID Protection\", \"DetectionSource\": \"Microsoft Entra ID Protection\", \"EntityType\": \"User\", \"EvidenceRole\": \"Impacted\", \"AccountName\": \"user3\", \"AccountDomain\": \"example.com\", \"AccountObjectId\": \"00000000-0000-0000-0000-000000000000\", \"AccountUpn\": \"user3@example.com\", \"Severity\": \"Medium\"}"
+    expect:
+      "actor.user.name": "user3"
+      "severity_id": 3
