@@ -393,8 +393,22 @@ parser_vrl: |
   }
   __consumed = ""
   # BEGIN parser-specific transformations
+  # timestamp: The LogRecord timestamp is converted to epoch milliseconds and wins over ingest time.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        timestamp
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
   # Declared source -> target mappings (field-coverage.yaml `mappings`).
-  __decl = "\n"
+  __decl = "\n\"severity\"\t[\"severity\"]\n\"trace_id\"\t[\"trace.uid\"]\n"
   __preserve = ["trace_id", "span_id", "nano_time_source"]
   # END parser-specific transformations
   # Escape literal dots before flattening so dotted source keys cannot overwrite

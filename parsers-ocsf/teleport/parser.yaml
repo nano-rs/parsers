@@ -538,6 +538,7 @@ parser_vrl: |
   # method: The SSO connector type normalized to the OCSF auth protocol; consume only when the expected ID is emitted.
   # verb: The Kubernetes verb drives the API Activity; the method itself also lands in http_request.http_method.
   # action: The scp direction or Teleport SFTPAction number drives the File System Activity; consume only when that activity is emitted.
+  # success: The success flag is the OCSF status; consume only when the expected ID is emitted.
   for_each(flatten(__source_kv)) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
@@ -583,6 +584,18 @@ parser_vrl: |
               __expected = get!({"download": 2, "upload": 1, "1": 14, "3": 2, "4": 3, "5": 8, "6": 8, "7": 6, "8": 6, "9": 14, "10": 2, "11": 4, "12": 1, "13": 4, "14": 8, "15": 8, "16": 5, "17": 2, "18": 1}, [downcase(to_string(__value) ?? "")])
               if __expected != null {
                   if contains(__repr, "," + "\"activity_id\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        success
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"true": 1, "false": 2}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if contains(__repr, "," + "\"status_id\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
               }
           }
       }
