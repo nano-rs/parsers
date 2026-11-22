@@ -168,7 +168,7 @@ parser_vrl: |
 
       # ---- time ----
       time_ms = 0
-      t, terr = parse_timestamp(string(p.created_at) ?? "", "%+")
+      t, terr = parse_timestamp(string(p.created_at) ?? "", "%+", timezone: "UTC")
       if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
 
       # ---- outcome / severity ----
@@ -346,25 +346,6 @@ parser_vrl: |
       }
   }
   __consumed = ""
-  # BEGIN parser-specific transformations
-  # created_at: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-  for_each(flatten(__source_kv)) -> |key, value| {
-      if match(key, r'(?x)
-      \A(?:
-        created_at
-      )\z') {
-          __value = value
-          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
-          if __clock_err == null {
-              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-              if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
-          }
-      }
-  }
-  # Declared source -> target mappings (field-coverage.yaml `mappings`).
-  __decl = "\n\"account_id\"\t[\"metadata.tenant_uid\"]\n\"actor_user_id\"\t[\"actor.user.uid\"]\n\"actor_user_name\"\t[\"actor.user.name\"]\n\"app_id\"\t[\"service.uid\"]\n\"app_name\"\t[\"service.name\"]\n\"custom_message\"\t[\"message\"]\n\"error_description\"\t[\"status_detail\"]\n\"event_type_id\"\t[\"metadata.event_code\"]\n\"id\"\t[\"metadata.uid\"]\n\"ipaddr\"\t[\"src_endpoint.ip\"]\n\"notes\"\t[\"message\"]\n\"risk_score\"\t[\"risk_score\"]\n\"user_id\"\t[\"user.uid\"]\n\"user_name\"\t[\"user.name\"]\n"
-  __preserve = []
-  # END parser-specific transformations
   # Escape literal dots before flattening so dotted source keys cannot overwrite
   # nested paths. Decode for naming, and disambiguate collisions with suffixes.
   # In compact JSON only an object key is followed by ':', so a source whose text
@@ -381,12 +362,32 @@ parser_vrl: |
       __tilde = contains(encode_json(__escaped), "~")
   }
   __flat = flatten(__escaped)
+  # BEGIN parser-specific transformations
+  # created_at: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+  for_each(__flat) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        created_at
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
+  # Declared source -> target mappings (field-coverage.yaml `mappings`).
+  __decl = "\n\"account_id\"\t[\"metadata.tenant_uid\"]\n\"actor_system\"\t[\"actor.app_name\"]\n\"actor_user_id\"\t[\"actor.user.uid\"]\n\"actor_user_name\"\t[\"actor.user.name\"]\n\"app_id\"\t[\"service.uid\"]\n\"app_name\"\t[\"service.name\"]\n\"custom_message\"\t[\"message\"]\n\"error_description\"\t[\"status_detail\"]\n\"event_type_id\"\t[\"category_uid\",\"metadata.event_code\"]\n\"id\"\t[\"metadata.uid\"]\n\"ipaddr\"\t[\"src_endpoint.ip\"]\n\"notes\"\t[\"message\"]\n\"risk_score\"\t[\"risk_score\"]\n\"user_id\"\t[\"user.uid\"]\n\"user_name\"\t[\"user.name\"]\n"
+  __preserve = []
+  # END parser-specific transformations
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
   # target paths + "\n" per mapped source key (a raw newline never occurs in
   # compact JSON). A key is consumed when its value, or every element of a scalar
-  # array, is at one of its own targets.
+  # array, is at one of its own targets. Keys stay ESCAPED here and in __consumed:
+  # a literal dotted key ("a~1b") and the nested path ("a.b") are different
+  # fields, and mapping one never consumes the other.
   for_each(__flat) -> |key, value| {
-      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
       # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
       __kt = encode_json(key)
       if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
@@ -424,7 +425,6 @@ parser_vrl: |
   __names = {}
   if __distinct {
       __kept = filter(__flat) -> |key, value| {
-          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
           # A key is kept unless an explicit mapping or transformation consumed it.
           # Do not spill a copy of the raw body.
           value != __raw_body && !contains(__consumed, "," + encode_json(key))
@@ -458,13 +458,13 @@ parser_vrl: |
       # Slow path, in source key order: a name already taken gets the next free
       # _2, _3, ... suffix.
       for_each(__flat) -> |key, value| {
+          __token = "," + encode_json(key)
           key = replace(replace(key, "~1", "."), "~0", "~")
           if is_array(value) || is_object(value) {
               value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
                   replace(replace(inner, "~1", "."), "~0", "~")
               }, ["v"])
           }
-          __token = "," + encode_json(key)
           if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")
