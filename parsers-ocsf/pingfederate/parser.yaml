@@ -25,7 +25,10 @@ description: >
   protocol, the tracking id metadata.correlation_uid, the transaction id
   metadata.uid, and responsetime the duration. Timestamps without a zone are read as
   UTC; ISO 8601 with a zone and epoch seconds or milliseconds are honored. Anything else (for example a PingFederate server.log line) is
-  kept whole as a Base Event with unmapped.parse_fallback. Distinct from the
+  kept whole as a Base Event with unmapped.parse_fallback. Only the subject and
+  description of a pipe line are free text; a line whose '|' placement fits the
+  fixed columns in more than one way (a forged tail in either) is never guessed
+  and is kept the same way, with status Unknown. Distinct from the
   PingOne cloud parser. Samples follow the PingFederate "Security audit
   logging" field reference and the Elastic ping_federate audit pipeline
   fixtures, with documentation addresses.
@@ -89,72 +92,76 @@ parser_vrl: |
       if merr == null {
           parts = map_values(split(string!(m.rest), "|")) -> |v| { strip_whitespace(string!(v)) }
           n = length(parts)
-          # The 14-field pattern has event at column 1 (0-based, after %d) and
-          # the 15-field one (transactionid after trackingid) at column 2. Two
-          # columns can hold a raw '|': the subject (the submitted username,
-          # logged verbatim) and the description. The layout is therefore read
-          # from fixed structure, never from the column count or one column:
-          #   - the event column sits before the subject, so it cannot be moved
-          #     by the subject; it picks the 14- or 15-field layout
-          #   - the subject's extra pipes (shift d) are found where ip, role and
-          #     status all sit in their own vocabularies
-          #   - whatever pipes remain belong to the description
-          # When more than one shift fits (a subject that embeds a fake tail),
-          # a non-success status wins over success, then the largest shift: a
-          # crafted subject must never turn a failed login into a success.
+          # Deterministic layout read. Every column except two has a fixed
+          # format; only the subject (the submitted username, logged verbatim)
+          # and the description are free text and may hold a raw '|'. So:
+          #   - the head (trackingid, [transactionid,] event) is read from the
+          #     left, the responsetime from the right
+          #   - every split of the extra pipes between subject and description
+          #     is tried, and the fixed columns between them (ip, app,
+          #     connectionid, protocol, host, role, status, adapterid) must all
+          #     fit their formats
+          #   - exactly one fitting reading is parsed; none or several (a
+          #     subject or description that embeds a forged tail) is NOT
+          #     guessed: the record falls back with status Unknown
+          # The 14- and 15-field layouts share a column alignment only when a
+          # 14-field subject holds '|'; the event vocabulary settles that one.
           statuses = ["success", "failure", "failed", "inprogress", "in progress"]
-          roles = ["idp", "sp", "as", "oauth", "ws-trust", "wstrust"]
+          roles = ["idp", "sp", "as", "oauth", "ws-trust", "wstrust", "sts"]
+          known_events = ["SSO", "SLO", "OAUTH", "STS", "AUTHN_ATTEMPT", "AUTHN_REQUEST", "AUTHN_SESSION_CREATED", "AUTHN_SESSION_DELETED", "AUTHN_SESSION_USED", "SRI_REVOKED", "LOGIN", "LOGOUT"]
           p1 = string(get(parts, [1]) ?? "") ?? ""
-          p1_event = match(p1, r'^(?:[A-Z][A-Z0-9_]*|OAuth)$')
+          p2 = string(get(parts, [2]) ?? "") ?? ""
+          resp_last = string(get(parts, [n - 1]) ?? "") ?? ""
           cands = []
-          for_each([13, 14]) -> |_bi, bv| {
-              b = bv
+          for_each([13, 14]) -> |_bi, b| {
               s0 = b - 11
               evc = string(get(parts, [s0 - 1]) ?? "") ?? ""
-              if n >= b && match(evc, r'^[A-Za-z][A-Za-z0-9_]*$') {
-                  for_each(parts) -> |d, _pv| {
-                      if d <= n - b {
-                          ipv = string(get(parts, [s0 + 1 + d]) ?? "") ?? ""
-                          rolev = downcase(string(get(parts, [s0 + 6 + d]) ?? "") ?? "")
-                          stv = downcase(string(get(parts, [s0 + 7 + d]) ?? "") ?? "")
-                          ip_ok = ipv == "" || is_ipv4(ipv) || is_ipv6(ipv)
-                          role_ok = rolev == "" || includes(roles, rolev)
-                          st_ok = stv == "" || includes(statuses, stv)
-                          if ip_ok && role_ok && st_ok && (ipv != "" || rolev != "") {
-                              cands = push(cands, { "b": b, "d": d, "st": stv })
-                          }
+              tidc = string(get(parts, [0]) ?? "") ?? ""
+              head_ok = n >= b && match(evc, r'^[A-Za-z][A-Za-z0-9_]*$') && match(tidc, r'^\S*$') && match(resp_last, r'^\d*$')
+              if b == 14 { head_ok = head_ok && match(p1, r'^\S+$') }
+              if head_ok {
+                  for_each(parts) -> |ds, _pv| {
+                      if ds <= n - b {
+                          col = s0 + 1 + ds
+                          ipv = string(get(parts, [col]) ?? "") ?? ""
+                          appv = string(get(parts, [col + 1]) ?? "") ?? ""
+                          connv = string(get(parts, [col + 2]) ?? "") ?? ""
+                          protov = string(get(parts, [col + 3]) ?? "") ?? ""
+                          hostv = string(get(parts, [col + 4]) ?? "") ?? ""
+                          rolev = downcase(string(get(parts, [col + 5]) ?? "") ?? "")
+                          stv = downcase(string(get(parts, [col + 6]) ?? "") ?? "")
+                          adv = string(get(parts, [col + 7]) ?? "") ?? ""
+                          ok = ipv == "" || is_ipv4(ipv) || is_ipv6(ipv)
+                          ok = ok && match(appv, r'^\S*$') && match(connv, r'^\S*$')
+                          # protocol names (SAML20, OAuth20, WSFED, OIDC) never hold a dot,
+                          # so a shifted hostname cannot pass as one
+                          ok = ok && match(protov, r'^(?:[A-Za-z][A-Za-z0-9_-]*)?$')
+                          ok = ok && match(hostv, r'^[A-Za-z0-9._:\x5B\x5D-]*$')
+                          ok = ok && (rolev == "" || includes(roles, rolev))
+                          ok = ok && (stv == "" || includes(statuses, stv))
+                          # Validators must accept every genuine value: a forged
+                          # reading can only win alone if the real one is rejected.
+                          # An adapter instance id is alphanumeric, never an address.
+                          ok = ok && match(adv, r'^[A-Za-z0-9._-]*$') && !is_ipv4(adv)
+                          if ok { cands = push(cands, { "b": b, "d": ds }) }
                       }
                   }
               }
           }
-          c13 = filter(cands) -> |_ci, c| { c.b == 13 }
-          c14 = filter(cands) -> |_ci, c| { c.b == 14 }
-          pick = []
-          if length(c13) > 0 && (p1_event || length(c14) == 0) { pick = c13 } else if length(c14) > 0 { pick = c14 }
+          if includes(known_events, upcase(p1)) {
+              cands = filter(cands) -> |_ci, c| { c.b == 13 }
+          } else if includes(known_events, upcase(p2)) {
+              cands = filter(cands) -> |_ci, c| { c.b == 14 }
+          }
           base = 0
           shift = 0
-          if length(pick) > 0 {
-              ns = filter(pick) -> |_ci, c| { c.st != "success" }
-              if length(ns) > 0 { pick = ns }
-              shift = -1
-              for_each(pick) -> |_ci, c| {
-                  cd = int(c.d) ?? 0
-                  if cd > shift { shift = cd; base = int(c.b) ?? 0 }
-              }
+          if length(cands) == 1 {
+              base = int(cands[0].b) ?? 0
+              shift = int(cands[0].d) ?? 0
+          } else if length(cands) > 1 {
+              fallback = "ambiguous PingFederate audit columns (subject or description holds '|')"
           } else {
-              # no column set fits the structure: keep the record, reading the
-              # layout from where a status word sits
-              st9 = downcase(string(get(parts, [9]) ?? "") ?? "")
-              st10 = downcase(string(get(parts, [10]) ?? "") ?? "")
-              if n >= 14 && includes(statuses, st10) {
-                  base = 14
-              } else if n >= 13 && includes(statuses, st9) {
-                  base = 13
-              } else if n == 13 {
-                  base = 13
-              } else if n >= 14 {
-                  base = 14
-              }
+              fallback = "PingFederate audit columns do not fit the documented layout"
           }
           names = []
           if base == 13 { names = ["trackingid", "event", "subject", "ip", "app", "connectionid", "protocol", "host", "role", "status", "adapterid", "description", "responsetime"] }
@@ -280,7 +287,7 @@ parser_vrl: |
       user = {}
       # OCSF requires user; an attempt that has not named a subject yet is "unknown".
       if subject != "" { user.name = subject } else { user.name = "unknown" }
-      if match(subject, r'^[^@\s]+@[^@\s]+\.[^@\s]+$') { user.email_addr = subject }
+      if match(subject, r'^[^@\s|]+@[^@\s|]+\.[^@\s|]+$') { user.email_addr = subject }
       src_endpoint = {}
       ip = string(f.ip) ?? ""
       if ip != "" { src_endpoint.ip = downcase(ip) }
@@ -886,3 +893,90 @@ samples:
       "status_id": "2"
       "src_endpoint.ip": "203.0.113.90"
       "metadata.event_code": "AUTHN_ATTEMPT"
+  # neon #78 r3: a forged "|ip|...|IdP|failure" tail in the subject of a real success keeps the real success and ip
+  - raw: "2026-11-02 14:14:41,077| tid:abc| SSO| admin@example.com|10.0.0.1|||||IdP|failure| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| success| HTMLFormAdapter| | 5"
+    expect:
+      "class_uid": "3002"
+      "status_id": "1"
+      "src_endpoint.ip": "203.0.113.90"
+      "metadata.event_code": "SSO"
+  # neon #78 r3: the same forged tail with an empty status
+  - raw: "2026-11-02 14:14:41,077| tid:abc| SSO| admin@example.com|10.0.0.1|||||IdP|| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| success| HTMLFormAdapter| | 5"
+    expect:
+      "class_uid": "3002"
+      "status_id": "1"
+      "src_endpoint.ip": "203.0.113.90"
+      "metadata.event_code": "SSO"
+  # neon #78 r3: the same forged tail with inprogress
+  - raw: "2026-11-02 14:14:41,077| tid:abc| SSO| admin@example.com|10.0.0.1|||||IdP|inprogress| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| success| HTMLFormAdapter| | 5"
+    expect:
+      "class_uid": "3002"
+      "status_id": "1"
+      "src_endpoint.ip": "203.0.113.90"
+      "metadata.event_code": "SSO"
+  # neon #78 r3: the forged subject tail on a 15-field record
+  - raw: "2026-11-02 14:14:41,077| tid:abc| a1b2c3d4-0000-4000-8000-000000000009| SSO| admin@example.com|10.0.0.1|||||IdP|failure| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| success| HTMLFormAdapter| | 5"
+    expect:
+      "class_uid": "3002"
+      "status_id": "1"
+      "src_endpoint.ip": "203.0.113.90"
+      "metadata.event_code": "SSO"
+  # neon #78 r3: forged success tail, real failure with empty ip and role: ambiguous, not guessed
+  - raw: "2026-11-02 14:14:41,077| tid:abc| AUTHN_ATTEMPT| admin@example.com|10.0.0.1|||||IdP|success| | | sp:cloud:saml2| SAML20| pf01.example.com| | failure| HTMLFormAdapter| bad| 5"
+    expect:
+      "class_uid": "0"
+      "status_id": "0"
+      "unmapped.parse_fallback": "ambiguous PingFederate audit columns (subject or description holds '|')"
+  # neon #78 r3: forged empty-status tail in the description: ambiguous, not guessed
+  - raw: "2026-11-02 14:14:41,077| tid:abc| AUTHN_ATTEMPT| attacker@evil.example| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| bad |10.0.0.1|||||IdP||||| 5"
+    expect:
+      "class_uid": "0"
+      "status_id": "0"
+      "unmapped.parse_fallback": "ambiguous PingFederate audit columns (subject or description holds '|')"
+  # neon #78 r3: forged failure tail in the description: ambiguous, not guessed
+  - raw: "2026-11-02 14:14:41,077| tid:abc| AUTHN_ATTEMPT| attacker@evil.example| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| bad |10.0.0.1|||||IdP|failure||| 5"
+    expect:
+      "class_uid": "0"
+      "status_id": "0"
+      "unmapped.parse_fallback": "ambiguous PingFederate audit columns (subject or description holds '|')"
+  # neon #78 r3: forged tail through adapterid in the subject of a real success: ambiguous, not guessed
+  - raw: "2026-11-02 14:14:41,077| tid:abc| SSO| admin@example.com|10.0.0.1|||||IdP|failure|HTMLFormAdapter|x| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| success| HTMLFormAdapter| | 5"
+    expect:
+      "class_uid": "0"
+      "status_id": "0"
+      "unmapped.parse_fallback": "ambiguous PingFederate audit columns (subject or description holds '|')"
+  # neon #78 r3: forged success tail through adapterid in the subject of a real failure: ambiguous, not guessed
+  - raw: "2026-11-02 14:14:41,077| tid:abc| AUTHN_ATTEMPT| eve|10.0.0.1|||||IdP|success|HTMLFormAdapter|x| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| | 5"
+    expect:
+      "class_uid": "0"
+      "status_id": "0"
+      "unmapped.parse_fallback": "ambiguous PingFederate audit columns (subject or description holds '|')"
+  # neon #78 r3: forged success tail through adapterid in the description of a real failure: ambiguous, not guessed
+  - raw: "2026-11-02 14:14:41,077| tid:abc| AUTHN_ATTEMPT| eve| 203.0.113.90 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| x|10.0.0.1|||||IdP|success|HTMLFormAdapter|| 5"
+    expect:
+      "class_uid": "0"
+      "status_id": "0"
+      "unmapped.parse_fallback": "ambiguous PingFederate audit columns (subject or description holds '|')"
+  # neon #78 r3: an all-uppercase transactionid keeps the 15-field layout
+  - raw: "2026-11-02 14:14:41,077| tid:abc| TX9876543210| AUTHN_ATTEMPT| alice@example.com| 192.0.2.50 | | sp:cloud:saml2| SAML20| pf01.example.com| IdP| failure| HTMLFormAdapter| bad password| 5"
+    expect:
+      "class_uid": "3002"
+      "status_id": "2"
+      "src_endpoint.ip": "192.0.2.50"
+      "metadata.event_code": "AUTHN_ATTEMPT"
+      "metadata.uid": "TX9876543210"
+      "activity_id": "1"
+      "user.name": "alice@example.com"
+  # neon #78 r3: uppercase hex transactionid on an OAuth record
+  - raw: "2026-11-02 14:07:02,512| tid:Zt5| A1B2C3D4E5F60708| OAuth| svc-reporting| 203.0.113.25 | | reporting-client| OAuth20| pf02.example.com| AS| success| | | 27"
+    expect:
+      "class_uid": "3002"
+      "metadata.uid": "A1B2C3D4E5F60708"
+      "user.name": "svc-reporting"
+  # neon #78 r3: empty ip, role and status with '|' in the description still parses
+  - raw: "2026-11-02 14:14:41,077| tid:abc| SRI_REVOKED| alice@example.com| | | sp:cloud:saml2| OAuth20| pf01.example.com| | | | reason | detail| 5"
+    expect:
+      "class_uid": "3002"
+      "metadata.event_code": "SRI_REVOKED"
+      "user.name": "alice@example.com"
+      "status_detail": "reason|detail"
