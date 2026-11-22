@@ -195,9 +195,10 @@ def sentinels(value, kind=None, factor=None, exclude=()):
     num = NUMBER.match(value)
     if num and kind is None and not num.group(1) and 0 <= int(value) < 32:
         # An enum-like code written as text ("3", "10").
+        # A text code is drawn the same way and ONLY that way (no shape
+        # variants), so a short lookup keyed by the observed codes cannot pass.
         code = _code(int(value), {int(x) for x in exclude if isinstance(x, str) and x.isdigit()} | {x for x in exclude if type(x) is int})
-        if code is not None:
-            out.append(str(code))
+        return [str(code)] if code is not None else []
     if num and kind == 'scale':
         decimals = len(num.group(1) or '')
         new = _number(float(value) if decimals else int(value), factor)
@@ -459,8 +460,9 @@ def probe(program, samples, sources, outputs, items, per_key=40, declared=None, 
         observed = set()
         for flat in flats:
             v = flat.get(key)
-            if v is not None and not isinstance(v, (dict, list)):
-                observed.add(v)
+            for x in (v if isinstance(v, list) else [v]):
+                if x is not None and not isinstance(x, (dict, list)):
+                    observed.add(x)
         for (name, event), source, output in zip(samples, sources, outputs):
             if used >= per_key:
                 break
