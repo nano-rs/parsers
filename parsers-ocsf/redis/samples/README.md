@@ -12,4 +12,5 @@ Each file is one input event. Addresses are documentation values
 | `monitor_ipv6.json`, `monitor_ipv6_loopback.json` | MONITOR with IPv6 clients, which Redis prints bracketed (`[db [ip]:port]`, `anetFormatAddr` in `src/anet.c`) |
 | `monitor_config_requirepass.json`, `monitor_acl_setuser.json` | MONITOR lines carrying credentials; the arguments are redacted from query_info |
 | `monitor_long_set.json` | Synthetic 9 KB SET payload: query_info.query_string bounded at 8192 characters, `metadata.is_truncated` set |
+| `monitor_config_primaryauth.json` | Valkey `CONFIG SET primaryauth` (replication password, Valkey `src/config.c`); redacted like `masterauth` |
 | `junk.json` | Malformed input; must fall back without aborting |

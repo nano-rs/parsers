@@ -118,15 +118,18 @@ parser_vrl: |
                   cm, cmerr = parse_regex(args, r'^"(?P<c>[^"]*)"')
                   if cmerr == null { command = string(cm.c) ?? "" }
                   # Never copy credentials out of raw_data: AUTH / HELLO / MIGRATE carry
-                  # passwords, CONFIG SET requirepass|masterauth sets one, and
-                  # ACL SETUSER rules carry >password / #hash.
+                  # passwords, CONFIG SET requirepass|masterauth (Valkey also
+                  # primaryauth|primaryuser) sets one, SENTINEL SET auth-pass /
+                  # sentinel-pass sets one, and ACL SETUSER rules carry >password / #hash.
                   cu = upcase(command)
                   if includes(["AUTH", "HELLO", "MIGRATE"], cu) {
                       query = cu + " <redacted>"
-                  } else if cu == "CONFIG" && match(args, r'(?i)"(?:requirepass|masterauth|masteruser|tls-key-file-pass|tls-client-key-file-pass)"') {
+                  } else if cu == "CONFIG" && match(args, r'(?i)"(?:requirepass|masterauth|masteruser|primaryauth|primaryuser|tls-key-file-pass|tls-client-key-file-pass)"') {
                       query = "CONFIG SET <redacted>"
-                  } else if cu == "ACL" && match(args, r'(?i)^"acl" "(?:setuser|deluser|dryrun)"') {
-                      su, suerr = parse_regex(args, r'(?i)^"acl" "(?P<sub>[a-z]+)"')
+                  } else if cu == "SENTINEL" && match(args, r'(?i)"(?:auth-pass|auth-user|sentinel-pass|sentinel-user)"') {
+                      query = "SENTINEL SET <redacted>"
+                  } else if cu == "ACL" && match(args, r'(?i)^"acl"\s+"(?:setuser|deluser|dryrun)"') {
+                      su, suerr = parse_regex(args, r'(?i)^"acl"\s+"(?P<sub>[a-z]+)"')
                       query = "ACL " + upcase(string(su.sub) ?? "") + " <redacted>"
                   } else {
                       query = args
@@ -692,3 +695,8 @@ samples:
     expect:
       "class_uid": 6005
       "metadata.is_truncated": "true"
+  # monitor_config_primaryauth (review round 2: Valkey replication password)
+  - raw: "1795170500.000001 [0 192.0.2.16:41000] \"CONFIG\" \"SET\" \"primaryauth\" \"SUPER_SECRET_PW_999\""
+    expect:
+      "class_uid": 6005
+      "query_info.query_string": "CONFIG SET <redacted>"

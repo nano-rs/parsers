@@ -22,6 +22,12 @@ description: >
   The PostgreSQL severity is kept (WARNING Medium, ERROR High, FATAL Critical,
   PANIC Fatal) and the SQLSTATE lands in status_code. Input that matches none of
   the formats is kept whole as a Base Event marked unmapped.parse_fallback.
+  Named log_timezone abbreviations are resolved with a fixed table. Three of
+  them are ambiguous and resolve as CST = US Central (-0600), IST = India
+  (+0530) and BST = UK summer time (+0100). Hosts in China (CST +0800), Israel
+  or Ireland (IST +0200 / +0100) or Bangladesh (BST +0600) would be shifted by
+  hours, so set PostgreSQL log_timezone = 'UTC' (or a zone that prints a
+  numeric offset) on those hosts.
 match_values:
   - postgresql
 category: application
@@ -131,8 +137,19 @@ parser_vrl: |
               if u != "[unknown]" { user = u; __source_kv.user = u }
               if d != "[unknown]" { db = d; __source_kv.dbname = d }
           }
-          rm, rmerr = parse_regex(prefix, r'(?:^|[:\s])(?P<h>[A-Za-z0-9._:-]+|\[local\])\((?P<p>\d+)\)')
-          if rmerr == null { rhost = string(rm.h) ?? ""; rport = string(rm.p) ?? ""; __source_kv.remote_host = rhost; __source_kv.remote_port = rport }
+          # %r: drop the already-matched timestamp first so its time zone (RDS
+          # '%t:%r:' puts 'UTC:' right before the host) and its colons cannot be
+          # swallowed into the host, then strip one delimiter colon ('::1' keeps
+          # its own). A bare ':' is only allowed inside an IPv6 literal.
+          rprefix = prefix
+          if ts != "" { rprefix = replace(rprefix, ts, "", count: 1) }
+          rprefix = replace(rprefix, r'^:', "")
+          rm, rmerr = parse_regex(rprefix, r'(?:^|[\s:])(?P<h>\[local\]|(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f.]*|[A-Za-z0-9._-]+)\((?P<p>\d+)\)')
+          if rmerr == null {
+              rhost = string(rm.h) ?? ""; rport = string(rm.p) ?? ""; __source_kv.remote_host = rhost; __source_kv.remote_port = rport
+          } else if match(rprefix, r'(?:^|[\s:])\[local\](?:[\s:]|$)') {
+              rhost = "[local]"
+          }
           # First line (plus tab-indented continuation of a multi-line statement).
           mm, mmerr = parse_regex(body, r'(?s)^(?P<main>.*?)(?:\n[^\t].*)?\z')
           msg = if mmerr == null { string(mm.main) ?? body } else { body }
@@ -156,6 +173,10 @@ parser_vrl: |
           tz = string(tp.tz) ?? ""
           off = "+0000"
           # log_timezone abbreviations PostgreSQL prints for %m / %t on non-UTC hosts
+          # Ambiguous abbreviations are pinned: CST = US Central -0600 (not China
+          # +0800), IST = India +0530 (not Israel +0200 or Ireland +0100), BST =
+          # UK +0100 (not Bangladesh +0600). Hosts in the other zones must log in
+          # UTC or a numeric offset; this table cannot tell them apart.
           tzmap = {"UTC": "+0000", "GMT": "+0000", "Z": "+0000", "EST": "-0500", "EDT": "-0400", "CST": "-0600", "CDT": "-0500", "MST": "-0700", "MDT": "-0600", "PST": "-0800", "PDT": "-0700", "AKST": "-0900", "AKDT": "-0800", "HST": "-1000", "WET": "+0000", "WEST": "+0100", "BST": "+0100", "CET": "+0100", "CEST": "+0200", "EET": "+0200", "EEST": "+0300", "MSK": "+0300", "IST": "+0530", "SGT": "+0800", "AWST": "+0800", "JST": "+0900", "KST": "+0900", "AEST": "+1000", "AEDT": "+1100", "NZST": "+1200", "NZDT": "+1300"}
           mo = string(get(tzmap, [tz]) ?? null) ?? ""
           if mo != "" { off = mo }
@@ -235,8 +256,10 @@ parser_vrl: |
   }
 
   # ---- bound SQL text: raw_data keeps the whole line (P2 event size) ----
-  # jsonlog is exempt: its fields are the source, and a shortened copy would
-  # move the full text into unmapped through the residual spill.
+  # jsonlog is exempt: its decoded record IS __source_kv, which the field
+  # coverage gate requires to equal the source JSON, and a shortened value is
+  # not represented, so the residual spill would copy the full text into
+  # unmapped. Bounding it needs a truncate transform in the coverage harness.
   truncated = false
   if log_format != "jsonlog" {
       if strlen(query) > 8192 { query = truncate(query, 8192); truncated = true }
@@ -831,3 +854,17 @@ samples:
     expect:
       "class_uid": 6005
       "metadata.is_truncated": "true"
+  # rds_prefix_auth_failed (review round 2: the time zone before %r must not join the host)
+  - raw: "2026-11-20 10:24:02 UTC:192.0.2.77(50432):bob@appdb:[24140]:FATAL:  password authentication failed for user \"bob\""
+    expect:
+      "class_uid": 3002
+      "status_id": 2
+      "src_endpoint.ip": "192.0.2.77"
+      "src_endpoint.port": 50432
+      "user.name": "bob"
+  # rds_prefix_ipv6_auth_failed (review round 2)
+  - raw: "2026-11-20 10:24:02 UTC:2001:db8::1(50432):bob@appdb:[24140]:FATAL:  password authentication failed for user \"bob\""
+    expect:
+      "class_uid": 3002
+      "src_endpoint.ip": "2001:db8::1"
+      "src_endpoint.port": 50432
