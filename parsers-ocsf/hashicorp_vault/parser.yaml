@@ -160,6 +160,8 @@ parser_vrl: |
                   wipe = push(wipe, append(array!(ap), [k]))
               }
           }
+      } else if a != null {
+          e = set(e, array!(ap), "<redacted>") ?? e
       }
   }
   req_keep = r'^(?:id|client_id|operation|path|mount_point|mount_type|mount_accessor|mount_class|mount_running_version|mount_running_sha256|mount_is_external_plugin|namespace|remote_address|remote_port|wrap_ttl|policy_override|replication_cluster|request_uri|client_token|client_token_accessor|headers|data)$'
@@ -299,21 +301,34 @@ parser_vrl: |
   }
 
   # ---- URLs: keep scheme, host, port and path; never userinfo, query or fragment ----
+  # An absolute (scheme://) or network-path (//host) URL is rebuilt from its
+  # parsed parts; a relative one keeps what precedes "?" / "#". "?<redacted>"
+  # is appended only when userinfo, a query or a fragment was removed; a URL
+  # that had none of them is kept exactly as written. Text that only looks
+  # like a URL with userinfo (scheme:user:pass@host, no "//") goes whole.
   for_each([["request", "request_uri"], ["response", "redirect"], ["request", "path"]]) -> |_i, up| {
       uv = get(e, array!(up)) ?? null
       if is_string(uv) && uv != "<redacted>" {
           u = string!(uv)
           clean = u
-          if match(u, r'^[A-Za-z][A-Za-z0-9+.\-]*://') {
-              pu, perr = parse_url(u, default_known_ports: false)
+          netpath = starts_with(u, "//")
+          if netpath || match(u, r'^[A-Za-z][A-Za-z0-9+.\-]*://') {
+              pin = u
+              if netpath { pin = "https:" + u }
+              pu, perr = parse_url(pin, default_known_ports: false)
               if perr == null && is_string(pu.host) && string!(pu.host) != "" {
-                  clean = (string(pu.scheme) ?? "") + "://" + string!(pu.host)
-                  if is_integer(pu.port) { clean = clean + ":" + to_string!(pu.port) }
-                  clean = clean + (string(pu.path) ?? "")
-                  if clean != replace(u, r'(?s)[?#].*', "") || contains(u, "?") || contains(u, "#") { clean = clean + "?<redacted>" }
+                  removed = (string(pu.username) ?? "") != "" || (string(pu.password) ?? "") != "" || contains(u, "?") || contains(u, "#") || contains(replace(u, r'(?s)^[A-Za-z0-9+.\-]*:?//', ""), "@")
+                  if removed {
+                      clean = "//" + string!(pu.host)
+                      if !netpath { clean = (string(pu.scheme) ?? "") + ":" + clean }
+                      if is_integer(pu.port) { clean = clean + ":" + to_string!(pu.port) }
+                      clean = clean + (string(pu.path) ?? "") + "?<redacted>"
+                  }
               } else {
                   clean = "<redacted>"
               }
+          } else if match(u, r'^[A-Za-z][A-Za-z0-9+.\-]*:[^/\s]*@') {
+              clean = "<redacted>"
           } else if match(u, r'[?#]') {
               clean = replace(u, r'(?s)[?#].*', "") + "?<redacted>"
           }
@@ -347,24 +362,42 @@ parser_vrl: |
   # ---- decoded token shapes and URLs in every remaining kept string ----
   # The allowlist above is the guarantee; this is defense in depth on the
   # DECODED values (JSON escapes are already resolved), never on raw text.
-  # A string holding a URL that is not reduced to scheme://host[:port]/path is
-  # replaced whole.
+  # error and warnings are skipped: they already hold only fixed phrases or a
+  # withheld marker. An auth scheme counts only after "authorization:" (the
+  # rest of that line goes), as Bearer / Negotiate with a credential-shaped
+  # value, as Basic with a base64 value, or as Digest with parameters (to the
+  # end of the line), so ordinary words such as "token" or "Basic" in a user
+  # agent or display name are left alone. A string holding a URL that is not
+  # reduced to [scheme:]//host[:port]/path, or userinfo-shaped text, goes whole.
+  keep_err = get(e, ["error"]) ?? null
+  keep_warn = get(e, ["response", "warnings"]) ?? null
+  tok_scrub = r'(?P<pre>^|[^A-Za-z0-9])(?:hv[sbr]\.[A-Za-z0-9_\-]{8,}|b\.[A-Za-z0-9_\-]{60,})'
+  e = map_keys(e, recursive: true) -> |kk| {
+      replace(replace(replace(kk, tok_scrub, "${pre}<redacted>"), r'(?P<pre>^|[^A-Za-z0-9])[sr]\.[A-Za-z0-9]{20,}', "${pre}<redacted>"), r'ey[A-Za-z0-9_\-=]{6,}\.ey[A-Za-z0-9_\-=]{6,}\.?[A-Za-z0-9_\-=]*', "<redacted>")
+  }
   e = map_values(e, recursive: true) -> |sv| {
       if is_string(sv) && !match(string!(sv), hmac_re) && sv != "<redacted>" {
           t = string!(sv)
-          t = replace(t, r'(?P<pre>^|[^A-Za-z0-9])hv[sbr]\.[A-Za-z0-9_\-]{8,}', "${pre}<redacted>")
+          t = replace(t, tok_scrub, "${pre}<redacted>")
           t = replace(t, r'(?P<pre>^|[^A-Za-z0-9])[sr]\.[A-Za-z0-9]{20,}(?P<post>[^A-Za-z0-9_\-]|$)', "${pre}<redacted>${post}")
           t = replace(t, r'(?P<pre>^|[^A-Za-z0-9])[sr]\.[A-Za-z0-9]{20,}(?P<post>[^A-Za-z0-9_\-]|$)', "${pre}<redacted>${post}")
-          t = replace(t, r'(?P<pre>^|[^A-Za-z0-9])b\.[A-Za-z0-9_\-]{60,}', "${pre}<redacted>")
           t = replace(t, r'ey[A-Za-z0-9_\-=]{6,}\.(?:ey[A-Za-z0-9_\-=]{6,}\.[A-Za-z0-9_\-=]*|[A-Za-z0-9_\-=]*\.[A-Za-z0-9_\-=]+\.[A-Za-z0-9_\-=]+\.[A-Za-z0-9_\-=]+)', "<redacted>")
-          t = replace(t, r'(?i)\b(?P<scheme>basic|bearer|negotiate|token|digest)\s+\S+', "${scheme} <redacted>")
-          t = replace(t, r'(?is)-----begin [a-z0-9 ]*private key(?: block)?-----.*?(?:-----end [a-z0-9 ]*private key(?: block)?-----|$)', "<redacted>")
-          if contains(t, "://") && !match(t, r'^[A-Za-z][A-Za-z0-9+.\-]*://[^/?#@\s]+(?:/[^?#@\s]*)?(?:\?<redacted>)?$') { t = "<redacted>" }
+          t = replace(t, r'(?i)(?P<k>(?:proxy-)?authorization[ \t]*[:=][ \t]*)[^\r\n]*', "${k}<redacted>")
+          t = replace(t, r'(?i)\b(?P<scheme>bearer|negotiate)[ \t]+[A-Za-z0-9+/=._~:%\-]{8,}', "${scheme} <redacted>")
+          t = replace(t, r'(?i)\b(?P<scheme>basic)[ \t]+[A-Za-z0-9+/]{8,}={0,2}(?P<post>[^A-Za-z0-9+/=]|$)', "${scheme} <redacted>${post}")
+          t = replace(t, r'(?i)\b(?P<scheme>digest)[ \t]+[A-Za-z0-9_\-]+=[^\r\n]*', "${scheme} <redacted>")
+          t = replace(t, r'(?is)-----begin [a-z0-9 \-]*private key(?: block)?-----.*?(?:-----end [a-z0-9 \-]*private key(?: block)?-----|$)', "<redacted>")
+          if (contains(t, "://") || starts_with(t, "//")) && !match(t, r'^(?:[A-Za-z][A-Za-z0-9+.\-]*:)?//[^/?#@\s]+(?:/[^?#@\s]*)?(?:\?<redacted>)?$') { t = "<redacted>" }
+          if match(t, r'^[A-Za-z][A-Za-z0-9+.\-]*:[^/\s]*@') { t = "<redacted>" }
           t
       } else {
           sv
       }
   }
+  if keep_err != null { e = set(e, ["error"], keep_err) ?? e }
+  if keep_warn != null { e = set(e, ["response", "warnings"], keep_warn) ?? e }
+  # Token shapes in the syslog header fields (host, app tag, msgid) too.
+  header = replace(replace(header, tok_scrub, "${pre}<redacted>"), r'(?P<pre>^|[^A-Za-z0-9])[sr]\.[A-Za-z0-9]{20,}', "${pre}<redacted>")
   # raw_data of a parsed entry is ALWAYS the (sanitized) syslog header plus the
   # re-encoded redacted object, never the original text: a duplicate key's
   # shadowed value or an escaped secret cannot survive in it.

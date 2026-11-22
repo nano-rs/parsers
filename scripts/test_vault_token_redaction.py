@@ -254,6 +254,27 @@ HOSTILE += [
                     'warnings': [{'w': 'LEAK-z36'}]}),
 ]
 
+# #82 review 2: a non-object response.auth, network-path URLs, auth schemes,
+# Digest tails, hyphenated PEM types, token-shaped keys and syslog fields.
+HOSTILE += [
+    entry(rid='rastr', response={'auth': 'LEAK-q1'}),
+    entry(rid='raarr', response={'auth': ['LEAK-q2', {'k': 'LEAK-q3'}]}),
+    entry(rid='loginra', request={'path': 'auth/userpass/login/eve', 'mount_type': 'userpass'},
+          response={'auth': 'LEAK-q4'}),
+    entry(rid='netpath', request={'request_uri': '//admin:LEAK-q5@vault.internal/v1/secret',
+                                  'path': '//admin:LEAK-q6@vault.internal/v1/secret',
+                                  'headers': {'host': ['//user:LEAK-q7@evil.com']}},
+          response={'redirect': '//user:LEAK-q8@idp.example.com/cb?a=LEAK-q9'}),
+    entry(rid='noslash', response={'redirect': 'https:user:LEAK-q10@idp.example.com/cb'},
+          request={'request_uri': 'https:\\\\user:LEAK-q11@vault.internal/cb'}),
+    entry(rid='digest', request={'headers': {'user-agent': ['Authorization: Digest username="alice", nonce="123", response="LEAK-q12"',
+                                                            'x Digest username="a", realm="v", response="LEAK-q13"']}}),
+    entry(rid='pemdash', auth={'display_name': '-----BEGIN ML-DSA PRIVATE KEY-----\nLEAK-q14\n-----END ML-DSA PRIVATE KEY-----'}),
+    entry(rid='tokkey', request={'data': {'hvs.LEAKq15keytokenvalue': 1, 'nested': {'s.LEAKq16legacykey12345678': True}}}),
+    'Jun  4 20:14:02 vault-0 hvs.LEAKq17tagtoken[812]: ' + entry(rid='hdrtok'),
+]
+
+
 # Lines that are not a complete Vault audit entry: their text must not be kept.
 UNPARSABLE = [
     'vault: login failed for "alice": password=LEAK-y1 api_key=LEAK-y2 Authorization: Token LEAK-y3',
@@ -281,6 +302,23 @@ CLEAN = [
                             'headers': {'user-agent': ['vault/1.19.1']}},
                 'response': {'mount_type': 'kv', 'data': {'data': {'k': H},
                                                           'metadata': {'created_time': H, 'version': 3}}}}),
+]
+
+# Clean values that must be kept exactly as written: normalized-looking URLs
+# with nothing to remove, Vault multi-errors made of known phrases, and
+# ordinary words such as "token" or "Basic" in a user agent or display name.
+CLEAN += [
+    json.dumps({'time': '2025-06-04T20:51:00Z', 'type': 'response',
+                'auth': {'client_token': H, 'accessor': H, 'display_name': 'token alice', 'policies': ['default']},
+                'request': {'id': 'clean-2', 'operation': 'read', 'mount_type': 'oidc', 'path': 'auth/oidc/oidc/auth_url',
+                            'request_uri': 'https://IDP.Example.COM:443/cb', 'remote_address': '192.0.2.81',
+                            'headers': {'user-agent': ['Vault Token Helper/1.0 (Basic Linux)']}},
+                'response': {'mount_type': 'oidc', 'redirect': 'https://idp.example.com'},
+                'error': '2 errors occurred:\n\t* missing client token\n\t* permission denied\n\n'}),
+    json.dumps({'time': '2025-06-04T20:52:00Z', 'type': 'response', 'error': 'bad token - permission denied',
+                'request': {'id': 'clean-3', 'operation': 'read', 'mount_type': 'kv', 'path': 'secret/data/app',
+                            'request_uri': '//vault.internal:8200/v1/secret/data/app', 'remote_address': '192.0.2.82'},
+                'response': {'mount_type': 'kv', 'redirect': 'https://idp.example.com/'}}),
 ]
 # Samples that carry clear credentials (or a syslog header with structured
 # data) and are therefore rewritten; every other sample must come through
@@ -328,14 +366,25 @@ def residual_probe():
     return json.dumps(obj)
 
 
+def diff_any(src, orig, path=''):
+    """Every difference, redaction included (for clean entries)."""
+    if isinstance(orig, dict) and isinstance(src, dict):
+        return [d for k in set(orig) | set(src) for d in diff_any(src.get(k), orig.get(k), f'{path}.{k}')]
+    return [] if src == orig else [f'{path}: {orig!r} became {src!r}']
+
+
 def redaction_diff(src, orig, path=''):
     """Differences between the captured source and the input other than redaction."""
     if src == '<redacted>':
         return []  # a whole value replaced (wrong type, or a wiped string)
     if isinstance(orig, dict):
-        if not isinstance(src, dict) or set(src) != set(orig):
-            return [f'{path}: keys {sorted(src) if isinstance(src, dict) else src!r} != {sorted(orig)}']
-        return [d for k in orig for d in redaction_diff(src[k], orig[k], f'{path}.{k}' if path else k)]
+        if not isinstance(src, dict):
+            return [f'{path}: {orig!r} became {src!r}']
+        renamed = set(src) - set(orig)
+        lost = set(orig) - set(src)
+        if len(renamed) != len(lost) or any('<redacted>' not in k for k in renamed):
+            return [f'{path}: keys {sorted(src)} != {sorted(orig)}']
+        return [d for k in set(orig) & set(src) for d in redaction_diff(src[k], orig[k], f'{path}.{k}' if path else k)]
     if isinstance(orig, list):
         if not isinstance(src, list) or len(src) != len(orig):
             return [f'{path}: list changed']
@@ -449,9 +498,10 @@ def main():
         if raw['message'] in CLEAN_SAMPLES and (source != original or kept_json(event.get('raw_data')) != original):
             failures.append(f'{raw["message"][:80]}...: clean sample was redacted or rewritten')
         if raw['message'] in CLEAN:
-            if kept_json(event.get('raw_data')) != original:
-                failures.append(f'{raw["message"][:80]}...: clean entry was rewritten')
-            if (event.get('resources') or [{}])[0].get('uid') != 'secret/data/s.payments-prod-us-east-1':
+            if kept_json(event.get('raw_data')) != original or source != original:
+                failures.append(f'{raw["message"][:80]}...: clean entry was rewritten: '
+                                f'{redaction_diff(source, original) or [d for d in diff_any(source, original)]}')
+            if '"clean-1"' in raw['message'] and (event.get('resources') or [{}])[0].get('uid') != 'secret/data/s.payments-prod-us-east-1':
                 failures.append(f'{raw["message"][:80]}...: clean path corrupted')
         elif raw['message'] in HOSTILE and event.get('class_uid') == 0 and source_json(raw['message']) is not None:
             failures.append(f'{raw["message"][:80]}...: parseable hostile entry fell back to Base Event')
