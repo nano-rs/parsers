@@ -190,12 +190,28 @@ def mutate_message(message, key, old, new):
     return variants
 
 
+def mutate_event(event, key, old, new):
+    """Events with source `key` changed: in the event's own fields (a collector
+    envelope next to `message`), or else inside its message."""
+    found = _resolve(event, key)
+    if found is not None and found[1] != 'message' and same(found[0][found[1]], old) and type(found[0][found[1]]) is type(old):
+        mutated = copy.deepcopy(event)
+        holder = _resolve(mutated, key)
+        holder[0][holder[1]] = new
+        return [mutated]
+    message = event.get('message')
+    if not isinstance(message, str):
+        return []
+    return [{**event, 'message': m} for m in mutate_message(message, key, old, new)]
+
+
 def run_vrl(program, messages):
-    """Run the instrumented program over messages; (output, source) per message."""
+    """Run the instrumented program over events (or bare message strings);
+    (output, source) per input."""
     with tempfile.TemporaryDirectory(prefix='provenance-') as tmp:
         tmp = Path(tmp)
         (tmp/'p.vrl').write_text(program + '\n.__coverage_source = __source_kv\n')
-        (tmp/'in.json').write_text(''.join(json.dumps({'message': m}) + '\n' for m in messages))
+        (tmp/'in.json').write_text(''.join(json.dumps(m if isinstance(m, dict) else {'message': m}) + '\n' for m in messages))
         run = subprocess.run(['vector', 'vrl', '--program', str(tmp/'p.vrl'), '--input', str(tmp/'in.json'), '--print-object'],
                              text=True, capture_output=True, timeout=900)
     assert run.returncode == 0, run.stderr
@@ -216,7 +232,18 @@ def transform_want(rule, value):
         if kind == 'lowercase':
             return value.lower() if isinstance(value, str) else MISSING
         if kind == 'epoch_ms':
-            clock = dt.datetime.fromisoformat(value.replace('Z', '+00:00')) if rule.get('format', '%+') == '%+' else dt.datetime.strptime(value, rule['format'])
+            fmt = rule.get('format', '%+')
+            if fmt == '%+':
+                clock = dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
+            else:
+                # chrono's %e (space-padded day) has no strptime twin; %d
+                # accepts the day once the padding space is collapsed.
+                if '%e' in fmt:
+                    fmt, value = fmt.replace('%e', '%d'), ' '.join(value.split())
+                    fmt = ' '.join(fmt.split())
+                clock = dt.datetime.strptime(value, fmt)
+            # A clock without an offset is local time, as Vector's runtime
+            # timezone reads it (vector vrl runs here, with this TZ).
             return int(clock.timestamp() * 1000)
         if kind == 'scale':
             return int(float(value) * rule['factor'])
@@ -235,6 +262,8 @@ def rule_mutations(rule, value):
         out = []
         for alt in [k for k, v in rule['values'].items() if v != here][:2]:
             if isinstance(value, bool):
+                if alt in ('true', 'false') and (alt == 'true') != value:
+                    out.append(alt == 'true')
                 continue
             if isinstance(value, int):
                 if alt.lstrip('-').isdigit():
@@ -267,11 +296,11 @@ def probe(program, samples, sources, outputs, items, per_key=6):
             variants = array_mutations(old) if isinstance(old, list) else (rule_mutations(rule, old) if rule else mutations(old))
             planned = False
             for new in variants:
-                for message in mutate_message(event['message'], key, old, new):
-                    if message == event['message']:
+                for mutated_event in mutate_event(event, key, old, new):
+                    if mutated_event == event:
                         continue
-                    plans.append((key, rule, old, new, event['message'], output, flat))
-                    messages.append(message)
+                    plans.append((key, rule, old, new, event.get('message'), output, flat))
+                    messages.append(mutated_event)
                     planned = True
             used += planned
     found = {}
