@@ -113,6 +113,7 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [OneLogin](parsers-ocsf/onelogin) | `onelogin` | OneLogin | JSON | Events API: 82 event_type_ids mapped (logins, failures, MFA, logouts, user lifecycle, password, role and privilege changes); other ids kept as Base Event |
 | [1Password](parsers-ocsf/onepassword) | `onepassword` | 1Password | JSON | Sign-in attempts, item usage, vault access events |
 | [CyberArk PAM](parsers-ocsf/cyberark) | `cyberark` | CyberArk | CEF syslog | Vault audit, PSM sessions, privileged access events |
+| [PingFederate](parsers-ocsf/pingfederate) | `pingfederate` | Ping Identity | Pipe-delimited audit.log (documented 15-field pattern) / CEF | Security audit log: SSO, SLO, OAuth, AUTHN_ATTEMPT and session events as Authentication with protocol, partner connection and tracking id |
 | [Netskope](parsers-ocsf/netskope) | `netskope` | Netskope | JSON | CASB/SSE: app activity, alerts, DLP, network events |
 | [F5 BIG-IP ASM](parsers-ocsf/f5_waf) | `f5_waf` | F5 | JSON | Web application firewall: attacks, violations, security events |
 | [HashiCorp Vault](parsers-ocsf/hashicorp_vault) | `hashicorp_vault` | HashiCorp | JSON (audit device) | Request / response audit entries as API Activity, login paths as Authentication; HMAC values kept as written. OCSF only |
