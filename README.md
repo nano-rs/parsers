@@ -95,7 +95,6 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [CyberArk PAM](parsers-ocsf/cyberark) | `cyberark` | CyberArk | CEF syslog | Vault audit, PSM sessions, privileged access events |
 | [Netskope](parsers-ocsf/netskope) | `netskope` | Netskope | JSON | CASB/SSE: app activity, alerts, DLP, network events |
 | [F5 BIG-IP ASM](parsers-ocsf/f5_waf) | `f5_waf` | F5 | JSON | Web application firewall: attacks, violations, security events |
-| [HashiCorp Vault](parsers-ocsf/hashicorp_vault) | `hashicorp_vault` | HashiCorp | JSON (audit device) | Request / response audit entries as API Activity, login paths as Authentication; HMAC values kept as written. OCSF only |
 | [Teleport](parsers-ocsf/teleport) | `teleport` | Teleport | JSON (audit log) | Logins and session start / end, exec and session commands, scp / sftp, user and access-request changes, role changes, cert and API events. OCSF only |
 
 ### Vulnerability Management
