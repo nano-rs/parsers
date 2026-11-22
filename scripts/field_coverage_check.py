@@ -121,6 +121,9 @@ def check(source, output, raw, rules, consumed=(), mappings=None):
             continue
         if value == raw: continue
         base = '.'.join(snake(provenance.unesc(part)) for part in key.split('.'))
+        # A name nano owns in unmapped is spilled as source_<name> (no forged marker).
+        if base in RESERVED or base.startswith('nano.'):
+            base = 'source_' + base
         matched = False
         for slot, actual in residual.items():
             if slot in used or not (slot == base or re.fullmatch(re.escape(base)+r'_\d+', slot)): continue
@@ -596,7 +599,28 @@ def strip_comments(vrl):
     return ''.join(out)
 
 
-TIMEZONE_ARG = re.compile(r',\s*timezone\s*:')
+def split_args(args):
+    """Top-level comma-separated arguments of a call (strings and nesting kept)."""
+    parts, depth, cur, i = [], 0, [], 0
+    while i < len(args):
+        c = args[i]
+        if c == '"':
+            j = i + 1
+            while j < len(args) and args[j] != '"':
+                j += 2 if args[j] == '\\' else 1
+            cur.append(args[i:j + 1]); i = j + 1; continue
+        if c == "'" and i and args[i - 1] == 'r':
+            j = args.find("'", i + 1); j = len(args) if j < 0 else j
+            cur.append(args[i:j + 1]); i = j + 1; continue
+        if c in '([{':
+            depth += 1
+        elif c in ')]}':
+            depth -= 1
+        elif c == ',' and depth == 0:
+            parts.append(''.join(cur)); cur = []; i += 1; continue
+        cur.append(c); i += 1
+    parts.append(''.join(cur))
+    return parts
 
 
 def naive_timestamps(vrl):
@@ -623,12 +647,22 @@ def naive_timestamps(vrl):
             elif c == ')':
                 depth -= 1
             i += 1
-        args = text[m.end():i]
-        # A format that carries an offset ("%+", %z, %:z) needs no timezone.
-        if not TIMEZONE_ARG.search(args) and not re.search(r'"[^"]*(?:%\+|%:?z)[^"]*"', args):
+        args = text[m.end():i - 1]
+        parts = split_args(args)
+        fmt = parts[1].strip() if len(parts) > 1 else ''
+        named = {p.split(':', 1)[0].strip(): p.split(':', 1)[1].strip() for p in parts[2:] if re.match(r'\s*\w+\s*:', p)}
+        # "local" is the Vector host's zone: the host-dependence the rule exists to stop.
+        if named.get('timezone', '').strip('"').lower() == 'local':
+            bad.append(text[m.start():i][:80])
+            continue
+        # A FORMAT (the second argument) that carries an offset needs no timezone.
+        if 'timezone' not in named and not re.fullmatch(r'"[^"]*(?:%\+|%:?z)[^"]*"', fmt):
             bad.append(text[m.start():i][:80])
     return bad
 
+
+# Names nano owns in unmapped: parser markers and the nano.* namespace.
+RESERVED = {'nano', 'nano_time_assumed_tz', 'nano_time_source', 'nano_operational'}
 
 PROBES = ('residual_probe', 'text_residual_probe')
 

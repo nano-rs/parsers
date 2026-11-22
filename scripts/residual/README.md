@@ -1,13 +1,17 @@
 # Residual source preservation
 
 `residual_spill.py` also opens every parser with the shared source-timezone
-prelude (`source_tz.vrl`): it reads and removes `.nano.source_timezone` (the
-log source's timezone setting, an IANA name or a fixed offset) and sets
-`__src_tz` (an IANA name; UTC if absent or invalid) and `__src_shift_ms` (any
-fixed `+HH:MM` offset, applied by arithmetic) for clocks without an offset. When a
-parser read such a clock (`__time_assumed`), the spill records the zone in
-`unmapped.nano_time_assumed_tz`. `.nano` is nano's input, never a source field:
-`scripts/test_source_timezone.py` checks the shift and that `.nano` never
+prelude (`source_tz.vrl`): it removes `.nano` whole and resolves
+`.nano.source_timezone` (the log source's timezone setting: an IANA name, or
+any `+HH:MM` offset; UTC if absent, invalid or "local") into `__src_tz` /
+`__src_shift_ms`, and `__src_year`, the current year in that zone. A parser
+reads an offset-less clock as UTC and records its ms in `__time_local`
+(`__time_noyear` for a clock without a year). Before anything else the spill
+block converts every `*time` field holding a recorded value to real UTC (DST:
+an ambiguous time takes its first occurrence, a gap time moves forward; a
+no-year clock more than a day ahead moves to last year) and records the zone
+in `unmapped.nano_time_assumed_tz`. `scripts/test_source_timezone.py` checks
+the shift, the DST transitions, the year boundary and that `.nano` never
 leaks.
 
 **Parsers never mask, redact or withhold anything.** A parser converts raw to

@@ -40,6 +40,10 @@ class ResidualTests(unittest.TestCase):
             ({'Res': 'r1'}, {'resources': [{'uid': 'x'}, {'uid': 'r1'}]}, {}),
             ({'Res': 'r1'}, {'resources': [{'name': 'r1'}]}, {'res': 'r1'}),
             ({'cs(Host)': 'h'}, {'http_request': {'url': {'hostname': 'h'}}}, {}),
+            # A source key named like a nano marker or the nano.* namespace is
+            # kept, renamed source_<name>: a log cannot forge a marker.
+            ({'nano_time_assumed_tz': 'Mars/Base', 'nano': {'x': 1}, 'nano_operational': True}, {},
+             {'source_nano_time_assumed_tz': 'Mars/Base', 'source_nano.x': 1, 'source_nano_operational': True}),
             # A literal dotted key is not the nested path it spells: mapping the
             # nested x.y never consumes the literal "x.y" (and vice versa).
             ({'x.y': 'literal', 'x': {'y': 'nested'}}, {'nested_target': 'nested'}, {'x.y': 'literal'}),
@@ -188,6 +192,10 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(naive('t = parse_timestamp(p.timezone, "%+")'), [])
         self.assertEqual(naive('t = parse_timestamp(s, "%d/%b/%Y:%H:%M:%S %z")'), [])
         self.assertEqual(len(naive('t = parse_timestamp(timezone, fmt)')), 1)
+        # "local" is the host's zone; an offset elsewhere in the call is not the format.
+        self.assertEqual(len(naive('t = parse_timestamp(s, "%Y", timezone: "local")')), 1)
+        self.assertEqual(len(naive('t = parse_timestamp(s + " %z", "%Y")')), 1)
+        self.assertEqual(naive('t = parse_timestamp(s + " +0000", "%Y %z")'), [])
         self.assertEqual(len(naive('t = parse_timestamp(s, "%Y") # timezone: "UTC"')), 1)
 
     def test_json_envelope_retired(self):
@@ -477,6 +485,20 @@ class ProvenanceTests(unittest.TestCase):
             path.write_text('parser_vrl: |\n' + body + 'samples: ' + json.dumps([{'raw': json.dumps({'msg': m, 'code': c})} for m, c in (('a', 0), ('b', 1), ('c', 2))]) + '\n')
             residual_spill.update(path)
             with self.assertRaisesRegex(AssertionError, 'without provenance.*PROVENANCE_SEED='):
+                fcc.run_parser(path)
+
+    def test_small_text_code_lookup_fails(self):
+        # The same 4-entry identity lookup over codes written as text.
+        program = JSON_PARSER.replace('"tags": STATIC', '"tags": [], "severity_id": 99') + 'if includes(["0", "1", "2", "3"], __source_kv.sev) { .severity_id = to_int!(__source_kv.sev) }\n'
+        import residual_spill
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'probe'/'parser.yaml'
+            path.parent.mkdir()
+            (path.parent/'field-coverage.yaml').write_text(json.dumps({'source': 'json', 'mappings': {'msg': 'message', 'sev': 'severity_id'}}))
+            body = ''.join('  ' + line + '\n' for line in program.strip().splitlines())
+            path.write_text('parser_vrl: |\n' + body + 'samples: ' + json.dumps([{'raw': json.dumps({'msg': m, 'sev': c})} for m, c in (('a', '0'), ('b', '1'), ('c', '2'), ('d', '3'))]) + '\n')
+            residual_spill.update(path)
+            with self.assertRaisesRegex(AssertionError, 'without provenance'):
                 fcc.run_parser(path)
 
     def test_draws_are_deterministic(self):
