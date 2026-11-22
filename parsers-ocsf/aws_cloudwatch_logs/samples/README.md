@@ -28,3 +28,5 @@ Account IDs use 123456789012 / 210987654321 and IPs documentation ranges.
 | `forwarder_bom_unmovable_json_secret_withheld.json` | review regression: a BOM JSON message that cannot be moved (input `message_json`) is withheld | constructed |
 | `forwarder_python_bracket_text.json` | a Python Lambda `[INFO]` line stays text: not mistaken for JSON | constructed |
 | `forwarder_unmovable_number_array_secret_withheld.json`, `forwarder_truncated_null_array_secret_withheld.json`, `export_line_truncated_number_array_secret_withheld.json` | review regression: a JSON array opening with a number or `null` that cannot be moved (input `message_json`, or truncated) is withheld, never echoed | constructed |
+| `forwarder_bracketed_timestamp_text.json` | review regression: a Python/Log4j `[2026-11-21 10:00:00,123] INFO` line stays text (not a JSON array) | constructed |
+| `forwarder_unmovable_null_array_withheld.json` | a valid JSON array that cannot be moved (input `message_json`) is withheld | constructed |

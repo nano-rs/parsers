@@ -164,6 +164,15 @@ class RunParserTests(unittest.TestCase):
     def test_lossless(self):
         self.run_parser()
 
+    def test_keep_without_raw_data_fails(self):
+        # parse_json_object keep withholds too: same raw_data rule, checked centrally.
+        _, any_withheld = fcc.withholds_data({'details': '{"important_action": "delete_prod_db"}'},
+                                             [{'kind': 'parse_json_object', 'paths': ['details'], 'target': 'details_json', 'keep': ['_never_exists']}])
+        self.assertTrue(any_withheld)
+        _, any_withheld = fcc.withholds_data({'details': '{"id": "1"}'},
+                                             [{'kind': 'parse_json_object', 'paths': ['details'], 'target': 'details_json', 'keep': ['id']}])
+        self.assertFalse(any_withheld)
+
     def test_withhold_without_raw_data_fails(self):
         with self.assertRaisesRegex(AssertionError, 'raw_data equal to the raw body'):
             self.run_parser(raw_data='"DROPPED_NO_RAW_COPY"')
@@ -541,6 +550,16 @@ class NormalizeProbeTests(unittest.TestCase):
         self.assertTrue(withheld['message']['withheld'])
         with self.assertRaises(AssertionError):
             normalize_probes(samples[:1], steps, fake_kv)
+
+    def test_probe_tail_key_and_decoded_keep(self):
+        step = dict(KV, tail_key='representation')
+        samples = [('tail', {'message': json.dumps({'message': 'operationType=CREATE, realmId=r1, representation={"id":"1"}'})})]
+        [(_, event)] = normalize_probes(samples, [step], fake_kv)
+        planted = json.loads(event['message'])['message']
+        self.assertTrue(planted.endswith(', representation={"id":"1"}'), planted)
+        keep = {'kind': 'parse_json_object', 'paths': ['representation'], 'target': 'representation_json', 'keep': ['id']}
+        decoded = [('obj', {'message': json.dumps({'representation': {'id': '1', 'x': 2}})})]
+        self.assertEqual([n for n, _ in normalize_probes(decoded, [keep])], ['withhold_probe_0'])
 
     def test_unexercised_step_fails(self):
         with self.assertRaises(AssertionError):
