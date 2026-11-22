@@ -5,32 +5,149 @@ source_normalize:
   match: ^(type|operationType)=
   key_value_delimiter: '='
   field_delimiter: ', '
-  tail_key: representation
-  reason: A Keycloak JSON log record carries the event line in `message`; the parser
-    replaces that key with the pairs parsed from it (`representation=` takes the rest
-    of the line, never split), so its details spill as redacted keys. Skipped on a
-    parse error, an empty result or a key the record already has.
-- kind: withhold
-  paths:
-  - message
-  match: '^[\s\S]'
-  reason: Any message left after the unpack (not a clean event line, or one that could
-    not be unpacked) may carry credentials key redaction cannot reach, so only its
-    byte length and sha256 stay (raw_data keeps it).
+  tail_keys:
+  - representation
+  - requestUri
+  - cookies
+  - stackTrace
+  reason: A Keycloak JSON log record carries the event line in `message`; the parser replaces
+    that key with the pairs parsed from it. The values a line ends with (representation, and
+    at TRACE requestUri, cookies, stackTrace) are cut off whole first, never split on ', '.
+    Skipped on a parse error, an empty result or a key the record already has.
+- kind: allowlist
+  keep:
+  - id
+  - time
+  - type
+  - operationType
+  - realmId
+  - realmName
+  - clientId
+  - userId
+  - ipAddress
+  - sessionId
+  - error
+  - resourceType
+  - resourcePath
+  - representation
+  - requestUri
+  - authSessionParentId
+  - authSessionTabId
+  - auth_method
+  - auth_type
+  - client_auth_method
+  - code_id
+  - consent
+  - grant_type
+  - redirect_uri
+  - response_mode
+  - response_type
+  - scope
+  - refresh_token_type
+  - username
+  - email
+  - impersonator
+  - impersonator_id
+  - impersonator_realm
+  - reason
+  - remember_me
+  - identity_provider
+  - identity_provider_identity
+  - register_method
+  - previous_email
+  - updated_email
+  - custom_required_action
+  - timestamp
+  - '@timestamp'
+  - level
+  - log.level
+  - log.logger
+  - loggerClassName
+  - loggerName
+  - threadName
+  - threadId
+  - hostName
+  - processName
+  - processId
+  - sequence
+  - ndc
+  - host.hostname
+  - process.name
+  - process.pid
+  - process.thread.id
+  - process.thread.name
+  - service.name
+  - service.version
+  - service.environment
+  - ecs.version
+  - event.sequence
+  - data_stream.type
+  - log_time
+  - log_level
+  - logger
+  - thread
+  nested:
+    details:
+    - auth_method
+    - auth_type
+    - client_auth_method
+    - code_id
+    - consent
+    - grant_type
+    - redirect_uri
+    - response_mode
+    - response_type
+    - scope
+    - refresh_token_type
+    - username
+    - email
+    - impersonator
+    - impersonator_id
+    - impersonator_realm
+    - reason
+    - remember_me
+    - identity_provider
+    - identity_provider_identity
+    - register_method
+    - previous_email
+    - updated_email
+    - custom_required_action
+    authDetails:
+    - realmId
+    - clientId
+    - userId
+    - ipAddress
+  urls:
+  - requestUri
+  - redirect_uri
+  reason: 'Fail closed: only documented Keycloak event fields and JSON log envelope metadata
+    stay; URLs keep scheme, host and path. Cookies, stack traces, request query strings, unparsed
+    or non-string messages, Quarkus exceptions, mdc, a pre-existing representation_json and
+    unknown details are withheld together.'
 - kind: parse_json_object
   paths:
   - representation
   target: representation_json
-  keep: [id, username, email, firstName, lastName, enabled, clientId, name, realm, type]
-  reason: An admin event's representation can hold secrets with no secret-looking key
-    (CredentialRepresentation value, private keys), so it is cut to non-secret scalar
-    fields; every other field is withheld together.
+  keep:
+  - id
+  - username
+  - email
+  - firstName
+  - lastName
+  - enabled
+  - clientId
+  - name
+  - realm
+  - type
+  reason: An admin event representation can hold secrets with no secret-looking key (CredentialRepresentation
+    value, private keys), so it is cut to non-secret scalar fields; every other field is withheld
+    together.
 - kind: withhold
   paths:
   - representation
-  match: '^[\s\S]'
-  reason: A representation that is not a JSON object (an array, not JSON) cannot be
-    filtered, so only its byte length and sha256 stay (raw_data keeps it).
+  match: ^[\s\S]
+  reason: A representation that is not a JSON object (an array, not JSON) cannot be filtered,
+    so only its byte length and sha256 stay (raw_data keeps it).
 transforms:
 - source: '@timestamp'
   kind: epoch_ms
@@ -54,6 +171,8 @@ probe:
   require: '[org.keycloak.events] (default task-'
   text: ', ResidualProbe="nan2421-text-unknown", password="nan2421-secret"'
   source: ResidualProbe
+  # The allowlist (source_normalize) withholds an unknown field.
+  expect_withheld: true
 consumed_candidates:
 - representation_json.email
 - representation_json.name

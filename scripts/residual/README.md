@@ -69,10 +69,19 @@ capture must equal the input after exactly those steps (`normalized_source` in
 - `parse_kv_merge` `{path, match, key_value_delimiter, field_delimiter}`: a
   top-level string matching `match` is parsed with VRL `parse_key_value`
   (whitespace strict; the checker calls Vector for the exact result), removed,
-  and its pairs merged in (Keycloak's JSON log `message`). With `tail_key`,
-  everything after the first `<field_delimiter><tail_key><kv_delimiter>` is
-  that key's value verbatim (a JSON string literal is unquoted), so a JSON
-  tail such as Keycloak's `representation={...}` is never split.
+  and its pairs merged in (Keycloak's JSON log `message`). With `tail_keys`,
+  the keys a line ends with keep their text verbatim (a JSON string literal
+  is unquoted), so a tail such as Keycloak's `representation={...}` or
+  `cookies=[...]` is never split.
+- `allowlist` `{keep, nested?, urls?}`: fail closed. Only `keep` top-level
+  keys with scalar values stay, plus each `nested` key's object cut to its own
+  key list; a `urls` key keeps only `scheme://host[:port]path` (VRL
+  `parse_url`, computed by Vector). Every other key (and the full form of a
+  shortened URL) is withheld together as `withheld_fields`. For sources whose
+  secrets have no secret-looking key: cookies, URLs, stack traces, a hostile
+  pre-existing key. `parse_kv_merge` takes `tail_keys` (the keys a line ends
+  with, each cut off whole: the last occurrence, the first key's first
+  occurrence) instead of a single `tail_key`.
 - `withhold` `{paths, match}`: at the first listed path that exists, a value
   whose text (the string itself, else its VRL `encode_json`) matches `match`
   is replaced by `{withheld: true, bytes, sha256}` of that text (UTF-8 bytes,
@@ -157,6 +166,9 @@ Some existing derived evidence has meaning beyond source-value equality.
 context). Those objects retain their existing shape and are recursively redacted.
 The flat dotted-key requirement applies to the new source residuals.
 
+A text probe with `expect_withheld: true` (a parser that allowlists its
+source, such as Keycloak) instead requires the unseen field to be withheld:
+absent from the source, counted in `withheld_fields`, kept in `raw_data`.
 Configured text probes inject unseen fields and password values through KV,
 CEF, XML, rendered Windows text, and multi-element syslog structured data. They
 assert both successful capture and redacted preservation. Probes are temporary

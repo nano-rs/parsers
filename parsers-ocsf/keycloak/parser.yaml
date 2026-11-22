@@ -47,49 +47,19 @@ parser_vrl: |
       __source_kv = object!(parsed)
       pj = object!(parsed)
       if is_string(pj.message) && match(string!(pj.message), r'^(type|operationType)=') {
-          # Keycloak JSON log handler: the jboss-logging line is in `message`.
-          # It is unpacked only when it parses to a non-empty set of pairs none of
-          # which the record already has (source_normalize parse_kv_merge in
-          # field-coverage.yaml); otherwise the record is kept whole.
-          # `, representation=` takes the rest of the line verbatim (its JSON may
-          # hold ", "): split it off before the key=value parse (tail_key).
-          jbody = string!(pj.message)
-          jtail = null
-          # find() is null when absent.
-          jif = find(jbody, ", representation=")
-          ji = -1
-          if is_integer(jif) { ji = to_int!(jif) }
-          if ji > 0 {
-              jtail = slice!(jbody, ji + 17)
-              jbody = slice!(jbody, 0, ji)
-              if starts_with(string!(jtail), "\"") {
-                  ju, juerr = parse_json(string!(jtail))
-                  if juerr == null && is_string(ju) { jtail = ju }
-              }
-          }
-          jkv, jkverr = parse_key_value(jbody, key_value_delimiter: "=", field_delimiter: ", ", whitespace: "strict")
-          jtail_collides = false
-          if jtail != null {
-              if exists(jkv.representation) { jtail_collides = true } else { jkv.representation = jtail }
-          }
-          jrest = pj
-          __discard = del(jrest.message)
-          jrest_keys = keys(jrest)
-          jcollide = false
-          for_each(jkv) -> |k, _v| { if includes(jrest_keys, k) { jcollide = true } }
-          if jkverr == null && length(jkv) > 0 && !jcollide && !jtail_collides {
-              shape = "json_log"
-              kv_body = string!(pj.message)
-              # ECS layout (@timestamp, log.level) or Keycloak's native Quarkus
-              # JSON log (timestamp, level).
-              envelope_time = string(get(pj, ["@timestamp"]) ?? "") ?? ""
-              if envelope_time == "" { envelope_time = string(pj.timestamp) ?? "" }
-              log_level = string(get(pj, ["log.level"]) ?? "") ?? ""
-              if log_level == "" { log_level = string(pj.level) ?? "" }
-          }
-          # A colliding or unparsable event line is never read as a REST event
-          # (those carry no `type=` message): it takes the explicit fallback, and
-          # its message is withheld below.
+          # Keycloak JSON log handler: the jboss-logging line is in `message`. It is
+          # unpacked below only when it parses cleanly and none of its pairs is a key
+          # the record already has (source_normalize parse_kv_merge); otherwise the
+          # record falls back and its message is withheld with every other
+          # non-allowlisted field. Never read as a REST event.
+          shape = "json_log"
+          kv_body = string!(pj.message)
+          # ECS layout (@timestamp, log.level) or Keycloak's native Quarkus
+          # JSON log (timestamp, level).
+          envelope_time = string(get(pj, ["@timestamp"]) ?? "") ?? ""
+          if envelope_time == "" { envelope_time = string(pj.timestamp) ?? "" }
+          log_level = string(get(pj, ["log.level"]) ?? "") ?? ""
+          if log_level == "" { log_level = string(pj.level) ?? "" }
       } else if exists(pj.type) || exists(pj.operationType) {
           shape = "json"
           e = pj
@@ -110,28 +80,59 @@ parser_vrl: |
 
   kv = {}
   if kv_body != "" {
+      # A jboss-logging line ends with values that may hold ", " (tail_keys):
+      # [representation], then at TRACE requestUri, cookies=[...] and stackTrace.
+      # Each is cut off whole (the last occurrence; representation the first)
+      # before the key=value parse, so a cookie or a JSON value never becomes a
+      # key of its own.
       kbody = kv_body
-      ktail = null
+      ktails = {}
+      for_each(["stackTrace", "cookies", "requestUri"]) -> |_i, tk| {
+          tmark = ", " + tk + "="
+          tpieces = split(kbody, tmark)
+          if length(tpieces) > 1 {
+              thead = join!(slice!(tpieces, 0, -1), tmark)
+              if thead != "" {
+                  tval = string!(tpieces[-1])
+                  if starts_with(tval, "\"") {
+                      tu, tuerr = parse_json(tval)
+                      if tuerr == null && is_string(tu) { tval = string!(tu) }
+                  }
+                  ktails = set!(ktails, [tk], tval)
+                  kbody = thead
+              }
+          }
+      }
       # find() is null when absent.
       kif = find(kbody, ", representation=")
       ki = -1
       if is_integer(kif) { ki = to_int!(kif) }
       if ki > 0 {
-          ktail = slice!(kbody, ki + 17)
+          rtail = slice!(kbody, ki + 17)
           kbody = slice!(kbody, 0, ki)
-          if starts_with(string!(ktail), "\"") {
-              ku, kuerr = parse_json(string!(ktail))
-              if kuerr == null && is_string(ku) { ktail = ku }
+          if starts_with(rtail, "\"") {
+              ku, kuerr = parse_json(rtail)
+              if kuerr == null && is_string(ku) { rtail = string!(ku) }
           }
+          ktails.representation = rtail
       }
       kv, kverr = parse_key_value(kbody, key_value_delimiter: "=", field_delimiter: ", ", whitespace: "strict")
-      if kverr == null && ktail != null {
-          if exists(kv.representation) { kverr = "representation given twice" } else { kv.representation = ktail }
+      kok = kverr == null && length(kv) > 0
+      if kok {
+          kv_keys = keys(kv)
+          for_each(ktails) -> |tk, _tv| { if includes(kv_keys, tk) { kok = false } }
+      }
+      if kok { kv = merge(kv, ktails) }
+      # A JSON log line unpacks only when no pair collides with a record key.
+      if kok && shape == "json_log" {
+          kouter = __source_kv
+          __discard = del(kouter.message)
+          kouter_keys = keys(kouter)
+          for_each(kv) -> |k, _v| { if includes(kouter_keys, k) { kok = false } }
       }
       # A line that does not parse (or parses to nothing) is not an event: it
-      # takes the explicit fallback with its source kept whole, never a
-      # Success with empty fields.
-      if kverr != null || length(kv) == 0 {
+      # takes the explicit fallback, never a Success with empty fields.
+      if !kok {
           shape = ""
           kv = {}
       }
@@ -154,15 +155,79 @@ parser_vrl: |
       e.details = details
   }
 
-  # ---- unparsed message text (source_normalize withhold) ----
-  # Any message left in the source (a JSON log line that is not a clean event
-  # line, or did not unpack) may carry credentials redaction cannot reach inside
-  # text: only its byte length and sha256 stay outside raw_data.
-  if is_string(__source_kv.message) || is_array(__source_kv.message) {
-      mw = __source_kv.message
-      mt = if is_string(mw) { string!(mw) } else { encode_json(mw) }
-      if match(mt, r'^[\s\S]') { __source_kv.message = {"withheld": true, "bytes": length(mt), "sha256": sha2(mt, variant: "SHA-256")} }
+
+  # ---- event-field allowlist (source_normalize allowlist in field-coverage.yaml) ----
+  # Fail closed: only the documented Keycloak event fields (and the JSON log
+  # envelope's own metadata) stay in the source; requestUri / redirect_uri keep
+  # only scheme://host[:port]path. Everything else (cookies, stackTrace, the
+  # full request URI, an unparsed or non-string message, Quarkus exception,
+  # mdc, a pre-existing representation_json, unknown details) is withheld
+  # together as withheld_fields: only its byte length and sha256 stay outside
+  # raw_data.
+  al_keep = ["id", "time", "type", "operationType", "realmId", "realmName", "clientId", "userId", "ipAddress", "sessionId", "error", "resourceType", "resourcePath", "representation", "requestUri", "authSessionParentId", "authSessionTabId", "auth_method", "auth_type", "client_auth_method", "code_id", "consent", "grant_type", "redirect_uri", "response_mode", "response_type", "scope", "refresh_token_type", "username", "email", "impersonator", "impersonator_id", "impersonator_realm", "reason", "remember_me", "identity_provider", "identity_provider_identity", "register_method", "previous_email", "updated_email", "custom_required_action", "timestamp", "@timestamp", "level", "log.level", "log.logger", "loggerClassName", "loggerName", "threadName", "threadId", "hostName", "processName", "processId", "sequence", "ndc", "host.hostname", "process.name", "process.pid", "process.thread.id", "process.thread.name", "service.name", "service.version", "service.environment", "ecs.version", "event.sequence", "data_stream.type", "log_time", "log_level", "logger", "thread"]
+  al_details = ["auth_method", "auth_type", "client_auth_method", "code_id", "consent", "grant_type", "redirect_uri", "response_mode", "response_type", "scope", "refresh_token_type", "username", "email", "impersonator", "impersonator_id", "impersonator_realm", "reason", "remember_me", "identity_provider", "identity_provider_identity", "register_method", "previous_email", "updated_email", "custom_required_action"]
+  al_auth = ["realmId", "clientId", "userId", "ipAddress"]
+  al_urls = ["requestUri", "redirect_uri"]
+  al_kept = {}
+  al_rest = {}
+  for_each(__source_kv) -> |k, v| {
+      if (k == "details" || k == "authDetails") && is_object(v) {
+          al_allowed = al_auth
+          if k == "details" { al_allowed = al_details }
+          al_inner = {}
+          al_inner_rest = {}
+          for_each(object!(v)) -> |ik, iv| {
+              if !includes(al_allowed, ik) || is_object(iv) || is_array(iv) {
+                  al_inner_rest = set!(al_inner_rest, [ik], iv)
+              } else if includes(al_urls, ik) {
+                  al_short = ""
+                  if is_string(iv) {
+                      au, auerr = parse_url(string!(iv))
+                      if auerr == null && is_string(au.scheme) && is_string(au.host) && string!(au.host) != "" {
+                          al_short = string!(au.scheme) + "://" + string!(au.host)
+                          if is_integer(au.port) { al_short = al_short + ":" + to_string!(au.port) }
+                          al_short = al_short + (string(au.path) ?? "")
+                      }
+                  }
+                  if al_short == "" {
+                      al_inner_rest = set!(al_inner_rest, [ik], iv)
+                  } else {
+                      al_inner = set!(al_inner, [ik], al_short)
+                      if al_short != iv { al_inner_rest = set!(al_inner_rest, [ik], iv) }
+                  }
+              } else {
+                  al_inner = set!(al_inner, [ik], iv)
+              }
+          }
+          al_kept = set!(al_kept, [k], al_inner)
+          if length(al_inner_rest) > 0 { al_rest = set!(al_rest, [k], al_inner_rest) }
+      } else if !includes(al_keep, k) || is_object(v) || is_array(v) {
+          al_rest = set!(al_rest, [k], v)
+      } else if includes(al_urls, k) {
+          al_short = ""
+          if is_string(v) {
+              au, auerr = parse_url(string!(v))
+              if auerr == null && is_string(au.scheme) && is_string(au.host) && string!(au.host) != "" {
+                  al_short = string!(au.scheme) + "://" + string!(au.host)
+                  if is_integer(au.port) { al_short = al_short + ":" + to_string!(au.port) }
+                  al_short = al_short + (string(au.path) ?? "")
+              }
+          }
+          if al_short == "" {
+              al_rest = set!(al_rest, [k], v)
+          } else {
+              al_kept = set!(al_kept, [k], al_short)
+              if al_short != v { al_rest = set!(al_rest, [k], v) }
+          }
+      } else {
+          al_kept = set!(al_kept, [k], v)
+      }
   }
+  if length(al_rest) > 0 {
+      al_text = encode_json(al_rest)
+      al_kept.withheld_fields = {"withheld": true, "bytes": length(al_text), "sha256": sha2(al_text, variant: "SHA-256")}
+  }
+  __source_kv = al_kept
 
   # ---- admin-event representation (source_normalize in field-coverage.yaml) ----
   # The representation is JSON (a user with credentials, a client with its secret,
@@ -307,7 +372,8 @@ parser_vrl: |
           op_delete = optype == "DELETE"
           target = {}
           if path_id != "" { target.uid = path_id }
-          rep = object(parse_json(string(e.representation) ?? "") ?? {}) ?? {}
+          # The allowlisted representation fields (never anything withheld).
+          rep = object(__source_kv.representation_json) ?? {}
           rep_user = string(rep.username) ?? ""
           if rep_user != "" { target.name = rep_user }
           rep_email = string(rep.email) ?? ""

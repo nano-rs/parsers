@@ -57,3 +57,13 @@ ranges, users with example.com addresses.
   (a JSON log message that is not a clean event line is withheld). Shapes per
   Keycloak's CredentialRepresentation, CertificateRepresentation and
   StripSecretsUtils.
+- Round-5 review regressions (each carries `nan2421-secret`, allowed only in
+  `raw_data`): TRACE jboss-logging lines (`text_trace_login_cookies_request_uri`,
+  `json_log_trace_login_cookies_request_uri`, `text_trace_admin_delete_user_cookies`,
+  `text_trace_login_error_stack_trace`, `text_trace_admin_create_user_representation`)
+  whose `requestUri`, `cookies=[...]` and `stackTrace` tails are cut off whole and
+  withheld (requestUri keeps scheme, host and path); and hostile JSON shapes
+  (`json_admin_object_representation_with_representation_json`,
+  `json_admin_preexisting_representation_json`, `json_log_object_message_secret`,
+  `json_log_quarkus_exception_secret`) withheld by the event-field allowlist. Line
+  layout per Keycloak's JBossLoggingEventListenerProvider (setKeycloakContext).
