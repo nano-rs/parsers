@@ -296,17 +296,20 @@ and after a large rewrite. CI runs the check on every PR (job "Parser load budge
   that has no offset in the Vector host's timezone, so one line gets a
   different time on every host; `field_coverage_check.py` rejects such a call.
   The goal is proper UTC everywhere, even when the log is not: honor an inline
-  timezone or offset when the line carries one; for a clock without an offset
-  pass `timezone: __src_tz` (the log source's timezone setting, which nano
-  sends as `.nano.source_timezone`, an IANA name or any `+HH:MM` offset; UTC
-  if unset or invalid) and, when that parse succeeds, set
-  `__time_assumed = true` and subtract `__src_shift_ms` (non-zero for a fixed
-  offset), so the event records the zone used in
-  `unmapped.nano_time_assumed_tz`. The shared prelude that
-  `residual_spill.py` puts at the top of every parser
+  timezone or offset when the line carries one. For a clock without an offset,
+  parse it with `timezone: "UTC"` and, when the parse succeeds, set
+  `__time_assumed = true` and append its ms to `__time_local`
+  (`__time_local = __time_local + "," + to_string(ms)`; a clock with no year
+  uses `__src_year` and appends to `__time_noyear` too). The shared spill block
+  then converts every `*time` field holding that value with the log source's
+  timezone setting (`.nano.source_timezone`: an IANA name with its DST rules,
+  or any `+HH:MM` offset; UTC if unset, invalid or "local"), resolves
+  ambiguous fall-back times to their first occurrence and gap times forward,
+  moves a no-year clock more than a day in the future to last year, and
+  records the zone used in `unmapped.nano_time_assumed_tz`. The shared prelude
   (`scripts/residual/source_tz.vrl`) resolves the setting and removes `.nano`
-  before the parser runs. Use `timezone: "UTC"` only for a format that is UTC
-  by specification.
+  before the parser runs. A UTC-by-specification format just uses
+  `timezone: "UTC"` and records nothing.
 - UDM names do not exist in OCSF. `src_ip` is `src_endpoint.ip`, `user` is
   `actor.user.name` (the actor) or `user.name` (the subject, class-dependent),
   `timestamp` is `time`, `id` is `metadata.uid`, `ext.foo` is `unmapped.foo`.
