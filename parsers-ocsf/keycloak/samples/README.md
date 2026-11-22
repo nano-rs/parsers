@@ -22,6 +22,10 @@ Sources:
 - `json_log_unparsable_kv_fallback` (review regression) is a native JSON log
   record whose event line does not parse (a trailing `, `): it takes the
   fallback branch with `message` kept, never a Success with empty fields.
+- `json_log_forwarder_type_collision_fallback` (review regression) is a JSON
+  log record a forwarder tagged with its own top-level `type`: the event line
+  collides with it, so the record falls back instead of being read as a REST
+  event with `status_id` Success.
 
 UUIDs are replaced with `00000000-0000-…` values, addresses with documentation
 ranges, users with example.com addresses.

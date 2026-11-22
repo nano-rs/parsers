@@ -59,7 +59,9 @@ def kind_templates():
 def rule_body(rule, templates):
     """One rule's body, written against the loop's `key` and `value`."""
     if isinstance(rule.get('target'), str):
-        path = ''.join('.' + vrl_string(part) for part in rule['target'].split('.'))
+        # Against __mapped (no raw_data, unmapped, or raw-body message), like
+        # every other piece of coverage evidence.
+        path = '__mapped' + ''.join('.' + vrl_string(part) for part in rule['target'].split('.'))
         match = path + ' == __expected'
     else:
         match = 'contains(__represented, "," + encode_json(encode_json(__expected)))'
@@ -131,6 +133,10 @@ def check_rule(rule):
     assert isinstance(rule, dict) and isinstance(rule.get('source'), str) and rule['source'], f'transform needs a source: {rule!r}'
     assert isinstance(rule.get('reason'), str) and rule['reason'].strip(), f'every transformation needs a justification: {rule["source"]}'
     assert rule.get('kind') in KINDS, f'{rule["source"]}: unknown transform kind {rule.get("kind")!r}'
+    if 'target' in rule:
+        target = rule['target']
+        assert isinstance(target, str) and target and all(target.split('.')), f'{rule["source"]}: target must be a dotted path'
+        assert target.split('.')[0] not in ('unmapped', 'raw_data'), f'{rule["source"]}: target may not be under unmapped or raw_data'
     if rule['kind'] == 'truncate':
         assert isinstance(rule.get('target'), str) and rule['target'], f'{rule["source"]}: truncate needs a target'
         length = rule.get('length')

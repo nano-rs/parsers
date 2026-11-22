@@ -67,8 +67,9 @@ parser_vrl: |
               log_level = string(get(pj, ["log.level"]) ?? "") ?? ""
               if log_level == "" { log_level = string(pj.level) ?? "" }
           }
-      }
-      if shape == "" && (exists(pj.type) || exists(pj.operationType)) {
+          # A colliding or unparsable event line is never read as a REST event
+          # (those carry no `type=` message): it takes the explicit fallback.
+      } else if exists(pj.type) || exists(pj.operationType) {
           shape = "json"
           e = pj
       }
@@ -483,7 +484,7 @@ parser_vrl: |
           __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              if __mapped."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
           }
       }
       if match(key, r'(?x)
@@ -494,7 +495,7 @@ parser_vrl: |
           if __value != null {
               __expected = get!({"login": "Logon", "login_error": "Logon", "logout": "Logoff"}, [downcase(to_string(__value) ?? "")])
               if __expected != null {
-                  if ."activity_name" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+                  if __mapped."activity_name" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
               }
           }
       }
