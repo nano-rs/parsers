@@ -19,7 +19,8 @@ description: >
   metadata.product.feature.name and finding_info.product, Resources[] to
   resources[] with their tags, and Network / Action / Process to evidences[].
   A GuardDuty finding imported without an Action object has its action read
-  from ProductFields aws/guardduty/service/action/*. The API call is also
+  from ProductFields aws/guardduty/service/action/* (network connection,
+  API call, DNS request and the first port probe, IPv4 or IPv6). The API call is also
   promoted to api, the Process to actor.process (uid "unknown" when ASFF has
   no Pid) and the first EC2 instance resource to device (host profile).
   metadata.uid is Id + UpdatedAt, so each update of a finding is its own record.
@@ -327,11 +328,14 @@ parser_vrl: |
       if length(keys(act)) == 0 && g_type != "" {
           act.ActionType = g_type
           gd_remote = {}
-          for_each(["networkConnectionAction", "awsApiCallAction"]) -> |_i, kind| {
+          # PORT_PROBE flattens its first probe as portProbeDetails/0/.
+          for_each(["networkConnectionAction", "awsApiCallAction", "portProbeAction/portProbeDetails/0"]) -> |_i, kind| {
               rp = gp + string!(kind) + "/remoteIpDetails/"
               rd = {}
               rv = to_string(get(pf, [rp + "ipAddressV4"]) ?? "") ?? ""
               if rv != "" { rd.IpAddressV4 = rv }
+              rv = to_string(get(pf, [rp + "ipAddressV6"]) ?? "") ?? ""
+              if rv != "" { rd.IpAddressV6 = rv }
               rv = to_string(get(pf, [rp + "country/countryName"]) ?? "") ?? ""
               if rv != "" { rd.Country = { "CountryName": rv } }
               rv = to_string(get(pf, [rp + "city/cityName"]) ?? "") ?? ""
@@ -360,6 +364,8 @@ parser_vrl: |
           if gv != "" { gnc.RemotePortDetails = { "Port": gv } }
           gv = to_string(get(pf, [np + "localIpDetails/ipAddressV4"]) ?? "") ?? ""
           if gv != "" { gnc.LocalIpDetails = { "IpAddressV4": gv } }
+          gv = to_string(get(pf, [np + "localIpDetails/ipAddressV6"]) ?? "") ?? ""
+          if gv != "" && !exists(gnc.LocalIpDetails) { gnc.LocalIpDetails = { "IpAddressV6": gv } }
           gr = object(get(gd_remote, ["networkConnectionAction"]) ?? {}) ?? {}
           if length(keys(gr)) > 0 { gnc.RemoteIpDetails = gr }
           if length(keys(gnc)) > 0 { act.NetworkConnectionAction = gnc }
@@ -374,6 +380,17 @@ parser_vrl: |
           if length(keys(gac)) > 0 { act.AwsApiCallAction = gac }
           gv = to_string(get(pf, [gp + "dnsRequestAction/domain"]) ?? "") ?? ""
           if gv != "" { act.DnsRequestAction = { "Domain": gv } }
+          pp = gp + "portProbeAction/portProbeDetails/0/"
+          gpd = {}
+          gv = to_string(get(pf, [pp + "localPortDetails/port"]) ?? "") ?? ""
+          if gv != "" { gpd.LocalPortDetails = { "Port": gv } }
+          gv = to_string(get(pf, [pp + "localIpDetails/ipAddressV4"]) ?? "") ?? ""
+          if gv != "" { gpd.LocalIpDetails = { "IpAddressV4": gv } }
+          gv = to_string(get(pf, [pp + "localIpDetails/ipAddressV6"]) ?? "") ?? ""
+          if gv != "" && !exists(gpd.LocalIpDetails) { gpd.LocalIpDetails = { "IpAddressV6": gv } }
+          gr = object(get(gd_remote, ["portProbeAction/portProbeDetails/0"]) ?? {}) ?? {}
+          if length(keys(gr)) > 0 { gpd.RemoteIpDetails = gr }
+          if length(keys(gpd)) > 0 { act.PortProbeAction = { "PortProbeDetails": [gpd] } }
       }
       api = {}
       query = {}
@@ -395,6 +412,7 @@ parser_vrl: |
           aproto = to_string(net_act.Protocol) ?? ""
           if aproto != "" && !exists(conn.protocol_name) { conn.protocol_name = downcase(aproto) }
           lip = to_string(get(net_act, ["LocalIpDetails", "IpAddressV4"]) ?? "") ?? ""
+          if lip == "" { lip = to_string(get(net_act, ["LocalIpDetails", "IpAddressV6"]) ?? "") ?? "" }
           if lip != "" {
               if cdir == "OUTBOUND" {
                   if !exists(src_ep.ip) { src_ep.ip = downcase(lip) }
@@ -423,6 +441,7 @@ parser_vrl: |
           pport = to_int(get(first_probe, ["LocalPortDetails", "Port"]) ?? 0) ?? 0
           if pport > 0 && !exists(dst_ep.port) { dst_ep.port = pport }
           plip = to_string(get(first_probe, ["LocalIpDetails", "IpAddressV4"]) ?? "") ?? ""
+          if plip == "" { plip = to_string(get(first_probe, ["LocalIpDetails", "IpAddressV6"]) ?? "") ?? "" }
           if plip != "" && !exists(dst_ep.ip) { dst_ep.ip = downcase(plip) }
       }
       # The remote party of a GuardDuty action: the destination of an outbound
@@ -764,6 +783,11 @@ parser_vrl: |
   # Action.NetworkConnectionAction.ConnectionDirection: Connection direction normalized to the OCSF direction_id in the evidence; consume only when that ID is emitted.
   # ProductFields.aws/guardduty/service/action/networkConnectionAction/protocol: Parser lowercases the GuardDuty protocol; consume only when the normalized value is emitted.
   # ProductFields.aws/guardduty/service/action/networkConnectionAction/connectionDirection: GuardDuty connection direction normalized to the OCSF direction_id in the evidence; consume only when that ID is emitted.
+  # ProductFields.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV6: Parser lowercases the GuardDuty IPv6 address; consume only when the normalized value is emitted.
+  # ProductFields.aws/guardduty/service/action/networkConnectionAction/localIpDetails/ipAddressV6: Parser lowercases the GuardDuty IPv6 address; consume only when the normalized value is emitted.
+  # ProductFields.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/ipAddressV6: Parser lowercases the GuardDuty IPv6 address; consume only when the normalized value is emitted.
+  # ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/ipAddressV6: Parser lowercases the GuardDuty IPv6 address; consume only when the normalized value is emitted.
+  # ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localIpDetails/ipAddressV6: Parser lowercases the GuardDuty IPv6 address; consume only when the normalized value is emitted.
   for_each(flatten(__source_kv)) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
@@ -838,6 +862,11 @@ parser_vrl: |
       | Action\.NetworkConnectionAction\.Protocol
       | Network\.SourceMac
       | ProductFields\.aws/guardduty/service/action/networkConnectionAction/protocol
+      | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV6
+      | ProductFields\.aws/guardduty/service/action/networkConnectionAction/localIpDetails/ipAddressV6
+      | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/ipAddressV6
+      | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/ipAddressV6
+      | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localIpDetails/ipAddressV6
       )\z') {
           __value = value
           if is_string(__value) {
@@ -985,6 +1014,7 @@ parser_vrl: |
   | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/city/cityName
   | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/country/countryName
   | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/ipAddressV4
+  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/ipAddressV6
   | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/organization/asn
   | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/organization/asnOrg
   | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/organization/isp
@@ -993,16 +1023,29 @@ parser_vrl: |
   | ProductFields\.aws/guardduty/service/action/dnsRequestAction/domain
   | ProductFields\.aws/guardduty/service/action/networkConnectionAction/connectionDirection
   | ProductFields\.aws/guardduty/service/action/networkConnectionAction/localIpDetails/ipAddressV4
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/localIpDetails/ipAddressV6
   | ProductFields\.aws/guardduty/service/action/networkConnectionAction/localPortDetails/port
   | ProductFields\.aws/guardduty/service/action/networkConnectionAction/protocol
   | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/city/cityName
   | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/country/countryName
   | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV4
+  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV6
   | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/asn
   | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/asnOrg
   | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/isp
   | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/org
   | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remotePortDetails/port
+  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localIpDetails/ipAddressV4
+  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localIpDetails/ipAddressV6
+  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localPortDetails/port
+  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/city/cityName
+  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/country/countryName
+  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/ipAddressV4
+  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/ipAddressV6
+  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/asn
+  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/asnOrg
+  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/isp
+  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/org
   | ProductFields\.aws/securityhub/CompanyName
   | ProductFields\.aws/securityhub/ProductName
   | ProductName
@@ -1260,6 +1303,9 @@ parser_vrl: |
 #     from the AWS Config integration and ASFF syntax pages
 #     https://docs.aws.amazon.com/securityhub/latest/userguide/securityhub-internal-providers.html
 #     https://docs.aws.amazon.com/securityhub/latest/userguide/securityhub-findings-format-syntax.html
+#   sh_guardduty_port_probe.json: a GuardDuty PORT_PROBE finding imported into
+#     Security Hub with the action in ProductFields, key layout from
+#     https://docs.aws.amazon.com/guardduty/latest/ug/securityhub-integration.html
 #   junk.json: a JSON record that is not a finding, Base Event fallback
 samples:
   - raw: '{"SchemaVersion":"2018-10-08","Id":"arn:aws:securityhub:us-east-1:123456789012:security-control/S3.8/finding/00000000-0000-0000-0000-000000000001","ProductArn":"arn:aws:securityhub:us-east-1::product/aws/securityhub","ProductName":"Security Hub","CompanyName":"AWS","Region":"us-east-1","GeneratorId":"security-control/S3.8","AwsAccountId":"123456789012","Types":["Software and Configuration Checks/Industry and Regulatory Standards"],"CreatedAt":"2026-08-18T19:00:00.000Z","UpdatedAt":"2026-08-18T20:00:00.000Z","Severity":{"Label":"HIGH","Normalized":70},"Title":"S3 general purpose buckets should block public access","Compliance":{"Status":"FAILED","SecurityControlId":"S3.8","RelatedRequirements":["NIST.800-53.r5 AC-21"]},"Resources":[{"Type":"AwsS3Bucket","Id":"arn:aws:s3:::example-bucket","Partition":"aws","Region":"us-east-1","Tags":{"env":"prod"}}],"Workflow":{"Status":"NEW"},"RecordState":"ACTIVE"}'
@@ -1316,6 +1362,25 @@ samples:
       device.hostname: ip-192-0-2-44.ec2.internal
       device.ip: 192.0.2.44
       evidences.0.src_endpoint.ip: 203.0.113.77
+  # Review round 2 P2: a PORT_PROBE imported via ProductFields rebuilds portProbeDetails/0 into evidences.
+  - raw: '{"SchemaVersion":"2018-10-08","ProductArn":"arn:aws:securityhub:us-east-1::product/aws/guardduty","GeneratorId":"arn:aws:guardduty:us-east-1:123456789012:detector/abc","AwsAccountId":"123456789012","CreatedAt":"2026-08-18T20:00:00.000Z","UpdatedAt":"2026-08-18T20:00:00.000Z","Severity":{"Label":"LOW","Normalized":20},"Resources":[{"Type":"AwsEc2Instance","Id":"arn:aws:ec2:us-east-1:123456789012:instance/i-0abcdef1234567890","Partition":"aws","Region":"us-east-1","Details":{"AwsEc2Instance":{"Type":"t3.micro","IpV4Addresses":["192.0.2.44"],"VpcId":"vpc-0a1b2c3d"}}}],"Workflow":{"Status":"NEW"},"RecordState":"ACTIVE","Id":"arn:aws:guardduty:us-east-1:123456789012:detector/abc/finding/pp01","Types":["TTPs/Discovery/Recon:EC2-PortProbeUnprotectedPort"],"Title":"Unprotected port on EC2 instance i-0abcdef1234567890 is being probed.","ProductFields":{"aws/guardduty/service/action/actionType":"PORT_PROBE","aws/guardduty/service/action/portProbeAction/blocked":"false","aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localPortDetails/port":"3389","aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localPortDetails/portName":"RDP","aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localIpDetails/ipAddressV4":"192.0.2.44","aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/ipAddressV4":"198.51.100.99","aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/country/countryName":"Example Country","aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/city/cityName":"Example City","aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/asn":"64502","aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/asnOrg":"EXAMPLE-PROBE-NET","aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/isp":"ExampleISP","aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/org":"ExampleOrg","aws/securityhub/ProductName":"GuardDuty","aws/securityhub/CompanyName":"Amazon"}}'
+    expect:
+      evidences.0.name: PORT_PROBE
+      evidences.0.src_endpoint.ip: 198.51.100.99
+      evidences.0.src_endpoint.autonomous_system.number: 64502
+      evidences.0.dst_endpoint.ip: 192.0.2.44
+      evidences.0.dst_endpoint.port: 3389
+  # Review round 2 P2: ProductFields ipAddressV6 on remote and local details (lowercased).
+  - raw: '{"SchemaVersion":"2018-10-08","ProductArn":"arn:aws:securityhub:us-east-1::product/aws/guardduty","GeneratorId":"arn:aws:guardduty:us-east-1:123456789012:detector/abc","AwsAccountId":"123456789012","CreatedAt":"2026-08-18T20:00:00.000Z","UpdatedAt":"2026-08-18T20:00:00.000Z","Severity":{"Label":"LOW","Normalized":20},"Resources":[{"Type":"AwsEc2Instance","Id":"arn:aws:ec2:us-east-1:123456789012:instance/i-0abcdef1234567890","Partition":"aws","Region":"us-east-1","Details":{"AwsEc2Instance":{"Type":"t3.micro","IpV4Addresses":["192.0.2.44"],"VpcId":"vpc-0a1b2c3d"}}}],"Workflow":{"Status":"NEW"},"RecordState":"ACTIVE","Id":"arn:aws:guardduty:us-east-1:123456789012:detector/abc/finding/v601","Types":["TTPs/Initial Access/UnauthorizedAccess:EC2-SSHBruteForce"],"Title":"2001:db8::99 is performing SSH brute force attacks.","ProductFields":{"aws/guardduty/service/action/actionType":"NETWORK_CONNECTION","aws/guardduty/service/action/networkConnectionAction/connectionDirection":"INBOUND","aws/guardduty/service/action/networkConnectionAction/protocol":"TCP","aws/guardduty/service/action/networkConnectionAction/localPortDetails/port":"22","aws/guardduty/service/action/networkConnectionAction/remotePortDetails/port":"50001","aws/guardduty/service/action/networkConnectionAction/localIpDetails/ipAddressV6":"2001:DB8::44","aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV6":"2001:DB8::99","aws/securityhub/ProductName":"GuardDuty","aws/securityhub/CompanyName":"Amazon"}}'
+    expect:
+      evidences.0.src_endpoint.ip: "2001:db8::99"
+      evidences.0.src_endpoint.port: 50001
+      evidences.0.dst_endpoint.ip: "2001:db8::44"
+      evidences.0.dst_endpoint.port: 22
+  - raw: '{"SchemaVersion":"2018-10-08","ProductArn":"arn:aws:securityhub:us-east-1::product/aws/guardduty","GeneratorId":"arn:aws:guardduty:us-east-1:123456789012:detector/abc","AwsAccountId":"123456789012","CreatedAt":"2026-08-18T20:00:00.000Z","UpdatedAt":"2026-08-18T20:00:00.000Z","Severity":{"Label":"LOW","Normalized":20},"Resources":[{"Type":"AwsEc2Instance","Id":"arn:aws:ec2:us-east-1:123456789012:instance/i-0abcdef1234567890","Partition":"aws","Region":"us-east-1","Details":{"AwsEc2Instance":{"Type":"t3.micro","IpV4Addresses":["192.0.2.44"],"VpcId":"vpc-0a1b2c3d"}}}],"Workflow":{"Status":"NEW"},"RecordState":"ACTIVE","Id":"arn:aws:guardduty:us-east-1:123456789012:detector/abc/finding/ap601","Types":["TTPs/Discovery/Recon:IAMUser-MaliciousIPCaller"],"Title":"API ListBuckets was invoked from a known malicious IP address.","ProductFields":{"aws/guardduty/service/action/actionType":"AWS_API_CALL","aws/guardduty/service/action/awsApiCallAction/api":"ListBuckets","aws/guardduty/service/action/awsApiCallAction/serviceName":"s3.amazonaws.com","aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/ipAddressV6":"2001:db8::77","aws/securityhub/ProductName":"GuardDuty","aws/securityhub/CompanyName":"Amazon"}}'
+    expect:
+      api.operation: ListBuckets
+      evidences.0.src_endpoint.ip: "2001:db8::77"
   # Review P2: a Vulnerabilities[] entry without Id is named by the finding (OCSF needs cve, advisory or cwe).
   - raw: '{"SchemaVersion":"2018-10-08","Id":"arn:aws:inspector2:us-east-1:123456789012:finding/0000aaaa","ProductArn":"arn:aws:securityhub:us-east-1::product/aws/inspector","ProductName":"Inspector","CompanyName":"Amazon","Region":"us-east-1","GeneratorId":"AWSInspector","AwsAccountId":"123456789012","Types":["Software and Configuration Checks/Vulnerabilities/CVE"],"CreatedAt":"2026-08-18T20:00:00Z","UpdatedAt":"2026-08-18T20:00:00Z","Severity":{"Label":"MEDIUM"},"Title":"Package finding without an identifier","Vulnerabilities":[{"VulnerablePackages":[{"Name":"libexample","Version":"1.2.3"}]}],"Workflow":{"Status":"NEW"},"RecordState":"ACTIVE"}'
     expect:
