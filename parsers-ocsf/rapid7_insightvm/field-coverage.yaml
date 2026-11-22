@@ -1,13 +1,5 @@
 source: json
 transforms:
-- source: type
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: severity
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
 - source: last_found
   kind: epoch_ms
   target: time
@@ -20,33 +12,32 @@ transforms:
   kind: epoch_ms
   target: time
   reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-consumed_candidates:
-- asset_id
-- categories
-- cves
-- cvss_v2_score
-- cvss_v3_score
-- hostname
-- id
-- ip
-- last_assessed_for_vulnerabilities
-- last_found
-- last_scan_id
-- port
-- remediated_date
-- risk_score
-- scan_id
-- severity
-- solution
-- tags
-- title
-- type
-- vulnerabilities
-- vulnerabilities.is_fix_available
-- vulnerabilities.remediation
-- vulnerabilities.severity
-- vulnerabilities.title
-- vulnerability_id
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  cves:
+  - observables.value
+  - vulnerabilities.cve.uid
+  hostname:
+  - evidences.dst_endpoint.hostname
+  - observables.value
+  - resources.device.hostname
+  - resources.hostname
+  - resources.name
+  id:
+  - finding_info.uid
+  ip:
+  - evidences.dst_endpoint.ip
+  - observables.value
+  - resources.device.ip
+  - resources.ip
+  port:
+  - evidences.dst_endpoint.port
+  solution:
+  - vulnerabilities.remediation.desc
+  title:
+  - finding_info.title
+  - vulnerabilities.title
+  vulnerability_id:
+  - finding_info.uid

@@ -14,6 +14,11 @@ transforms:
   reason: Flow end converted to the emitted millisecond clock.
 - source: event.proto
   kind: lowercase
+  target: connection_info.protocol_name
+  reason: Transport protocol lowercased onto connection_info.protocol_name.
+- source: event.proto
+  kind: lowercase
+  target: evidences.connection_info.protocol_name
   reason: Transport protocol lowercased onto connection_info.protocol_name.
 - source: event.alert.severity
   kind: enum
@@ -22,7 +27,8 @@ transforms:
     '1': 4
     '2': 3
     '3': 2
-  reason: Suricata severity (1 most severe) normalized to the OCSF severity; consume only when the expected ID is emitted.
+  reason: Suricata severity (1 most severe) normalized to the OCSF severity; consume only when the expected
+    ID is emitted.
 - source: event.alert.action
   kind: enum
   target: action_id
@@ -33,36 +39,73 @@ transforms:
     dropped: 2
     drop: 2
   reason: Alert verdict normalized to the OCSF action; consume only when the expected ID is emitted.
-consumed_candidates:
-- availability_zone
-- event.alert.category
-- event.alert.rev
-- event.alert.signature
-- event.alert.signature_id
-- event.app_proto
-- event.aws_metadata.resource_arn
-- event.dest_ip
-- event.dest_port
-- event.event_type
-- event.flow_id
-- event.http.hostname
-- event.http.http_method
-- event.http.http_user_agent
-- event.http.protocol
-- event.http.url
-- event.netflow.bytes
-- event.netflow.pkts
-- event.sni
-- event.src_ip
-- event.src_port
-- event.tls.fingerprint
-- event.tls.issuerdn
-- event.tls.serial
-- event.tls.sni
-- event.tls.subject
-- event.tls.version
-- event.tls_error.error_message
-- firewall_name
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  availability_zone:
+  - cloud.zone
+  event.alert.category:
+  - finding_info.analytic.category
+  - finding_info.types
+  - firewall_rule.category
+  event.alert.rev:
+  - finding_info.analytic.version
+  - firewall_rule.version
+  event.alert.signature:
+  - finding_info.analytic.name
+  - finding_info.title
+  - firewall_rule.name
+  - message
+  event.alert.signature_id:
+  - finding_info.analytic.uid
+  - firewall_rule.uid
+  event.app_proto:
+  - app_protocol_name
+  event.aws_metadata.resource_arn:
+  - finding_info.product_uid
+  event.dest_ip:
+  - dst_endpoint.ip
+  - evidences.dst_endpoint.ip
+  event.dest_port:
+  - dst_endpoint.port
+  - evidences.dst_endpoint.port
+  event.flow_id:
+  - connection_info.uid
+  - evidences.connection_info.uid
+  event.http.hostname:
+  - evidences.http_request.url.hostname
+  event.http.http_method:
+  - evidences.http_request.http_method
+  event.http.http_user_agent:
+  - evidences.http_request.user_agent
+  event.http.protocol:
+  - evidences.http_request.version
+  event.http.url:
+  - evidences.http_request.url.path
+  event.netflow.bytes:
+  - traffic.bytes_out
+  event.netflow.pkts:
+  - traffic.packets_out
+  event.sni:
+  - dst_endpoint.hostname
+  event.src_ip:
+  - evidences.src_endpoint.ip
+  - src_endpoint.ip
+  event.src_port:
+  - evidences.src_endpoint.port
+  - src_endpoint.port
+  event.tls.issuerdn:
+  - evidences.tls.certificate.issuer
+  event.tls.serial:
+  - evidences.tls.certificate.serial_number
+  event.tls.sni:
+  - evidences.tls.sni
+  event.tls.subject:
+  - evidences.tls.certificate.subject
+  event.tls.version:
+  - evidences.tls.version
+  event.tls_error.error_message:
+  - status_detail
+  firewall_name:
+  - metadata.reporter.name

@@ -1,28 +1,26 @@
 source: text
+probe:
+  mode: before
+  anchor: ']'
+  require: 'action:'
+  text: ; ResidualProbe:"nan2421-text-unknown"; password:"nan2421-secret"
+  source: ResidualProbe
 transforms:
 - source: service_id
   kind: lowercase
+  target: dst_endpoint.svc_name
   reason: Parser case-normalizes this parsed field when represented in output.
 - source: proto
   kind: lowercase
+  target: connection_info.protocol_name
   reason: Parser case-normalizes this parsed field when represented in output.
-- source: ifdir
+- source: proto
   kind: lowercase
+  target: connection_info.protocol_num
   reason: Parser case-normalizes this parsed field when represented in output.
-- source: rule_action
+- source: proto
   kind: lowercase
-  reason: Parser case-normalizes this parsed field when represented in output.
-- source: action
-  kind: lowercase
-  reason: Parser case-normalizes this parsed field when represented in output.
-- source: auth_status
-  kind: lowercase
-  reason: Parser case-normalizes this parsed field when represented in output.
-- source: severity
-  kind: lowercase
-  reason: Parser case-normalizes this parsed field when represented in output.
-- source: attack_severity
-  kind: lowercase
+  target: evidences.connection_info.protocol_num
   reason: Parser case-normalizes this parsed field when represented in output.
 - source: action
   kind: enum
@@ -46,12 +44,8 @@ transforms:
     dropped: 2
     log: 3
     observed: 3
-  reason: Named vendor outcome/protocol/severity normalized by the existing mapping;
-    consume only when the expected ID is emitted.
-- source: header.app
-  kind: lowercase
-  reason: Case normalization already performed by the parser; observed at metadata.log_source,
-    and checked against the emitted branch.
+  reason: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when
+    the expected ID is emitted.
 - source: rule_action
   kind: enum
   target: action_id
@@ -74,14 +68,8 @@ transforms:
     dropped: 2
     log: 3
     observed: 3
-  reason: Named vendor outcome/protocol/severity normalized by the existing mapping;
-    consume only when the expected ID is emitted.
-- source: severity
-  kind: enum
-  target: severity
-  values:
-    medium: Medium
-  reason: Parser normalizes the caption case; verify the emitted caption.
+  reason: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when
+    the expected ID is emitted.
 - source: severity
   kind: enum
   target: severity_id
@@ -97,88 +85,87 @@ transforms:
     error: 4
     critical: 5
     fatal: 6
-  reason: Named vendor outcome/protocol/severity normalized by the existing mapping;
-    consume only when the expected ID is emitted.
-probe:
-  mode: before
-  anchor: ']'
-  require: 'action:'
-  text: ; ResidualProbe:"nan2421-text-unknown"; password:"nan2421-secret"
-  source: ResidualProbe
-consumed_candidates:
-- CVE
-- IPS_id
-- action
-- app_category
-- app_name
-- appi_name
-- attack
-- attack_severity
-- auth_method
-- auth_status
-- bot_name
-- bytes
-- client_inbound_bytes
-- client_inbound_packets
-- client_outbound_bytes
-- client_outbound_packets
-- community
-- confidence_level
-- dst
-- dst_machine_name
-- duration
-- elapsed
-- header.host
-- header.payload
-- header.ts
-- i/f_dir
-- i/f_name
-- ifdir
-- ifname
-- inzone
-- layer_name
-- logid
-- loguid
-- malware_family
-- malware_rule_id
-- matched_category
-- message_info
-- method
-- orig
-- origin
-- originsicname
-- outzone
-- peer_gateway
-- product
-- protection_id
-- protection_name
-- proto
-- reason
-- received_bytes
-- resource
-- rule
-- rule_action
-- rule_name
-- rule_uid
-- s_port
-- sent_bytes
-- service
-- service_id
-- session_id
-- severity
-- src
-- src_machine_name
-- src_user_name
-- ssl_server_name
-- sys_message
-- time
-- user
-- user_agent
-- virus_name
-- xlatedport
-- xlatedst
-- xlatesport
-- xlatesrc
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+  reason: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when
+    the expected ID is emitted.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  appi_name:
+  - app_name
+  auth_method:
+  - auth_protocol
+  confidence_level:
+  - confidence_score
+  dst:
+  - dst_endpoint.ip
+  - evidences.dst_endpoint.ip
+  - observables.value
+  header.host:
+  - device.hostname
+  - src_endpoint.hostname
+  i/f_name:
+  - src_endpoint.interface_name
+  ifname:
+  - src_endpoint.interface_name
+  inzone:
+  - src_endpoint.zone
+  layer_name:
+  - firewall_rule.category
+  loguid:
+  - metadata.original_event_uid
+  matched_category:
+  - http_request.url.categories
+  orig:
+  - device.ip
+  origin:
+  - device.ip
+  originsicname:
+  - device.name
+  outzone:
+  - dst_endpoint.zone
+  product:
+  - metadata.product.feature.name
+  protection_id:
+  - finding_info.analytic.uid
+  - finding_info.uid
+  protection_name:
+  - finding_info.analytic.name
+  - finding_info.title
+  proto:
+  - connection_info.protocol_name
+  - connection_info.protocol_num
+  - evidences.connection_info.protocol_num
+  reason:
+  - status_detail
+  resource:
+  - evidences.url.url_string
+  - http_request.url.url_string
+  rule:
+  - firewall_rule.uid
+  rule_name:
+  - firewall_rule.name
+  rule_uid:
+  - firewall_rule.uid
+  s_port:
+  - evidences.src_endpoint.port
+  - src_endpoint.port
+  service:
+  - dst_endpoint.port
+  - evidences.dst_endpoint.port
+  service_id:
+  - dst_endpoint.svc_name
+  src:
+  - evidences.src_endpoint.ip
+  - observables.value
+  - src_endpoint.ip
+  src_user_name:
+  - actor.user.name
+  - evidences.user.name
+  - observables.value
+  - user.name
+  sys_message:
+  - status_detail
+  user:
+  - actor.user.name
+  - observables.value

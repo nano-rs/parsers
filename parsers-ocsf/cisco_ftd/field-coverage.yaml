@@ -7,9 +7,15 @@ transforms:
   reason: RFC 3339 syslog timestamp converted to event milliseconds; "Mon DD YYYY" clocks remain residual.
 - source: fields.Protocol
   kind: lowercase
+  target: connection_info.protocol_name
+  reason: Protocol name lowercased into connection_info.protocol_name.
+- source: fields.Protocol
+  kind: lowercase
+  target: evidences.connection_info.protocol_num
   reason: Protocol name lowercased into connection_info.protocol_name.
 - source: event.protocol
   kind: lowercase
+  target: connection_info.protocol_name
   reason: Protocol name lowercased into connection_info.protocol_name.
 - source: event.protocol
   kind: enum
@@ -48,63 +54,128 @@ transforms:
     inbound: 1
     outbound: 2
   reason: Connection build direction normalized to the OCSF direction id.
-consumed_candidates:
-- header.host
-- header.msg_id
-- fields.SrcIP
-- fields.DstIP
-- fields.SrcPort
-- fields.DstPort
-- fields.IngressInterface
-- fields.EgressInterface
-- fields.IngressZone
-- fields.EgressZone
-- fields.Protocol
-- fields.ConnectionID
-- fields.User
-- fields.ApplicationProtocol
-- fields.URL
-- fields.URI
-- fields.AccessControlRuleName
-- fields.AccessControlRuleReason
-- fields.IPReputationSICategory
-- fields.URLSICategory
-- fields.DNSSICategory
-- fields.ACPolicy
-- fields.InitiatorBytes
-- fields.ResponderBytes
-- fields.InitiatorPackets
-- fields.ResponderPackets
-- fields.Revision
-- fields.Message
-- fields.Classification
-- fields.IntrusionPolicy
-- fields.FileName
-- fields.FileSize
-- fields.FileSHA256
-- fields.FileType
-- fields.ThreatName
-- fields.FilePolicy
-- fields.FileAction
-- fields.DeviceUUID
-- event.src_ip
-- event.dst_ip
-- event.src_port
-- event.dst_port
-- event.src_iface
-- event.dst_iface
-- event.protocol
-- event.conn_id
-- event.acl
-- event.bytes
-- event.reason
-- event.server
-- event.service
-- event.user
-- event.src_user
-- event.dst_user
-- event.proxy_user
-- message
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  header.host:
+  - device.hostname
+  header.msg_id:
+  - metadata.event_code
+  fields.SrcIP:
+  - evidences.src_endpoint.ip
+  - src_endpoint.ip
+  fields.DstIP:
+  - dst_endpoint.ip
+  - evidences.dst_endpoint.ip
+  fields.SrcPort:
+  - evidences.src_endpoint.port
+  - src_endpoint.port
+  fields.DstPort:
+  - dst_endpoint.port
+  - evidences.dst_endpoint.port
+  fields.IngressInterface:
+  - evidences.src_endpoint.interface_name
+  - src_endpoint.interface_name
+  fields.EgressInterface:
+  - dst_endpoint.interface_name
+  - evidences.dst_endpoint.interface_name
+  fields.IngressZone:
+  - evidences.src_endpoint.zone
+  - src_endpoint.zone
+  fields.EgressZone:
+  - dst_endpoint.zone
+  - evidences.dst_endpoint.zone
+  fields.Protocol:
+  - connection_info.protocol_name
+  - evidences.connection_info.protocol_num
+  fields.ConnectionID:
+  - connection_info.uid
+  fields.User:
+  - actor.user.name
+  - evidences.user.name
+  fields.ApplicationProtocol:
+  - app_name
+  fields.URL:
+  - url.url_string
+  fields.URI:
+  - evidences.url.url_string
+  fields.AccessControlRuleName:
+  - firewall_rule.name
+  fields.AccessControlRuleReason:
+  - firewall_rule.desc
+  fields.IPReputationSICategory:
+  - firewall_rule.category
+  fields.ACPolicy:
+  - policy.name
+  fields.InitiatorBytes:
+  - traffic.bytes_out
+  fields.ResponderBytes:
+  - traffic.bytes_in
+  fields.InitiatorPackets:
+  - traffic.packets_out
+  fields.Revision:
+  - finding_info.analytic.version
+  fields.Message:
+  - finding_info.analytic.name
+  - finding_info.title
+  fields.Classification:
+  - finding_info.types
+  fields.IntrusionPolicy:
+  - policy.name
+  fields.FileName:
+  - evidences.file.name
+  fields.FileSize:
+  - evidences.file.size
+  fields.FileType:
+  - evidences.file.desc
+  fields.ThreatName:
+  - malware.name
+  fields.FilePolicy:
+  - policy.name
+  fields.FileAction:
+  - status_detail
+  fields.DeviceUUID:
+  - device.uid
+  event.src_ip:
+  - dst_endpoint.ip
+  - src_endpoint.ip
+  event.dst_ip:
+  - dst_endpoint.ip
+  - src_endpoint.ip
+  event.src_port:
+  - dst_endpoint.port
+  - src_endpoint.port
+  event.dst_port:
+  - dst_endpoint.port
+  - src_endpoint.port
+  event.src_iface:
+  - dst_endpoint.interface_name
+  - src_endpoint.interface_name
+  event.dst_iface:
+  - dst_endpoint.interface_name
+  - src_endpoint.interface_name
+  event.protocol:
+  - connection_info.protocol_name
+  event.conn_id:
+  - connection_info.uid
+  event.acl:
+  - firewall_rule.name
+  - firewall_rule.uid
+  event.bytes:
+  - traffic.bytes
+  event.reason:
+  - status_detail
+  event.server:
+  - dst_endpoint.hostname
+  - dst_endpoint.ip
+  event.user:
+  - user.name
+  event.src_user:
+  - actor.user.name
+  event.dst_user:
+  - actor.user.name
+  event.proxy_user:
+  - actor.user.name
+  message:
+  - message

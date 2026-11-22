@@ -1,0 +1,970 @@
+name: tenable_ocsf
+display_name: Tenable Vulnerability Findings (OCSF)
+version: "1.1.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses Tenable vulnerability findings into OCSF 1.9.0 "Vulnerability Finding"
+  (class_uid 2002) with the security_control profile. Three shapes are
+  recognized: the Tenable Vulnerability Management (Tenable.io) vulnerability
+  export (asset{} + plugin{} + state), the Tenable Security Center (Tenable.sc)
+  analysis API vulnerability record (pluginID, severity{}, ip, epoch-second
+  firstSeen / lastSeen) and the Nessus REST API vulnerability row (plugin_id,
+  plugin_name, numeric severity) from GET /scans/{id} or
+  /scans/{id}/hosts/{host_id}. Each finding is one record; a vulnerability
+  export or Nessus response array must be split one finding per event
+  upstream (the parser does not fan out). Severity (info / low / medium /
+  high / critical, or 0-4) maps to severity_id 1-5. The state maps to the
+  lifecycle: OPEN is Create / New, REOPENED (or a Security Center cumulative
+  record with hasBeenMitigated) is Update / New with status_detail, FIXED (or
+  a Security Center patched record: sourceType patched, or a non-cumulative
+  record whose mitigateTime / lastMitigated is not older than lastSeen) is
+  Close / Resolved, and an accepted risk is
+  Suppressed. Every CVE id becomes its own vulnerabilities[] entry carrying
+  the CVSS v2 / v3 / v4 base scores and vectors (N/A and other non-CVE
+  tokens are dropped); a plugin without a CVE is an advisory keyed by its
+  plugin id. An IPv6-only asset uses its IPv6 address as the IP.
+  The plugin is finding_info.analytic (uid = plugin id, category = family),
+  the asset is resource / resources[] / device (IP, FQDN, NetBIOS, MAC, OS),
+  and port / protocol / service sit in resource.data with a Port observable.
+  Anything else falls back to Base Event with the raw record kept.
+match_values:
+  - tenable
+category: security
+vendor: "Tenable"
+product: "Tenable Vulnerability Management / Security Center / Nessus"
+parser_vrl: |
+  # Tenable (Vulnerability Management / Security Center / Nessus) -> OCSF 1.9.0
+  # Vulnerability Finding (2002) / Base Event (0)
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+  ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
+
+  parsed, err = parse_json(raw_log)
+  __source_kv = object(parsed) ?? {}
+  e = object(parsed) ?? {}
+
+  # ---- which Tenable shape ----
+  # Tenable Vulnerability Management (Tenable.io) export: asset{} + plugin{}
+  # Tenable Security Center (Tenable.sc) analysis API: pluginID + severity{}
+  # Nessus REST API scan / host vulnerability rows: plugin_id + plugin_name
+  shape = "unknown"
+  if is_object(e.asset) && is_object(e.plugin) {
+      shape = "tio"
+  } else if e.pluginID != null && is_object(e.severity) {
+      shape = "tsc"
+  } else if e.plugin_id != null && e.plugin_name != null {
+      shape = "nessus"
+  }
+
+  if err != null || !is_object(parsed) || shape == "unknown" {
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 99,
+          "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": 0,
+          "message": "Unrecognized Tenable record",
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "uid": sha2("tenable|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "error",
+              "log_name": "tenable",
+              "product": { "name": "Tenable", "vendor_name": "Tenable" }
+          }
+      }
+      # NAN-5264: explicit fallback marker; nano parser health counts it.
+      . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+  } else {
+      plugin_id = ""
+      plugin_name = ""
+      family = ""
+      synopsis = ""
+      desc = ""
+      solution = ""
+      refs = []
+      cves = []
+      sev_key = ""
+      state = "OPEN"
+      first_ms = 0
+      last_ms = 0
+      host_ip = ""
+      host_ip6 = ""
+      host_fqdn = ""
+      host_name = ""
+      host_uid = ""
+      host_mac = ""
+      netbios = ""
+      os_name = ""
+      port = 0
+      proto = ""
+      svc = ""
+      has_patch = null
+      exploit = null
+      v2_score = -1.0
+      v2_vector = ""
+      v3_score = -1.0
+      v3_vector = ""
+      v4_score = -1.0
+      v4_vector = ""
+      finding_uid = ""
+      product_name = "Tenable Vulnerability Management"
+      log_name = "vulnerability export"
+      status_detail = ""
+      accepted = false
+      vendor_sev = ""
+      cpe = ""
+
+      if shape == "tio" {
+          a = object(e.asset) ?? {}
+          p = object(e.plugin) ?? {}
+          plugin_id = to_string(p.id) ?? ""
+          plugin_name = to_string(p.name) ?? ""
+          family = to_string(p.family) ?? ""
+          synopsis = to_string(p.synopsis) ?? ""
+          desc = to_string(p.description) ?? ""
+          solution = to_string(p.solution) ?? ""
+          refs = array(p.see_also) ?? []
+          for_each(array(p.cve) ?? []) -> |_i, c| {
+              cs = upcase(to_string(c) ?? "")
+              if match(cs, r'^CVE-\d{4}-\d+$') { cves = push(cves, cs) }
+          }
+          sev_key = downcase(to_string(e.severity) ?? "")
+          state = upcase(to_string(e.state) ?? "OPEN")
+          ff = to_string(e.first_found) ?? ""
+          if ff != "" {
+              t, terr = parse_timestamp(ff, "%+")
+              if terr == null { first_ms = to_unix_timestamp(t, unit: "milliseconds") }
+          }
+          lf = to_string(e.last_found) ?? ""
+          if lf != "" {
+              t, terr = parse_timestamp(lf, "%+")
+              if terr == null { last_ms = to_unix_timestamp(t, unit: "milliseconds") }
+          }
+          host_ip = to_string(a.ipv4) ?? ""
+          host_ip6 = to_string(a.ipv6) ?? ""
+          host_fqdn = to_string(a.fqdn) ?? ""
+          host_name = to_string(a.hostname) ?? ""
+          host_uid = to_string(a.uuid) ?? ""
+          host_mac = to_string(a.mac_address) ?? ""
+          netbios = to_string(a.netbios_name) ?? ""
+          os_list = array(a.operating_system) ?? []
+          os_name = to_string(get(os_list, [0]) ?? "") ?? ""
+          po = object(e.port) ?? {}
+          port = to_int(po.port) ?? 0
+          proto = to_string(po.protocol) ?? ""
+          svc = to_string(po.service) ?? ""
+          if is_boolean(p.has_patch) { has_patch = p.has_patch }
+          if is_boolean(p.exploit_available) { exploit = p.exploit_available }
+          v2_score = if p.cvss_base_score == null || p.cvss_base_score == "" { -1.0 } else { to_float(p.cvss_base_score) ?? -1.0 }
+          v2_vector = to_string(get(p, ["cvss_vector", "raw"]) ?? "") ?? ""
+          v3_score = if p.cvss3_base_score == null || p.cvss3_base_score == "" { -1.0 } else { to_float(p.cvss3_base_score) ?? -1.0 }
+          v3_vector = to_string(get(p, ["cvss3_vector", "raw"]) ?? "") ?? ""
+          v4_score = if p.cvss4_base_score == null || p.cvss4_base_score == "" { -1.0 } else { to_float(p.cvss4_base_score) ?? -1.0 }
+          v4_vector = to_string(get(p, ["cvss4_vector", "raw"]) ?? "") ?? ""
+          finding_uid = to_string(e.finding_id) ?? ""
+          vendor_sev = to_string(p.risk_factor) ?? ""
+          cpe_list = array(p.cpe) ?? []
+          cpe = to_string(get(cpe_list, [0]) ?? "") ?? ""
+          if upcase(to_string(e.severity_modification_type) ?? "") == "ACCEPTED" { accepted = true }
+      } else if shape == "tsc" {
+          product_name = "Tenable Security Center"
+          log_name = "analysis vulnerability"
+          plugin_id = to_string(e.pluginID) ?? ""
+          plugin_name = to_string(e.pluginName) ?? ""
+          family = to_string(get(e, ["family", "name"]) ?? "") ?? ""
+          synopsis = to_string(e.synopsis) ?? ""
+          desc = to_string(e.description) ?? ""
+          solution = to_string(e.solution) ?? ""
+          see = to_string(e.seeAlso) ?? ""
+          if see != "" { refs = split(see, r'\s+') }
+          for_each(split(to_string(e.cve) ?? "", ",")) -> |_i, c| {
+              # Tenable.sc writes N/A or other references here too; only CVE ids
+              # become vulnerabilities[].cve.
+              cs = upcase(strip_whitespace(c))
+              if match(cs, r'^CVE-\d{4}-\d+$') { cves = push(cves, cs) }
+          }
+          sev_key = to_string(get(e, ["severity", "id"]) ?? "") ?? ""
+          if sev_key == "" { sev_key = downcase(to_string(get(e, ["severity", "name"]) ?? "") ?? "") }
+          # hasBeenMitigated is "1" both on a cumulative record that resurfaced
+          # (reopened) and on a patched record that is currently fixed; the
+          # patched one carries a positive mitigation time (or sourceType patched).
+          # A cumulative record is the live view: a mitigation time older than
+          # lastSeen is history from before the finding resurfaced, not a fix.
+          mitigated_at = 0
+          if e.mitigateTime != null { mitigated_at = to_int(e.mitigateTime) ?? 0 } else if e.lastMitigated != null { mitigated_at = to_int(e.lastMitigated) ?? 0 }
+          src_type = downcase(to_string(e.sourceType) ?? "")
+          seen_at = to_int(e.lastSeen) ?? 0
+          if src_type == "patched" || (src_type != "cumulative" && mitigated_at > 0 && (seen_at == 0 || mitigated_at >= seen_at)) {
+              state = "FIXED"
+          } else if (to_string(e.hasBeenMitigated) ?? "") == "1" {
+              state = "REOPENED"
+              status_detail = "Previously mitigated"
+          }
+          if (to_string(e.acceptRisk) ?? "") == "1" { accepted = true }
+          fs = to_int(e.firstSeen) ?? 0
+          if fs > 0 { first_ms = fs * 1000 }
+          ls = to_int(e.lastSeen) ?? 0
+          if ls > 0 { last_ms = ls * 1000 }
+          host_ip = to_string(e.ip) ?? ""
+          host_fqdn = to_string(e.dnsName) ?? ""
+          host_uid = to_string(e.uuid) ?? ""
+          host_mac = to_string(e.macAddress) ?? ""
+          netbios = to_string(e.netbiosName) ?? ""
+          os_name = to_string(e.operatingSystem) ?? ""
+          port = to_int(e.port) ?? 0
+          proto = to_string(e.protocol) ?? ""
+          ea = downcase(to_string(e.exploitAvailable) ?? "")
+          if ea == "yes" { exploit = true }
+          if ea == "no" { exploit = false }
+          v2_score = if e.baseScore == null || e.baseScore == "" { -1.0 } else { to_float(e.baseScore) ?? -1.0 }
+          v2_vector = to_string(e.cvssVector) ?? ""
+          v3_score = if e.cvssV3BaseScore == null || e.cvssV3BaseScore == "" { -1.0 } else { to_float(e.cvssV3BaseScore) ?? -1.0 }
+          v3_vector = to_string(e.cvssV3Vector) ?? ""
+          vendor_sev = to_string(e.riskFactor) ?? ""
+          cpe = to_string(e.cpe) ?? ""
+          if contains(cpe, "<br/>") { cpe = "" }
+          rid = to_string(get(e, ["repository", "id"]) ?? "") ?? ""
+          finding_uid = "tsc|" + rid + "|" + host_ip + "|" + host_fqdn + "|" + plugin_id + "|" + to_string(port) + "|" + proto
+      } else {
+          product_name = "Nessus"
+          log_name = "scan results"
+          plugin_id = to_string(e.plugin_id) ?? ""
+          plugin_name = to_string(e.plugin_name) ?? ""
+          family = to_string(e.plugin_family) ?? ""
+          sev_key = downcase(to_string(e.severity) ?? "")
+          hn = to_string(e.hostname) ?? ""
+          if match(hn, ip_re) { host_ip = hn } else { host_fqdn = hn }
+          hid = to_string(e.host_id) ?? ""
+          finding_uid = "nessus|" + hid + "|" + hn + "|" + plugin_id
+      }
+
+      # ---- severity: Tenable name or 0-4 id ----
+      severity_id = 0
+      severity = "Unknown"
+      if sev_key == "info" || sev_key == "informational" || sev_key == "none" || sev_key == "0" { severity_id = 1; severity = "Informational" }
+      if sev_key == "low" || sev_key == "1" { severity_id = 2; severity = "Low" }
+      if sev_key == "medium" || sev_key == "2" { severity_id = 3; severity = "Medium" }
+      if sev_key == "high" || sev_key == "3" { severity_id = 4; severity = "High" }
+      if sev_key == "critical" || sev_key == "4" { severity_id = 5; severity = "Critical" }
+
+      # ---- lifecycle: OPEN / REOPENED / FIXED ----
+      activity_id = 1
+      activity_name = "Create"
+      status_id = 1
+      status_str = "New"
+      if state == "REOPENED" {
+          activity_id = 2
+          activity_name = "Update"
+          if status_detail == "" { status_detail = "Reopened" }
+      } else if state == "FIXED" {
+          activity_id = 3
+          activity_name = "Close"
+          status_id = 4
+          status_str = "Resolved"
+      } else if state != "OPEN" && state != "NEW" && state != "ACTIVE" {
+          status_id = 99
+          status_str = "Other"
+          status_detail = state
+      }
+      if accepted && status_id != 4 {
+          status_id = 3
+          status_str = "Suppressed"
+          status_detail = "Risk accepted"
+      }
+
+      time_ms = last_ms
+      if time_ms == 0 { time_ms = first_ms }
+      if finding_uid == "" { finding_uid = sha2("tenable|" + host_uid + "|" + plugin_id + "|" + to_string(port) + "|" + proto, variant: "SHA-256") }
+      title = plugin_name
+      if title == "" { title = "Tenable plugin " + plugin_id }
+
+      finding_info = { "uid": finding_uid, "title": title, "types": ["Vulnerability"], "data_sources": [product_name] }
+      if synopsis != "" { finding_info.desc = synopsis }
+      if first_ms > 0 { finding_info.first_seen_time = first_ms }
+      if last_ms > 0 { finding_info.last_seen_time = last_ms }
+      if plugin_id != "" {
+          an = { "uid": plugin_id, "name": title, "type_id": 1, "type": "Rule" }
+          if family != "" { an.category = family }
+          finding_info.analytic = an
+      }
+
+      # ---- CVSS ----
+      cvss = []
+      if v4_score >= 0.0 {
+          c4 = { "base_score": v4_score, "version": "4.0", "depth": "Base", "vendor_name": "Tenable" }
+          if v4_vector != "" { c4.vector_string = v4_vector }
+          cvss = push(cvss, c4)
+      }
+      if v3_score >= 0.0 && (v3_score > 0.0 || v3_vector != "") {
+          c3 = { "base_score": v3_score, "version": "3", "depth": "Base", "vendor_name": "Tenable" }
+          if v3_vector != "" { c3.vector_string = v3_vector }
+          cvss = push(cvss, c3)
+      }
+      if v2_score >= 0.0 && (v2_score > 0.0 || v2_vector != "") {
+          c2 = { "base_score": v2_score, "version": "2.0", "depth": "Base", "vendor_name": "Tenable" }
+          if v2_vector != "" { c2.vector_string = v2_vector }
+          cvss = push(cvss, c2)
+      }
+
+      base_vuln = { "title": title, "severity": severity, "vendor_name": "Tenable" }
+      if vendor_sev != "" { base_vuln.severity = vendor_sev }
+      if desc != "" { base_vuln.desc = desc }
+      if length(refs) > 0 { base_vuln.references = refs }
+      if solution != "" { base_vuln.remediation = { "desc": solution } }
+      if has_patch != null { base_vuln.is_fix_available = has_patch }
+      if exploit != null { base_vuln.is_exploit_available = exploit }
+      if first_ms > 0 { base_vuln.first_seen_time = first_ms }
+      if last_ms > 0 { base_vuln.last_seen_time = last_ms }
+      if family != "" { base_vuln.category = family }
+
+      # One vulnerability per CVE (OCSF allows just one of cve/advisory/cwe on
+      # each); a plugin with no CVE is an advisory keyed by its plugin id.
+      vulns = []
+      for_each(cves) -> |_i, c| {
+          cve = { "uid": upcase(to_string(c) ?? "") }
+          if length(cvss) > 0 { cve.cvss = cvss }
+          vulns = push(vulns, merge(base_vuln, { "cve": cve }))
+      }
+      if length(vulns) == 0 {
+          adv = { "uid": plugin_id, "title": title }
+          if plugin_id == "" { adv.uid = finding_uid }
+          vulns = [merge(base_vuln, { "advisory": adv })]
+      }
+
+      # ---- the scanned asset ----
+      res = {}
+      if host_uid != "" { res.uid = host_uid }
+      if !match(host_ip, ip_re) && match(host_ip6, ip_re) { host_ip = downcase(host_ip6) }
+      if match(host_ip, ip_re) { res.ip = host_ip }
+      if host_fqdn != "" { res.hostname = downcase(host_fqdn) }
+      rname = host_fqdn
+      if rname == "" { rname = netbios }
+      if rname == "" && host_name != "" && !match(host_name, ip_re) { rname = host_name }
+      if rname == "" { rname = host_ip }
+      if rname != "" { res.name = rname }
+      if !exists(res.name) && !exists(res.uid) { res.uid = finding_uid }
+      res.type = "Host"
+      if port > 0 || proto != "" || svc != "" {
+          rd = {}
+          if port > 0 { rd.port = port }
+          if proto != "" { rd.protocol = proto }
+          if svc != "" { rd.service = svc }
+          res.data = rd
+      }
+
+      dev = { "type_id": 0, "type": "Unknown" }
+      if host_uid != "" { dev.uid = host_uid }
+      if match(host_ip, ip_re) { dev.ip = host_ip }
+      if host_fqdn != "" { dev.hostname = downcase(host_fqdn) } else if host_name != "" && !match(host_name, ip_re) { dev.hostname = downcase(host_name) }
+      if netbios != "" { dev.name = netbios }
+      if host_mac != "" { dev.mac = downcase(host_mac) }
+      if os_name != "" {
+          os_type_id = 0
+          os_type = "Unknown"
+          los = downcase(os_name)
+          if contains(los, "windows") { os_type_id = 100; os_type = "Windows" } else if contains(los, "mac os") || contains(los, "macos") { os_type_id = 300; os_type = "macOS" } else if contains(los, "linux") { os_type_id = 200; os_type = "Linux" }
+          dev.os = { "name": os_name, "type_id": os_type_id, "type": os_type }
+          if cpe != "" && starts_with(cpe, "cpe:/o") { dev.os.cpe_name = cpe }
+      }
+
+      obs = []
+      for_each(cves) -> |_i, c| { obs = push(obs, { "name": "vulnerabilities.cve.uid", "type": "CVE Object: uid", "type_id": 18, "value": upcase(to_string(c) ?? "") }) }
+      if match(host_ip, ip_re) { obs = push(obs, { "name": "resource.ip", "type": "IP Address", "type_id": 2, "value": host_ip }) }
+      if host_ip6 != "" && downcase(host_ip6) != host_ip { obs = push(obs, { "name": "device.ipv6", "type": "IP Address", "type_id": 2, "value": downcase(host_ip6) }) }
+      if host_fqdn != "" { obs = push(obs, { "name": "resource.hostname", "type": "Hostname", "type_id": 1, "value": downcase(host_fqdn) }) }
+      if port > 0 { obs = push(obs, { "name": "resource.data.port", "type": "Port", "type_id": 11, "value": to_string(port) }) }
+
+      ocsf = {
+          "class_uid": 2002,
+          "class_name": "Vulnerability Finding",
+          "category_uid": 2,
+          "category_name": "Findings",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": 200200 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": title,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["security_control"],
+              "uid": sha2("tenable|" + finding_uid + "|" + state + "|" + to_string(time_ms), variant: "SHA-256"),
+              "original_event_uid": finding_uid,
+              "log_name": log_name,
+              "log_provider": product_name,
+              "product": { "name": product_name, "vendor_name": "Tenable" }
+          },
+          "finding_info": finding_info,
+          "vulnerabilities": vulns,
+          "resource": res,
+          "resources": [res],
+          "is_alert": severity_id >= 4 && status_id != 4 && status_id != 3
+      }
+      if length(obs) > 0 { ocsf.observables = obs }
+      if exists(dev.uid) || exists(dev.ip) || exists(dev.hostname) || exists(dev.name) { ocsf.device = dev }
+      if status_detail != "" { ocsf.status_detail = status_detail }
+      if e.count != null { ocsf.count = to_int(e.count) ?? 1 }
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # Values spill exactly as parsed: a parser never masks, redacts or withholds
+  # anything (masking is an opt-in pipeline step, never a parser concern).
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # A source field is consumed ONLY by an explicit mapping: a field-coverage.yaml
+  # `mappings` entry (source key -> target paths) or a `transforms` rule with a
+  # target, whose value is found AT THAT TARGET PATH of the selected branch. A
+  # value that merely appears somewhere else in the event never consumes a field
+  # (no coincidental consumption); everything else spills.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The sets below are strings instead
+  # (a read shares the buffer). __repr holds one member per mapped leaf:
+  # "," + encode_json(path) + "=" + encode_json(encode_json(value)), plus the
+  # to_string form for a string or a float, so a numeric string is represented by
+  # its typed scalar. Every part is a JSON text, inside which a '"' is always
+  # escaped, so a member is matched exactly. Paths drop array indices
+  # (resources.0.uid is resources.uid); arrays are walked two levels deep, and a
+  # leaf deeper than that is simply not mapping evidence (it can only spill more).
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped = object!(parse_json!(encode_json(__mapped)))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __copy = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __repr = ""
+  for_each(flatten(__mapped)) -> |path, value| {
+      __p = encode_json(path)
+      if is_array(value) {
+          for_each(array!(value)) -> |_i, item| {
+              if is_object(item) {
+                  for_each(flatten(object!(item))) -> |sub, leaf| {
+                      __q = encode_json(path + "." + sub)
+                      if is_array(leaf) {
+                          for_each(array!(leaf)) -> |_j, x| {
+                              if !is_object(x) && !is_array(x) {
+                                  __repr = __repr + ("," + __q + "=" + encode_json(encode_json(x)))
+                                  if is_string(x) || is_float(x) { __repr = __repr + ("," + __q + "=" + encode_json(to_string!(x))) }
+                              }
+                          }
+                      } else {
+                          __repr = __repr + ("," + __q + "=" + encode_json(encode_json(leaf)))
+                          if is_string(leaf) || is_float(leaf) { __repr = __repr + ("," + __q + "=" + encode_json(to_string!(leaf))) }
+                      }
+                  }
+              } else if !is_array(item) {
+                  __repr = __repr + ("," + __p + "=" + encode_json(encode_json(item)))
+                  if is_string(item) || is_float(item) { __repr = __repr + ("," + __p + "=" + encode_json(to_string!(item))) }
+              }
+          }
+      } else {
+          __repr = __repr + ("," + __p + "=" + encode_json(encode_json(value)))
+          if is_string(value) || is_float(value) { __repr = __repr + ("," + __p + "=" + encode_json(to_string!(value))) }
+      }
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # first_found: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # last_found: Successful ISO timestamp conversion to the emitted millisecond clock.
+  # firstSeen: Security Center epoch seconds converted to the emitted millisecond clock.
+  # lastSeen: Security Center epoch seconds converted to the emitted millisecond clock.
+  # severity: Tenable severity name (or Nessus 0-4 level) normalized to the OCSF severity; consume only when the expected ID is emitted.
+  # severity.id: Security Center 0-4 severity id normalized to the OCSF severity; consume only when the expected ID is emitted.
+  # state: The finding state drives the OCSF activity (OPEN Create, REOPENED Update, FIXED Close); consume only when that activity is emitted.
+  # asset.fqdn: Parser lowercases the FQDN; consume only when the normalized value is emitted.
+  # asset.fqdn: Parser lowercases the FQDN; consume only when the normalized value is emitted.
+  # asset.fqdn: Parser lowercases the FQDN; consume only when the normalized value is emitted.
+  # asset.fqdn: Parser lowercases the FQDN; consume only when the normalized value is emitted.
+  # asset.fqdn: Parser lowercases the FQDN; consume only when the normalized value is emitted.
+  # asset.fqdn: Parser lowercases the FQDN; consume only when the normalized value is emitted.
+  # dnsName: Parser lowercases the DNS name; consume only when the normalized value is emitted.
+  # dnsName: Parser lowercases the DNS name; consume only when the normalized value is emitted.
+  # dnsName: Parser lowercases the DNS name; consume only when the normalized value is emitted.
+  # dnsName: Parser lowercases the DNS name; consume only when the normalized value is emitted.
+  # dnsName: Parser lowercases the DNS name; consume only when the normalized value is emitted.
+  # dnsName: Parser lowercases the DNS name; consume only when the normalized value is emitted.
+  # asset.mac_address: Parser lowercases the MAC address; consume only when the normalized value is emitted.
+  # macAddress: Parser lowercases the MAC address; consume only when the normalized value is emitted.
+  # asset.ipv6: Parser lowercases the IPv6 address; consume only when the normalized value is emitted.
+  # asset.ipv6: Parser lowercases the IPv6 address; consume only when the normalized value is emitted.
+  # asset.ipv6: Parser lowercases the IPv6 address; consume only when the normalized value is emitted.
+  # asset.ipv6: Parser lowercases the IPv6 address; consume only when the normalized value is emitted.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        first_found
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__repr, "," + "\"finding_info.first_seen_time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        last_found
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__repr, "," + "\"finding_info.last_seen_time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        firstSeen
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if contains(__repr, "," + "\"finding_info.first_seen_time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        lastSeen
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if contains(__repr, "," + "\"finding_info.last_seen_time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        severity
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"info": 1, "informational": 1, "none": 1, "low": 2, "medium": 3, "high": 4, "critical": 5, "0": 1, "1": 2, "2": 3, "3": 4, "4": 5}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if contains(__repr, "," + "\"severity_id\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        severity\.id
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"0": 1, "1": 2, "2": 3, "3": 4, "4": 5}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if contains(__repr, "," + "\"severity_id\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        state
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"open": 1, "reopened": 2, "fixed": 3}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if contains(__repr, "," + "\"activity_id\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        asset\.fqdn
+      | dnsName
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__repr, "," + "\"device.hostname\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        asset\.fqdn
+      | dnsName
+      | asset\.ipv6
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__repr, "," + "\"observables.value\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        asset\.fqdn
+      | dnsName
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__repr, "," + "\"resource.hostname\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        asset\.fqdn
+      | dnsName
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__repr, "," + "\"resource.name\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        asset\.fqdn
+      | dnsName
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__repr, "," + "\"resources.hostname\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        asset\.fqdn
+      | dnsName
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__repr, "," + "\"resources.name\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        asset\.mac_address
+      | macAddress
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__repr, "," + "\"device.mac\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        asset\.ipv6
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__repr, "," + "\"device.ip\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        asset\.ipv6
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__repr, "," + "\"resource.ip\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        asset\.ipv6
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__repr, "," + "\"resources.ip\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
+  # Declared source -> target mappings (field-coverage.yaml `mappings`).
+  __decl = "\n\"asset.fqdn\"\t[\"device.hostname\",\"observables.value\",\"resource.hostname\",\"resource.name\",\"resources.hostname\",\"resources.name\"]\n\"asset.ipv4\"\t[\"device.ip\",\"observables.value\",\"resource.ip\",\"resources.ip\"]\n\"asset.ipv6\"\t[\"device.ip\",\"observables.value\",\"resource.ip\",\"resources.ip\"]\n\"asset.mac_address\"\t[\"device.mac\"]\n\"asset.netbios_name\"\t[\"device.name\"]\n\"asset.operating_system\"\t[\"device.os.name\"]\n\"asset.uuid\"\t[\"device.uid\",\"resource.uid\",\"resources.uid\"]\n\"count\"\t[\"count\"]\n\"cve\"\t[\"observables.value\",\"vulnerabilities.cve.uid\"]\n\"description\"\t[\"vulnerabilities.desc\"]\n\"dnsName\"\t[\"device.hostname\",\"observables.value\",\"resource.hostname\",\"resource.name\",\"resources.hostname\",\"resources.name\"]\n\"family.name\"\t[\"finding_info.analytic.category\",\"vulnerabilities.category\"]\n\"finding_id\"\t[\"finding_info.uid\",\"metadata.original_event_uid\"]\n\"hostname\"\t[\"device.ip\",\"observables.value\",\"resource.ip\",\"resource.name\",\"resources.ip\",\"resources.name\"]\n\"ip\"\t[\"device.ip\",\"observables.value\",\"resource.ip\",\"resource.name\",\"resources.ip\",\"resources.name\"]\n\"macAddress\"\t[\"device.mac\"]\n\"netbiosName\"\t[\"device.name\",\"resource.name\",\"resources.name\"]\n\"operatingSystem\"\t[\"device.os.name\"]\n\"plugin.cve\"\t[\"observables.value\",\"vulnerabilities.cve.uid\"]\n\"plugin.description\"\t[\"vulnerabilities.desc\"]\n\"plugin.exploit_available\"\t[\"vulnerabilities.is_exploit_available\"]\n\"plugin.family\"\t[\"finding_info.analytic.category\",\"vulnerabilities.category\"]\n\"plugin.has_patch\"\t[\"vulnerabilities.is_fix_available\"]\n\"plugin.id\"\t[\"finding_info.analytic.uid\"]\n\"plugin.name\"\t[\"finding_info.analytic.name\",\"finding_info.title\",\"message\",\"vulnerabilities.title\"]\n\"plugin.risk_factor\"\t[\"vulnerabilities.severity\"]\n\"plugin.see_also\"\t[\"vulnerabilities.references\"]\n\"plugin.solution\"\t[\"vulnerabilities.remediation.desc\"]\n\"plugin.synopsis\"\t[\"finding_info.desc\"]\n\"plugin_family\"\t[\"finding_info.analytic.category\",\"vulnerabilities.category\"]\n\"plugin_id\"\t[\"finding_info.analytic.uid\",\"vulnerabilities.advisory.uid\"]\n\"plugin_name\"\t[\"finding_info.analytic.name\",\"finding_info.title\",\"message\",\"vulnerabilities.advisory.title\",\"vulnerabilities.title\"]\n\"pluginID\"\t[\"finding_info.analytic.uid\",\"vulnerabilities.advisory.uid\"]\n\"pluginName\"\t[\"finding_info.analytic.name\",\"finding_info.title\",\"message\",\"vulnerabilities.advisory.title\",\"vulnerabilities.title\"]\n\"port\"\t[\"observables.value\",\"resource.data.port\",\"resources.data.port\"]\n\"port.port\"\t[\"observables.value\",\"resource.data.port\",\"resources.data.port\"]\n\"port.protocol\"\t[\"resource.data.protocol\",\"resources.data.protocol\"]\n\"port.service\"\t[\"resource.data.service\",\"resources.data.service\"]\n\"protocol\"\t[\"resource.data.protocol\",\"resources.data.protocol\"]\n\"riskFactor\"\t[\"vulnerabilities.severity\"]\n\"seeAlso\"\t[\"vulnerabilities.references\"]\n\"solution\"\t[\"vulnerabilities.remediation.desc\"]\n\"synopsis\"\t[\"finding_info.desc\"]\n"
+  __preserve = []
+  # END parser-specific transformations
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
+  # target paths + "\n" per mapped source key (a raw newline never occurs in
+  # compact JSON). A key is consumed when its value, or every element of a scalar
+  # array, is at one of its own targets.
+  for_each(__flat) -> |key, value| {
+      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+      # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
+      __kt = encode_json(key)
+      if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
+          __kt = replace(replace(replace(replace(replace(replace(__kt, r'\x28', "\\u0028"), r'\x29', "\\u0029"), r'\x5B', "\\u005b"), r'\x5D', "\\u005d"), r'\x7B', "\\u007b"), r'\x7D', "\\u007d")
+      }
+      __at = find(__decl, "\n" + __kt + "\t")
+      if is_integer(__at) && !is_object(value) {
+          __rest = slice!(__decl, int!(__at) + strlen(__kt) + 2)
+          __hit = false
+          for_each(array!(parse_json!(slice!(__rest, 0, int!(find(__rest, "\n")))))) -> |_i, target| {
+              __tok = "," + encode_json(target) + "="
+              if !__hit && is_array(value) {
+                  __all = !is_empty(array!(value))
+                  for_each(array!(value)) -> |_j, item| {
+                      if __all {
+                          __all = !is_object(item) && !is_array(item) && (contains(__repr, __tok + encode_json(encode_json(item))) || ((is_string(item) || is_float(item)) && contains(__repr, __tok + encode_json(to_string!(item)))))
+                      }
+                  }
+                  __hit = __all
+              } else if !__hit {
+                  __hit = contains(__repr, __tok + encode_json(encode_json(value))) || ((is_string(value) || is_float(value)) && contains(__repr, __tok + encode_json(to_string!(value))))
+              }
+          }
+          if __hit { __consumed = __consumed + ("," + encode_json(key)) }
+      }
+  }
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless an explicit mapping or transformation consumed it.
+          # Do not spill a copy of the raw body.
+          value != __raw_body && !contains(__consumed, "," + encode_json(key))
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a name already taken gets the next free
+      # _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __token = "," + encode_json(key)
+          if !contains(__consumed, __token) && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and copies of a
+  # source value (that value is mapped or spilled above under its source path).
+  # A value merely equal to some mapped attribute is kept: equality with an
+  # unrelated attribute is no evidence that it is represented.
+  # The canonical source spill above is the authoritative representation of
+  # containers. The cheap conditions run first; the source value set is built on
+  # first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, as-is. These
+  # entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__copy.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+# Sample provenance (sidecar samples/ directory). IPs, hostnames, asset UUIDs
+# and MAC addresses are replaced with documentation values; long plugin
+# descriptions, CVE lists and plugin output are shortened.
+#   tio_open_chrome_low.json, tio_open_sharepoint_high.json, tio_reopened.json,
+#   tio_fixed.json: Elastic integrations Tenable Vulnerability Management
+#     vulnerability export fixture
+#     https://github.com/elastic/integrations/blob/main/packages/tenable_io/data_stream/vulnerability/_dev/test/pipeline/test-vulnerability.log
+#     field reference: https://developer.tenable.com/reference/exports-vulns-download-chunk
+#   tsc_info_previously_mitigated.json, tsc_high_package_cves.json,
+#   tsc_critical_java_smb.json, tsc_low_accepted_risk.json (acceptRisk set to
+#   "1" to exercise the accepted-risk branch): Elastic integrations Tenable
+#     Security Center vulnerability fixture
+#     https://github.com/elastic/integrations/blob/main/packages/tenable_sc/data_stream/vulnerability/_dev/test/pipeline/test-vulnerability.log
+#   nessus_scan_vuln_info.json: Nessus API scan details vulnerabilities[] row
+#     https://avleonov.com/2016/06/03/retrieving-scan-results-with-nessus-api/
+#   nessus_host_vuln_high.json: Nessus API host details vulnerabilities[] row,
+#     field set per https://docs.rs/nessus/0.3.0/src/nessus/structs.rs.html
+#   tsc_patched_mitigated.json, tio_ipv6_only_asset.json,
+#   nessus_host_vuln_named_severity.json: variants of the fixtures above (a
+#     Security Center patched record with hasBeenMitigated and mitigateTime and
+#     an N/A token in cve, an IPv6-only asset, a Nessus row whose severity is a
+#     name rather than a 0-4 level)
+#   junk.json: not JSON, Base Event fallback
+samples:
+  - raw: '{"asset":{"fqdn":"app-12.example.com","hostname":"app-12","uuid":"00000000-0000-4000-8000-000000000012","ipv4":"192.0.2.12","operating_system":["CentOS Linux 7.9.2009"],"tracked":true},"plugin":{"id":9062,"name":"Google Chrome < 48.0.2564.82 Multiple Vulnerabilities","cve":["CVE-2016-1620","CVE-2016-1614"],"cvss_base_score":9.3,"cvss_vector":{"raw":"AV:N/AC:M/Au:N/C:C/I:C/A:C"},"family":"Web Clients","has_patch":false,"risk_factor":"HIGH","solution":"Update the Chrome browser to 48.0.2564.82 or later."},"port":{"port":"0","protocol":"TCP"},"severity":"high","finding_id":"84f45a4f-2277-52e0-b84f-2bb96a853124","first_found":"2018-12-31T20:59:47Z","last_found":"2019-01-31T20:59:47Z","state":"REOPENED"}'
+    expect:
+      class_uid: 2002
+      activity_id: 2
+      type_uid: 200202
+      severity_id: 4
+      status_id: 1
+      status_detail: Reopened
+      vulnerabilities.0.cve.uid: CVE-2016-1620
+      vulnerabilities.1.cve.uid: CVE-2016-1614
+      vulnerabilities.0.cve.cvss.0.version: "2.0"
+      vulnerabilities.0.is_fix_available: false
+      finding_info.uid: 84f45a4f-2277-52e0-b84f-2bb96a853124
+      finding_info.analytic.uid: "9062"
+      resource.ip: 192.0.2.12
+      device.os.type_id: 200
+  - raw: '{"asset":{"fqdn":"app-13.example.com","uuid":"00000000-0000-4000-8000-000000000013","ipv4":"192.0.2.13"},"plugin":{"id":9062,"name":"Google Chrome < 48.0.2564.82 Multiple Vulnerabilities","cve":["CVE-2016-1620"]},"port":{"port":"0","protocol":"TCP"},"severity":"critical","finding_id":"84f45a4f-2277-52e0-b84f-2bb96a853125","last_found":"2019-02-28T20:59:47Z","state":"FIXED"}'
+    expect:
+      activity_id: 3
+      status_id: 4
+      severity_id: 5
+      is_alert: false
+  - raw: '{"pluginID":"171860","severity":{"id":"4","name":"Critical","description":"Critical Severity"},"hasBeenMitigated":"0","acceptRisk":"0","ip":"192.0.2.30","port":"445","protocol":"TCP","pluginName":"Oracle Java SE Multiple Vulnerabilities (January 2023 CPU)","firstSeen":"1674518400","lastSeen":"1675123200","exploitAvailable":"No","baseScore":"10.0","cvssVector":"AV:N/AC:L/Au:N/C:C/I:C/A:C","cvssV3BaseScore":"9.8","cvssV3Vector":"AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H","cve":"CVE-2023-21830,CVE-2023-21835","operatingSystem":"Microsoft Windows Server 2019 Standard","family":{"id":"20","name":"Windows","type":"active"},"repository":{"id":"1","name":"Live"}}'
+    expect:
+      class_uid: 2002
+      activity_id: 1
+      severity_id: 5
+      time: 1675123200000
+      vulnerabilities.1.cve.uid: CVE-2023-21835
+      vulnerabilities.0.cve.cvss.0.base_score: "9.8"
+      vulnerabilities.0.is_exploit_available: false
+      resource.data.port: 445
+      device.os.type_id: 100
+      metadata.product.name: Tenable Security Center
+      is_alert: true
+  - raw: '{"host_id":2,"hostname":"192.0.2.44","plugin_id":57608,"plugin_name":"SMB Signing not required","plugin_family":"Misc.","count":1,"vuln_index":4,"severity_index":1,"severity":2}'
+    expect:
+      class_uid: 2002
+      severity_id: 3
+      vulnerabilities.0.advisory.uid: "57608"
+      resource.ip: 192.0.2.44
+      metadata.product.name: Nessus
+  - raw: '{"pluginID":"171860","severity":{"id":"4","name":"Critical"},"hasBeenMitigated":"1","mitigateTime":"1675900800","ip":"192.0.2.30","port":"445","protocol":"TCP","pluginName":"Oracle Java SE Multiple Vulnerabilities (January 2023 CPU)","firstSeen":"1674518400","lastSeen":"1675123200","cve":"CVE-2023-21830,N/A"}'
+    expect:
+      activity_id: 3
+      status_id: 4
+      is_alert: false
+      vulnerabilities.0.cve.uid: CVE-2023-21830
+      vulnerabilities.1: <missing>
+  # Cumulative record that resurfaced after an old mitigation: still open (REOPENED)
+  - raw: '{"pluginID":"171861","severity":{"id":"4","name":"Critical"},"hasBeenMitigated":"1","lastMitigated":"1674000000","sourceType":"cumulative","ip":"192.0.2.31","port":"445","protocol":"TCP","pluginName":"Oracle Java SE Multiple Vulnerabilities (January 2023 CPU)","firstSeen":"1673000000","lastSeen":"1675123200","cve":"CVE-2023-21830"}'
+    expect:
+      activity_id: 2
+      is_alert: true
+      status_detail: Previously mitigated
+  - raw: '{"asset":{"fqdn":"v6-host.example.com","uuid":"00000000-0000-4000-8000-000000000060","ipv6":"2001:db8::60"},"plugin":{"id":156641,"name":"Security Updates for Microsoft SharePoint Server 2016 (January 2022)","cve":["CVE-2022-21837"]},"port":{"port":445,"protocol":"TCP"},"severity":"high","finding_id":"02716af9-1adb-4057-b4d5-dcb0c36b2999","last_found":"2023-05-04T05:03:13.737Z","state":"OPEN"}'
+    expect:
+      resource.ip: 2001:db8::60
+      device.ip: 2001:db8::60
+  - raw: '{"host_id":3,"hostname":"192.0.2.45","plugin_id":97833,"plugin_name":"MS17-010: Security Update for Microsoft Windows SMB Server","plugin_family":"Windows","severity":"Critical"}'
+    expect:
+      severity_id: 5
+      is_alert: true
+  - raw: "not a tenable record"
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: unparsable input

@@ -25,6 +25,7 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [SentinelOne](parsers-ocsf/sentinelone) | `sentinelone` | SentinelOne | JSON | Threats, activity logs, Deep Visibility (process, network, DNS, file, registry) |
 | [VMware Carbon Black](parsers-ocsf/carbon_black) | `carbon_black` | VMware | JSON | CB Analytics alerts, watchlist hits, process events with MITRE TTPs |
 | [Microsoft Defender EDR](parsers-ocsf/defender_edr) | `defender_edr` | Microsoft | JSON | Process creation, network connections, file events, logon activities |
+| [Microsoft Defender XDR](parsers-ocsf/defender_xdr) | `defender_xdr` | Microsoft | JSON (Graph security API + streaming API) | Alerts (alerts_v2) and incidents as findings with evidence, MITRE techniques and classification; AlertInfo / AlertEvidence rows |
 | [Microsoft Sysmon](parsers-ocsf/windows_sysmon) | `windows_sysmon` | Microsoft | JSON (Vector/Winlogbeat/NXLog) | Process, network, file, registry, DNS events from Sysmon |
 | [Microsoft Sysmon (XML)](parsers-ocsf/sysmon_xml) | `windows_sysmon` | Microsoft | Native XML | All 29 Sysmon event IDs with hash splitting and MITRE extraction |
 | [Microsoft Sysmon for Linux (XML)](parsers-ocsf/sysmon_linux_xml) | `linux_sysmon` | Microsoft | Native XML | Sysmon for Linux: process, network, file events with MITRE extraction |
@@ -39,6 +40,7 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Moat](parsers-ocsf/moat_edr) | `moat_edr` | Omarchy | JSON (NDJSON envelope) | Supply-chain sensor: alerts with correlation chains and AI triage, alert updates, package-install receipts, shipper heartbeat, plus the opt-in process / network / file telemetry classes. OCSF only |
 | [macOS Unified Log](parsers-ocsf/macos_unified_log) | `macos_unified_log` | Apple | JSON (`log show --style ndjson`) | sshd, sudo, loginwindow, opendirectoryd and authd authentication; TCC permission changes; Gatekeeper / XProtect rejections and malware verdicts; every other entry kept as Base Event |
 | [Fail2ban](parsers-ocsf/fail2ban) | `fail2ban` | Fail2ban | fail2ban.log / syslog / journal | Ban, Reban, Restore Ban, already banned, Unban and Found as Detection Findings keyed on jail and address; server and jail lines kept |
+| [Wazuh](parsers-ocsf/wazuh) | `wazuh` | Wazuh | JSON (alerts.json) | Rule level, groups, MITRE, agent, decoder and decoded data as Detection Finding; syscheck / FIM file alerts (added, modified, deleted, whodata) as File System Activity. OCSF only |
 
 ### Network & Firewall
 
@@ -63,6 +65,7 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Cloudflare Zero Trust](parsers-ocsf/cloudflare_zero_trust) | `cloudflare_zero_trust` | Cloudflare | JSON (Logpush) | Gateway DNS, Gateway HTTP, Gateway Network, Access requests |
 | [Cisco Umbrella](parsers-ocsf/cisco_umbrella) | `cisco_umbrella` | Cisco | CSV | DNS and proxy logs with domain categorization and identity |
 | [Infoblox DHCP](parsers-ocsf/infoblox_dhcp) | `infoblox_dhcp` | Infoblox | Syslog | DISCOVER, OFFER, REQUEST, ACK, RELEASE, NAK, INFORM |
+| [Windows DNS Server](parsers-ocsf/windows_dns) | `windows_dns` | Microsoft | Debug log text / Analytical ETW JSON (Winlogbeat, NXLog) | Queries, responses and recursion (ETW 256-262, debug PACKET lines) with rcode, flags, opcode and transaction id; audit events as Base Event |
 | [ISC BIND](parsers-ocsf/bind_dns) | `bind_dns` | ISC | Syslog / file channel | Query log, ACL and zone transfer denials, RPZ rewrites, other named categories |
 | [Conduit MITM Proxy](parsers-ocsf/conduit_proxy) | `conduit_proxy` | Conduit | JSON | HTTP/HTTPS requests with TLS interception status, threat scoring, DLP |
 | [AWS Network Firewall](parsers-ocsf/aws_network_firewall) | `aws_network_firewall` | Amazon | JSON (Suricata EVE `event`) | Alert logs as Detection Finding (allowed / blocked / rejected, rule, 5-tuple, HTTP / TLS evidence), netflow logs as Network Activity, TLS engine revocation / SNI errors |
@@ -90,14 +93,17 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Amazon CloudFront](parsers-ocsf/aws_cloudfront) | `aws_cloudfront` | Amazon | Tab-separated W3C / JSON | Standard (legacy) access logs, real-time logs and standard logging v2 JSON as HTTP Activity: viewer, edge, cache result, TLS, geo-blocked requests |
 | [Azure Activity Log](parsers-ocsf/azure_activity) | `azure_activity` | Microsoft | JSON | Operations, status, caller identity, resources |
 | [Azure Sign-in Logs](parsers-ocsf/azure_signin) | `azure_signin` | Microsoft | JSON | Entra ID sign-ins: interactive, non-interactive, service principal |
+| [Microsoft Entra ID Audit Logs](parsers-ocsf/entra_audit) | `entra_audit` | Microsoft | JSON (diagnostic settings + Graph directoryAudits) | User, group and directory role changes, MFA security info registration, app consent and permission grants, credential adds. OCSF only |
 | [Azure Monitor diagnostic export](parsers-ocsf/azure_monitor) | `azure_monitor` | Microsoft | JSON (Diagnostic Settings → Event Hubs / storage) | One lane for a mixed hub, dispatched on `category`: Activity Log (all 8 categories; Defender for Cloud alerts as Detection Finding), Entra ID sign-ins (interactive, non-interactive, service principal, managed identity) and Entra ID audit (user / group / role management). Unknown categories kept whole as Base Event. OCSF only |
 | [Azure Firewall](parsers-ocsf/azure_firewall) | `azure_firewall` | Microsoft | JSON | Network rules, application rules, threat intel, DNS proxy |
+| [Azure NSG / VNet Flow Logs](parsers-ocsf/azure_nsg_flow) | `azure_nsg_flow` | Microsoft | JSON (NSG v1/v2, VNet v4/v5 flowTuples) | Allow / deny flows with rule, direction, state and byte / packet counters |
 | [Microsoft Defender for Cloud](parsers-ocsf/defender_for_cloud) | `defender_for_cloud` | Microsoft | JSON (continuous export / Event Hubs, REST API, Logic App) | Security alerts as Detection Finding with ATT&CK and entities; assessments, sub-assessments and regulatory compliance as Compliance Finding |
 | [GCP Audit Log](parsers-ocsf/gcp_audit) | `gcp_audit` | Google | JSON | IAM changes, API calls, resource operations, authorization |
 | [GCP VPC Flow Logs](parsers-ocsf/gcp_vpc_flow) | `gcp_vpc_flow` | Google | JSON (Cloud Logging LogEntry) | VPC flows (logName `vpc_flows` only): 5-tuple, bytes / packets, VM, VPC, subnet, geo and ASN per side |
 | [Kubernetes Audit](parsers-ocsf/kubernetes_audit) | `kubernetes_audit` | CNCF | JSON | API server audit: resource operations, RBAC, user identity |
 | [Microsoft 365](parsers-ocsf/microsoft_365) | `microsoft_365` | Microsoft | JSON | Exchange, SharePoint, Azure AD, DLP, Teams audit events |
 | [Google Workspace Audit](parsers-ocsf/google_workspace) | `gws_login` | Google | JSON | Admin SDK Reports: login, admin console, OAuth token, Drive activity |
+| [Wiz](parsers-ocsf/wiz) | `wiz` | Wiz | JSON (API + webhooks) | Issues and Detections / Threats as Detection Finding, vulnerability findings as Vulnerability Finding, cloud configuration findings as Compliance Finding. OCSF only |
 | [AWS CloudWatch Logs (generic)](parsers-ocsf/aws_cloudwatch_logs) | `aws_cloudwatch_logs` | Amazon | JSON (subscription / Firehose envelope, per-event) / export lines | Any log group: each inner message becomes a Base Event with log group, account and event id; JSON messages pass through. Multi-event envelopes must be split upstream. OCSF only |
 | [Google Cloud Logging (generic)](parsers-ocsf/gcp_logging) | `gcp_logging` | Google | JSON LogEntry (Pub/Sub, push wrapper, sink) | Any log: textPayload / jsonPayload as Base Event, httpRequest as HTTP Activity, project / location on cloud; audit logs belong on gcp_audit. OCSF only |
 
@@ -115,6 +121,7 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Netskope](parsers-ocsf/netskope) | `netskope` | Netskope | JSON | CASB/SSE: app activity, alerts, DLP, network events |
 | [F5 BIG-IP ASM](parsers-ocsf/f5_waf) | `f5_waf` | F5 | JSON | Web application firewall: attacks, violations, security events |
 | [HashiCorp Vault](parsers-ocsf/hashicorp_vault) | `hashicorp_vault` | HashiCorp | JSON (audit device) | Request / response audit entries as API Activity, login paths as Authentication; HMAC values kept as written. OCSF only |
+| [Teleport](parsers-ocsf/teleport) | `teleport` | Teleport | JSON (audit log) | Logins and session start / end, exec and session commands, scp / sftp, user and access-request changes, role changes, cert and API events. OCSF only |
 
 ### Vulnerability Management
 
@@ -122,6 +129,7 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 |--------|-------------|--------|--------|-------------|
 | [Qualys](parsers-ocsf/qualys) | `qualys` | Qualys | JSON | Host detections, knowledge base, WAS findings, compliance |
 | [Rapid7 InsightVM](parsers-ocsf/rapid7_insightvm) | `rapid7_insightvm` | Rapid7 | JSON | Vulnerability findings, asset data, remediation events |
+| [Tenable](parsers-ocsf/tenable) | `tenable` | Tenable | JSON | Vulnerability Management export, Security Center analysis and Nessus API findings as Vulnerability Finding: CVEs, CVSS v2 / v3 / v4, plugin, asset, port, state (open, reopened, fixed). OCSF only |
 
 ### Email Security
 
@@ -144,6 +152,7 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 |--------|-------------|--------|--------|-------------|
 | [Apache HTTP Server](parsers-ocsf/apache) | `apache_access` | Apache | Combined/common log | Client IP, method, status, bytes, user agent, referrer |
 | [Nginx](parsers-ocsf/nginx) | `nginx` | Nginx | Combined / JSON / error | Access and error logs with upstream and proxy support |
+| [Microsoft IIS](parsers-ocsf/iis) | `iis` | Microsoft | W3C extended log | Default and extended field sets, `#Fields`-driven JSON wrapper, NXLog / App Service named keys |
 | [HAProxy](parsers-ocsf/haproxy) | `haproxy` | HAProxy Technologies | Default / tcplog / httplog / httpslog / error | HTTP mode as HTTP Activity, TCP mode and connection errors as Network Activity; timers, termination state, frontend/backend/server. OCSF only |
 | [Traefik](parsers-ocsf/traefik) | `traefik` | Traefik Labs | CLF / genericCLF / JSON access, JSON / logfmt app log | Access logs as HTTP Activity with router, service, TLS and trace; application log as Base Event. OCSF only |
 | [Caddy](parsers-ocsf/caddy) | `caddy` | Caddy | JSON (zap) | Access and request error logs as HTTP Activity with decoded TLS; server logs as Base Event. OCSF only |
@@ -280,6 +289,13 @@ and after a large rewrite. CI runs the check on every PR (job "Parser load budge
   parser concern. Review rejects parser-level redaction.
 - Emit the **complete OCSF object on the root** (`. = ocsf`) so it lands in
   the lake and every canonical path is stored as its own queryable column.
+- **Declare every mapping explicitly.** `field-coverage.yaml` `mappings` lists
+  each source key with the OCSF path(s) it is copied to, and each `transforms`
+  rule names its target. A source field counts as mapped only when its value is
+  at one of its own targets; a value that merely equals some other attribute
+  spills to `unmapped`. `python3 scripts/infer_mappings.py parsers-ocsf/<name>`
+  writes the declarations by perturbing each source value, and
+  `field_coverage_check.py` re-verifies every one the same way.
 - UDM names do not exist in OCSF. `src_ip` is `src_endpoint.ip`, `user` is
   `actor.user.name` (the actor) or `user.name` (the subject, class-dependent),
   `timestamp` is `time`, `id` is `metadata.uid`, `ext.foo` is `unmapped.foo`.

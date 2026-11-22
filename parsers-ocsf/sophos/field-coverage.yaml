@@ -1,37 +1,57 @@
 source: text
+probe:
+  mode: suffix
+  require: '='
+  text: ' ResidualProbe="nan2421-text-unknown" password="nan2421-secret"'
+  source: ResidualProbe
 transforms:
 - source: device_name
   kind: lowercase
+  target: device.hostname
   reason: Parser case-normalizes this parsed field when represented in output.
-- source: priority
+- source: device_name
   kind: lowercase
+  target: dst_endpoint.hostname
   reason: Parser case-normalizes this parsed field when represented in output.
 - source: src_ip
   kind: lowercase
+  target: evidences.src_endpoint.ip
+  reason: Parser case-normalizes this parsed field when represented in output.
+- source: src_ip
+  kind: lowercase
+  target: src_endpoint.ip
   reason: Parser case-normalizes this parsed field when represented in output.
 - source: dst_ip
   kind: lowercase
+  target: dst_endpoint.ip
+  reason: Parser case-normalizes this parsed field when represented in output.
+- source: dst_ip
+  kind: lowercase
+  target: evidences.dst_endpoint.ip
   reason: Parser case-normalizes this parsed field when represented in output.
 - source: src_mac
   kind: lowercase
+  target: src_endpoint.mac
   reason: Parser case-normalizes this parsed field when represented in output.
 - source: dst_mac
   kind: lowercase
-  reason: Parser case-normalizes this parsed field when represented in output.
-- source: protocol
-  kind: lowercase
+  target: dst_endpoint.mac
   reason: Parser case-normalizes this parsed field when represented in output.
 - source: user_name
   kind: lowercase
+  target: actor.user.name
+  reason: Parser case-normalizes this parsed field when represented in output.
+- source: user_name
+  kind: lowercase
+  target: user.name
   reason: Parser case-normalizes this parsed field when represented in output.
 - source: localinterfaceip
   kind: lowercase
+  target: src_endpoint.ip
   reason: Parser case-normalizes this parsed field when represented in output.
 - source: remoteinterfaceip
   kind: lowercase
-  reason: Parser case-normalizes this parsed field when represented in output.
-- source: filehash
-  kind: lowercase
+  target: dst_endpoint.ip
   reason: Parser case-normalizes this parsed field when represented in output.
 - source: status
   kind: enum
@@ -41,8 +61,8 @@ transforms:
     succeeded: 1
     failure: 2
     failed: 2
-  reason: Named vendor outcome/protocol/severity normalized by the existing mapping;
-    consume only when the expected ID is emitted.
+  reason: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when
+    the expected ID is emitted.
 - source: protocol
   kind: enum
   target: connection_info.protocol_num
@@ -52,126 +72,101 @@ transforms:
     icmp: 1
     icmpv6: 58
     ipv6-icmp: 58
-  reason: Named vendor outcome/protocol/severity normalized by the existing mapping;
-    consume only when the expected ID is emitted.
-probe:
-  mode: suffix
-  require: '='
-  text: ' ResidualProbe="nan2421-text-unknown" password="nan2421-secret"'
-  source: ResidualProbe
-consumed_candidates:
-- activityname
-- ap
-- app_category
-- application
-- auth_client
-- auth_mechanism
-- classification
-- client_mac
-- connectionname
-- connectiontype
-- connevent
-- connid
-- contenttype
-- cpu
-- date
-- device
-- device_id
-- device_name
-- dir_disp
-- disk
-- dnat_ip
-- dnat_port
-- domain
-- dst_country_code
-- dst_ip
-- dst_mac
-- dst_port
-- dst_zone
-- dstzonetype
-- duration
-- eventid
-- exceptions
-- extra
-- filehash
-- filename
-- from_email_addr
-- fw_rule_id
-- gid
-- hb_health
-- header.body
-- header.pri
-- http_category
-- http_category_type
-- httpresponsecode
-- iap
-- icmp_code
-- icmp_type
-- in_interface
-- ips_policy
-- live_users
-- localgateway
-- localinterfaceip
-- localnetwork
-- log_component
-- log_id
-- log_subtype
-- log_type
-- mailid
-- mailsize
-- mem
-- message
-- method
-- name
-- nat_rule_id
-- out_interface
-- policy_type
-- priority
-- protocol
-- quarantine
-- quarantine_reason
-- reason
-- receiver
-- recv_bytes
-- recv_pkts
-- reference
-- referer
-- remoteinterfaceip
-- remotenetwork
-- rev
-- rule
-- sender
-- sent_bytes
-- sent_pkts
-- sid
-- signature_id
-- signature_msg
-- snat_ip
-- snat_port
-- src_country_code
-- src_ip
-- src_mac
-- src_port
-- src_zone
-- srczonetype
-- ssid
-- status
-- subject
-- threatname
-- threattype
-- time
-- timezone
-- to_email_addr
-- tran_dst_ip
-- tran_dst_port
-- tran_src_ip
-- tran_src_port
-- tunnelip
-- url
-- user_agent
-- user_gp
-- user_name
-- vconnid
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+  reason: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when
+    the expected ID is emitted.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  connid:
+  - connection_info.uid
+  contenttype:
+  - http_response.content_type
+  device_id:
+  - device.uid
+  domain:
+  - http_request.url.hostname
+  dst_country_code:
+  - dst_endpoint.location.country
+  dst_ip:
+  - dst_endpoint.ip
+  - evidences.dst_endpoint.ip
+  dst_mac:
+  - dst_endpoint.mac
+  dst_port:
+  - dst_endpoint.port
+  - evidences.dst_endpoint.port
+  duration:
+  - duration
+  eventid:
+  - finding_info.analytic.uid
+  - finding_info.uid
+  filename:
+  - evidences.file.name
+  - evidences.file.path
+  from_email_addr:
+  - email.from
+  http_category:
+  - http_request.url.categories
+  httpresponsecode:
+  - http_response.code
+  localinterfaceip:
+  - src_endpoint.ip
+  log_id:
+  - finding_info.analytic.uid
+  - finding_info.uid
+  - metadata.original_event_uid
+  log_type:
+  - metadata.event_code
+  mailid:
+  - email.message_uid
+  mailsize:
+  - email.size
+  method:
+  - http_request.http_method
+  reason:
+  - status_detail
+  recv_bytes:
+  - traffic.bytes_in
+  recv_pkts:
+  - traffic.packets_in
+  referer:
+  - http_request.referrer
+  remoteinterfaceip:
+  - dst_endpoint.ip
+  rule:
+  - finding_info.analytic.name
+  sent_bytes:
+  - traffic.bytes_out
+  sent_pkts:
+  - traffic.packets_out
+  signature_id:
+  - finding_info.analytic.uid
+  - finding_info.uid
+  signature_msg:
+  - finding_info.title
+  src_country_code:
+  - src_endpoint.location.country
+  src_ip:
+  - evidences.src_endpoint.ip
+  - src_endpoint.ip
+  src_mac:
+  - src_endpoint.mac
+  src_port:
+  - evidences.src_endpoint.port
+  - src_endpoint.port
+  subject:
+  - email.subject
+  threatname:
+  - finding_info.analytic.name
+  - finding_info.title
+  - malware.name
+  to_email_addr:
+  - email.to
+  url:
+  - http_request.url.url_string
+  user_agent:
+  - http_request.user_agent
+  user_name:
+  - actor.user.name
+  - user.name

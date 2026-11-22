@@ -4,26 +4,45 @@ transforms:
   kind: epoch_ms
   target: time
   reason: Envoy START_TIME (RFC 3339) converted to event milliseconds.
-consumed_candidates:
-- authority
-- bytes_received
-- bytes_sent
-- connection_termination_details
-- downstream_peer_principal
-- downstream_peer_uri_san
-- duration
-- method
-- path
-- protocol
-- request_id
-- response_code
-- response_code_details
-- response_flags
-- upstream_peer_principal
-- upstream_peer_uri_san
-- upstream_service_time
-- user_agent
-- x_forwarded_for
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  authority:
+  - http_request.url.hostname
+  bytes_received:
+  - traffic.bytes_out
+  bytes_sent:
+  - http_response.length
+  - traffic.bytes_in
+  connection_termination_details:
+  - status_detail
+  downstream_peer_uri_san:
+  - src_endpoint.svc_name
+  duration:
+  - duration
+  method:
+  - http_request.http_method
+  path:
+  - http_request.url.path
+  protocol:
+  - app_protocol_name
+  - http_request.version
+  request_id:
+  - http_request.uid
+  - metadata.correlation_uid
+  response_code:
+  - http_response.code
+  - http_status
+  response_code_details:
+  - status_detail
+  response_flags:
+  - status_code
+  upstream_peer_uri_san:
+  - dst_endpoint.svc_name
+  upstream_service_time:
+  - http_response.latency
+  user_agent:
+  - http_request.user_agent
+  x_forwarded_for:
+  - http_request.x_forwarded_for

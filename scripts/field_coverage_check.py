@@ -32,9 +32,10 @@ import re
 import subprocess
 import tempfile
 import yaml
-from residual_spill import ROOT, check_rule, update
+from residual_spill import ROOT, check_rule, mappings_of, norm_path, update
+import provenance
+from provenance import MISSING, at, leaf_index, same, transform_want
 
-MISSING = object()
 # source_normalize step kinds and their required parameters (and types).
 NORMALIZE_KINDS = {
     'unwrap_single': {'path': str},
@@ -69,16 +70,6 @@ def values(value):
             yield from values(item)
 
 
-def same(a, b):
-    if type(a) in (int, float) and type(b) in (int, float):
-        return a == b
-    if type(a) is type(b):
-        return a == b
-    # VRL to_string conversions preserve scalar numeric/boolean values.
-    scalar = lambda v: json.dumps(v, separators=(',', ':')) if not isinstance(v, str) else v
-    return a is not None and b is not None and not isinstance(a, (dict, list)) and not isinstance(b, (dict, list)) and scalar(a) == scalar(b)
-
-
 def snake(key):
     # Mirror VRL snakecase boundaries, including Unicode letters, while keeping
     # punctuation such as @ and / which are legitimate source key characters.
@@ -98,61 +89,33 @@ def snake(key):
     return ''.join(out).strip('_')
 
 
-def represented(value, mapped):
-    if any(same(value, item) for item in mapped): return True
-    return isinstance(value, list) and bool(value) and all(
-        not isinstance(item, (dict, list)) and any(same(item, output) for output in mapped)
-        for item in value)
-
-
 def mapped_view(output, raw):
     """The event as coverage evidence: never raw_data, unmapped, or a message
     that is just the raw body (spill.vrl's __mapped)."""
     return {k: v for k, v in output.items() if k not in ('unmapped', 'raw_data') and not (k == 'message' and v == raw)}
 
 
-def transformed(rule, value, output, mapped, raw=MISSING):
-    try:
-        kind = rule['kind']
-        if kind == 'lowercase':
-            if not isinstance(value, str): return False
-            want = value.lower()
-        elif kind == 'epoch_ms':
-            clock = dt.datetime.fromisoformat(value.replace('Z', '+00:00')) if rule.get('format', '%+') == '%+' else dt.datetime.strptime(value, rule['format'])
-            want = int(clock.timestamp() * 1000)
-        elif kind == 'scale':
-            want = int(float(value) * rule['factor'])
-        elif kind == 'hex':
-            if not isinstance(value, str) or not value.lower().startswith('0x'): return False
-            want = int(value, 16)
-        elif kind == 'enum':
-            want = rule['values'].get(str(value).lower(), MISSING)
-        else:
-            raise AssertionError(f'unknown transform {kind}')
-    except (ValueError, TypeError, AttributeError, OverflowError):
-        return False
-    if 'target' in rule:
-        # The target is looked up in the mapped event only, so a rule can never
-        # be satisfied by unmapped, raw_data or a message equal to the raw body.
-        actual = mapped_view(output, raw)
-        for part in rule['target'].split('.'):
-            if not isinstance(actual, dict) or part not in actual: return False
-            actual = actual[part]
-        return want is not MISSING and same(want, actual)
-    return any(same(want, item) for item in mapped)
+def transformed(rule, value, index):
+    """A rule consumes its source only when the converted value is AT its target."""
+    want = transform_want(rule, value)
+    return want is not MISSING and at(index, norm_path(rule['target']), want)
 
 
-def check(source, output, raw, rules, consumed=(), candidates=None):
+def check(source, output, raw, rules, consumed=(), mappings=None):
+    """Every source field is consumed by an explicit mapping (its value at one of
+    its declared target paths), a transforms rule (its converted value at the
+    rule's target) or a reference check, or it is in unmapped unaltered. A value
+    that merely appears elsewhere in the event never counts."""
     assert '__coverage_source' not in output
     residual = output.get('unmapped', {})
     assert isinstance(residual, dict), 'unmapped must be an object'
     assert 'unmapped' not in output or residual, 'empty unmapped'
-    mapped_event = mapped_view(output, raw)
-    mapped = list(values(mapped_event))
+    index = leaf_index(mapped_view(output, raw))
+    mappings = mappings or {}
     fields = list(flatten(source))
     used = set()
     for key, value in fields:
-        if key in consumed or ((candidates is None or key in candidates) and represented(value, mapped)) or any(r['source'] == key and transformed(r, value, output, mapped, raw) for r in rules):
+        if key in consumed or any(at(index, target, value) for target in mappings.get(key, ())) or any(r['source'] == key and transformed(r, value, index) for r in rules):
             continue
         if value == raw: continue
         base = '.'.join(snake(part) for part in key.split('.'))
@@ -503,6 +466,7 @@ def run_parser(path, supplied=None, output_dir=None):
     config = yaml.safe_load(config_path.read_text())
     update(path, check=True)
     rules, steps = validate_config(config)
+    mappings = mappings_of(config)
     doc = yaml.safe_load(path.read_text())
     samples = samples_for(path, doc, supplied)
     assert samples, f'{path}: no samples'
@@ -559,8 +523,10 @@ def run_parser(path, supplied=None, output_dir=None):
         assert len(outputs) == len(samples), f'Vector returned {len(outputs)} events for {len(samples)} samples: {run.stdout[:500]}'
         count = 0
         spill_keys = set()
+        outputs_sources = []
         for (name, event), output in zip(samples, outputs):
             source = output.pop('__coverage_source')
+            outputs_sources.append((name, event, output, source))
             if config['source'] in ('json', 'mixed'):
                 try: original = json.loads(event['message'])
                 except json.JSONDecodeError: original = {}
@@ -571,7 +537,7 @@ def run_parser(path, supplied=None, output_dir=None):
                 consumed = []
                 if config.get('reference') == 'windows_sysmon':
                     consumed = reference_consumed(source, output)
-                count += check(source, output, event['message'], rules, consumed, config['consumed_candidates'])
+                count += check(source, output, event['message'], rules, consumed, mappings)
             except AssertionError as error:
                 raise AssertionError(f'{path.parent.name}/{name}: {error}') from error
             # raw_data, when emitted, is the untouched original (never masked,
@@ -597,7 +563,33 @@ def run_parser(path, supplied=None, output_dir=None):
                 source_dir.mkdir(exist_ok=True)
                 (source_dir/(name+'.json')).write_text(json.dumps(source, indent=2)+'\n')
         assert count > 0, f'{path.parent.name}: no parsed source fields were assessed'
+        verify_provenance(path, doc['parser_vrl'], samples, outputs_sources, mappings, rules)
         print(f'PASS {path.parent.name}: {len(samples)} samples, {count} source fields; spilled: {", ".join(sorted(spill_keys))}')
+
+
+PROBES = ('residual_probe', 'text_residual_probe')
+
+
+def verify_provenance(path, program, samples, outputs_sources, mappings, rules):
+    """Every declared mapping and every transforms rule must be demonstrated: in
+    some sample, perturbing the source value moves the value at the declared
+    target with it. A declaration that only ever matches by coincidence (or
+    that no sample exercises) fails."""
+    real = [(n, e, o, s) for n, e, o, s in outputs_sources if n not in PROBES and not n.startswith('normalize_probe_')]
+    samples = [(n, e) for n, e, _, _ in real]
+    sources = [s for _, _, _, s in real]
+    outputs = [o for _, _, o, _ in real]
+    items = [(key, None) for key in mappings] + [(rule['source'], rule) for rule in rules]
+    found = provenance.probe(program, samples, sources, outputs, items, per_key=12)
+    missing = []
+    for key, targets in mappings.items():
+        for target in targets:
+            if target not in found.get((key, None), {}):
+                missing.append(f'{key} -> {target}')
+    for rule in rules:
+        if norm_path(rule['target']) not in found.get((rule['source'], id(rule)), {}):
+            missing.append(f'{rule["source"]} ({rule["kind"]}) -> {rule["target"]}')
+    assert not missing, f'{path.parent.name}: declared mapping(s) without provenance in any sample (perturbing the source does not move the target): ' + ', '.join(missing[:12]) + (' ...' if len(missing) > 12 else '')
 
 
 def main():
