@@ -100,6 +100,12 @@ jobs:
           fi
           bash scripts/validate-vrl.sh /tmp/all_parsers.txt
 
+      # validate-vrl.sh must judge "aborted" by whether the program completed,
+      # never by event text: sample values such as 'root'@host once read as an
+      # abort and failed parsers that ran fine.
+      - name: Test validate-vrl.sh abort detection
+        run: bash scripts/test_validate_vrl.sh
+
   validate-ocsf:
     name: Validate OCSF
     runs-on: ubuntu-24.04  # validator binary needs glibc >= 2.34
@@ -171,6 +177,12 @@ jobs:
 
       - name: Check field coverage for every OCSF parser
         run: python3 scripts/field_coverage_check.py --all
+
+      # A Vault audit device with log_raw=true writes live tokens and
+      # secrets; the hashicorp_vault parser must scrub every one of them from
+      # raw_data, mapped columns and the unmapped spill.
+      - name: Test that no Vault credential survives the parser
+        run: python3 scripts/test_vault_token_redaction.py
 
   # NAN-5388: compiling is not enough; a parser must also compile FAST. An
   # install's deploy waits 45 s for Vector to acknowledge a reload, and a reload

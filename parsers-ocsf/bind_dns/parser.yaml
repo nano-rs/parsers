@@ -1,0 +1,682 @@
+name: bind_dns_ocsf
+display_name: ISC BIND named (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses ISC BIND 9 (named) logs into OCSF 1.9.0, from syslog or from a file
+  channel with print-time / print-category / print-severity. Query log lines
+  (category queries) become DNS Activity (4003) Query with the client as
+  src_endpoint, the listening address as dst_endpoint and the query flags
+  (TCP, EDNS, DNSSEC OK, cookies) decoded. ACL refusals ("query (cache)
+  'name/A/IN' denied", zone transfer and update denials) become DNS Activity
+  with action Denied; zone transfer denials are Medium severity because they
+  usually mean reconnaissance. Response Policy Zone hits ("rpz QNAME
+  NXDOMAIN rewrite ... via ...") become DNS Activity with the RPZ trigger and
+  policy record in firewall_rule and an action that follows the policy
+  (NXDOMAIN / NODATA / DROP are Denied with status Failure, Local-Data and
+  CNAME rewrites are Modified, PASSTHRU is Allowed) and the rewritten rcode. Every other named line (lame servers,
+  DNSSEC validation, zone maintenance, resolver errors) becomes Base Event
+  (0) with the category and severity kept; an unrecognizable line is a Base
+  Event marked with unmapped.parse_fallback.
+match_values:
+  - bind_dns
+category: network
+vendor: "ISC"
+product: "BIND"
+parser_vrl: |
+  # ISC BIND named -> OCSF 1.9.0 DNS Activity (4003) / Base Event (0)
+  raw_log = if is_string(.message) { string!(.message) } else { encode_json(.) }
+  __raw_body = raw_log
+  __source_kv = {}
+
+  time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
+  recognized = false
+  host = ""
+  level = ""
+  sev_num = -1
+  body = raw_log
+
+  # ---- optional syslog envelope ----
+  sm, se = parse_regex(body, r'^(?:<(?P<pri>\d{1,3})>)?(?:1\s+)?(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}|\d{4}-\d{2}-\d{2}T\S+)\s+(?P<host>\S+)\s+named(?:\x5B(?P<pid>\d+)\x5D)?(?:\s+\S+\s+-\s+-)?:?\s+(?P<rest>.*)$')
+  if se == null {
+      recognized = true
+      hdr = { "ts": sm.ts, "host": sm.host }
+      if sm.pri != null { hdr.pri = sm.pri; sev_num = mod(to_int(sm.pri) ?? 6, 8) }
+      if sm.pid != null { hdr.pid = sm.pid }
+      __source_kv.header = hdr
+      host = string!(sm.host)
+      body = string!(sm.rest)
+      ts_str = string!(sm.ts)
+      t1, t1e = parse_timestamp(ts_str, "%+")
+      if t1e == null {
+          time_ms = to_unix_timestamp(t1, unit: "milliseconds")
+      } else {
+          t2, t2e = parse_timestamp(replace(ts_str, r'\s+', " ") + " " + format_timestamp!(now(), "%Y"), "%b %d %H:%M:%S %Y", timezone: "UTC")
+          if t2e == null { time_ms = to_unix_timestamp(t2, unit: "milliseconds") }
+      }
+  }
+
+  # ---- optional file-channel print-time ----
+  fm, fe = parse_regex(body, r'^(?P<ftime>\d{2}-[A-Z][a-z]{2}-\d{4}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+(?P<rest>.*)$')
+  if fe == null {
+      recognized = true
+      __source_kv.file_time = fm.ftime
+      body = string!(fm.rest)
+      tf, tfe = parse_timestamp(string!(fm.ftime), "%d-%b-%Y %H:%M:%S%.f", timezone: "UTC")
+      if tfe == null { time_ms = to_unix_timestamp(tf, unit: "milliseconds") }
+  }
+
+  # ---- optional print-category / print-severity ----
+  cm, ce = parse_regex(body, r'^(?P<category>queries|query-errors|security|rpz|rpz-passthru|lame-servers|default|general|client|config|database|dnssec|dispatch|edns-disabled|network|notify|resolver|unmatched|update|update-security|xfer-in|xfer-out|cname|spill|serve-stale|zoneload|nsid|trust-anchor-telemetry|delegation-only):\s+(?:(?P<level>info|notice|warning|error|critical|dynamic|debug(?:\s+\d+)?):\s+)?(?P<rest>.*)$')
+  if ce == null {
+      recognized = true
+      __source_kv.category = cm.category
+      if cm.level != null { __source_kv.level = cm.level; level = string!(cm.level) }
+      body = string!(cm.rest)
+  } else {
+      lm, le = parse_regex(body, r'^(?P<level>info|notice|warning|error|critical):\s+(?P<rest>.*)$')
+      if le == null {
+          __source_kv.level = lm.level
+          level = string!(lm.level)
+          body = string!(lm.rest)
+      }
+  }
+
+  severity_id = 1
+  severity = "Informational"
+  if level == "warning" || sev_num == 4 { severity_id = 3; severity = "Medium" }
+  if level == "notice" || sev_num == 5 { severity_id = 2; severity = "Low" }
+  if level == "error" || sev_num == 3 { severity_id = 4; severity = "High" }
+  if level == "critical" || sev_num == 2 || sev_num == 1 { severity_id = 5; severity = "Critical" }
+  if sev_num == 0 { severity_id = 6; severity = "Fatal" }
+
+  route = "base"
+  activity_id = 1
+  activity_name = "Query"
+  action_id = 0
+  action = "Unknown"
+  disposition_id = 0
+  disposition = "Unknown"
+  status_id = 0
+  status_str = "Unknown"
+  src = {}
+  dst = { "svc_name": "dns", "port": 53 }
+  query = {}
+  conn = {}
+  rule = {}
+  opcode = ""
+  view = ""
+  flag_ids = []
+  rcode = ""
+  rcode_id = -1
+
+  # ---- client-scoped messages ----
+  km, ke = parse_regex(body, r'^client\s+(?:@(?P<handle>0x[0-9A-Fa-f]+)\s+)?(?P<ip>[0-9A-Fa-f.:]+)#(?P<port>\d+)(?:\s+\x28(?P<qname>[^\x29]*)\x29)?:\s+(?:view\s+(?P<view>[^:]+):\s+)?(?P<cmsg>.*)$')
+  if ke == null {
+      recognized = true
+      kc = { "ip": km.ip, "port": km.port }
+      if km.handle != null { kc.handle = km.handle }
+      if km.qname != null { kc.qname = km.qname }
+      if km.view != null { kc.view = km.view; view = string!(km.view) }
+      __source_kv.client = kc
+      src = { "ip": km.ip, "port": to_int(km.port) ?? 0 }
+      cmsg = string!(km.cmsg)
+
+      qm, qe = parse_regex(cmsg, r'^query:\s+(?P<name>\S+)\s+(?P<class>\S+)\s+(?P<type>\S+)\s+(?P<flags>[-+A-Z0-9\x28\x29]+)\s+\x28(?P<server>[^\x29]+)\x29\s*$')
+      if qe == null {
+          __source_kv.query = qm
+          route = "dns"
+          action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed"
+          status_id = 1; status_str = "Success"
+          query = { "hostname": qm.name, "class": qm.class, "type": qm.type }
+          dst.ip = qm.server
+          flags = string!(qm.flags)
+          # BIND query-log flags: + RD set, - RD clear, E(n) EDNS, T TCP,
+          # S signed, D DO (DNSSEC OK), C CD, V/K server cookie.
+          if starts_with(flags, "+") { flag_ids = push(flag_ids, 3) }
+          if contains(flags, "C") { flag_ids = push(flag_ids, 6) }
+          if contains(flags, "T") {
+              conn = { "direction_id": 1, "protocol_num": 6, "protocol_name": "tcp" }
+          } else {
+              conn = { "direction_id": 1, "protocol_num": 17, "protocol_name": "udp" }
+          }
+      } else {
+          dm, de = parse_regex(cmsg, r'^(?P<op>query(?:\s+\x28(?P<acl>[^\x29]+)\x29)?|zone transfer|update|notify|update forwarding)\s+\x27(?P<name>[^/\x27]+)/(?:(?P<type>[^/\x27]+)/)?(?P<class>[^/\x27]+)\x27\s+(?P<verdict>denied|approved)')
+          if de == null {
+              __source_kv.acl = dm
+              route = "dns"
+              op = string!(dm.op)
+              query = { "hostname": dm.name, "class": dm.class }
+              if dm.type != null { query.type = dm.type }
+              if starts_with(op, "update") { opcode = "Update"; query.opcode = "Update"; query.opcode_id = 5 }
+              if op == "notify" { opcode = "Notify"; query.opcode = "Notify"; query.opcode_id = 4 }
+              if dm.acl != null { rule = { "name": dm.acl, "type": "ACL" } }
+              if dm.verdict == "denied" {
+                  action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
+                  status_id = 2; status_str = "Failure"
+                  if severity_id < 2 { severity_id = 2; severity = "Low" }
+                  if op == "zone transfer" && severity_id < 3 { severity_id = 3; severity = "Medium" }
+              } else {
+                  action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed"
+                  status_id = 1; status_str = "Success"
+              }
+          } else {
+              rm, re = parse_regex(cmsg, r'^rpz\s+(?P<trigger>QNAME|IP|NSDNAME|NSIP|CLIENT-IP)\s+(?P<policy>NXDOMAIN|NODATA|Local-Data|CNAME|PASSTHRU|DROP|TCP-Only|DISABLED|Qname-Wait-Recurse|Nsdname-Wait-Recurse)\s+rewrite\s+(?P<name>[^/\s]+)/(?P<type>[^/\s]+)/(?P<class>\S+)\s+via\s+(?P<via>\S+)')
+              if re == null {
+                  __source_kv.rpz = rm
+                  route = "dns"
+                  pol = string!(rm.policy)
+                  query = { "hostname": rm.name, "type": rm.type, "class": rm.class }
+                  rule = { "name": rm.via, "type": "RPZ " + string!(rm.trigger), "desc": pol }
+                  status_id = 1; status_str = "Success"
+                  if pol == "PASSTHRU" || pol == "DISABLED" {
+                      action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed"
+                  } else if pol == "Local-Data" || pol == "CNAME" {
+                      action_id = 4; action = "Modified"; disposition_id = 7; disposition = "Custom Action"
+                      if severity_id < 3 { severity_id = 3; severity = "Medium" }
+                  } else {
+                      action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
+                      status_id = 2; status_str = "Failure"
+                      if severity_id < 3 { severity_id = 3; severity = "Medium" }
+                  }
+                  # the rewritten answer the client received
+                  if pol == "NXDOMAIN" { rcode = "NXDomain"; rcode_id = 3 }
+                  if pol == "NODATA" || pol == "Local-Data" || pol == "CNAME" { rcode = "NoError"; rcode_id = 0 }
+              }
+          }
+      }
+      if route == "base" { __source_kv.message = cmsg }
+  } else if recognized {
+      __source_kv.message = body
+  }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": sha2("bind_dns|raw|" + raw_log, variant: "SHA-256"),
+      "profiles": ["host", "security_control"],
+      "log_name": "named",
+      "product": { "name": "BIND", "vendor_name": "ISC" }
+  }
+  cat = string(__source_kv.category) ?? ""
+  if cat != "" { metadata.log_provider = cat }
+  if level != "" { metadata.log_level = level }
+
+  if route == "dns" {
+      . = {
+          "class_uid": 4003, "class_name": "DNS Activity",
+          "category_uid": 4, "category_name": "Network Activity",
+          "activity_id": activity_id, "activity_name": activity_name,
+          "type_uid": 400300 + activity_id,
+          "severity_id": severity_id, "severity": severity,
+          "status_id": status_id, "status": status_str,
+          "action_id": action_id, "action": action,
+          "disposition_id": disposition_id, "disposition": disposition,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata,
+          "query": query,
+          "src_endpoint": src,
+          "dst_endpoint": dst
+      }
+      if host != "" { .dst_endpoint.hostname = host }
+      if length(conn) > 0 { .connection_info = conn }
+      if length(flag_ids) > 0 { .flag_ids = flag_ids }
+      if length(rule) > 0 { .firewall_rule = rule }
+      if rcode_id >= 0 { .rcode = rcode; .rcode_id = rcode_id }
+      if opcode == "Update" { .opcode = "Update"; .opcode_id = 5 }
+      if opcode == "Notify" { .opcode = "Notify"; .opcode_id = 4 }
+      if view != "" { .policy = { "name": view, "type": "view" } }
+      if host != "" { .device = { "hostname": host, "type_id": 1, "type": "Server" } }
+  } else {
+      . = {
+          "class_uid": 0, "class_name": "Base Event",
+          "category_uid": 0, "category_name": "Uncategorized",
+          "activity_id": 99, "activity_name": "Other",
+          "type_uid": 99,
+          "severity_id": severity_id, "severity": severity,
+          "status_id": 0, "status": "Unknown",
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": metadata
+      }
+      if recognized {
+          .message = string(__source_kv.message) ?? body
+      } else {
+          . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+      }
+  }
+
+  .
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # header.ts: RFC 5424 syslog timestamp converted to event milliseconds; RFC 3164 clocks carry no year and remain residual.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        header\.ts
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    header\.host
+  | category
+  | level
+  | client\.ip
+  | client\.port
+  | client\.view
+  | query\.name
+  | query\.class
+  | query\.type
+  | query\.server
+  | acl\.name
+  | acl\.class
+  | acl\.type
+  | acl\.acl
+  | rpz\.name
+  | rpz\.type
+  | rpz\.class
+  | rpz\.via
+  | rpz\.policy
+  | message
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # Sources: BIND 9 Administrator Reference Manual, logging categories and
+  # query-log format (https://bind9.readthedocs.io/en/latest/reference.html#logging-categories),
+  # ISC KB "What do EDNS flags in the query log mean" (https://kb.isc.org/docs/aa-01218),
+  # ISC KB on RPZ logging (https://kb.isc.org/docs/aa-00525) and the BIND
+  # samples in https://docs.sekoia.com/integration/categories/network/bind/ .
+  # Addresses and names replaced with documentation values.
+  # Query log via syslog, BIND 9.16+ (client handle, EDNS + cookie flags)
+  - raw: '<30>Nov 21 10:00:00 ns1 named[1234]: client @0x7f9b4c0a8d10 192.0.2.5#53214 (www.example.com): query: www.example.com IN A +E(0)K (192.0.2.53)'
+    expect:
+      class_uid: 4003
+      activity_id: 1
+      query.hostname: www.example.com
+      query.type: A
+      src_endpoint.ip: 192.0.2.5
+      src_endpoint.port: 53214
+      dst_endpoint.ip: 192.0.2.53
+      connection_info.protocol_name: udp
+  # Query log, file channel with print-time, print-category and print-severity, TCP + DNSSEC
+  - raw: '21-Nov-2026 10:00:01.123 queries: info: client @0x7f9b4c0a8d10 2001:db8::25#40112 (example.org): query: example.org IN DNSKEY +ETDC (2001:db8::53)'
+    expect:
+      class_uid: 4003
+      time: 1795255201123
+      src_endpoint.ip: 2001:db8::25
+      connection_info.protocol_name: tcp
+      metadata.log_provider: queries
+  # Query log, pre-9.11 form without the client handle, with a view
+  - raw: '21-Nov-2026 10:00:02.000 client 198.51.100.7#61001 (mail.example.net): view external: query: mail.example.net IN MX - (198.51.100.53)'
+    expect:
+      class_uid: 4003
+      query.type: MX
+      policy.name: external
+  # ACL refusal of a recursive query
+  - raw: '<29>Nov 21 10:00:03 ns1 named[1234]: client @0x7f9b4c0a8d10 203.0.113.44#41234 (www.example.com): query (cache) ''www.example.com/A/IN'' denied'
+    expect:
+      class_uid: 4003
+      action_id: 2
+      disposition_id: 2
+      status_id: 2
+      firewall_rule.name: cache
+      src_endpoint.ip: 203.0.113.44
+  # Zone transfer refusal (reconnaissance) from the security category
+  - raw: '21-Nov-2026 10:00:04.000 security: error: client @0x7f9b4c0a9000 203.0.113.99#50111 (example.com): zone transfer ''example.com/AXFR/IN'' denied'
+    expect:
+      class_uid: 4003
+      query.type: AXFR
+      action_id: 2
+      severity_id: 4
+  # Dynamic update refusal
+  - raw: '21-Nov-2026 10:00:05.000 update-security: error: client @0x7f9b4c0a9100 198.51.100.20#5353: update ''example.com/IN'' denied'
+    expect:
+      class_uid: 4003
+      opcode_id: 5
+      action_id: 2
+  # RPZ hit, NXDOMAIN policy
+  - raw: '21-Nov-2026 10:00:06.000 rpz: info: client @0x7f9b4c0a9200 192.0.2.66#57152 (malware.example.net): rpz QNAME NXDOMAIN rewrite malware.example.net/A/IN via malware.example.net.rpz.example.com'
+    expect:
+      class_uid: 4003
+      action_id: 2
+      disposition_id: 2
+      status_id: 2
+      rcode_id: 3
+      rcode: NXDomain
+      severity_id: 3
+      firewall_rule.name: malware.example.net.rpz.example.com
+      firewall_rule.type: RPZ QNAME
+  # RPZ PASSTHRU (allow list), Sekoia sample shape
+  - raw: '<30>Nov 21 10:00:07 ns1 named[1234]: client @0x12345678 192.0.2.4#52998 (id.example.org): rpz QNAME PASSTHRU rewrite id.example.org/A/IN via id.example.org.0-1.wl.rpz'
+    expect:
+      class_uid: 4003
+      action_id: 1
+      status_id: 1
+      rcode_id: <missing>
+  # RPZ NODATA block: a denied, failed lookup answered with an empty NOERROR
+  - raw: '21-Nov-2026 10:00:06.500 rpz: info: client @0x7f9b4c0a9210 192.0.2.68#57153 (tracker.example.net): rpz QNAME NODATA rewrite tracker.example.net/AAAA/IN via tracker.example.net.rpz.example.com'
+    expect:
+      class_uid: 4003
+      action_id: 2
+      status_id: 2
+      rcode_id: 0
+  # RPZ Local-Data rewrite (walled garden)
+  - raw: '21-Nov-2026 10:00:08.000 rpz: info: client @0x7f9b4c0a9300 192.0.2.67#40000 (phish.example.com): rpz QNAME Local-Data rewrite phish.example.com/AAAA/IN via phish.example.com.rpz.example.com'
+    expect:
+      class_uid: 4003
+      action_id: 4
+  # Non-query lines -> Base Event
+  - raw: '21-Nov-2026 10:00:09.000 lame-servers: info: lame server resolving ''1.2.0.192.in-addr.arpa'' (in ''2.0.192.in-addr.arpa''?): 192.0.2.1#53'
+    expect:
+      class_uid: 0
+      metadata.log_provider: lame-servers
+  - raw: '<28>Nov 21 10:00:10 ns1 named[1234]: validating api.example.com/A: no valid signature found'
+    expect:
+      class_uid: 0
+      severity_id: 3
+  - raw: '21-Nov-2026 10:00:11.000 notify: info: zone 10.in-addr.arpa/IN: sending notifies (serial 393191)'
+    expect:
+      class_uid: 0
+  # Malformed line -> Base Event with the fallback marker
+  - raw: 'this is not a named log line'
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: unparsable input
