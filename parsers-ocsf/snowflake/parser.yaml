@@ -100,16 +100,16 @@ parser_vrl: |
       if kind == "query" { ts = string(p.START_TIME) ?? "" }
       if kind == "access" { ts = string(p.QUERY_START_TIME) ?? "" }
       time_ms = 0
-      t1, e1 = parse_timestamp(ts, "%+")
+      t1, e1 = parse_timestamp(ts, "%+", timezone: "UTC")
       if e1 == null {
           time_ms = to_unix_timestamp(t1, unit: "milliseconds")
       } else {
-          t2, e2 = parse_timestamp(ts, "%Y-%m-%d %H:%M:%S%.f %z")
+          t2, e2 = parse_timestamp(ts, "%Y-%m-%d %H:%M:%S%.f %z", timezone: "UTC")
           if e2 == null {
               time_ms = to_unix_timestamp(t2, unit: "milliseconds")
           } else {
               # A trailing " Z" (UTC) or no zone at all: both are UTC.
-              t3, e3 = parse_timestamp(replace(ts, r' Z$', ""), "%Y-%m-%d %H:%M:%S%.f")
+              t3, e3 = parse_timestamp(replace(ts, r' Z$', ""), "%Y-%m-%d %H:%M:%S%.f", timezone: "UTC")
               if e3 == null { time_ms = to_unix_timestamp(t3, unit: "milliseconds") }
           }
       }
@@ -205,7 +205,11 @@ parser_vrl: |
           ocsf.database = { "name": db_name, "type_id": 1, "type": "Relational" }
           qtext = string(p.QUERY_TEXT) ?? ""
           # The full statement, never truncated: a parser keeps every value.
-          qinfo = { "uid": to_string(p.QUERY_ID) ?? "", "query_string": qtext }
+          # query_info needs a uid (OCSF at_least_one name / uid); a null or
+          # absent QUERY_ID gets the fallback metadata.uid gets below.
+          qinfo_uid = to_string(p.QUERY_ID) ?? ""
+          if qinfo_uid == "" { qinfo_uid = sha2("snowflake|raw|" + raw_log, variant: "SHA-256") }
+          qinfo = { "uid": qinfo_uid, "query_string": qtext }
           ocsf.query_info = qinfo
           exec = downcase(string(p.EXECUTION_STATUS) ?? "")
           if exec == "fail" || exec == "incident" { status_id = 2; status_str = "Failure" }
@@ -233,6 +237,9 @@ parser_vrl: |
           ddl = object(ddl) ?? {}
           objects = array(direct) ?? []
           if length(objects) == 0 { objects = array(base) ?? [] }
+          # A write that reads no table (INSERT ... VALUES) names its target only
+          # in OBJECTS_MODIFIED.
+          if length(objects) == 0 { objects = array(modified) ?? [] }
           n_modified = length(array(modified) ?? [])
 
           tbl = {}
@@ -278,7 +285,8 @@ parser_vrl: |
               if ddl_op == "CREATE" { activity_id = 6; activity_name = "Create" }
               if ddl_op == "ALTER" || ddl_op == "REPLACE" { activity_id = 2; activity_name = "Update" }
               if ddl_op == "DROP" { activity_id = 7; activity_name = "Delete" }
-              if ddl_name != "" && length(tbl) == 0 && (ddl_domain == "TABLE" || ddl_domain == "VIEW") { tbl = { "name": ddl_name } }
+              if ddl_name != "" && length(tbl) == 0 && (ddl_domain == "TABLE" || ddl_domain == "VIEW" || ddl_domain == "MATERIALIZED VIEW" || ddl_domain == "EXTERNAL TABLE" || ddl_domain == "STREAM") { tbl = { "name": ddl_name } }
+              if ddl_name != "" && length(bucket) == 0 && ddl_domain == "STAGE" { bucket = { "name": ddl_name, "type_id": 99, "type": "Snowflake Stage" } }
               ocsf.class_uid = 6005
               ocsf.class_name = "Datastore Activity"
               ocsf.category_uid = 6
@@ -790,3 +798,20 @@ samples:
     expect:
       "class_uid": 0
       "metadata.version": "1.9.0"
+  # #77 P2-2: INSERT ... VALUES names its target only in OBJECTS_MODIFIED
+  - raw: "{\"QUERY_ID\": \"01b2c3d4-0000-1111-0000-000000000077\", \"QUERY_START_TIME\": \"2026-08-18 10:00:00.000 Z\", \"USER_NAME\": \"ETL_USER\", \"DIRECT_OBJECTS_ACCESSED\": [], \"BASE_OBJECTS_ACCESSED\": [], \"OBJECTS_MODIFIED\": [{\"objectDomain\": \"Table\", \"objectName\": \"PROD_DB.PUBLIC.ORDERS\", \"objectId\": 1234, \"columns\": [{\"columnName\": \"ID\"}]}], \"OBJECT_MODIFIED_BY_DDL\": null}"
+    expect:
+      "class_uid": 6005
+      "activity_id": 5
+      "table.name": "PROD_DB.PUBLIC.ORDERS"
+  # #77 P2-2: CREATE STAGE maps the stage as the data bucket
+  - raw: "{\"QUERY_ID\": \"01b2c3d4-0000-1111-0000-000000000078\", \"QUERY_START_TIME\": \"2026-08-18 10:01:00.000 Z\", \"USER_NAME\": \"ETL_USER\", \"DIRECT_OBJECTS_ACCESSED\": [], \"BASE_OBJECTS_ACCESSED\": [], \"OBJECTS_MODIFIED\": [], \"OBJECT_MODIFIED_BY_DDL\": {\"objectDomain\": \"Stage\", \"objectName\": \"PROD_DB.PUBLIC.EXFIL_STAGE\", \"objectId\": 77, \"operationType\": \"CREATE\", \"properties\": {}}}"
+    expect:
+      "class_uid": 6005
+      "activity_id": 6
+      "databucket.name": "PROD_DB.PUBLIC.EXFIL_STAGE"
+  # #77 P2-3: a null QUERY_ID still gives query_info a uid (the metadata.uid fallback)
+  - raw: "{\"QUERY_ID\": null, \"QUERY_TEXT\": \"SELECT 1\", \"QUERY_TYPE\": \"SELECT\", \"START_TIME\": \"2026-08-18 10:02:00.000 Z\", \"USER_NAME\": \"ANALYST\", \"EXECUTION_STATUS\": \"SUCCESS\"}"
+    expect:
+      "class_uid": 6005
+      "query_info.query_string": "SELECT 1"

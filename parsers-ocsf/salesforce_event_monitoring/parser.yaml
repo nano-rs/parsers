@@ -217,16 +217,22 @@ parser_vrl: |
           if rtype == "" {
               # A schema-normalized collector may send every field, absent ones as
               # null or "", so a field signals a type only when it holds a value.
-              if (string(r.ReportId) ?? "") != "" { rtype = "ReportEvent" }
-              if (string(r.PageUrl) ?? "") != "" { rtype = "LightningUriEvent" }
-              if (string(r.Query) ?? "") != "" || (exists(r.QueriedEntities) && exists(r.ApiType)) { rtype = "ApiEvent" }
-              if rtype == "" && (exists(r.LoginType) || exists(r.LoginUrl)) { rtype = "LoginEvent" }
+              # In priority order, so a report or page event is never overwritten.
+              if (string(r.ReportId) ?? "") != "" {
+                  rtype = "ReportEvent"
+              } else if (string(r.PageUrl) ?? "") != "" {
+                  rtype = "LightningUriEvent"
+              } else if (string(r.Query) ?? "") != "" || ((string(r.QueriedEntities) ?? "") != "" && (string(r.ApiType) ?? "") != "") {
+                  rtype = "ApiEvent"
+              } else if (string(r.LoginType) ?? "") != "" || (string(r.LoginUrl) ?? "") != "" {
+                  rtype = "LoginEvent"
+              }
               # Streamed (Pub/Sub) deliveries carry no attributes.type: an admin
               # login-as carries a DelegatedUsername (and never outranks a report,
               # page or API event), and a logout is a session record with no
               # operation, query, page or login details.
               if (rtype == "" || rtype == "LoginEvent") && (string(r.DelegatedUsername) ?? "") != "" { rtype = "LoginAsEvent" }
-              if rtype == "" && exists(r.SessionKey) && !exists(r.Operation) && !exists(r.ApiType) && !exists(r.Status) { rtype = "LogoutEvent" }
+              if rtype == "" && (string(r.SessionKey) ?? "") != "" && (string(r.Operation) ?? "") == "" && (string(r.ApiType) ?? "") == "" && (string(r.Status) ?? "") == "" { rtype = "LogoutEvent" }
           }
           et = rtype
           ts = string(r.EventDate) ?? ""
@@ -261,18 +267,19 @@ parser_vrl: |
           if region != "" { loc.region = region }
           postal = string(r.PostalCode) ?? ""
           if postal != "" { loc.postal_code = postal }
-          if is_float(r.LoginLatitude) { loc.lat = r.LoginLatitude }
-          if is_float(r.LoginLongitude) { loc.long = r.LoginLongitude }
+          # An equatorial or prime-meridian coordinate arrives as an integer (0, 1).
+          if is_float(r.LoginLatitude) || is_integer(r.LoginLatitude) { loc.lat = r.LoginLatitude }
+          if is_float(r.LoginLongitude) || is_integer(r.LoginLongitude) { loc.long = r.LoginLongitude }
       }
 
       # ---- time ----
       time_ms = 0
-      clock, clock_err = parse_timestamp(ts, "%+")
+      clock, clock_err = parse_timestamp(ts, "%+", timezone: "UTC")
       if clock_err == null {
           time_ms = to_unix_timestamp(clock, unit: "milliseconds")
       } else if fmt == "elf" {
           # EventLogFile TIMESTAMP is GMT, e.g. 20130715233322.670.
-          clock2, clock2_err = parse_timestamp(string(r.TIMESTAMP) ?? "", "%Y%m%d%H%M%S%.f")
+          clock2, clock2_err = parse_timestamp(string(r.TIMESTAMP) ?? "", "%Y%m%d%H%M%S%.f", timezone: "UTC")
           if clock2_err == null { time_ms = to_unix_timestamp(clock2, unit: "milliseconds") }
       }
 
@@ -361,7 +368,11 @@ parser_vrl: |
           ocsf.table = tbl
           if family == "query" {
               # The full query, never truncated: a parser keeps every value.
-              qinfo = { "uid": evt_uid, "query_string": query }
+              # query_info needs a uid (OCSF at_least_one name / uid): the same
+              # fallback metadata.uid gets below when the event has no id.
+              qinfo_uid = evt_uid
+              if qinfo_uid == "" { qinfo_uid = sha2("salesforce_event_monitoring|raw|" + raw_log, variant: "SHA-256") }
+              qinfo = { "uid": qinfo_uid, "query_string": query }
               ocsf.query_info = qinfo
           }
       } else {
@@ -497,7 +508,7 @@ parser_vrl: |
       | EventDate
       )\z') {
           __value = value
-          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
               if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
@@ -933,3 +944,38 @@ samples:
       "class_uid": 6005
       "query_info.query_string": "SELECT Id FROM Account"
       "metadata.version": "1.9.0"
+  # #77 P1-1: schema-normalized ReportEvent (null ApiType) stays a report
+  - raw: "{\"EventDate\": \"2026-08-18T10:00:00Z\", \"EventIdentifier\": \"evt-report-1\", \"Username\": \"jdoe@example.com\", \"UserId\": \"005000000000111AAA\", \"ReportId\": \"00O000000000001AAA\", \"Name\": \"Revenue Report\", \"Operation\": \"ReportExported\", \"QueriedEntities\": \"Opportunity\", \"ApiType\": null, \"PageUrl\": null, \"Query\": null, \"SourceIp\": \"203.0.113.10\"}"
+    expect:
+      "class_uid": 6005
+      "metadata.event_code": "ReportEvent"
+      "severity_id": 3
+  # #77 P1-1: schema-normalized LoginAsEvent (null QueriedEntities / ApiType)
+  - raw: "{\"EventDate\": \"2026-08-18T10:01:00Z\", \"EventIdentifier\": \"evt-loginas-1\", \"Username\": \"jdoe@example.com\", \"UserId\": \"005000000000111AAA\", \"DelegatedUsername\": \"admin@example.com\", \"LoginType\": \"Application\", \"QueriedEntities\": null, \"ApiType\": null, \"ReportId\": null, \"PageUrl\": null, \"Query\": null, \"SourceIp\": \"203.0.113.11\"}"
+    expect:
+      "class_uid": 3002
+      "metadata.event_code": "LoginAsEvent"
+  # #77 P1-1: schema-normalized failed LoginEvent
+  - raw: "{\"EventDate\": \"2026-08-18T10:02:00Z\", \"EventIdentifier\": \"evt-login-1\", \"Username\": \"jdoe@example.com\", \"UserId\": \"005000000000111AAA\", \"LoginType\": \"Application\", \"Status\": \"Invalid Password\", \"QueriedEntities\": null, \"ApiType\": null, \"ReportId\": null, \"PageUrl\": null, \"Query\": null, \"SourceIp\": \"203.0.113.12\"}"
+    expect:
+      "class_uid": 3002
+      "metadata.event_code": "LoginEvent"
+      "status_id": 2
+  # #77 P1-1: schema-normalized LogoutEvent (null Operation / Status)
+  - raw: "{\"EventDate\": \"2026-08-18T10:03:00Z\", \"EventIdentifier\": \"evt-logout-1\", \"Username\": \"jdoe@example.com\", \"UserId\": \"005000000000111AAA\", \"SessionKey\": \"s1\", \"Operation\": null, \"Status\": null, \"ApiType\": null, \"ReportId\": null, \"PageUrl\": null, \"Query\": null, \"SourceIp\": \"203.0.113.13\"}"
+    expect:
+      "class_uid": 3002
+      "metadata.event_code": "LogoutEvent"
+  # #77 P1-1: schema-normalized LightningUriEvent keeps its page
+  - raw: "{\"EventDate\": \"2026-08-18T10:04:00Z\", \"EventIdentifier\": \"evt-uri-1\", \"Username\": \"jdoe@example.com\", \"UserId\": \"005000000000111AAA\", \"PageUrl\": \"/lightning/r/Account/001/view\", \"QueriedEntities\": \"Account\", \"ApiType\": null, \"ReportId\": null, \"Query\": null, \"SourceIp\": \"203.0.113.14\"}"
+    expect:
+      "metadata.event_code": "LightningUriEvent"
+  # #77 P2-1: integer login coordinates are mapped
+  - raw: "{\"EventDate\": \"2026-08-18T10:05:00Z\", \"EventIdentifier\": \"evt-login-2\", \"Username\": \"jdoe@example.com\", \"UserId\": \"005000000000111AAA\", \"LoginType\": \"Application\", \"Status\": \"Success\", \"LoginLatitude\": 1, \"LoginLongitude\": 0, \"SourceIp\": \"203.0.113.15\"}"
+    expect:
+      "src_endpoint.location.lat": 1
+      "src_endpoint.location.long": 0
+  # #77 P2-3: an ApiEvent query with no id still has a query_info.uid
+  - raw: "{\"EventDate\": \"2026-08-18T10:06:00Z\", \"Username\": \"jdoe@example.com\", \"UserId\": \"005000000000111AAA\", \"Query\": \"SELECT Id FROM Account\", \"QueriedEntities\": \"Account\", \"ApiType\": \"REST\", \"SourceIp\": \"203.0.113.16\"}"
+    expect:
+      "class_uid": 6005
