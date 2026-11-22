@@ -41,7 +41,7 @@ PARSER = ROOT / 'parsers-ocsf/hashicorp_vault/parser.yaml'
 # one; legacy b. batch tokens are long.
 TOKEN = re.compile(r'(?<![A-Za-z0-9])(?:hv[sbr]\.[A-Za-z0-9_-]{8,}|[sr]\.[A-Za-z0-9]{20,}(?![A-Za-z0-9_-])|b\.[A-Za-z0-9_-]{60,})')
 # A JWT (padding allowed) or a 5-part JWE, whose second segment is not eyJ.
-JWT = re.compile(r'eyJ[A-Za-z0-9_=-]{6,}\.(?:eyJ[A-Za-z0-9_=-]{6,}|[A-Za-z0-9_=-]*\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+\.)')
+JWT = re.compile(r'ey[A-Za-z0-9_=-]{6,}\.(?:ey[A-Za-z0-9_=-]{6,}|[A-Za-z0-9_=-]*\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+\.)')
 HMAC = re.compile(r'^hmac-sha256:[0-9a-f]{64}$')
 VAULT_JSON = re.compile(r'\{\s*"(?:time|type|auth|request|response|error|forwarded_from)"\s*:')
 # Plaintext secrets the raw-mode samples carry in non-token-shaped fields.
@@ -206,6 +206,54 @@ HOSTILE += [
     entry(rid='eyi', error='bad jwt eyJhbGciOiJIUzI1NiJ9.eyIxIjoiTEVBSy14MTMifQ.c2ln'),
 ]
 
+# #82 review 1: URLs, JSON escapes, odd token shapes, un-HMAC'd error and
+# warnings, duplicate keys, and kept envelope fields of the wrong type.
+def escaped(text, plain, esc):
+    assert plain in text, plain
+    return text.replace(plain, esc)
+
+
+HOSTILE += [
+    entry(rid='frag', response={'redirect': 'https://app.example.com/callback#access_token=LEAK-z1&id_token=LEAK-z2'}),
+    entry(rid='fragq', response={'redirect': 'https://app.example.com/cb#access_token=LEAK-z3?x=1'}),
+    entry(rid='userinfo', request={'request_uri': 'https://user:LEAK-z5@vault.internal/v1/secret/data/app'},
+          response={'redirect': 'https://admin:LEAK-z4@idp.example.com/login'}),
+    entry(rid='relfrag', request={'request_uri': '/v1/auth/oidc/callback#code=LEAK-z6'}),
+    # JSON escapes: the secret is only visible after decoding
+    escaped(entry(rid='esc1', request={'path': 'auth/token/lookup/hvs.LEAKz7escapedtoken'}), 'hvs.LEAK', '\\u0068vs.LEAK'),
+    escaped(entry(rid='esc2', request={'headers': {'user-agent': ['x eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJMRUFLIn0.LEAKz8sig']}}),
+            'eyJhbGci', '\\u0065yJhbGci'),
+    escaped(entry(rid='esc3', auth={'display_name': '-----BEGIN RSA PRIVATE KEY-----\nLEAK-z9\n-----END RSA PRIVATE KEY-----'}),
+            '-----BEGIN', '\\u002d----BEGIN'),
+    entry(rid='esc4', error='Authorization: Bearer\tLEAKz10tabbearer', response={'warnings': ['Basic\nLEAKz11nl']}),
+    # adjacent legacy tokens, Bearer values with ':' / '%', lowercase PEM, in kept strings
+    entry(rid='adj', request={'path': 'secret/data/s.LEAKone1234567890123456 s.LEAKtwo1234567890123456'},
+          auth={'display_name': 'r.LEAKthr1234567890123456,r.LEAKfou1234567890123456'}),
+    entry(rid='bearer', request={'headers': {'user-agent': ['Authorization: Bearer pk:LEAK-z12 Bearer abcdef12%2FLEAK-z13']}}),
+    entry(rid='pemlow', auth={'display_name': '-----begin rsa private key-----\nLEAK-z14\n-----end rsa private key-----'}),
+    # un-HMAC'd error / warnings with DSN passwords and URL query secrets
+    entry(rid='dsn', error='failed to connect to postgres://admin:LEAK-z15@db.internal:5432/prod'),
+    entry(rid='urlerr', error='Get "https://idp.example.com/token?client_secret=LEAK-z16&code=LEAK-z17": 401',
+          response={'warnings': ['retry with password=LEAK-z18', 'see https://x.example.com/?token=LEAK-z19']}),
+    # duplicate keys: the earlier, shadowed value must not survive in raw_data
+    '{"time":"2025-06-04T20:40:00Z","type":"response","auth":{"client_token":"LEAK-z20","client_token":"' + H + '"},'
+    '"request":{"id":"dup1","operation":"read","path":"secret/data/app"}}',
+    '{"time":"2025-06-04T20:40:00Z","type":"response","request":{"id":"dup2","operation":"update","path":"secret/data/app",'
+    '"data":{"password":"LEAK-z21"},"data":{}}}',
+    '{"extra":"LEAK-z22","extra":"","time":"2025-06-04T20:40:00Z","type":"response",'
+    '"request":{"id":"dup3","operation":"read","path":"secret/data/app"}}',
+    # mfa_requirement is not a kept field; kept fields with the wrong type or shape
+    entry(rid='mfa', auth={'mfa_requirement': {'mfa_request_id': 'LEAK-z23', 'mfa_constraints': {}}}),
+    entry(rid='shape', time={'t': 'LEAK-z24'}, forwarded_from={'f': 'LEAK-z25'},
+          auth={'display_name': {'x': 'LEAK-z26'}, 'policies': ['default', {'x': 'LEAK-z27'}],
+                'policy_results': {'allowed': True, 'extra': 'LEAK-z28'}, 'token_ttl': 'LEAK-z29',
+                'metadata': {'role': 'ci', 'n': {'deep': 'LEAK-z30'}}},
+          request={'namespace': {'id': 'root', 'secret': 'LEAK-z31'},
+                   'headers': {'user-agent': 'LEAK-z32', 'x-request-id': ['ok', {'a': 'LEAK-z33'}]}},
+          response={'wrap_info': {'creation_path': {'p': 'LEAK-z34'}, 'format': ['LEAK-z35']},
+                    'warnings': [{'w': 'LEAK-z36'}]}),
+]
+
 # Lines that are not a complete Vault audit entry: their text must not be kept.
 UNPARSABLE = [
     'vault: login failed for "alice": password=LEAK-y1 api_key=LEAK-y2 Authorization: Token LEAK-y3',
@@ -282,6 +330,8 @@ def residual_probe():
 
 def redaction_diff(src, orig, path=''):
     """Differences between the captured source and the input other than redaction."""
+    if src == '<redacted>':
+        return []  # a whole value replaced (wrong type, or a wiped string)
     if isinstance(orig, dict):
         if not isinstance(src, dict) or set(src) != set(orig):
             return [f'{path}: keys {sorted(src) if isinstance(src, dict) else src!r} != {sorted(orig)}']
@@ -297,13 +347,33 @@ def redaction_diff(src, orig, path=''):
     return [f'{path}: {orig!r} became {src!r}']
 
 
+def kept_json(raw_data):
+    """The JSON object raw_data carries after its (sanitized) syslog header."""
+    raw_data = raw_data or ''
+    for start in [i for i, c in enumerate(raw_data) if c == '{']:
+        try:
+            obj = json.loads(raw_data[start:], strict=False)
+        except json.JSONDecodeError:
+            continue
+        return obj if isinstance(obj, dict) else None
+    return None
+
+
 def source_json(message):
-    """The input entry as JSON, syslog header removed; None when it is not JSON."""
-    match = VAULT_JSON.search(message)
-    if not match:
-        return None
+    """The input entry as JSON, syslog header removed; None when it is not JSON.
+
+    Mirrors the parser: a line that starts with a brace is the entry itself;
+    otherwise the entry starts at the first brace that opens a Vault key."""
+    text = message.strip()
+    if text.startswith('{'):
+        start = 0
+    else:
+        match = VAULT_JSON.search(message)
+        if not match:
+            return None
+        text, start = message[match.start():].strip(), 0
     try:
-        obj = json.loads(message[match.start():].strip(), strict=False)
+        obj = json.loads(text[start:], strict=False)
     except json.JSONDecodeError:
         return None
     return obj if isinstance(obj, dict) else None
@@ -337,6 +407,8 @@ def main():
         if event.get('class_uid') == 0:
             if source != {}:
                 failures.append(f'{raw["message"][:80]}...: fallback still captures a source to spill')
+            if event.get('unmapped') != {'parse_fallback': 'unparsable input'}:
+                failures.append(f'{raw["message"][:80]}...: fallback unmapped is {event.get("unmapped")!r}')
             body = raw['message'].encode()
             if (event.get('raw_data') != MARKER or event.get('raw_data_size') != len(body)
                     or (event.get('raw_data_hash') or {}).get('value') != hashlib.sha256(body).hexdigest()):
@@ -349,6 +421,12 @@ def main():
             failures.append(f'{raw["message"][:80]}...: mapped, but the input is not JSON')
         else:
             failures += [f'{raw["message"][:60]}...: {d}' for d in redaction_diff(source, original)]
+            body = raw['message'].encode()
+            if (event.get('raw_data_size') != len(body)
+                    or (event.get('raw_data_hash') or {}).get('value') != hashlib.sha256(body).hexdigest()):
+                failures.append(f'{raw["message"][:60]}...: raw_data_size / raw_data_hash do not identify the original')
+            if kept_json(event.get('raw_data')) != source:
+                failures.append(f'{raw["message"][:60]}...: raw_data is not the re-encoded redacted record')
             try:
                 fcc.check(source, event, raw['message'], rules, [], candidates)
                 checked += 1
@@ -361,20 +439,21 @@ def main():
             failures.append(f'{raw["message"][:80]}...: leaked {sorted(set(leaks))}')
         if '"raw_data"' not in out:
             failures.append(f'{raw["message"][:80]}...: raw_data missing')
-        for path in (('session', 'uid'), ('actor', 'session', 'uid')):
+        for path in (('session', 'uid'), ('actor', 'session', 'uid'),
+                     ('session', 'credential_uid'), ('actor', 'session', 'credential_uid')):
             node = event
             for part in path:
                 node = node.get(part) if isinstance(node, dict) else None
             if node is not None and not HMAC.match(str(node)):
                 failures.append(f'{raw["message"][:80]}...: {".".join(path)} is {node!r}, not an HMAC accessor')
-        if raw['message'] in CLEAN_SAMPLES and (source != original or event.get('raw_data') != raw['message']):
+        if raw['message'] in CLEAN_SAMPLES and (source != original or kept_json(event.get('raw_data')) != original):
             failures.append(f'{raw["message"][:80]}...: clean sample was redacted or rewritten')
         if raw['message'] in CLEAN:
-            if event.get('raw_data') != raw['message']:
+            if kept_json(event.get('raw_data')) != original:
                 failures.append(f'{raw["message"][:80]}...: clean entry was rewritten')
             if (event.get('resources') or [{}])[0].get('uid') != 'secret/data/s.payments-prod-us-east-1':
                 failures.append(f'{raw["message"][:80]}...: clean path corrupted')
-        elif raw['message'] in HOSTILE and event.get('class_uid') == 0 and 'LEAK' in raw['message'] and raw['message'].lstrip().startswith(('{', '<')) and 'trunc' not in raw['message']:
+        elif raw['message'] in HOSTILE and event.get('class_uid') == 0 and source_json(raw['message']) is not None:
             failures.append(f'{raw["message"][:80]}...: parseable hostile entry fell back to Base Event')
     # The source fixtures really do carry the secrets, so a pass is meaningful.
     corpus = ''.join(i['message'] for i in inputs)

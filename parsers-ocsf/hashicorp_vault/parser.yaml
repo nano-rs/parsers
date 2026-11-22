@@ -28,23 +28,21 @@ description: >
   matching. HMAC'd values (hmac-sha256:...) are kept exactly as Vault wrote
   them and never decoded. Credentials are never stored, and the scrub fails
   closed (log_raw=true, hmac_accessor=false and non-HMAC request / response
-  keys alike): every Vault token, JWT / JWE, Basic / Bearer credential and
-  PEM private key anywhere in the line, every non-HMAC client token, wrap
-  token and accessor, every non-HMAC string at any depth of request.data,
-  response.data, response.wrap_info, response.secret and every header but a
-  short allowlist (user-agent and the like), every key outside the known
-  Vault envelope (top level and inside auth / request / response), nested or
-  credential-named auth.metadata values, the request_uri query string and
-  the response.redirect query string are replaced with "<redacted>" before
-  mapping (only hmac-sha256:<64 hex> counts as HMAC'd); a syslog header is
-  kept only as a plain RFC 3164 / RFC 5424 header, its structured data as
-  "[<redacted>]", and raw_data keeps the
-  scrubbed record (re-encoded only when something was scrubbed). Numbers,
-  booleans and RFC 3339 timestamps are kept, as Vault never HMACs them.
+  keys alike). Only the known Vault envelope is kept, each field with the
+  type Vault's schema gives it; client tokens, wrap tokens and accessors only
+  when HMAC'd (hmac-sha256:<64 hex>); headers only from a short allowlist
+  (user-agent and the like); auth.metadata only as flat, non-credential
+  strings. Every other value (payloads such as request.data / response.data,
+  unknown keys at any level, values of the wrong type) has each string
+  replaced with "<redacted>". URLs keep only scheme, host, port and path. An
+  error is kept only when made of known Vault error phrases, and warnings
+  never; otherwise they become "<redacted> sha256:<hash>". raw_data of a
+  parsed entry is always the re-encoded redacted record (behind a plain RFC
+  3164 / 5424 syslog header, structured data redacted), never the original
+  text, and raw_data_size / raw_data_hash (SHA-256) identify the original.
   Anything that is not a complete Vault audit entry (a truncated or non-JSON
   line, an unknown type, no request) falls back to Base Event keeping none of
-  its text: raw_data is a fixed marker, raw_data_size / raw_data_hash
-  (SHA-256) identify the original, and nothing is spilled.
+  its text: raw_data is a fixed marker, and nothing is spilled.
 match_values:
   - hashicorp_vault
 category: security
@@ -61,33 +59,30 @@ parser_vrl: |
   # An audit device with log_raw=true, hmac_accessor=false or an operator's
   # audit_non_hmac_request_keys / audit_non_hmac_response_keys writes live
   # tokens, passwords and secret payloads in clear, under any key name and at
-  # any depth. Before anything is mapped, and before the record is kept in
-  # raw_data, the parser:
-  #   1. replaces every Vault token (hvs. / hvb. / hvr., legacy s. / r. / b.),
-  #      JWT / JWE, Basic / Bearer credential and PEM private key anywhere in
-  #      the line with "<redacted>";
-  #   2. keeps a client token, wrap token or token accessor only when it is
-  #      HMAC'd;
-  #   3. replaces every non-HMAC string, at any depth, in the payload regions
-  #      (request.data, response.data, response.secret except lease_id,
-  #      response.wrap_info except its timing fields, every header except a
-  #      short allowlist such as user-agent) and in any auth / request /
-  #      response key that is not on the known-envelope allowlist;
-  #   4. wipes every top-level key outside the entry envelope the same way;
-  #   5. in auth.metadata (which Vault itself logs in clear) wipes any nested
-  #      value and any value whose key names a credential, and drops the query
-  #      string of request.request_uri;
-  # and a line that is not a complete audit entry (the Base Event fallback)
-  # keeps no text at all: raw_data is a fixed marker plus the original's byte
-  # length and SHA-256.
-  # Numbers and booleans are kept: Vault never HMACs them either.
+  # any depth. The line is parsed first; everything below works on the parsed
+  # object and its DECODED values, never on the original text:
+  #   1. a client token, wrap token or token accessor is kept only when it is
+  #      HMAC'd (hmac-sha256:<64 hex>);
+  #   2. every non-HMAC string, at any depth, is replaced in the payload
+  #      regions (request.data, response.data, response.secret except
+  #      lease_id, response.wrap_info except its timing fields, every header
+  #      but a short allowlist), in every key outside the known envelope (top
+  #      level and inside auth / request / response) and in auth.metadata
+  #      values that are nested or credential-named;
+  #   3. every kept envelope field must have its schema type, or it is
+  #      replaced whole;
+  #   4. URLs keep scheme, host, port and path only; error keeps only known
+  #      Vault error phrases and warnings are withheld (marker + SHA-256);
+  #   5. token, JWT, auth-scheme and PEM shapes are redacted in what is left;
+  # and raw_data is the sanitized syslog header plus the re-encoded object.
+  # A line that is not a complete audit entry (the Base Event fallback) keeps
+  # no text at all: raw_data is a fixed marker. Both carry the original's byte
+  # length and SHA-256. Numbers and booleans are kept: Vault never HMACs them.
   raw_in = to_string(.message) ?? ""
-  raw_log = replace(raw_in, r'(?P<pre>^|[^A-Za-z0-9])hv[sbr]\.[A-Za-z0-9_\-]{8,}', "${pre}<redacted>")
-  raw_log = replace(raw_log, r'(?P<pre>^|[^A-Za-z0-9])[sr]\.[A-Za-z0-9]{20,}(?P<post>[^A-Za-z0-9_\-]|$)', "${pre}<redacted>${post}")
-  raw_log = replace(raw_log, r'(?P<pre>^|[^A-Za-z0-9])b\.[A-Za-z0-9_\-]{60,}', "${pre}<redacted>")
-  raw_log = replace(raw_log, r'ey[A-Za-z0-9_\-=]{6,}\.(?:ey[A-Za-z0-9_\-=]{6,}\.[A-Za-z0-9_\-=]*|[A-Za-z0-9_\-=]*\.[A-Za-z0-9_\-=]+\.[A-Za-z0-9_\-=]+\.[A-Za-z0-9_\-=]+)', "<redacted>")
-  raw_log = replace(raw_log, r'(?i)\b(?P<scheme>basic|bearer|negotiate)\s+[A-Za-z0-9+/=._~\-]{8,}', "${scheme} <redacted>")
-  raw_log = replace(raw_log, r'(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|$)', "<redacted>")
+  raw_log = raw_in
+  # The original is identified, never kept: raw_data is always rebuilt below.
+  raw_sha = sha2(raw_in, variant: "SHA-256")
+  raw_size = to_int(length(encode_base16(raw_in)) / 2)
   __source_kv = {}
   ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
   # Vault's audit HMAC is exactly hmac-sha256:<64 lowercase hex>; nothing else
@@ -108,7 +103,6 @@ parser_vrl: |
   # data, which can carry anything, becomes "[<redacted>]", and any other text
   # before the JSON becomes "<redacted> ". No pattern looks for credentials in
   # it: what is not known to be a header field is dropped.
-  header_in = header
   if header != "" {
       h3164, h3164err = parse_regex(header, r'^(?:<\d{1,3}>)?[A-Z][a-z]{2} [ 0-9]\d \d{2}:\d{2}:\d{2} [A-Za-z0-9._:\-]+ [A-Za-z0-9._/\-]+(?:\x5B\d+\x5D)?: ?$')
       h5424, h5424err = parse_regex(header, r'^(?P<pre><\d{1,3}>\d{1,2} [0-9T:.+\-Z]+ [A-Za-z0-9._:\-]+ [A-Za-z0-9._/\-]+ [A-Za-z0-9._\-]+ [A-Za-z0-9._\-]+ )(?P<sd>-|\x5B.*\x5D)? ?$')
@@ -142,7 +136,7 @@ parser_vrl: |
           wipe = push(wipe, [k])
       }
   }
-  auth_keep = r'^(?:display_name|entity_id|entity_created|policies|token_policies|identity_policies|external_namespace_policies|no_default_policy|policy_results|token_type|token_ttl|token_issue_time|remaining_uses|num_uses|orphan|renewable|lease_duration|explicit_max_ttl|period|mfa_requirement|client_token|accessor|accessor_token|metadata)$'
+  auth_keep = r'^(?:display_name|entity_id|entity_created|policies|token_policies|identity_policies|external_namespace_policies|no_default_policy|policy_results|token_type|token_ttl|token_issue_time|remaining_uses|num_uses|orphan|renewable|lease_duration|explicit_max_ttl|period|client_token|accessor|accessor_token|metadata)$'
   meta_secret = r'pass|secret|token|jwt|credential|private|key|signature|otp|cookie|bearer|authoriz|code'
   for_each([["auth"], ["response", "auth"]]) -> |_i, ap| {
       a = get(e, array!(ap)) ?? null
@@ -155,7 +149,10 @@ parser_vrl: |
                   # Vault logs in clear; a nested value, or a credential-named key,
                   # is wiped.
                   for_each(object!(v)) -> |mk, mv| {
-                      if is_object(mv) || is_array(mv) || (match(downcase(mk), meta_secret) && mv != null && mv != "" && !match(to_string(mv) ?? "", hmac_re)) {
+                      if mv != null && !is_string(mv) {
+                          # Vault metadata is map[string]string: anything else goes whole.
+                          e = set(e, append(array!(ap), ["metadata", mk]), "<redacted>") ?? e
+                      } else if match(downcase(mk), meta_secret) && mv != "" && !match(to_string(mv) ?? "", hmac_re) {
                           wipe = push(wipe, append(array!(ap), ["metadata", mk]))
                       }
                   }
@@ -179,16 +176,6 @@ parser_vrl: |
       if hdrs != null && !is_object(hdrs) { wipe = push(wipe, [side, "headers"]) }
       for_each(object(hdrs) ?? {}) -> |hk, _hv| {
           if !match(downcase(hk), hdr_keep) { wipe = push(wipe, [side, "headers", hk]) }
-      }
-  }
-  # A URI's query string (an OIDC callback code, ?token=...) is never kept:
-  # request.request_uri and response.redirect keep only what precedes "?".
-  for_each([["request", "request_uri"], ["response", "redirect"]]) -> |_i, up| {
-      uv = get(e, array!(up)) ?? null
-      if is_string(uv) && contains(string!(uv), "?") {
-          e = set(e, array!(up), replace(string!(uv), r'(?s)\?.*', "?<redacted>")) ?? e
-      } else if uv != null && !is_string(uv) {
-          wipe = push(wipe, up)
       }
   }
   wi = get(e, ["response", "wrap_info"]) ?? null
@@ -220,8 +207,168 @@ parser_vrl: |
       }
       if d != null { e = set(e, array!(wp), d) ?? e }
   }
-  scrubbed = raw_log != raw_in || header != header_in || encode_json(e) != encode_json(e_in)
-  if scrubbed && is_object(parsed) { raw_log = header + encode_json(e) }
+  # ---- type and shape of the kept envelope ----
+  # A kept field must have the type Vault's audit schema gives it; anything
+  # else (an object where a string belongs, a non-string policy name, an
+  # extra namespace key, ...) is replaced by "<redacted>" whole.
+  shapes = [
+      {"p": ["time"], "k": "s"}, {"p": ["type"], "k": "s"}, {"p": ["forwarded_from"], "k": "s"},
+      {"p": ["request", "id"], "k": "s"}, {"p": ["request", "client_id"], "k": "s"}, {"p": ["request", "operation"], "k": "s"},
+      {"p": ["request", "path"], "k": "s"}, {"p": ["request", "mount_point"], "k": "s"}, {"p": ["request", "mount_type"], "k": "s"},
+      {"p": ["request", "mount_accessor"], "k": "s"}, {"p": ["request", "mount_class"], "k": "s"},
+      {"p": ["request", "mount_running_version"], "k": "s"}, {"p": ["request", "mount_running_sha256"], "k": "s"},
+      {"p": ["request", "mount_is_external_plugin"], "k": "b"}, {"p": ["request", "namespace"], "k": "ns"},
+      {"p": ["request", "remote_address"], "k": "s"}, {"p": ["request", "remote_port"], "k": "i"},
+      {"p": ["request", "wrap_ttl"], "k": "i"}, {"p": ["request", "policy_override"], "k": "b"},
+      {"p": ["request", "replication_cluster"], "k": "s"}, {"p": ["request", "request_uri"], "k": "s"},
+      {"p": ["response", "mount_point"], "k": "s"}, {"p": ["response", "mount_type"], "k": "s"},
+      {"p": ["response", "mount_accessor"], "k": "s"}, {"p": ["response", "mount_class"], "k": "s"},
+      {"p": ["response", "mount_running_plugin_version"], "k": "s"}, {"p": ["response", "mount_running_sha256"], "k": "s"},
+      {"p": ["response", "mount_is_external_plugin"], "k": "b"}, {"p": ["response", "redirect"], "k": "s"},
+      {"p": ["response", "warnings"], "k": "as"},
+      {"p": ["response", "wrap_info", "ttl"], "k": "i"}, {"p": ["response", "wrap_info", "creation_time"], "k": "s"},
+      {"p": ["response", "wrap_info", "creation_path"], "k": "s"}, {"p": ["response", "wrap_info", "format"], "k": "s"},
+      {"p": ["response", "wrap_info", "seal_wrap"], "k": "b"}
+  ]
+  for_each([["auth"], ["response", "auth"]]) -> |_i, ap| {
+      for_each([
+          {"p": ["display_name"], "k": "s"}, {"p": ["entity_id"], "k": "s"}, {"p": ["entity_created"], "k": "b"},
+          {"p": ["policies"], "k": "as"}, {"p": ["token_policies"], "k": "as"}, {"p": ["identity_policies"], "k": "as"},
+          {"p": ["external_namespace_policies"], "k": "oas"}, {"p": ["no_default_policy"], "k": "b"},
+          {"p": ["policy_results"], "k": "pr"}, {"p": ["token_type"], "k": "s"}, {"p": ["token_ttl"], "k": "i"},
+          {"p": ["token_issue_time"], "k": "s"}, {"p": ["remaining_uses"], "k": "i"}, {"p": ["num_uses"], "k": "i"},
+          {"p": ["orphan"], "k": "b"}, {"p": ["renewable"], "k": "b"}, {"p": ["lease_duration"], "k": "i"},
+          {"p": ["explicit_max_ttl"], "k": "i"}, {"p": ["period"], "k": "i"}, {"p": ["metadata"], "k": "os"}
+      ]) -> |_j, sh| {
+          shapes = push(shapes, {"p": append(array!(ap), array!(sh.p)), "k": sh.k})
+      }
+  }
+  for_each(["request", "response"]) -> |_i, side| {
+      for_each(object(get(e, [side, "headers"]) ?? {}) ?? {}) -> |hk, _hv| {
+          shapes = push(shapes, {"p": [side, "headers", hk], "k": "as"})
+      }
+  }
+  for_each(shapes) -> |_i, sh| {
+      sp = array!(sh.p)
+      sk = string!(sh.k)
+      sv = get(e, sp) ?? null
+      if sv != null && sv != "<redacted>" {
+          ok = true
+          strs = true
+          if is_array(sv) {
+              for_each(array!(sv)) -> |_j, x| { if !is_string(x) { strs = false } }
+          } else if is_object(sv) {
+              for_each(object!(sv)) -> |_j, x| { if !is_string(x) { strs = false } }
+          }
+          if sk == "s" { ok = is_string(sv) }
+          if sk == "b" { ok = is_boolean(sv) }
+          if sk == "i" { ok = is_integer(sv) }
+          if sk == "as" { ok = is_array(sv) && strs }
+          if sk == "os" { ok = is_object(sv) && strs }
+          if sk == "ns" {
+              ok = is_object(sv) && strs
+              for_each(object(sv) ?? {}) -> |nk, _nv| { if !includes(["id", "path"], nk) { ok = false } }
+          }
+          if sk == "oas" {
+              ok = is_object(sv)
+              for_each(object(sv) ?? {}) -> |_nk, nv| {
+                  if !is_array(nv) { ok = false }
+                  for_each(array(nv) ?? []) -> |_j, x| { if !is_string(x) { ok = false } }
+              }
+          }
+          if sk == "pr" {
+              ok = is_object(sv)
+              for_each(object(sv) ?? {}) -> |pk, pv| {
+                  if pk == "allowed" {
+                      if !is_boolean(pv) { ok = false }
+                  } else if pk == "granting_policies" {
+                      if !is_array(pv) { ok = false }
+                      for_each(array(pv) ?? []) -> |_j, gp| {
+                          if !is_object(gp) { ok = false }
+                          for_each(object(gp) ?? {}) -> |gk, gv| {
+                              if !is_string(gv) || !includes(["name", "namespace_id", "namespace_path", "type", "id"], gk) { ok = false }
+                          }
+                      }
+                  } else {
+                      ok = false
+                  }
+              }
+          }
+          if !ok { e = set(e, sp, "<redacted>") ?? e }
+      }
+  }
+
+  # ---- URLs: keep scheme, host, port and path; never userinfo, query or fragment ----
+  for_each([["request", "request_uri"], ["response", "redirect"], ["request", "path"]]) -> |_i, up| {
+      uv = get(e, array!(up)) ?? null
+      if is_string(uv) && uv != "<redacted>" {
+          u = string!(uv)
+          clean = u
+          if match(u, r'^[A-Za-z][A-Za-z0-9+.\-]*://') {
+              pu, perr = parse_url(u, default_known_ports: false)
+              if perr == null && is_string(pu.host) && string!(pu.host) != "" {
+                  clean = (string(pu.scheme) ?? "") + "://" + string!(pu.host)
+                  if is_integer(pu.port) { clean = clean + ":" + to_string!(pu.port) }
+                  clean = clean + (string(pu.path) ?? "")
+                  if clean != replace(u, r'(?s)[?#].*', "") || contains(u, "?") || contains(u, "#") { clean = clean + "?<redacted>" }
+              } else {
+                  clean = "<redacted>"
+              }
+          } else if match(u, r'[?#]') {
+              clean = replace(u, r'(?s)[?#].*', "") + "?<redacted>"
+          }
+          if clean != u { e = set(e, array!(up), clean) ?? e }
+      }
+  }
+
+  # ---- error and warnings: Vault never HMACs them ----
+  # An error is kept only when it is made of known Vault error phrases (and
+  # the multierror wrapper); anything else is withheld as a marker plus the
+  # SHA-256 of the text. Every warning is withheld the same way.
+  error_in = string(e_in.error) ?? ""
+  ev = get(e, ["error"]) ?? null
+  if is_string(ev) && ev != "" {
+      rest = downcase(string!(ev))
+      rest = replace(rest, r'\d+ errors? occurred:', "")
+      rest = replace(rest, r'permission denied|invalid username or password|invalid credentials|invalid token|bad token|unsupported path|unsupported operation|missing client token|internal error|rate limit quota exceeded|service unavailable|invalid request', "")
+      if !match(rest, r'^[\s*.:;,\-]*$') {
+          e = set(e, ["error"], "<redacted> sha256:" + sha2(string!(ev), variant: "SHA-256")) ?? e
+      }
+  } else if ev != null && !is_string(ev) {
+      e = set(e, ["error"], "<redacted>") ?? e
+  }
+  wv = get(e, ["response", "warnings"]) ?? null
+  if is_array(wv) {
+      e = set(e, ["response", "warnings"], map_values(array!(wv)) -> |w| {
+          if is_string(w) && w != "" && w != "<redacted>" { "<redacted> sha256:" + sha2(string!(w), variant: "SHA-256") } else { w }
+      }) ?? e
+  }
+
+  # ---- decoded token shapes and URLs in every remaining kept string ----
+  # The allowlist above is the guarantee; this is defense in depth on the
+  # DECODED values (JSON escapes are already resolved), never on raw text.
+  # A string holding a URL that is not reduced to scheme://host[:port]/path is
+  # replaced whole.
+  e = map_values(e, recursive: true) -> |sv| {
+      if is_string(sv) && !match(string!(sv), hmac_re) && sv != "<redacted>" {
+          t = string!(sv)
+          t = replace(t, r'(?P<pre>^|[^A-Za-z0-9])hv[sbr]\.[A-Za-z0-9_\-]{8,}', "${pre}<redacted>")
+          t = replace(t, r'(?P<pre>^|[^A-Za-z0-9])[sr]\.[A-Za-z0-9]{20,}(?P<post>[^A-Za-z0-9_\-]|$)', "${pre}<redacted>${post}")
+          t = replace(t, r'(?P<pre>^|[^A-Za-z0-9])[sr]\.[A-Za-z0-9]{20,}(?P<post>[^A-Za-z0-9_\-]|$)', "${pre}<redacted>${post}")
+          t = replace(t, r'(?P<pre>^|[^A-Za-z0-9])b\.[A-Za-z0-9_\-]{60,}', "${pre}<redacted>")
+          t = replace(t, r'ey[A-Za-z0-9_\-=]{6,}\.(?:ey[A-Za-z0-9_\-=]{6,}\.[A-Za-z0-9_\-=]*|[A-Za-z0-9_\-=]*\.[A-Za-z0-9_\-=]+\.[A-Za-z0-9_\-=]+\.[A-Za-z0-9_\-=]+)', "<redacted>")
+          t = replace(t, r'(?i)\b(?P<scheme>basic|bearer|negotiate|token|digest)\s+\S+', "${scheme} <redacted>")
+          t = replace(t, r'(?is)-----begin [a-z0-9 ]*private key(?: block)?-----.*?(?:-----end [a-z0-9 ]*private key(?: block)?-----|$)', "<redacted>")
+          if contains(t, "://") && !match(t, r'^[A-Za-z][A-Za-z0-9+.\-]*://[^/?#@\s]+(?:/[^?#@\s]*)?(?:\?<redacted>)?$') { t = "<redacted>" }
+          t
+      } else {
+          sv
+      }
+  }
+  # raw_data of a parsed entry is ALWAYS the (sanitized) syslog header plus the
+  # re-encoded redacted object, never the original text: a duplicate key's
+  # shadowed value or an escaped secret cannot survive in it.
+  if is_object(parsed) { raw_log = header + encode_json(e) }
   __raw_body = raw_log
   __source_kv = e
   req = object(e.request) ?? {}
@@ -237,8 +384,6 @@ parser_vrl: |
       __source_kv = {}
       raw_log = "<unparsable Vault audit record withheld>"
       __raw_body = raw_log
-      raw_sha = sha2(raw_in, variant: "SHA-256")
-      raw_size = length(encode_base16(raw_in)) / 2
       . = {
           "class_uid": 0,
           "class_name": "Base Event",
@@ -254,7 +399,7 @@ parser_vrl: |
           "time": 0,
           "message": "Unrecognized Vault audit record",
           "raw_data": raw_log,
-          "raw_data_size": to_int(raw_size),
+          "raw_data_size": raw_size,
           "raw_data_hash": { "algorithm_id": 3, "algorithm": "SHA-256", "value": raw_sha },
           "metadata": {
               "version": "1.9.0",
@@ -272,6 +417,8 @@ parser_vrl: |
       resp_auth = object(resp.auth) ?? {}
       operation = downcase(to_string(req.operation) ?? "")
       error = to_string(e.error) ?? ""
+      # Severity and authorization are classified on the original text, which
+      # is never emitted; status_detail and message carry the scrubbed error.
       mount_type = to_string(req.mount_type) ?? ""
       if mount_type == "" { mount_type = to_string(resp.mount_type) ?? "" }
       mount_point = to_string(req.mount_point) ?? ""
@@ -299,7 +446,7 @@ parser_vrl: |
       severity_id = 1
       severity = "Informational"
       if error != "" { severity_id = 2; severity = "Low" }
-      if contains(downcase(error), "permission denied") || contains(downcase(error), "invalid username or password") { severity_id = 3; severity = "Medium" }
+      if contains(downcase(error_in), "permission denied") || contains(downcase(error_in), "invalid username or password") { severity_id = 3; severity = "Medium" }
 
       # ---- source endpoint ----
       src = {}
@@ -369,7 +516,7 @@ parser_vrl: |
               if pns != "" { authz = push(authz, { "policy": { "name": pns } }) }
           }
       }
-      if error != "" && contains(downcase(error), "permission denied") {
+      if error != "" && contains(downcase(error_in), "permission denied") {
           authz = push(authz, { "decision": "denied" })
       }
 
@@ -384,7 +531,7 @@ parser_vrl: |
           "type": entry_type,
           "product": { "name": "Vault", "vendor_name": "HashiCorp" }
       }
-      if req_id == "" { metadata.uid = sha2("hashicorp_vault|raw|" + raw_log, variant: "SHA-256") } else { metadata.correlation_uid = req_id }
+      if req_id == "" { metadata.uid = raw_sha } else { metadata.correlation_uid = req_id }
       mrv = to_string(req.mount_running_version) ?? ""
       if mrv != "" { metadata.product.version = mrv }
 
@@ -419,6 +566,8 @@ parser_vrl: |
               "time": time_ms,
               "message": message,
               "raw_data": raw_log,
+              "raw_data_size": raw_size,
+              "raw_data_hash": { "algorithm_id": 3, "algorithm": "SHA-256", "value": raw_sha },
               "metadata": metadata,
               "user": user,
               "src_endpoint": src,
@@ -474,6 +623,8 @@ parser_vrl: |
               "time": time_ms,
               "message": message,
               "raw_data": raw_log,
+              "raw_data_size": raw_size,
+              "raw_data_hash": { "algorithm_id": 3, "algorithm": "SHA-256", "value": raw_sha },
               "metadata": metadata,
               "actor": actor,
               "api": api,
@@ -970,13 +1121,14 @@ samples:
       session.uid: <missing>
       raw_data: '{"auth":{"accessor":"<redacted>","client_token":"<redacted>","display_name":"userpass-bob"},"request":{"data":{"password":"<redacted>"},"id":"aa11bb22-0000-4000-8000-000000000003","mount_type":"userpass","operation":"update","path":"auth/userpass/login/bob","remote_address":"198.51.100.20"},"response":{"auth":{"client_token":"<redacted>","display_name":"userpass-bob"},"mount_type":"userpass"},"time":"2025-06-04T20:14:02.100000Z","type":"response"}'
   # A path segment that merely starts with "s." is not a legacy token: the
-  # clean, HMAC'd entry keeps its path and is not rewritten.
+  # clean, HMAC'd entry keeps its path; raw_data is its canonical re-encoding.
   - raw: '{"time":"2025-06-04T20:50:00Z","type":"response","auth":{"client_token":"hmac-sha256:c39c69748f0894cb4cd0333c779e72343ba45af287649d0fbcc37e9b079abe5d","accessor":"hmac-sha256:3348fe9b24b078f97d747363dda2d55bb0445e90b512e9f68f48d289fed798b3","display_name":"userpass-alice","policies":["default"]},"request":{"id":"aa11bb22-0000-4000-8000-000000000050","operation":"read","mount_type":"kv","path":"secret/data/s.payments-prod-us-east-1","remote_address":"192.0.2.80"},"response":{"mount_type":"kv","data":{"metadata":{"created_time":"hmac-sha256:9c910646d7399704ee015b4247b374bfb950282339d902a221b1ff4c83b13ee7","version":3}}}}'
     expect:
       class_uid: 6003
       resources.0.uid: secret/data/s.payments-prod-us-east-1
       actor.session.uid: hmac-sha256:3348fe9b24b078f97d747363dda2d55bb0445e90b512e9f68f48d289fed798b3
-      raw_data: '{"time":"2025-06-04T20:50:00Z","type":"response","auth":{"client_token":"hmac-sha256:c39c69748f0894cb4cd0333c779e72343ba45af287649d0fbcc37e9b079abe5d","accessor":"hmac-sha256:3348fe9b24b078f97d747363dda2d55bb0445e90b512e9f68f48d289fed798b3","display_name":"userpass-alice","policies":["default"]},"request":{"id":"aa11bb22-0000-4000-8000-000000000050","operation":"read","mount_type":"kv","path":"secret/data/s.payments-prod-us-east-1","remote_address":"192.0.2.80"},"response":{"mount_type":"kv","data":{"metadata":{"created_time":"hmac-sha256:9c910646d7399704ee015b4247b374bfb950282339d902a221b1ff4c83b13ee7","version":3}}}}'
+      raw_data: '{"auth":{"accessor":"hmac-sha256:3348fe9b24b078f97d747363dda2d55bb0445e90b512e9f68f48d289fed798b3","client_token":"hmac-sha256:c39c69748f0894cb4cd0333c779e72343ba45af287649d0fbcc37e9b079abe5d","display_name":"userpass-alice","policies":["default"]},"request":{"id":"aa11bb22-0000-4000-8000-000000000050","mount_type":"kv","operation":"read","path":"secret/data/s.payments-prod-us-east-1","remote_address":"192.0.2.80"},"response":{"data":{"metadata":{"created_time":"hmac-sha256:9c910646d7399704ee015b4247b374bfb950282339d902a221b1ff4c83b13ee7","version":3}},"mount_type":"kv"},"time":"2025-06-04T20:50:00Z","type":"response"}'
+      raw_data_size: 626
   - raw: "==> Vault server started! Log data will stream in below:"
     expect:
       class_uid: 0
