@@ -20,14 +20,17 @@ class DeclTests(unittest.TestCase):
     def test_raw_bracket_counts_stay_balanced(self):
         # One unmatched bracket per manifest: a set holding all six would balance by accident.
         for char in BRACKETS:
-            for mappings in ({'x' + char + 'y': ['t']}, {'k': ['t' + char + 'u']}):
+            with self.assertRaises(AssertionError):
+                generated({'mappings': {'k': ['t' + char + 'u']}})  # no OCSF path holds a bracket
+            for mappings in ({'x' + char + 'y': ['t']},):
                 source = generated({'mappings': mappings})
                 for opening, closing in ('()', '[]', '{}'):
                     self.assertEqual(source.count(opening), source.count(closing), (char, mappings))
 
     def test_lookup_whole_keys_under_vector(self):
         keys = ['x' + char + 'y' for char in BRACKETS] + ['a.b c#d', 'plain', 'quo"te', 'back\\slash']
-        mappings = {key: ['target'] for key in keys}
+        # A literal dot in a key is declared escaped (~1), as provenance names it.
+        mappings = {key.replace('~', '~0').replace('.', '~1'): ['target'] for key in keys}
         near = ['x' + char for char in BRACKETS] + ['plainx', 'xplain', 'a.b c', 'plai']
         cases = [({key: 'v'}, {'target': 'v'}, {}) for key in keys]
         cases += [({key: 'v'}, {'target': 'v'}, {key_name(key): 'v'}) for key in near]

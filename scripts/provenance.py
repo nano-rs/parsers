@@ -11,7 +11,11 @@ field_coverage_check.py uses this to verify every declared mapping and every
 """
 import copy
 import json
+import math
 import os
+import random
+import re
+import secrets
 from pathlib import Path
 import subprocess
 import tempfile
@@ -19,6 +23,26 @@ import tempfile
 MISSING = object()
 # Vector runs in UTC, so no result depends on the checking host's timezone.
 VECTOR_ENV = {**os.environ, 'TZ': 'UTC'}
+
+
+def esc(key):
+    """A literal key as one flattened path segment: '~' and '.' escaped, as
+    spill.vrl does, so a literal dotted key never names a nested path."""
+    return key.replace('~', '~0').replace('.', '~1')
+
+
+def unesc(segment):
+    return segment.replace('~1', '.').replace('~0', '~')
+
+
+def esc_flatten(value, prefix=''):
+    """Source flattening with escaped segments: {"a": {"b": 1}} is "a.b",
+    {"a.b": 1} is "a~1b". Mapping keys name source fields this way."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from esc_flatten(item, prefix + '.' + esc(key) if prefix else esc(key))
+    else:
+        yield prefix, value
 
 
 def obj_flatten(value, prefix=''):
@@ -78,71 +102,129 @@ def at(index, target, value):
     return any(same(value, v) for v in found)
 
 
-def _shift_letter(char):
-    lower = char.lower()
-    if lower in 'abcdef':
-        new = 'abcdef'[('abcdef'.index(lower) + 1) % 6]
-    else:
-        new = 'g' if lower == 'z' else chr(ord(lower) + 1)
-    return new.upper() if char.isupper() else new
+# A per-run seed: every perturbation is a fresh random value, so a target that
+# merely happens to hold some fixed value can never follow it (set
+# PROVENANCE_SEED to reproduce a run).
+RNG = random.Random(os.environ.get('PROVENANCE_SEED') or secrets.randbits(64))
+IPV4 = re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}$')
+IPV6 = re.compile(r'^[0-9A-Fa-f:]{2,}$')
+NUMBER = re.compile(r'^-?\d+(?:\.(\d+))?$')
+CLOCK = re.compile(r'(?<!\d)(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?!\d)')
+DAY = re.compile(r'(?<!\d)(\d{4}[-/]\d{2}[-/])(\d{2})(?!\d)')
+HEX = set('abcdefABCDEF')
+DRAWS = 4
 
 
-def mutations(value):
-    """Small, shape-preserving changes of a scalar (so a parser that validates
-    an IP, a timestamp or a hash still accepts it), most conservative first."""
+def _rand_like(text):
+    """The same shape with fresh random characters: a digit becomes a random
+    digit, a hex letter a random hex letter, any other letter a random letter
+    (case kept); punctuation and separators stay."""
+    out = []
+    for c in text:
+        if c.isascii() and c.isdigit():
+            out.append(RNG.choice('0123456789'))
+        elif c in HEX:
+            out.append(RNG.choice('abcdef' if c.islower() else 'ABCDEF'))
+        elif c.isascii() and c.isalpha():
+            letters = 'ghijklmnopqrstuvwxyz'
+            out.append(RNG.choice(letters if c.islower() else letters.upper()))
+        else:
+            out.append(c)
+    return ''.join(out)
+
+
+def _number(value, factor=None):
+    """A random number of the same type and sign, far enough from `value` that
+    a `scale` by `factor` (e.g. 0.001, us -> ms) still moves the result."""
+    step = max(1, math.ceil(1 / abs(factor))) if factor else 1
+    delta = RNG.randint(1000, 9999) * step
+    if isinstance(value, float):
+        return value + delta + RNG.randint(1, 99) / 100
+    return value + delta if value >= 0 else value - delta
+
+
+def sentinels(value, kind=None, factor=None):
+    """Fresh, type-correct perturbations of a scalar, most specific first. Each
+    is random per run, so it cannot coincide with a value the parser holds."""
     if isinstance(value, bool):
         return [not value]
     if isinstance(value, int):
-        return [value + 1] + ([value - 1] if value > 0 else [])
+        if kind is None and 0 <= value < 32:
+            # Enum-like codes (severity, rcode, logon type) are range-checked.
+            return list(dict.fromkeys(v for v in (RNG.randint(0, 31), RNG.randint(0, 15), RNG.randint(1, 65535)) if v != value))
+        if kind is None and 0 <= value < 65536:
+            # Ports and small ids are range-checked too.
+            return list(dict.fromkeys(v for v in (RNG.randint(1, 65535), RNG.randint(1, 65535)) if v != value))
+        return [_number(value, factor)]
     if isinstance(value, float):
-        return [value + 0.5]
-    if not isinstance(value, str):
+        return [_number(value, factor)]
+    if not isinstance(value, str) or not value:
         return []
     out = []
-    digits = [i for i, c in enumerate(value) if c.isascii() and c.isdigit()]
-    if digits:
-        i = digits[-1]
-        d = int(value[i])
-        out.append(value[:i] + str(d - 1 if d > 1 else d + 1) + value[i + 1:])
-    letters = [i for i, c in enumerate(value) if c.isascii() and c.isalpha()]
-    if letters:
-        i = letters[-1]
-        out.append(value[:i] + _shift_letter(value[i]) + value[i + 1:])
-    out.append(value + 'q' if value else 'q')
-    return list(dict.fromkeys(m for m in out if m != value))
+    num = NUMBER.match(value)
+    if num and kind is None and not num.group(1) and 0 <= int(value) < 32:
+        # An enum-like code written as text ("3", "10").
+        out += [str(RNG.randint(0, 15)), str(RNG.randint(0, 31))]
+    if num and kind == 'scale':
+        decimals = len(num.group(1) or '')
+        new = _number(float(value) if decimals else int(value), factor)
+        out.append(f'{new:.{decimals}f}' if decimals else str(new))
+    if kind == 'scale':
+        # Only a whole-number move is certain to move the scaled result.
+        return list(dict.fromkeys(v for v in out if v != value))
+    if CLOCK.search(value):
+        # A clock keeps its format and fraction; only the time of day moves.
+        out.append(CLOCK.sub(lambda m: '%02d:%02d:%02d' % (RNG.randint(0, 23), RNG.randint(0, 59), RNG.randint(0, 59)), value, count=1))
+    if DAY.search(value):
+        out.append(DAY.sub(lambda m: m.group(1) + '%02d' % RNG.randint(1, 28), value, count=1))
+    if kind == 'epoch_ms':
+        return list(dict.fromkeys(v for v in out if v != value))
+    if IPV4.match(value):
+        out.append('%d.%d.%d.%d' % (RNG.randint(11, 223), RNG.randint(0, 255), RNG.randint(0, 255), RNG.randint(1, 254)))
+    elif kind == 'hex' and value.lower().startswith('0x'):
+        out.append(value[:2] + ''.join(RNG.choice('0123456789abcdef') for _ in value[2:]))
+    else:
+        # Narrowest first: only the tail (a prefix such as "hmac-sha256:" or a
+        # drive and directory stays), only the digits ("CVE-" stays), then the
+        # whole shape, then a suffix for free text.
+        half = len(value) // 2
+        out.append(value[:half] + _rand_like(value[half:]))
+        if any(c.isascii() and c.isdigit() for c in value):
+            out.append(''.join(RNG.choice('0123456789') if c.isascii() and c.isdigit() else c for c in value))
+        out.append(_rand_like(value))
+        if not IPV6.match(value) and kind is None:
+            out.append(value + '-' + ''.join(RNG.choice('ghijklmnopqrstuvwxyz') for _ in range(6)))
+    return list(dict.fromkeys(v for v in out if v != value))
+
+
+def mutations(value):
+    return sentinels(value)
 
 
 def array_mutations(value):
-    """Element-wise variants of a scalar array (variant j mutates every element)."""
+    """A fresh sentinel for every element of a scalar array (variant j uses
+    each element's j-th sentinel)."""
     if not value or any(isinstance(x, (dict, list)) for x in value):
         return []
-    per = [mutations(x) for x in value]
+    per = [sentinels(x) for x in value]
     if not all(per):
         return []
     return [[m[min(j, len(m) - 1)] for m in per] for j in range(max(len(m) for m in per))]
 
 
 def _resolve(obj, key):
-    """Container and leaf of a flattened `key` in a raw JSON input, matching
-    dotted segments greedily and stepping into one-element arrays."""
-    parts = key.split('.')
+    """Container and leaf of an escaped flattened `key` in a raw JSON input,
+    stepping into one-element arrays (an unwrapped envelope)."""
+    parts = [unesc(p) for p in key.split('.')]
     holder = obj
-    i = 0
-    while i < len(parts):
+    for i, part in enumerate(parts):
         if isinstance(holder, list) and len(holder) == 1:
             holder = holder[0]
-        if not isinstance(holder, dict):
+        if not isinstance(holder, dict) or part not in holder:
             return None
-        for j in range(len(parts), i, -1):
-            name = '.'.join(parts[i:j])
-            if name in holder:
-                if j == len(parts):
-                    return holder, name
-                holder = holder[name]
-                i = j
-                break
-        else:
-            return None
+        if i == len(parts) - 1:
+            return holder, part
+        holder = holder[part]
     return None
 
 
@@ -208,19 +290,34 @@ def mutate_event(event, key, old, new):
     return [{**event, 'message': m} for m in mutate_message(message, key, old, new)]
 
 
-def run_vrl(program, messages):
+def run_vrl(program, messages, tolerant=False):
     """Run the instrumented program over events (or bare message strings);
-    (output, source) per input."""
+    (output, source) per input. With `tolerant`, an input the program aborts
+    on (a perturbation it rejects) yields None instead of failing the run:
+    each input carries an id the program removes before the parser sees it."""
+    events = [dict(m) if isinstance(m, dict) else {'message': m} for m in messages]
+    head = '__probe_id = del(.__probe_id)\n' if tolerant else ''
+    tail = '\n.__coverage_source = __source_kv\n' + ('.__probe_id = __probe_id\n' if tolerant else '')
+    if tolerant:
+        for i, e in enumerate(events):
+            e['__probe_id'] = i
     with tempfile.TemporaryDirectory(prefix='provenance-') as tmp:
         tmp = Path(tmp)
-        (tmp/'p.vrl').write_text(program + '\n.__coverage_source = __source_kv\n')
-        (tmp/'in.json').write_text(''.join(json.dumps(m if isinstance(m, dict) else {'message': m}) + '\n' for m in messages))
+        (tmp/'p.vrl').write_text(head + program + tail)
+        (tmp/'in.json').write_text(''.join(json.dumps(e) + '\n' for e in events))
         run = subprocess.run(['vector', 'vrl', '--program', str(tmp/'p.vrl'), '--input', str(tmp/'in.json'), '--print-object'],
                              text=True, capture_output=True, timeout=900, env=VECTOR_ENV)
-    assert run.returncode == 0, run.stderr
+    assert run.returncode == 0 or tolerant, run.stderr
     outputs = [json.loads(line, strict=False) for line in run.stdout.splitlines() if line.startswith('{')]
-    assert len(outputs) == len(messages), f'Vector returned {len(outputs)} events for {len(messages)} inputs'
-    return [(o, o.pop('__coverage_source', {})) for o in outputs]
+    if not tolerant:
+        assert len(outputs) == len(messages), f'Vector returned {len(outputs)} events for {len(messages)} inputs'
+        return [(o, o.pop('__coverage_source', {})) for o in outputs]
+    by_id = {}
+    for o in outputs:
+        pid = o.pop('__probe_id', None)
+        if isinstance(pid, int):
+            by_id[pid] = (o, o.pop('__coverage_source', {}))
+    return [by_id.get(i) for i in range(len(events))]
 
 
 def mapped_view(output, raw):
@@ -263,28 +360,62 @@ def transform_want(rule, value):
 
 def rule_mutations(rule, value):
     if rule['kind'] == 'enum':
+        # One alternative per distinct target value (every one, not the first few).
         here = rule['values'].get(str(value).lower(), MISSING)
-        out = []
-        for alt in [k for k, v in rule['values'].items() if v != here][:2]:
+        seen, out = set(), []
+        for alt, target in rule['values'].items():
+            key = json.dumps(target, sort_keys=True)
+            if target == here or key in seen:
+                continue
             if isinstance(value, bool):
                 if alt in ('true', 'false') and (alt == 'true') != value:
                     out.append(alt == 'true')
+                    seen.add(key)
                 continue
             if isinstance(value, int):
                 if alt.lstrip('-').isdigit():
                     out.append(int(alt))
+                    seen.add(key)
             elif isinstance(value, str):
                 out.append(alt.upper() if value.isupper() else (alt.capitalize() if value[:1].isupper() else alt))
+                seen.add(key)
         return out
-    return mutations(value)
+    return sentinels(value, rule['kind'], rule.get('factor'))
 
 
-def probe(program, samples, sources, outputs, items, per_key=6):
+def _count(index, target, value):
+    return sum(1 for x in index.get(target, ()) if same(value, x))
+
+
+def followed(before, after, target, want_old, want_new):
+    """The value at `target` moved WITH the source: the old value left it and
+    exactly the new (fresh, random) value arrived. For a list, element by
+    element as a multiset, so a static list can never pass."""
+    olds = want_old if isinstance(want_old, list) else [want_old]
+    news = want_new if isinstance(want_new, list) else [want_new]
+    if len(olds) != len(news) or not olds:
+        return False
+    moved = False
+    for o, n in zip(olds, news):
+        if isinstance(o, (dict, list)) or isinstance(n, (dict, list)):
+            return False
+        if same(o, n):
+            continue
+        if not (_count(after, target, n) > _count(before, target, n) and _count(after, target, o) < _count(before, target, o)):
+            return False
+        moved = True
+    return moved
+
+
+def probe(program, samples, sources, outputs, items, per_key=40, declared=None):
     """Perturbation runs for `items`: (key, rule or None) pairs.
 
     Returns {(key, rule_id): {target: True}} for every normalized target path
-    whose value followed the perturbed source value in at least one sample,
-    and held the original value before. `rule_id` is None for a plain mapping.
+    whose value followed the perturbed source value (fresh random sentinels)
+    in at least one sample. `rule_id` is None for a plain mapping. Only a
+    sample whose mapped event holds the current value counts toward
+    `per_key` (at a declared target, when `declared` maps item -> targets), so
+    branches that ignore the field do not use up the budget.
     """
     plans, messages = [], []
     for key, rule in items:
@@ -292,41 +423,58 @@ def probe(program, samples, sources, outputs, items, per_key=6):
         for (name, event), source, output in zip(samples, sources, outputs):
             if used >= per_key:
                 break
-            flat = dict(obj_flatten(source))
+            flat = dict(esc_flatten(source))
             if key not in flat:
                 continue
             old = flat[key]
             if isinstance(old, dict) or old is None:
                 continue
-            variants = array_mutations(old) if isinstance(old, list) else (rule_mutations(rule, old) if rule else mutations(old))
+            want_old = old if rule is None else transform_want(rule, old)
+            if want_old is MISSING:
+                continue
+            before = leaf_index(mapped_view(output, event.get('message')))
+            targets = (declared or {}).get((key, id(rule) if rule else None))
+            places = targets if targets is not None else list(before)
+            if not any(at(before, target, want_old) for target in places):
+                continue
+            # Several fresh draws: a parser that accepts only some values (an
+            # enum code, a range) still sees one it maps.
+            variants = []
+            for _ in range(DRAWS):
+                variants += array_mutations(old) if isinstance(old, list) else (rule_mutations(rule, old) if rule else sentinels(old))
+            variants = [v for i, v in enumerate(variants) if v not in variants[:i]]
             planned = False
             for new in variants:
                 for mutated_event in mutate_event(event, key, old, new):
                     if mutated_event == event:
                         continue
-                    plans.append((key, rule, old, new, event.get('message'), output, flat))
+                    plans.append((key, rule, old, new, event, output, flat))
                     messages.append(mutated_event)
                     planned = True
             used += planned
     found = {}
     if not messages:
         return found
-    for (key, rule, old, new, raw, output, flat), (mutated, source) in zip(plans, run_vrl(program, messages)):
+    for (key, rule, old, new, event, output, flat), mutated_event, result in zip(plans, messages, run_vrl(program, messages, tolerant=True)):
+        if result is None:
+            continue
+        mutated, source = result
         # The perturbation must change exactly this source field, to `new`.
-        mflat = dict(obj_flatten(source))
+        mflat = dict(esc_flatten(source))
         if not same_value(mflat.get(key, MISSING), new):
             continue
         if set(mflat) != set(flat) or any(not _bystander(k, v, mflat[k], key, old) for k, v in flat.items() if mflat[k] != v):
             continue
-        before, after = leaf_index(mapped_view(output, raw)), leaf_index(mapped_view(mutated, None))
+        before = leaf_index(mapped_view(output, event.get('message')))
+        after = leaf_index(mapped_view(mutated, mutated_event.get('message')))
         if rule is None:
             want_old, want_new = old, new
         else:
             want_old, want_new = transform_want(rule, old), transform_want(rule, new)
             if want_old is MISSING or want_new is MISSING or same(want_old, want_new):
                 continue
-        for target in after:
-            if at(after, target, want_new) and at(before, target, want_old) and not at(after, target, want_old if not isinstance(want_old, list) else []):
+        for target in set(after) | set(before):
+            if followed(before, after, target, want_old, want_new):
                 found.setdefault((key, id(rule) if rule else None), {})[target] = True
     return found
 

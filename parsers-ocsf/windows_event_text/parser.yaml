@@ -985,49 +985,65 @@ parser_vrl: |
       }
   }
   __consumed = ""
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
   # BEGIN parser-specific transformations
-  # event_data.Subject.Account Name: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.Subject.Account Name: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.Subject.Account Domain: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.Subject.Account Domain: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.Target Account.Account Name: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.Target Account.Account Domain: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.Network Information.Source Network Address: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.Network Information.Source Address: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.Network Information.Network Address: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.Network Information.Workstation Name: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.New Logon.Account Name: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.New Logon.Account Domain: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.Account For Which Logon Failed.Account Name: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.Account For Which Logon Failed.Account Domain: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.Account Whose Credentials Were Used.Account Name: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.Account Whose Credentials Were Used.Account Domain: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.Account Information.Account Name: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.Account Information.Supplied Realm Name: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.Additional Information.Failure Code: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.Account Information.Account Domain: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.General.Logon Account: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.Creator Subject.Account Name: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.Creator Subject.Account Domain: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.New Account.Account Name: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.New Account.Account Domain: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.Account That Was Locked Out.Account Name: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.Group.Group Name: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.Group.Group Domain: Rendered Windows identity is lowercased in the selected branch.
-  # event_data.Member.Account Name: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Subject~1Account Name: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Subject~1Account Name: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Subject~1Account Domain: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Subject~1Account Domain: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Target Account~1Account Name: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Target Account~1Account Domain: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Network Information~1Source Network Address: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Network Information~1Source Address: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Network Information~1Network Address: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Network Information~1Workstation Name: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.New Logon~1Account Name: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.New Logon~1Account Domain: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Account For Which Logon Failed~1Account Name: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Account For Which Logon Failed~1Account Domain: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Account Whose Credentials Were Used~1Account Name: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Account Whose Credentials Were Used~1Account Domain: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Account Information~1Account Name: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Account Information~1Supplied Realm Name: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Additional Information~1Failure Code: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Account Information~1Account Domain: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.General~1Logon Account: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Creator Subject~1Account Name: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Creator Subject~1Account Domain: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.New Account~1Account Name: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.New Account~1Account Domain: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Account That Was Locked Out~1Account Name: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Group~1Group Name: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Group~1Group Domain: Rendered Windows identity is lowercased in the selected branch.
+  # event_data.Member~1Account Name: Rendered Windows identity is lowercased in the selected branch.
   # header.ComputerName: Rendered computer name is lowercased for device.hostname.
   # header.ComputerName: Rendered computer name is lowercased for device.hostname.
-  # event_data.Process Information.Process ID: Parsed hexadecimal process ID or access mask is represented as an integer at this destination.
-  # event_data.Process Information.Creator Process ID: Parsed hexadecimal process ID or access mask is represented as an integer at this destination.
-  # event_data.Process Information.New Process ID: Parsed hexadecimal process ID or access mask is represented as an integer at this destination.
-  # event_data.Process Information.Process ID: Parsed hexadecimal process ID or access mask is represented as an integer at this destination.
+  # event_data.Process Information~1Process ID: Parsed hexadecimal process ID or access mask is represented as an integer at this destination.
+  # event_data.Process Information~1Creator Process ID: Parsed hexadecimal process ID or access mask is represented as an integer at this destination.
+  # event_data.Process Information~1New Process ID: Parsed hexadecimal process ID or access mask is represented as an integer at this destination.
+  # event_data.Process Information~1Process ID: Parsed hexadecimal process ID or access mask is represented as an integer at this destination.
   # computer: Case normalization already performed by the parser; observed at device.hostname, and checked against the emitted branch.
   # computer: Case normalization already performed by the parser; observed at device.hostname, and checked against the emitted branch.
-  for_each(flatten(__source_kv)) -> |key, value| {
+  for_each(__flat) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
-        event_data\.Subject\.Account\ Name
-      | event_data\.Creator\ Subject\.Account\ Name
+        event_data\.Subject\~1Account\ Name
+      | event_data\.Creator\ Subject\~1Account\ Name
       )\z') {
           __value = value
           if is_string(__value) {
@@ -1037,16 +1053,16 @@ parser_vrl: |
       }
       if match(key, r'(?x)
       \A(?:
-        event_data\.Subject\.Account\ Name
-      | event_data\.Target\ Account\.Account\ Name
-      | event_data\.New\ Logon\.Account\ Name
-      | event_data\.Account\ For\ Which\ Logon\ Failed\.Account\ Name
-      | event_data\.Account\ Whose\ Credentials\ Were\ Used\.Account\ Name
-      | event_data\.Account\ Information\.Account\ Name
-      | event_data\.General\.Logon\ Account
-      | event_data\.New\ Account\.Account\ Name
-      | event_data\.Account\ That\ Was\ Locked\ Out\.Account\ Name
-      | event_data\.Member\.Account\ Name
+        event_data\.Subject\~1Account\ Name
+      | event_data\.Target\ Account\~1Account\ Name
+      | event_data\.New\ Logon\~1Account\ Name
+      | event_data\.Account\ For\ Which\ Logon\ Failed\~1Account\ Name
+      | event_data\.Account\ Whose\ Credentials\ Were\ Used\~1Account\ Name
+      | event_data\.Account\ Information\~1Account\ Name
+      | event_data\.General\~1Logon\ Account
+      | event_data\.New\ Account\~1Account\ Name
+      | event_data\.Account\ That\ Was\ Locked\ Out\~1Account\ Name
+      | event_data\.Member\~1Account\ Name
       )\z') {
           __value = value
           if is_string(__value) {
@@ -1056,8 +1072,8 @@ parser_vrl: |
       }
       if match(key, r'(?x)
       \A(?:
-        event_data\.Subject\.Account\ Domain
-      | event_data\.Creator\ Subject\.Account\ Domain
+        event_data\.Subject\~1Account\ Domain
+      | event_data\.Creator\ Subject\~1Account\ Domain
       )\z') {
           __value = value
           if is_string(__value) {
@@ -1067,14 +1083,14 @@ parser_vrl: |
       }
       if match(key, r'(?x)
       \A(?:
-        event_data\.Subject\.Account\ Domain
-      | event_data\.Target\ Account\.Account\ Domain
-      | event_data\.New\ Logon\.Account\ Domain
-      | event_data\.Account\ For\ Which\ Logon\ Failed\.Account\ Domain
-      | event_data\.Account\ Whose\ Credentials\ Were\ Used\.Account\ Domain
-      | event_data\.Account\ Information\.Supplied\ Realm\ Name
-      | event_data\.Account\ Information\.Account\ Domain
-      | event_data\.New\ Account\.Account\ Domain
+        event_data\.Subject\~1Account\ Domain
+      | event_data\.Target\ Account\~1Account\ Domain
+      | event_data\.New\ Logon\~1Account\ Domain
+      | event_data\.Account\ For\ Which\ Logon\ Failed\~1Account\ Domain
+      | event_data\.Account\ Whose\ Credentials\ Were\ Used\~1Account\ Domain
+      | event_data\.Account\ Information\~1Supplied\ Realm\ Name
+      | event_data\.Account\ Information\~1Account\ Domain
+      | event_data\.New\ Account\~1Account\ Domain
       )\z') {
           __value = value
           if is_string(__value) {
@@ -1084,9 +1100,9 @@ parser_vrl: |
       }
       if match(key, r'(?x)
       \A(?:
-        event_data\.Network\ Information\.Source\ Network\ Address
-      | event_data\.Network\ Information\.Source\ Address
-      | event_data\.Network\ Information\.Network\ Address
+        event_data\.Network\ Information\~1Source\ Network\ Address
+      | event_data\.Network\ Information\~1Source\ Address
+      | event_data\.Network\ Information\~1Network\ Address
       )\z') {
           __value = value
           if is_string(__value) {
@@ -1096,7 +1112,7 @@ parser_vrl: |
       }
       if match(key, r'(?x)
       \A(?:
-        event_data\.Network\ Information\.Workstation\ Name
+        event_data\.Network\ Information\~1Workstation\ Name
       )\z') {
           __value = value
           if is_string(__value) {
@@ -1106,7 +1122,7 @@ parser_vrl: |
       }
       if match(key, r'(?x)
       \A(?:
-        event_data\.Additional\ Information\.Failure\ Code
+        event_data\.Additional\ Information\~1Failure\ Code
       )\z') {
           __value = value
           if is_string(__value) {
@@ -1116,7 +1132,7 @@ parser_vrl: |
       }
       if match(key, r'(?x)
       \A(?:
-        event_data\.Group\.Group\ Name
+        event_data\.Group\~1Group\ Name
       )\z') {
           __value = value
           if is_string(__value) {
@@ -1126,7 +1142,7 @@ parser_vrl: |
       }
       if match(key, r'(?x)
       \A(?:
-        event_data\.Group\.Group\ Domain
+        event_data\.Group\~1Group\ Domain
       )\z') {
           __value = value
           if is_string(__value) {
@@ -1158,8 +1174,8 @@ parser_vrl: |
       }
       if match(key, r'(?x)
       \A(?:
-        event_data\.Process\ Information\.Process\ ID
-      | event_data\.Process\ Information\.Creator\ Process\ ID
+        event_data\.Process\ Information\~1Process\ ID
+      | event_data\.Process\ Information\~1Creator\ Process\ ID
       )\z') {
           __value = value
           __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
@@ -1171,8 +1187,8 @@ parser_vrl: |
       }
       if match(key, r'(?x)
       \A(?:
-        event_data\.Process\ Information\.New\ Process\ ID
-      | event_data\.Process\ Information\.Process\ ID
+        event_data\.Process\ Information\~1New\ Process\ ID
+      | event_data\.Process\ Information\~1Process\ ID
       )\z') {
           __value = value
           __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
@@ -1184,31 +1200,16 @@ parser_vrl: |
       }
   }
   # Declared source -> target mappings (field-coverage.yaml `mappings`).
-  __decl = "\n\"channel\"\t[\"metadata.log_name\"]\n\"event_data.Account For Which Logon Failed.Account Name\"\t[\"user.name\"]\n\"event_data.Account For Which Logon Failed.Security ID\"\t[\"user.uid\"]\n\"event_data.Account Information.Account Name\"\t[\"user.name\"]\n\"event_data.Account Information.Security ID\"\t[\"user.uid\"]\n\"event_data.Account Information.User ID\"\t[\"user.uid\"]\n\"event_data.Account That Was Locked Out.Account Name\"\t[\"user.name\"]\n\"event_data.Account That Was Locked Out.Security ID\"\t[\"user.uid\"]\n\"event_data.Account Whose Credentials Were Used.Account Name\"\t[\"user.name\"]\n\"event_data.Additional Information.Failure Code\"\t[\"status_code\"]\n\"event_data.Creator Subject.Account Name\"\t[\"actor.user.name\"]\n\"event_data.Creator Subject.Security ID\"\t[\"actor.user.uid\"]\n\"event_data.Detailed Authentication Information.Authentication Package\"\t[\"auth_protocol\"]\n\"event_data.Failure Information.Failure Reason\"\t[\"status_detail\"]\n\"event_data.Failure Information.Status\"\t[\"status_code\"]\n\"event_data.General.Logon Account\"\t[\"user.name\"]\n\"event_data.General.Service Account\"\t[\"win_service.service_start_name\"]\n\"event_data.General.Service File Name\"\t[\"win_service.cmd_line\",\"win_service.service_file.path\"]\n\"event_data.General.Service Name\"\t[\"win_service.name\"]\n\"event_data.Group.Security ID\"\t[\"group.uid\"]\n\"event_data.Logon Information.Logon Type\"\t[\"logon_type_id\"]\n\"event_data.Member.Account Name\"\t[\"user.name\"]\n\"event_data.Member.Security ID\"\t[\"user.uid\"]\n\"event_data.Network Information.Client Port\"\t[\"src_endpoint.port\"]\n\"event_data.Network Information.Network Address\"\t[\"src_endpoint.ip\"]\n\"event_data.Network Information.Relative Target Name\"\t[\"file.path\"]\n\"event_data.Network Information.Share Name\"\t[\"share\"]\n\"event_data.Network Information.Source Address\"\t[\"src_endpoint.ip\"]\n\"event_data.Network Information.Source Network Address\"\t[\"src_endpoint.ip\"]\n\"event_data.Network Information.Source Port\"\t[\"src_endpoint.port\"]\n\"event_data.New Account.Account Name\"\t[\"user.name\"]\n\"event_data.New Account.Security ID\"\t[\"user.uid\"]\n\"event_data.New Logon.Account Name\"\t[\"user.name\"]\n\"event_data.New Logon.Logon ID\"\t[\"session.uid\"]\n\"event_data.New Logon.Security ID\"\t[\"user.uid\"]\n\"event_data.Object.New Value\"\t[\"reg_value.data\"]\n\"event_data.Object.Object Name\"\t[\"file.path\",\"reg_key.path\",\"reg_value.path\"]\n\"event_data.Object.Object Value Name\"\t[\"reg_value.name\"]\n\"event_data.Process Information.Creator Process Name\"\t[\"actor.process.file.path\"]\n\"event_data.Process Information.Exit Status\"\t[\"status_code\"]\n\"event_data.Process Information.New Process Name\"\t[\"process.file.path\"]\n\"event_data.Process Information.Process Command Line\"\t[\"process.cmd_line\"]\n\"event_data.Process Information.Process Name\"\t[\"actor.process.file.path\",\"process.file.path\"]\n\"event_data.Rule Information.Rule ID\"\t[\"entity.uid\",\"firewall_rule.uid\"]\n\"event_data.Rule Information.Rule Name\"\t[\"entity.name\",\"firewall_rule.name\"]\n\"event_data.Service Information.Service Account\"\t[\"win_service.service_start_name\"]\n\"event_data.Service Information.Service File Name\"\t[\"win_service.cmd_line\",\"win_service.service_file.path\"]\n\"event_data.Service Information.Service Name\"\t[\"win_service.name\"]\n\"event_data.Subject.Account Domain\"\t[\"actor.user.domain\"]\n\"event_data.Subject.Account Name\"\t[\"actor.user.name\",\"user.name\"]\n\"event_data.Subject.Logon ID\"\t[\"session.uid\"]\n\"event_data.Subject.Logon Type\"\t[\"logon_type_id\"]\n\"event_data.Subject.Security ID\"\t[\"actor.user.uid\",\"user.uid\"]\n\"event_data.Target Account.Account Name\"\t[\"user.name\"]\n\"event_data.Target Account.Security ID\"\t[\"user.uid\"]\n\"event_data.Task Information.Task Name\"\t[\"job.file.path\",\"job.name\"]\n\"event_id\"\t[\"metadata.event_code\"]\n\"provider\"\t[\"metadata.log_provider\"]\n\"record_number\"\t[\"metadata.original_event_uid\"]\n"
+  __decl = "\n\"channel\"\t[\"metadata.log_name\"]\n\"event_data.Account For Which Logon Failed~1Account Name\"\t[\"user.name\"]\n\"event_data.Account For Which Logon Failed~1Security ID\"\t[\"user.uid\"]\n\"event_data.Account Information~1Account Name\"\t[\"user.name\"]\n\"event_data.Account Information~1Security ID\"\t[\"user.uid\"]\n\"event_data.Account Information~1User ID\"\t[\"user.uid\"]\n\"event_data.Account That Was Locked Out~1Account Name\"\t[\"user.name\"]\n\"event_data.Account That Was Locked Out~1Security ID\"\t[\"user.uid\"]\n\"event_data.Account Whose Credentials Were Used~1Account Name\"\t[\"user.name\"]\n\"event_data.Additional Information~1Failure Code\"\t[\"status_code\"]\n\"event_data.Creator Subject~1Account Name\"\t[\"actor.user.name\"]\n\"event_data.Creator Subject~1Security ID\"\t[\"actor.user.uid\"]\n\"event_data.Detailed Authentication Information~1Authentication Package\"\t[\"auth_protocol\"]\n\"event_data.Failure Information~1Failure Reason\"\t[\"status_detail\"]\n\"event_data.Failure Information~1Status\"\t[\"status_code\"]\n\"event_data.General~1Logon Account\"\t[\"user.name\"]\n\"event_data.General~1Service Account\"\t[\"win_service.service_start_name\"]\n\"event_data.General~1Service File Name\"\t[\"win_service.cmd_line\",\"win_service.service_file.path\"]\n\"event_data.General~1Service Name\"\t[\"win_service.name\"]\n\"event_data.Group~1Security ID\"\t[\"group.uid\"]\n\"event_data.Logon Information~1Logon Type\"\t[\"logon_type_id\"]\n\"event_data.Member~1Account Name\"\t[\"user.name\"]\n\"event_data.Member~1Security ID\"\t[\"user.uid\"]\n\"event_data.Network Information~1Client Port\"\t[\"src_endpoint.port\"]\n\"event_data.Network Information~1Network Address\"\t[\"src_endpoint.ip\"]\n\"event_data.Network Information~1Relative Target Name\"\t[\"file.path\"]\n\"event_data.Network Information~1Share Name\"\t[\"share\"]\n\"event_data.Network Information~1Source Address\"\t[\"src_endpoint.ip\"]\n\"event_data.Network Information~1Source Network Address\"\t[\"src_endpoint.ip\"]\n\"event_data.Network Information~1Source Port\"\t[\"src_endpoint.port\"]\n\"event_data.New Account~1Account Name\"\t[\"user.name\"]\n\"event_data.New Account~1Security ID\"\t[\"user.uid\"]\n\"event_data.New Logon~1Account Name\"\t[\"user.name\"]\n\"event_data.New Logon~1Logon ID\"\t[\"session.uid\"]\n\"event_data.New Logon~1Security ID\"\t[\"user.uid\"]\n\"event_data.Object~1New Value\"\t[\"reg_value.data\"]\n\"event_data.Object~1Object Name\"\t[\"file.path\",\"reg_key.path\",\"reg_value.path\"]\n\"event_data.Object~1Object Value Name\"\t[\"reg_value.name\"]\n\"event_data.Process Information~1Creator Process Name\"\t[\"actor.process.file.path\"]\n\"event_data.Process Information~1Exit Status\"\t[\"status_code\"]\n\"event_data.Process Information~1New Process Name\"\t[\"process.file.path\"]\n\"event_data.Process Information~1Process Command Line\"\t[\"process.cmd_line\"]\n\"event_data.Process Information~1Process Name\"\t[\"actor.process.file.path\",\"process.file.path\"]\n\"event_data.Rule Information~1Rule ID\"\t[\"entity.uid\",\"firewall_rule.uid\"]\n\"event_data.Rule Information~1Rule Name\"\t[\"entity.name\",\"firewall_rule.name\"]\n\"event_data.Service Information~1Service Account\"\t[\"win_service.service_start_name\"]\n\"event_data.Service Information~1Service File Name\"\t[\"win_service.cmd_line\",\"win_service.service_file.path\"]\n\"event_data.Service Information~1Service Name\"\t[\"win_service.name\"]\n\"event_data.Subject~1Account Domain\"\t[\"actor.user.domain\"]\n\"event_data.Subject~1Account Name\"\t[\"actor.user.name\",\"user.name\"]\n\"event_data.Subject~1Logon ID\"\t[\"session.uid\"]\n\"event_data.Subject~1Logon Type\"\t[\"logon_type_id\"]\n\"event_data.Subject~1Security ID\"\t[\"actor.user.uid\",\"user.uid\"]\n\"event_data.Target Account~1Account Name\"\t[\"user.name\"]\n\"event_data.Target Account~1Security ID\"\t[\"user.uid\"]\n\"event_data.Task Information~1Task Name\"\t[\"job.file.path\",\"job.name\"]\n\"event_id\"\t[\"metadata.event_code\"]\n\"provider\"\t[\"metadata.log_provider\"]\n\"record_number\"\t[\"metadata.original_event_uid\"]\n"
   __preserve = []
   # END parser-specific transformations
-  # Escape literal dots before flattening so dotted source keys cannot overwrite
-  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
-  # In compact JSON only an object key is followed by ':', so a source whose text
-  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
-  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
-  __escaped = object!(__copy.source)
-  __tilde = false
-  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
-      __escaped = map_keys(__escaped, recursive: true) -> |key| {
-          replace(replace(key, "~", "~0"), ".", "~1")
-      }
-      # Keys without a "~" decode to themselves, including the object keys inside
-      # an array that flatten leaves escaped; encode_json never escapes a "~".
-      __tilde = contains(encode_json(__escaped), "~")
-  }
-  __flat = flatten(__escaped)
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
   # target paths + "\n" per mapped source key (a raw newline never occurs in
   # compact JSON). A key is consumed when its value, or every element of a scalar
-  # array, is at one of its own targets.
+  # array, is at one of its own targets. Keys stay ESCAPED here and in __consumed:
+  # a literal dotted key ("a~1b") and the nested path ("a.b") are different
+  # fields, and mapping one never consumes the other.
   for_each(__flat) -> |key, value| {
-      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
       # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
       __kt = encode_json(key)
       if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
@@ -1246,7 +1247,6 @@ parser_vrl: |
   __names = {}
   if __distinct {
       __kept = filter(__flat) -> |key, value| {
-          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
           # A key is kept unless an explicit mapping or transformation consumed it.
           # Do not spill a copy of the raw body.
           value != __raw_body && !contains(__consumed, "," + encode_json(key))
@@ -1280,13 +1280,13 @@ parser_vrl: |
       # Slow path, in source key order: a name already taken gets the next free
       # _2, _3, ... suffix.
       for_each(__flat) -> |key, value| {
+          __token = "," + encode_json(key)
           key = replace(replace(key, "~1", "."), "~0", "~")
           if is_array(value) || is_object(value) {
               value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
                   replace(replace(inner, "~1", "."), "~0", "~")
               }, ["v"])
           }
-          __token = "," + encode_json(key)
           if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")
