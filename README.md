@@ -107,9 +107,9 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Duo Security](parsers-ocsf/duo) | `duo` | Cisco | JSON | Authentication, admin actions, MFA with device/geo context |
 | [Cisco ISE](parsers-ocsf/cisco_ise) | `cisco_ise` | Cisco | Syslog key=value | RADIUS and TACACS+ authentication passed/failed, RADIUS and TACACS+ accounting, TACACS+ command accounting, posture |
 | [Auth0](parsers-ocsf/auth0) | `auth0` | Okta | JSON | 20+ event types: login, signup, MFA, token exchange, management API |
-| [Keycloak](parsers-ocsf/keycloak) | `keycloak` | Keycloak | JSON / jboss-logging text | User events (LOGIN, LOGIN_ERROR, CODE_TO_TOKEN, ...) and admin events (users, roles, groups, clients) from the REST API, event listeners or the server log |
 | [1Password](parsers-ocsf/onepassword) | `onepassword` | 1Password | JSON | Sign-in attempts, item usage, vault access events |
 | [CyberArk PAM](parsers-ocsf/cyberark) | `cyberark` | CyberArk | CEF syslog | Vault audit, PSM sessions, privileged access events |
+| [Keycloak](parsers-ocsf/keycloak) | `keycloak` | Keycloak | JSON / jboss-logging text | User events (LOGIN, LOGIN_ERROR, CODE_TO_TOKEN, ...) and admin events (users, roles, groups, clients) from the REST API, event listeners or the server log |
 | [Netskope](parsers-ocsf/netskope) | `netskope` | Netskope | JSON | CASB/SSE: app activity, alerts, DLP, network events |
 | [F5 BIG-IP ASM](parsers-ocsf/f5_waf) | `f5_waf` | F5 | JSON | Web application firewall: attacks, violations, security events |
 | [HashiCorp Vault](parsers-ocsf/hashicorp_vault) | `hashicorp_vault` | HashiCorp | JSON (audit device) | Request / response audit entries as API Activity, login paths as Authentication; HMAC values kept as written. OCSF only |
