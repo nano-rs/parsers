@@ -11,6 +11,8 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 START = '# NAN-2421 residual spill.'
 END = '# END NAN-2421 residual spill'
+TZ_START = '# NAN source timezone.'
+TZ_END = '# END NAN source timezone'
 
 
 KINDS = ('lowercase', 'epoch_ms', 'scale', 'enum', 'hex')
@@ -218,8 +220,21 @@ def generated(config):
     return (ROOT / 'scripts/residual/spill.vrl').read_text().replace('__TRANSFORMS__', transformations(config)).rstrip()
 
 
+def prelude():
+    """The shared source-timezone block every parser starts with."""
+    return (ROOT / 'scripts/residual/source_tz.vrl').read_text().rstrip()
+
+
 def update(path, check=False):
     text = path.read_text()
+    # The source-timezone prelude opens parser_vrl, before the parser reads
+    # anything (it removes .nano, nano's own input, from the event).
+    tz_pattern = r'  ' + re.escape(TZ_START) + r'.*?  ' + re.escape(TZ_END) + r'\n'
+    tz_block = '\n'.join('  ' + s if s else '' for s in prelude().splitlines()) + '\n'
+    assert re.search(tz_pattern, text, re.S) or not check, f'{path}: missing source-timezone prelude'
+    text_wo = re.sub(tz_pattern, '', text, flags=re.S)
+    head = text_wo.index('\n', text_wo.index('parser_vrl:')) + 1
+    text = text_wo[:head] + tz_block + text_wo[head:]
     config = yaml.safe_load(path.with_name('field-coverage.yaml').read_text())
     block = '\n'.join('  ' + s if s else '' for s in generated(config).splitlines()) + '\n'
     pattern = r'  ' + re.escape(START) + r'.*?  ' + re.escape(END) + r'\n'
@@ -233,7 +248,7 @@ def update(path, check=False):
     if index < len(stripped):
         new += '\n' + stripped[index:]
     if check:
-        assert new == text, f'{path}: generated spill is stale; run scripts/residual_spill.py {path}'
+        assert new == path.read_text(), f'{path}: generated spill is stale; run scripts/residual_spill.py {path}'
     else:
         path.write_text(new)
 
