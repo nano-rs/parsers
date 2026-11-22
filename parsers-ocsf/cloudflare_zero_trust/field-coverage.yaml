@@ -1,0 +1,118 @@
+source: json
+transforms:
+- source: Datetime
+  kind: epoch_ms
+  target: time
+  reason: RFC 3339 Logpush clock converted to event milliseconds.
+- source: Datetime
+  kind: scale
+  factor: 1000
+  target: time
+  reason: Unix-seconds Logpush clock converted to event milliseconds.
+- source: Datetime
+  kind: scale
+  factor: 1.0e-06
+  target: time
+  reason: Unix-nanoseconds Logpush clock converted to event milliseconds.
+- source: CreatedAt
+  kind: epoch_ms
+  target: time
+  reason: RFC 3339 Access clock converted to event milliseconds.
+- source: CreatedAt
+  kind: scale
+  factor: 1000
+  target: time
+  reason: Unix-seconds Access clock converted to event milliseconds.
+- source: CreatedAt
+  kind: scale
+  factor: 1.0e-06
+  target: time
+  reason: Unix-nanoseconds Access clock converted to event milliseconds.
+- source: QueryName
+  kind: lowercase
+  reason: Query name lowercased into query.hostname.
+- source: HTTPHost
+  kind: lowercase
+  reason: Host lowercased into http_request.url.hostname and dst_endpoint.hostname.
+- source: SNI
+  kind: lowercase
+  reason: SNI lowercased into dst_endpoint.hostname.
+- source: HTTPMethod
+  kind: lowercase
+  reason: Method is upper case on the wire; the parser upcases it, so a lower-case source is the only transformed form.
+- source: Action
+  kind: enum
+  target: action_id
+  values:
+    allow: 1
+    allowedonnorulematch: 1
+    block: 2
+    login: 1
+  reason: Gateway / Access verdict normalized to the OCSF action; consume only when the expected ID is emitted.
+- source: ResolverDecision
+  kind: enum
+  target: action_id
+  values:
+    allowedonnopolicymatch: 1
+    allowedbyqueryname: 1
+    allowedbyanswername: 1
+    blockedrule: 2
+    blockedbycategory: 2
+    blockedalwayscategory: 2
+  reason: Resolver decision normalized to the OCSF action; consume only when the expected ID is emitted.
+- source: Transport
+  kind: enum
+  target: connection_info.protocol_num
+  values:
+    tcp: 6
+    udp: 17
+    icmp: 1
+  reason: Transport name normalized to the IANA protocol number.
+consumed_candidates:
+- AccountID
+- AppDomain
+- AppUUID
+- BlockedFileHash
+- BlockedFileName
+- BlockedFileSize
+- DestinationIP
+- DestinationIPCountryCode
+- DestinationPort
+- DeviceID
+- DeviceName
+- DstIP
+- DstPort
+- Email
+- HTTPHost
+- HTTPMethod
+- HTTPStatusCode
+- HTTPVersion
+- IPAddress
+- PolicyID
+- PolicyName
+- Policy
+- Protocol
+- QueryName
+- QuerySize
+- QueryTypeName
+- RCode
+- RayID
+- Referer
+- RequestID
+- ResolvedIPs
+- SNI
+- SessionID
+- SourceIP
+- SourceIPCountryCode
+- SourceInternalIP
+- SourcePort
+- SrcIP
+- SrcPort
+- Transport
+- URL
+- UserAgent
+- UserID
+- UserUID
+consumed_reason: Only source keys read by this parser are eligible for exact-value
+  consumption; the selected branch must emit the value. Unknown keys always spill,
+  even when their value equals an OCSF default.

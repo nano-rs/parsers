@@ -1,0 +1,870 @@
+name: pfsense_ocsf
+display_name: pfSense / OPNsense (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Parses pfSense and OPNsense syslog (RFC 3164 or RFC 5424) into OCSF 1.9.0.
+  The filterlog CSV packet log (IPv4 and IPv6; TCP, UDP, ICMP and any other
+  protocol) becomes Network Activity (4001): pass is activity Traffic with
+  action Allowed, block and reject are activity Refuse with action Denied,
+  the rule tracker id becomes firewall_rule.uid, and the in / out column
+  becomes connection_info.direction_id Inbound / Outbound with the logging
+  interface on the ingress (src) or egress (dst) endpoint. unbound query and reply
+  lines become DNS Activity (4003), dhcpd lease messages become DHCP
+  Activity (4004), and OpenVPN user authentication lines become
+  Authentication (3002). Every other program on the box (dhcp6c, php-fpm,
+  OpenVPN TLS chatter, flowd, ...) becomes Base Event (0) with the syslog
+  header parsed; a line with no recognizable syslog header is a Base Event
+  marked with unmapped.parse_fallback.
+match_values:
+  - pfsense
+category: network
+vendor: "Netgate / Deciso"
+product: "pfSense / OPNsense"
+parser_vrl: |
+  # pfSense / OPNsense -> OCSF 1.9.0 Network Activity (4001) / DNS Activity
+  # (4003) / DHCP Activity (4004) / Authentication (3002) / Base Event (0)
+  raw_log = if is_string(.message) { string!(.message) } else { encode_json(.) }
+  __raw_body = raw_log
+  __source_kv = {}
+
+  time_ms = to_int(to_unix_timestamp(now(), unit: "milliseconds"))
+  header_ok = false
+  host = ""
+  prog = ""
+  msg = raw_log
+  sev_num = 6
+
+  # ---- syslog header: RFC 5424 first, then RFC 3164 ----
+  h5, h5e = parse_regex(raw_log, r'^<(?P<pri>\d{1,3})>1\s+(?P<ts>\S+)\s+(?P<host>\S+)\s+(?P<prog>\S+)\s+(?P<pid>\S+)\s+(?P<msgid>\S+)\s+(?P<sd>-|(?:\x5B(?:[^\x5D\\]|\\.)*\x5D)+)\s?(?P<msg>.*)$')
+  if h5e == null {
+      header_ok = true
+      hdr = { "pri": h5.pri, "ts": h5.ts, "host": h5.host, "prog": h5.prog, "pid": h5.pid }
+      if h5.msgid != "-" { hdr.msgid = h5.msgid }
+      if h5.sd != "-" { hdr.structured_data = h5.sd }
+      __source_kv.header = hdr
+      host = string(h5.host) ?? ""
+      prog = string(h5.prog) ?? ""
+      msg = string(h5.msg) ?? ""
+      sev_num = mod(to_int(h5.pri) ?? 6, 8)
+      t5, t5e = parse_timestamp(string(h5.ts) ?? "", "%+")
+      if t5e == null { time_ms = to_unix_timestamp(t5, unit: "milliseconds") }
+  } else {
+      h3, h3e = parse_regex(raw_log, r'^(?:<(?P<pri>\d{1,3})>)?(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(?:(?P<host>[^\s\x5B]+)\s+)?(?P<prog>[A-Za-z0-9_./-]+)(?:\x5B(?P<pid>\d+)\x5D)?:\s?(?P<msg>.*)$')
+      if h3e == null {
+          header_ok = true
+          hdr = { "ts": h3.ts, "prog": h3.prog }
+          if h3.pri != null { hdr.pri = h3.pri; sev_num = mod(to_int(h3.pri) ?? 6, 8) }
+          if h3.host != null { hdr.host = h3.host; host = string!(h3.host) }
+          if h3.pid != null { hdr.pid = h3.pid }
+          __source_kv.header = hdr
+          prog = string(h3.prog) ?? ""
+          msg = string(h3.msg) ?? ""
+          ts_str = replace(string(h3.ts) ?? "", r'\s+', " ")
+          t3, t3e = parse_timestamp(ts_str + " " + format_timestamp!(now(), "%Y"), "%b %d %H:%M:%S %Y", timezone: "UTC")
+          if t3e == null { time_ms = to_unix_timestamp(t3, unit: "milliseconds") }
+      }
+  }
+  prog = replace(prog, r'^/', "")
+
+  severity_id = 1
+  severity = "Informational"
+  if sev_num == 0 { severity_id = 6; severity = "Fatal" }
+  if sev_num == 1 || sev_num == 2 { severity_id = 5; severity = "Critical" }
+  if sev_num == 3 { severity_id = 4; severity = "High" }
+  if sev_num == 4 { severity_id = 3; severity = "Medium" }
+  if sev_num == 5 { severity_id = 2; severity = "Low" }
+
+  metadata = {
+      "version": "1.9.0",
+      "uid": sha2("pfsense|raw|" + raw_log, variant: "SHA-256"),
+      "profiles": ["host", "security_control"],
+      "log_name": "pfsense",
+      "log_provider": prog,
+      "product": { "name": "pfSense / OPNsense", "vendor_name": "Netgate / Deciso" }
+  }
+  if prog == "" { __d = del(metadata.log_provider) }
+  device = {}
+  if host != "" { device = { "hostname": host, "type_id": 9, "type": "Firewall" } }
+
+  route = "base"
+  activity_id = 99
+  activity_name = "Other"
+  action_id = 0
+  action = "Unknown"
+  disposition_id = 0
+  disposition = "Unknown"
+  status_id = 0
+  status_str = "Unknown"
+  src = {}
+  dst = {}
+  conn = {}
+  rule_uid = ""
+  pkt_len = 0
+  query = {}
+  rcode = ""
+  user_name = ""
+  dhcp_type = ""
+
+  if header_ok && prog == "filterlog" {
+      # ================= filterlog CSV =================
+      f = split(msg, ",")
+      n = length(f)
+      if n >= 9 {
+          fl = {
+              "rule_number": f[0], "sub_rule": f[1], "anchor": f[2], "tracker": f[3],
+              "interface": f[4], "reason": f[5], "action": f[6], "direction": f[7],
+              "ip_version": f[8]
+          }
+          ipver = string(f[8]) ?? ""
+          proto_name = ""
+          proto_num = -1
+          rest_at = -1
+          if ipver == "4" && n >= 20 {
+              fl.tos = f[9]; fl.ecn = f[10]; fl.ttl = f[11]; fl.id = f[12]; fl.offset = f[13]
+              fl.ip_flags = f[14]; fl.protocol_id = f[15]; fl.protocol = f[16]; fl.length = f[17]
+              fl.src_ip = f[18]; fl.dst_ip = f[19]
+              proto_num = to_int(f[15]) ?? -1
+              proto_name = downcase(string(f[16]) ?? "")
+              pkt_len = to_int(f[17]) ?? 0
+              rest_at = 20
+          } else if ipver == "6" && n >= 17 {
+              fl.class = f[9]; fl.flow_label = f[10]; fl.hop_limit = f[11]; fl.protocol = f[12]
+              fl.protocol_id = f[13]; fl.length = f[14]; fl.src_ip = f[15]; fl.dst_ip = f[16]
+              proto_num = to_int(f[13]) ?? -1
+              proto_name = downcase(string(f[12]) ?? "")
+              pkt_len = to_int(f[14]) ?? 0
+              rest_at = 17
+          }
+          if rest_at > 0 {
+              rest = slice(f, rest_at) ?? []
+              if proto_num == 6 && length(rest) >= 3 {
+                  fl.src_port = rest[0]; fl.dst_port = rest[1]; fl.data_length = rest[2]
+                  if length(rest) >= 9 {
+                      fl.tcp_flags = rest[3]; fl.sequence = rest[4]; fl.ack = rest[5]
+                      fl.window = rest[6]; fl.urg = rest[7]; fl.tcp_options = rest[8]
+                  }
+              } else if proto_num == 17 && length(rest) >= 3 {
+                  fl.src_port = rest[0]; fl.dst_port = rest[1]; fl.data_length = rest[2]
+              } else if (proto_num == 1 || proto_num == 58) && length(rest) >= 1 {
+                  fl.icmp_type = rest[0]
+                  # everything after the ICMP type, as logged (id,seq / unreach detail / ...)
+                  if length(rest) > 1 { fl.icmp_data = string(get(split(msg, ",", limit: rest_at + 2), [rest_at + 1]) ?? "") ?? "" }
+              } else if length(rest) > 0 {
+                  fl.protocol_data = string(get(split(msg, ",", limit: rest_at + 1), [rest_at]) ?? "") ?? ""
+              }
+          }
+          # Empty CSV columns (unused anchor, ECN, ACK, ...) carry no value.
+          fl = compact(fl, string: true, null: true)
+          __source_kv.filter = fl
+
+          if rest_at > 0 {
+              route = "network"
+              act = downcase(string(f[6]) ?? "")
+              if act == "pass" {
+                  activity_id = 6; activity_name = "Traffic"
+                  action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed"
+                  status_id = 1; status_str = "Success"
+              } else if act == "block" || act == "reject" {
+                  activity_id = 5; activity_name = "Refuse"
+                  action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
+                  status_id = 2; status_str = "Failure"
+              }
+              sip = string(fl.src_ip) ?? ""
+              dip = string(fl.dst_ip) ?? ""
+              if sip != "" { src.ip = sip }
+              if dip != "" { dst.ip = dip }
+              sp = to_int(fl.src_port) ?? 0
+              dp = to_int(fl.dst_port) ?? 0
+              if sp > 0 { src.port = sp }
+              if dp > 0 { dst.port = dp }
+              iface = string(f[4]) ?? ""
+              # filterlog direction is relative to the interface that logged the
+              # packet: "in" arrived on it (ingress), "out" left through it (egress).
+              pdir = downcase(string(f[7]) ?? "")
+              conn = { "direction_id": 0 }
+              if pdir == "in" {
+                  conn = { "direction_id": 1, "direction": "Inbound" }
+                  if iface != "" { src.interface_name = iface }
+              } else if pdir == "out" {
+                  conn = { "direction_id": 2, "direction": "Outbound" }
+                  if iface != "" { dst.interface_name = iface }
+              } else if iface != "" {
+                  src.interface_name = iface
+              }
+              if proto_num >= 0 { conn.protocol_num = proto_num }
+              if proto_name != "" { conn.protocol_name = proto_name }
+              if proto_num == 1 && proto_name == "" { conn.protocol_name = "icmp" }
+              rule_uid = string(f[3]) ?? ""
+              if rule_uid == "" { rule_uid = string(f[0]) ?? "" }
+          }
+      }
+  } else if header_ok && prog == "unbound" {
+      # ================= unbound query / reply log =================
+      um, ue = parse_regex(msg, r'^\x5B(?P<thread>[^\x5D]+)\x5D\s+(?P<level>\w+):\s+(?P<client>[0-9A-Fa-f.:]+)\s+(?P<qname>\S+)\s+(?P<qtype>[A-Z0-9]+)\s+(?P<qclass>[A-Z]+)(?:\s+(?P<rcode>[A-Z]+)\s+(?P<duration>[0-9.]+)\s+(?P<cached>\d)\s+(?P<size>\d+))?\s*$')
+      if ue == null {
+          __source_kv.dns = um
+          route = "dns"
+          qn = replace(string(um.qname) ?? "", r'\.$', "")
+          query = { "hostname": qn, "type": um.qtype, "class": um.qclass }
+          src.ip = um.client
+          activity_id = 1; activity_name = "Query"
+          action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed"
+          status_id = 1; status_str = "Success"
+          if um.rcode != null {
+              activity_id = 2; activity_name = "Response"
+              rcode = string!(um.rcode)
+              if rcode != "NOERROR" { status_id = 2; status_str = "Failure" }
+          }
+      }
+  } else if header_ok && prog == "dhcpd" {
+      # ================= ISC dhcpd =================
+      dm, de = parse_regex(msg, r'^(?P<type>DHCP[A-Z]+)\s+(?:(?:on|for|of)\s+(?P<ip>[0-9.]+)\s+(?:\x28(?P<server>[0-9.]+)\x29\s+)?(?:to|from)\s+|from\s+)?(?P<mac>(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})?\s*(?:\x28(?P<hostname>[^\x29]*)\x29)?\s*(?:via\s+(?P<via>\S+))?')
+      if de == null {
+          route = "dhcp"
+          dcap = { "type": dm.type }
+          if dm.ip != null { dcap.ip = dm.ip }
+          if dm.server != null { dcap.server = dm.server }
+          if dm.mac != null { dcap.mac = dm.mac }
+          if dm.hostname != null { dcap.hostname = dm.hostname }
+          if dm.via != null { dcap.via = dm.via }
+          __source_kv.dhcp = dcap
+          dhcp_type = string!(dm.type)
+          if dhcp_type == "DHCPDISCOVER" { activity_id = 1; activity_name = "Discover" }
+          if dhcp_type == "DHCPOFFER" { activity_id = 2; activity_name = "Offer" }
+          if dhcp_type == "DHCPREQUEST" { activity_id = 3; activity_name = "Request" }
+          if dhcp_type == "DHCPDECLINE" { activity_id = 4; activity_name = "Decline" }
+          if dhcp_type == "DHCPACK" { activity_id = 5; activity_name = "Ack" }
+          if dhcp_type == "DHCPNAK" { activity_id = 6; activity_name = "Nak" }
+          if dhcp_type == "DHCPRELEASE" { activity_id = 7; activity_name = "Release" }
+          if dhcp_type == "DHCPINFORM" { activity_id = 8; activity_name = "Inform" }
+          status_id = 1; status_str = "Success"
+          if activity_id == 4 || activity_id == 6 { status_id = 2; status_str = "Failure" }
+          if dm.ip != null { src.ip = dm.ip }
+          if dm.mac != null { src.mac = downcase(string!(dm.mac)) }
+          if dm.hostname != null && dm.hostname != "" { src.hostname = dm.hostname }
+          # A DISCOVER client has no address yet: its MAC is its only identity.
+          if !exists(src.ip) && !exists(src.hostname) && exists(src.mac) { src.uid = src.mac }
+          dst = { "svc_name": "dhcp", "port": 67 }
+          if dm.via != null { dst.interface_name = dm.via }
+          if dm.server != null { dst.ip = dm.server }
+      }
+  } else if header_ok && prog == "openvpn" {
+      # ================= OpenVPN user authentication =================
+      om, oe = parse_regex(msg, r'^(?:(?P<client>[0-9A-Fa-f.:]+):(?P<client_port>\d+)\s+)?user\s+\x27(?P<user>[^\x27]+)\x27\s+(?P<result>authenticated|could not authenticate)')
+      if oe == null {
+          route = "auth"
+          ocap = { "user": om.user, "result": om.result }
+          if om.client != null { ocap.client = om.client; ocap.client_port = om.client_port }
+          __source_kv.openvpn = ocap
+          user_name = string!(om.user)
+          activity_id = 1; activity_name = "Logon"
+          if om.result == "authenticated" {
+              status_id = 1; status_str = "Success"
+              action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed"
+          } else {
+              status_id = 2; status_str = "Failure"
+              action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
+              if severity_id < 2 { severity_id = 2; severity = "Low" }
+          }
+          if om.client != null { src.ip = om.client; src.port = to_int(om.client_port) ?? 0 }
+      } else {
+          pm, pe = parse_regex(msg, r'^(?P<client>[0-9A-Fa-f.:]+):(?P<client_port>\d+)\s+\x5B(?P<user>[^\x5D]+)\x5D\s+Peer Connection Initiated with')
+          if pe == null {
+              route = "auth"
+              __source_kv.openvpn = { "client": pm.client, "client_port": pm.client_port, "user": pm.user }
+              user_name = string!(pm.user)
+              activity_id = 1; activity_name = "Logon"
+              status_id = 1; status_str = "Success"
+              action_id = 1; action = "Allowed"; disposition_id = 1; disposition = "Allowed"
+              src.ip = pm.client
+              src.port = to_int(pm.client_port) ?? 0
+          }
+      }
+  }
+
+  base = {
+      "severity_id": severity_id,
+      "severity": severity,
+      "time": time_ms,
+      "raw_data": raw_log,
+      "metadata": metadata
+  }
+
+  if route == "network" {
+      . = merge(base, {
+          "class_uid": 4001, "class_name": "Network Activity",
+          "category_uid": 4, "category_name": "Network Activity",
+          "activity_id": activity_id, "activity_name": activity_name,
+          "type_uid": 400100 + activity_id,
+          "status_id": status_id, "status": status_str,
+          "action_id": action_id, "action": action,
+          "disposition_id": disposition_id, "disposition": disposition,
+          "connection_info": conn
+      })
+      if length(src) > 0 { .src_endpoint = src }
+      if length(dst) > 0 { .dst_endpoint = dst }
+      if pkt_len > 0 { .traffic = { "bytes_out": pkt_len, "packets_out": 1 } }
+      if rule_uid != "" { .firewall_rule = { "uid": rule_uid } }
+  } else if route == "dns" {
+      . = merge(base, {
+          "class_uid": 4003, "class_name": "DNS Activity",
+          "category_uid": 4, "category_name": "Network Activity",
+          "activity_id": activity_id, "activity_name": activity_name,
+          "type_uid": 400300 + activity_id,
+          "status_id": status_id, "status": status_str,
+          "action_id": action_id, "action": action,
+          "disposition_id": disposition_id, "disposition": disposition,
+          "query": query,
+          "src_endpoint": src,
+          "dst_endpoint": { "svc_name": "dns", "port": 53 }
+      })
+      if host != "" { .dst_endpoint.hostname = host }
+      if rcode != "" {
+          .rcode = rcode
+          rc = { "NOERROR": 0, "FORMERR": 1, "SERVFAIL": 2, "NXDOMAIN": 3, "NOTIMP": 4, "REFUSED": 5 }
+          .rcode_id = get(rc, [rcode]) ?? 99
+      }
+  } else if route == "dhcp" {
+      . = merge(base, {
+          "class_uid": 4004, "class_name": "DHCP Activity",
+          "category_uid": 4, "category_name": "Network Activity",
+          "activity_id": activity_id, "activity_name": activity_name,
+          "type_uid": 400400 + activity_id,
+          "status_id": status_id, "status": status_str,
+          "dst_endpoint": dst
+      })
+      if dhcp_type != "" { .metadata.event_code = dhcp_type }
+      if length(src) > 0 { .src_endpoint = src }
+  } else if route == "auth" {
+      . = merge(base, {
+          "class_uid": 3002, "class_name": "Authentication",
+          "category_uid": 3, "category_name": "Identity & Access Management",
+          "activity_id": activity_id, "activity_name": activity_name,
+          "type_uid": 300200 + activity_id,
+          "status_id": status_id, "status": status_str,
+          "action_id": action_id, "action": action,
+          "disposition_id": disposition_id, "disposition": disposition,
+          "user": { "name": user_name },
+          "is_remote": true,
+          "service": { "name": "OpenVPN" },
+          "logon_type": "VPN"
+      })
+      if length(src) > 0 { .src_endpoint = src }
+      if host != "" { .dst_endpoint = { "hostname": host } }
+  } else {
+      . = merge(base, {
+          "class_uid": 0, "class_name": "Base Event",
+          "category_uid": 0, "category_name": "Uncategorized",
+          "activity_id": 99, "activity_name": "Other",
+          "type_uid": 99,
+          "status_id": 0, "status": "Unknown"
+      })
+      if header_ok {
+          .message = msg
+          __source_kv.message = msg
+      } else {
+          . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
+      }
+  }
+  if length(device) > 0 { .device = device }
+
+  .
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __safe = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __safe_json = encode_json(__safe)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__safe_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # header.ts: RFC 5424 timestamp converted to event milliseconds; RFC 3164 clocks carry no year and remain residual.
+  # filter.protocol: filterlog protocol names (UDP on IPv6) are lowercased into connection_info.protocol_name.
+  # filter.action: filterlog verdict normalized to the OCSF action; consume only when the expected ID is emitted.
+  # dhcp.mac: Client MAC lowercased into src_endpoint.mac.
+  # filter.direction: filterlog packet direction normalized to the OCSF direction id.
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        header\.ts
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if ."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        filter\.protocol
+      | dhcp\.mac
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        filter\.action
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"pass": 1, "block": 2, "reject": 2}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."action_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        filter\.direction
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"in": 1, "out": 2}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if ."connection_info"."direction_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    header\.host
+  | header\.prog
+  | filter\.tracker
+  | filter\.rule_number
+  | filter\.interface
+  | filter\.protocol
+  | filter\.protocol_id
+  | filter\.src_ip
+  | filter\.dst_ip
+  | filter\.src_port
+  | filter\.dst_port
+  | filter\.length
+  | dns\.client
+  | dns\.qtype
+  | dns\.qclass
+  | dns\.rcode
+  | dhcp\.type
+  | dhcp\.ip
+  | dhcp\.server
+  | dhcp\.mac
+  | dhcp\.hostname
+  | dhcp\.via
+  | openvpn\.user
+  | openvpn\.client
+  | openvpn\.client_port
+  | message
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Redact at every depth, including objects inside arrays, before serialization.
+  # Redaction needs a sensitive word in a key or a name/key value, and encode_json
+  # never escapes a letter, so text without one of the words needs no walk.
+  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+      __safe = map_values(__safe, recursive: true) -> |value| {
+          if is_object(value) {
+              # Header/parameter arrays commonly encode sensitive keys as name/value
+              # or Key/Value objects instead of using the secret name as an object key.
+              __sensitive_pair = false
+              for_each(object!(value)) -> |key, child| {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                      __sensitive_pair = true
+                  }
+              }
+              for_each(object!(value)) -> |key, _child| {
+                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                      value = set!(value, [key], "<redacted>")
+                  }
+              }
+          }
+          value
+      }
+  }
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__safe.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Redacted leaves always remain
+          # visible. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if value == "<redacted>" {
+              true
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if (!contains(__consumed, __token) || value == "<redacted>") && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Existing aggregates may contain sensitive descendants; the canonical source
+  # spill above is the authoritative representation of containers. The cheap
+  # conditions run first; the source value set is built on first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, with recursive
+  # redaction. These entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__safe.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # Sources (real lines from the Elastic pfsense integration test fixtures,
+  # IPs, hosts and users replaced with documentation values):
+  #   https://github.com/elastic/integrations/tree/main/packages/pfsense/data_stream/log/_dev/test/pipeline
+  # Field order: https://docs.netgate.com/pfsense/en/latest/monitoring/logs/raw-filter-format.html
+  # OPNsense RFC 3164, IPv4 TCP block (test-opensense.log)
+  - raw: '<134>Jan 1 02:21:38 fw01.example.com filterlog[97530]: 146,,,1535324496,igb1.12,match,block,in,4,0x0,,63,12617,0,DF,6,tcp,60,10.170.12.50,203.0.113.10,49724,853,0,S,1891286705,,64240,,mss;sackOK;TS;nop;wscale'
+    expect:
+      class_uid: 4001
+      activity_id: 5
+      action_id: 2
+      src_endpoint.ip: 10.170.12.50
+      dst_endpoint.ip: 203.0.113.10
+      dst_endpoint.port: 853
+      connection_info.protocol_name: tcp
+      firewall_rule.uid: "1535324496"
+      connection_info.direction_id: 1
+      src_endpoint.interface_name: igb1.12
+  # OPNsense IPv6 UDP block (test-opensense.log)
+  - raw: '<134>Dec 31 22:02:55 fw01.example.com filterlog[15307]: 6,,,1000000105,igb1.27,match,block,in,6,0x00,0xf6279,1,UDP,17,32,fe80::208:9bff:fef3:652b,ff02::1:2,546,547,32'
+    expect:
+      class_uid: 4001
+      activity_id: 5
+      src_endpoint.ip: fe80::208:9bff:fef3:652b
+      connection_info.protocol_num: 17
+      connection_info.protocol_name: udp
+  # OPNsense RFC 5424, IPv4 TCP pass (test-opensense.log)
+  - raw: '<134>1 2022-06-09T14:44:11-06:00 opnsense.example.com filterlog 76404 - [meta sequenceId="1"] 124,,,fae559338f65e11c53669fc3642c93c2,ixl1_vlan70,match,pass,out,4,0x0,,63,5687,0,DF,6,tcp,60,192.168.1.1,10.10.10.10,40370,80,0,S,3364871769,,65535,,mss;sackOK;TS;nop;wscale'
+    expect:
+      class_uid: 4001
+      activity_id: 6
+      action_id: 1
+      time: 1654807451000
+      dst_endpoint.port: 80
+      connection_info.direction_id: 2
+      dst_endpoint.interface_name: ixl1_vlan70
+      src_endpoint.interface_name: <missing>
+  # pfSense RFC 3164 without hostname, ICMP echo request pass (test-pfsense-bsd.log)
+  - raw: '<134>Jul  4 11:10:45 filterlog[72237]: 176,,,1520797901,igb1.10,match,pass,in,4,0x0,,64,62096,0,DF,1,icmp,84,10.100.10.30,198.51.100.1,request,37728,164'
+    expect:
+      class_uid: 4001
+      activity_id: 6
+      connection_info.protocol_num: 1
+      connection_info.protocol_name: icmp
+  # pfSense IGMP pass (test-pfsense-bsd.log)
+  - raw: '<134>Jul  3 19:10:33 filterlog[72237]: 199,,,1557957510,igb1.12,match,pass,in,4,0xc0,,1,0,0,DF,2,igmp,32,10.170.12.17,198.51.100.1,datalength=8'
+    expect:
+      class_uid: 4001
+      connection_info.protocol_num: 2
+  # pfSense IPv6 ICMPv6 pass (test-pfsense-bsd.log)
+  - raw: '<134>Jan 1 02:21:39 fw01.example.com filterlog[97530]: 32,,,1535324496a,igb0,match,pass,in,6,0x0,0x00000,255,ipv6-icmp,58,16,fe80::208:9bff:fef3:652b,ff02::1:2,datalength=16'
+    expect:
+      class_uid: 4001
+      connection_info.protocol_num: 58
+  # pfSense UDP DNS pass with a UUID tracker (test-pfsense-bsd.log)
+  - raw: '<134>May  8 14:04:06 host-1.example.local filterlog[69300]: 52,,,00000000-0000-0000-0000-000000000000,igc2,match,pass,in,4,0x0,,64,9146,0,none,17,udp,94,198.51.100.10,198.51.100.1,42590,53,74'
+    expect:
+      class_uid: 4001
+      dst_endpoint.port: 53
+  # unbound query log (test-pfsense-unbound.log)
+  - raw: '<30>Aug 15 16:19:02 unbound[26931]: [26931:0] info: 192.168.1.1 api.example.org. A IN'
+    expect:
+      class_uid: 4003
+      activity_id: 1
+      query.hostname: api.example.org
+      query.type: A
+      src_endpoint.ip: 192.168.1.1
+  # unbound log-replies line (unbound.conf(5) log-replies format)
+  - raw: '<30>Aug 15 16:19:03 unbound[26931]: [26931:0] info: 192.168.1.1 missing.example.org. AAAA IN NXDOMAIN 0.012345 0 98'
+    expect:
+      class_uid: 4003
+      activity_id: 2
+      rcode: NXDOMAIN
+      rcode_id: 3
+      status_id: 2
+  # dhcpd lease conversation (test-pfsense-dhcp.log)
+  - raw: '<190>Jul  4 09:39:40 dhcpd[64305]: DHCPDISCOVER from 4c:55:41:a0:fa:99 via eth0.60'
+    expect:
+      class_uid: 4004
+      activity_id: 1
+      src_endpoint.mac: 4c:55:41:a0:fa:99
+  - raw: '<190>Jul  4 09:39:41 dhcpd[64305]: DHCPREQUEST for 10.150.60.56 (10.150.60.1) from 4c:55:41:a0:fa:99 (computer-name) via eth0.60'
+    expect:
+      class_uid: 4004
+      activity_id: 3
+      src_endpoint.ip: 10.150.60.56
+      src_endpoint.hostname: computer-name
+  - raw: '<190>Jul  4 09:39:41 dhcpd[64305]: DHCPACK on 10.150.60.56 to 4c:55:41:a0:fa:99 (computer-name) via eth0.60'
+    expect:
+      class_uid: 4004
+      activity_id: 5
+      src_endpoint.ip: 10.150.60.56
+  # OpenVPN user auth (test-pfsense-openvpn.log)
+  - raw: "<37>Jul  3 21:42:57 openvpn[19830]: user 'bob' authenticated"
+    expect:
+      class_uid: 3002
+      status_id: 1
+      user.name: bob
+  - raw: "<36>1 2021-07-03T22:40:38.477134-05:00 pfsense.example.com openvpn 68813 - - user 'bob' could not authenticate."
+    expect:
+      class_uid: 3002
+      status_id: 2
+      user.name: bob
+  - raw: '<29>Jul  3 21:42:57 openvpn[66026]: 198.51.100.149:37849 [bob] Peer Connection Initiated with [AF_INET]198.51.100.149:37849'
+    expect:
+      class_uid: 3002
+      src_endpoint.ip: 198.51.100.149
+      user.name: bob
+  # Other programs -> Base Event with the header parsed (test-pfsense-openvpn.log, test-pfsense-dhcp.log)
+  - raw: '<27>1 2021-07-03T22:17:01.074560-05:00 pfsense.example.com openvpn 66026 - - TLS Error: cannot locate HMAC in incoming packet from [AF_INET]203.0.113.1:34745'
+    expect:
+      class_uid: 0
+      severity_id: 4
+  - raw: '<190>Jul 23 18:07:11 dhcp6c[10256]: Sending Release'
+    expect:
+      class_uid: 0
+      message: Sending Release
+  # Malformed line -> Base Event with the fallback marker
+  - raw: 'not a pfsense log line'
+    expect:
+      class_uid: 0
+      unmapped.parse_fallback: unparsable input
