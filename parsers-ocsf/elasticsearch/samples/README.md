@@ -32,3 +32,11 @@ Sources:
 Cluster and node ids are replaced with `AAAA…` values, node names genericized,
 public addresses replaced with documentation ranges. Records that carry a
 `message` key are stored in the `{"message": "<raw line>"}` wrapper.
+
+Review additions (neon, #79): `audit_access_denied_run_by` and
+`audit_put_user_run_by` carry `user.run_by.*` as Elasticsearch's
+`LoggingAuditTrail` writes it for a request made under `es-security-runas-user`;
+`opensearch_failed_login_none` carries the `<NONE>` effective user and the
+attempted user that OpenSearch's `BackendRegistry` logs on a failed login;
+`opensearch_security_index_attempt` is the `OPENDISTRO_SECURITY_INDEX_ATTEMPT`
+category.

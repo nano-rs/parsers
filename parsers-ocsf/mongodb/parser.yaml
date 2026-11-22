@@ -119,6 +119,7 @@ parser_vrl: |
       duration_ms = -1
       session_uid = ""
       target_user = {}
+      denied = false
 
       if shape == "log" {
           # ================= structured log (4.4+) =================
@@ -276,6 +277,8 @@ parser_vrl: |
               if pu != "" { user.name = pu }
               if pu != "" && pdb != "" { user.uid = pdb + "." + pu }
               auth_mech = string(param.mechanism) ?? ""
+              # The session's roles belong to the user who logged on or off.
+              if pu == an && exists(actor.user.groups) { user.groups = actor.user.groups }
               actor = {}
               db_name = ""
           } else if atype == "clientMetadata" {
@@ -315,7 +318,7 @@ parser_vrl: |
                   if includes(["listCollections", "listIndexes", "listDatabases"], cmd_name) { activity_id = 8; activity_name = "List" }
                   pargs = object(param.args) ?? {}
                   if length(pargs) > 0 { query_string = encode_json(pargs) }
-                  if result == 13 { severity_id = 3; severity = "Medium" }
+                  if result == 13 { severity_id = 3; severity = "Medium"; denied = true }
               } else {
                   cmd_name = atype
               }
@@ -403,6 +406,11 @@ parser_vrl: |
           "product": product
       }
       if event_code != "" { meta.event_code = event_code }
+      if denied {
+          meta.profiles = ["security_control"]
+          ocsf.action_id = 2; ocsf.action = "Denied"
+          ocsf.disposition_id = 2; ocsf.disposition = "Blocked"
+      }
       if log_level != "" { meta.log_level = log_level }
       if session_uid != "" && shape == "log" { meta.correlation_uid = session_uid }
       if shape == "log" {
@@ -814,6 +822,23 @@ samples:
     expect:
       class_uid: 0
       "unmapped.parse_fallback": "unparsable input"
+  # neon #79: audit logon keeps the session roles as user.groups
+  - raw: "{\"atype\":\"authenticate\",\"ts\":{\"$date\":\"2023-04-01T12:00:00.000Z\"},\"uuid\":{\"$binary\":\"AAAAAAAAAAAAAAAAAAAAAA==\",\"$type\":\"04\"},\"local\":{\"ip\":\"127.0.0.1\",\"port\":27017},\"remote\":{\"ip\":\"192.0.2.100\",\"port\":54320},\"users\":[{\"user\":\"auditUser\",\"db\":\"admin\"}],\"roles\":[{\"role\":\"dbAdmin\",\"db\":\"admin\"}],\"param\":{\"user\":\"auditUser\",\"db\":\"admin\",\"mechanism\":\"SCRAM-SHA-256\"},\"result\":0}"
+    expect:
+      "class_uid": 3002
+      "user.groups.0.name": "dbAdmin@admin"
+  # neon #79: audit logoff keeps the session roles as user.groups
+  - raw: "{ \"atype\": \"logout\", \"ts\": { \"$date\": \"2024-01-29T06:57:15.366+00:00\" }, \"uuid\": { \"$binary\": \"AAAAAAAAAAAAAAAAAAAAAg==\", \"$type\": \"04\" }, \"local\": { \"ip\": \"127.0.0.1\", \"port\": 27017 }, \"remote\": { \"ip\": \"127.0.0.1\", \"port\": 43714 }, \"users\":[ { \"user\":\"mms-monitoring-agent\", \"db\":\"admin\" } ], \"roles\": [ { \"role\": \"backup\", \"db\": \"admin\" }, { \"role\": \"clusterAdmin\", \"db\": \"admin\" } ], \"result\": 0 }"
+    expect:
+      "class_uid": 3002
+      "user.groups.1.name": "clusterAdmin@admin"
+  # neon #79: authCheck result 13 is a security control denial
+  - raw: "{\"atype\":\"authCheck\",\"ts\":{\"$date\":\"2023-04-01T12:05:00.000Z\"},\"uuid\":{\"$binary\":\"AAAAAAAAAAAAAAAAAAAAAw==\",\"$type\":\"04\"},\"local\":{\"ip\":\"127.0.0.1\",\"port\":27017},\"remote\":{\"ip\":\"192.0.2.101\",\"port\":54321},\"users\":[{\"user\":\"userTest\",\"db\":\"test\"}],\"roles\":[{\"role\":\"read\",\"db\":\"test\"}],\"param\":{\"command\":\"insert\",\"ns\":\"test.orders\",\"args\":{\"insert\":\"orders\",\"documents\":[{\"_id\":1}],\"$db\":\"test\"}},\"result\":13}"
+    expect:
+      "class_uid": 6005
+      "action_id": 2
+      "disposition_id": 2
+      "metadata.profiles.0": "security_control"
   # NAN-3702: metadata.uid is sha256("mongodb|raw|" + raw), so the same record
   # parsed twice gets the same uid (a random uid could never match).
   - raw: "NAN-3702 determinism probe: not a mongodb record"

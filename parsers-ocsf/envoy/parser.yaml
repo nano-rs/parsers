@@ -247,7 +247,18 @@ parser_vrl: |
           if url_obj.path == "" { url_obj.path = "/" }
           qs = string(up[1]) ?? ""
           if qs != "" { url_obj.query_string = qs }
-          if authority != "" { url_obj.hostname = authority }
+          # :authority is host, host:port, [v6] or [v6]:port.
+          if authority != "" {
+              am = parse_regex(authority, r'^(?:\x5B(?P<h6>[0-9A-Fa-f:.]+)\x5D|(?P<h>[^:\x5B\x5D]+))(?::(?P<p>[0-9]{1,5}))?$') ?? {}
+              ahost = string(am.h) ?? string(am.h6) ?? ""
+              if ahost != "" {
+                  url_obj.hostname = ahost
+                  aport = to_int(am.p) ?? 0
+                  if aport > 0 { url_obj.port = aport }
+              } else {
+                  url_obj.hostname = authority
+              }
+          }
           req = { "url": url_obj }
           if method != "" { req.http_method = method }
           if protocol != "" { req.version = protocol }
@@ -308,6 +319,12 @@ parser_vrl: |
           "product": { "name": "Envoy", "vendor_name": "Envoy Proxy" }
       }
       if req_id != "" { ocsf.metadata.correlation_uid = req_id }
+      if is_rbac {
+          # Envoy's RBAC filter enforced a policy: a security control denial, not an app 403.
+          ocsf.metadata.profiles = ["security_control"]
+          ocsf.action_id = 2; ocsf.action = "Denied"
+          ocsf.disposition_id = 2; ocsf.disposition = "Blocked"
+      }
 
       . = ocsf
   }
@@ -676,6 +693,29 @@ samples:
     expect:
       class_uid: 0
       "unmapped.parse_fallback": "unparsable input"
+  # neon #79: authority host:port splits into url.hostname and url.port
+  - raw: "[2022-07-20T09:52:24.955Z] \"GET /details/0 HTTP/1.1\" 200 - via_upstream - \"-\" 0 178 2 1 \"-\" \"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.5060.114 Safari/537.36\" \"00000000-0000-0000-0000-000000000001\" \"details:9080\" \"10.68.2.10:9080\" inbound|9080|| 127.0.0.6:47889 10.68.2.10:9080 10.68.1.7:39696 outbound_.9080_._.details.default.svc.cluster.local default"
+    expect:
+      "http_request.url.hostname": "details"
+      "http_request.url.port": 9080
+  # neon #79: an authority with no port stays whole
+  - raw: "[2025-02-03T17:45:09.882Z] \"GET /search?q=widgets&page=2 HTTP/1.1\" 200 - 0 5321 18 17 \"-\" \"Mozilla/5.0 (X11; Linux x86_64)\" \"00000000-0000-0000-0000-00000000000c\" \"shop.example.com\" \"10.1.4.22:8080\""
+    expect:
+      "http_request.url.hostname": "shop.example.com"
+      "http_request.url.port": "<missing>"
+  # neon #79: HTTP RBAC denial is a security control denial
+  - raw: "[2023-05-10T14:02:11.019Z] \"POST /api/admin HTTP/1.1\" 403 - rbac_access_denied_matched_policy[ns[foo]-policy[deny-admin]-rule[0]] - \"-\" 0 19 0 - \"-\" \"curl/8.0.1\" \"00000000-0000-0000-0000-00000000000a\" \"httpbin:8000\" \"-\" inbound|80|| - 10.44.1.27:80 10.44.1.23:46520 outbound_.8000_._.httpbin.foo.svc.cluster.local -"
+    expect:
+      "class_uid": 4002
+      "action_id": 2
+      "disposition_id": 2
+      "metadata.profiles.0": "security_control"
+  # neon #79: TCP RBAC denial is a security control denial
+  - raw: "[2024-03-11T08:05:02.771Z] \"- - -\" 0 - - rbac_access_denied_matched_policy[none] \"-\" 0 0 0 - \"-\" \"-\" \"-\" \"-\" \"-\" inbound|27017|| - 10.0.4.12:27017 10.0.1.9:52210 outbound_.27017_._.mongo.db.svc.cluster.local -"
+    expect:
+      "class_uid": 4001
+      "activity_id": 5
+      "action_id": 2
   # NAN-3702: metadata.uid is sha256("envoy|raw|" + raw), so the same record
   # parsed twice gets the same uid (a random uid could never match).
   - raw: "NAN-3702 determinism probe: not a envoy record"

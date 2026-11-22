@@ -114,7 +114,11 @@ parser_vrl: |
       ocsf = {}
       profiles = []
 
-      az, azerr = parse_regex(msg, r'Principal = (?P<principal>\S+) is (?P<result>Allowed|Denied) [Oo]peration = (?P<operation>\S+) from host = (?P<host>\S+) on resource = (?P<resource>\S+) for request = (?P<request>\S+) with resourceRefCount = (?P<ref_count>\d+)(?: based on rule (?P<rule>.+))?')
+      # The principal and the resource name can hold spaces (an mTLS X.500 DN
+      # "User:CN=client01, OU=apps, O=Example Corp", a consumer group id), so both
+      # are bounded by the literal separators, not by whitespace. Pre-2.x
+      # SimpleAclAuthorizer lines end at the resource (no request / refcount).
+      az, azerr = parse_regex(msg, r'^Principal = (?P<principal>.+?) is (?P<result>Allowed|Denied) [Oo]peration = (?P<operation>\S+) from host = (?P<host>\S+) on resource = (?P<resource>.+?)(?: for request = (?P<request>\S+) with resourceRefCount = (?P<ref_count>\d+))?(?: based on rule (?P<rule>.+))?$')
       af, aferr = parse_regex(msg, r'(?s)^Failed (?P<reauth>re-)?authentication with (?P<peer>\S+)(?: \x28channelId=(?P<channel_id>[^\x29]*)\x29)? \x28(?P<reason>.*)\x29$')
       asu, asuerr = parse_regex(msg, r'^Successfully authenticated client: authenticationID=(?P<authentication_id>[^;]+); authorizationID=(?P<authorization_id>[^;.]+(?:\.[^;.]+)*)\.?$')
 
@@ -126,8 +130,9 @@ parser_vrl: |
           op = string!(az.operation)
           host = string!(az.host)
           resource = string!(az.resource)
-          request = string!(az.request)
-          __source_kv = merge(__source_kv, { "principal": principal, "result": string!(az.result), "operation": op, "host": host, "resource": resource, "request": request, "ref_count": to_int(az.ref_count) ?? 0 })
+          request = string(az.request) ?? ""
+          __source_kv = merge(__source_kv, { "principal": principal, "result": string!(az.result), "operation": op, "host": host, "resource": resource })
+          if request != "" { __source_kv.request = request; __source_kv.ref_count = to_int(az.ref_count) ?? 0 }
           rule = string(az.rule) ?? ""
           if rule != "" { __source_kv.rule = rule }
           opu = upcase(op)
@@ -150,7 +155,8 @@ parser_vrl: |
               res.name = string(rp[1]) ?? ""
           }
           ocsf.resources = [res]
-          ocsf.api = { "operation": op, "service": { "name": "Apache Kafka" }, "request": { "uid": request } }
+          ocsf.api = { "operation": op, "service": { "name": "Apache Kafka" } }
+          if request != "" { ocsf.api.request = { "uid": request } }
           if is_ipv4(host) || is_ipv6(host) { ocsf.src_endpoint = { "ip": host } } else { ocsf.src_endpoint = { "hostname": host } }
           if string!(az.result) == "Denied" {
               status_id = 2; status_str = "Failure"; status_detail = "Denied"
@@ -200,8 +206,13 @@ parser_vrl: |
               aid = strip_whitespace(string!(asu.authentication_id))
               zid = strip_whitespace(string!(asu.authorization_id))
               __source_kv = merge(__source_kv, { "authentication_id": aid, "authorization_id": zid })
+              # RFC 4422: the authentication id proved the credentials (the actor);
+              # a different authorization id is the identity it acts as (the subject).
               user = { "name": aid }
-              if zid != aid { ocsf.actor = { "user": { "name": zid } } }
+              if zid != "" && zid != aid {
+                  ocsf.actor = { "user": { "name": aid } }
+                  user = { "name": zid }
+              }
               # SaslServerCallbackHandler is the GSSAPI (Kerberos) callback handler.
               if ends_with(logger, "SaslServerCallbackHandler") { ocsf.auth_protocol_id = 2; ocsf.auth_protocol = "Kerberos" }
           }
@@ -601,6 +612,32 @@ samples:
     expect:
       class_uid: 0
       "unmapped.parse_fallback": "unparsable input"
+  # neon #79: an mTLS X.500 DN principal with spaces still parses
+  - raw: "[2024-05-02 10:14:05,612] INFO Principal = User:CN=client01, OU=apps, O=Example Corp is Denied operation = READ from host = 192.0.2.10 on resource = Topic:LITERAL:orders for request = Fetch with resourceRefCount = 1 based on rule DefaultDeny (kafka.authorizer.logger)"
+    expect:
+      "class_uid": 6003
+      "action_id": 2
+      "actor.user.name": "CN=client01, OU=apps, O=Example Corp"
+      "src_endpoint.ip": "192.0.2.10"
+  # neon #79: a resource name with spaces
+  - raw: "[2024-05-02 10:14:09,020] INFO Principal = User:analytics is Denied operation = READ from host = 192.0.2.11 on resource = Group:LITERAL:nightly report consumers for request = OffsetCommit with resourceRefCount = 1 based on rule DefaultDeny (kafka.authorizer.logger)"
+    expect:
+      "class_uid": 6003
+      "resources.0.name": "nightly report consumers"
+      "resources.0.type": "Group"
+  # neon #79: pre-2.x SimpleAclAuthorizer line without request / refcount
+  - raw: "[2018-03-01 08:00:01,100] INFO Principal = User:bob is Denied Operation = Read from host = 198.51.100.23 on resource = Topic:payments (kafka.authorizer.logger)"
+    expect:
+      "class_uid": 6003
+      "status_id": 2
+      "resources.0.name": "payments"
+      "api.request.uid": "<missing>"
+  # neon #79: authenticationID is the actor, a different authorizationID the subject
+  - raw: "2025-01-01 12:41:02,330 INFO org.apache.kafka.common.security.authenticator.SaslServerCallbackHandler: [data-plane-kafka-network-thread-543-ListenerName(SASL_SSL)-SASL_SSL-33]: Successfully authenticated client: authenticationID=svc-proxy@EXAMPLE.COM; authorizationID=alice@EXAMPLE.COM."
+    expect:
+      "class_uid": 3002
+      "user.name": "alice@EXAMPLE.COM"
+      "actor.user.name": "svc-proxy@EXAMPLE.COM"
   # NAN-3702: metadata.uid is sha256("kafka|raw|" + raw), so the same record
   # parsed twice gets the same uid (a random uid could never match).
   - raw: "NAN-3702 determinism probe: not a kafka record"

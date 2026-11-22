@@ -150,6 +150,10 @@ parser_vrl: |
               urealm = string(get(f, ["user", "realm"]) ?? "") ?? ""
               roles = array(get(f, ["user", "roles"]) ?? []) ?? []
               run_as = string(get(f, ["user", "run_as", "name"]) ?? "") ?? ""
+              # Under es-security-runas-user, user.name is the impersonated (effective)
+              # user and user.run_by.* is the user that authenticated: the real actor.
+              run_by = string(get(f, ["user", "run_by", "name"]) ?? "") ?? ""
+              run_by_realm = string(get(f, ["user", "run_by", "realm"]) ?? "") ?? ""
               api_op = string(f.action) ?? ""
               req_uid = string(get(f, ["request", "id"]) ?? "") ?? ""
               http_method = string(get(f, ["request", "method"]) ?? "") ?? ""
@@ -218,6 +222,11 @@ parser_vrl: |
                       if starts_with(action, "create_") { activity_id = 1; activity_name = "Create" }
                   }
               }
+              if run_by != "" && run_by != uname && (class_uid == 6003 || class_uid == 3007) {
+                  rb = { "name": run_by }
+                  if run_by_realm != "" { rb.domain = run_by_realm }
+                  actor.user = rb
+              }
               if origin != "" {
                   r = parse_regex(origin, r'^(?:\x5B(?P<ip6>[0-9A-Fa-f:.]+)\x5D|(?P<ip4>[0-9]{1,3}(?:\.[0-9]{1,3}){3})):(?P<port>[0-9]+)$') ?? {}
                   rip = string(r.ip4) ?? string(r.ip6) ?? ""
@@ -228,6 +237,8 @@ parser_vrl: |
               cat = string(f.audit_category) ?? ""
               event_code = cat
               uname = string(f.audit_request_effective_user) ?? ""
+              # OpenSearch logs the sentinel "<NONE>" when no credentials were read.
+              if uname == "<NONE>" { uname = "" }
               init_user = string(f.audit_request_initiating_user) ?? ""
               api_op = string(f.audit_transport_action) ?? string(f.audit_request_privilege) ?? ""
               http_method = string(f.audit_rest_request_method) ?? ""
@@ -245,13 +256,28 @@ parser_vrl: |
                   class_uid = 3002; activity_id = 1; activity_name = "Logon"; status_id = 2; status_str = "Failure"
                   severity_id = 2; severity = "Low"
                   status_detail = string(f.audit_authentication_failure_reason) ?? cat
-                  if uname == "" { user.name = string(f.audit_request_attempted_user) ?? "unknown" }
-              } else if cat == "GRANTED_PRIVILEGES" || cat == "MISSING_PRIVILEGES" || cat == "BAD_HEADERS" {
+                  if uname == "" {
+                      attempted = string(f.audit_request_attempted_user) ?? ""
+                      if attempted == "" || attempted == "<NONE>" { attempted = "unknown" }
+                      user.name = attempted
+                  }
+              } else if cat == "SSL_EXCEPTION" {
+                  # A failed TLS / client-certificate handshake is a failed logon at the transport.
+                  class_uid = 3002; activity_id = 1; activity_name = "Logon"; status_id = 2; status_str = "Failure"
+                  severity_id = 3; severity = "Medium"
+                  exc = string(f.audit_request_exception_stacktrace) ?? ""
+                  status_detail = "SSL_EXCEPTION"
+                  if exc != "" { status_detail = string(split(exc, "\n")[0]) ?? exc }
+                  ocsf.auth_protocol_id = 99; ocsf.auth_protocol = "TLS"
+                  if length(user) == 0 { user.name = "unknown" }
+              } else if cat == "GRANTED_PRIVILEGES" || cat == "MISSING_PRIVILEGES" || cat == "BAD_HEADERS" || cat == "OPENDISTRO_SECURITY_INDEX_ATTEMPT" {
                   class_uid = 6003
                   if cat == "GRANTED_PRIVILEGES" { status_id = 1; status_str = "Success" } else {
                       status_id = 2; status_str = "Failure"; severity_id = 3; severity = "Medium"; status_detail = cat
                       if cat == "MISSING_PRIVILEGES" { denied = true }
                   }
+                  # An attempt to write the security plugin's own users / roles index.
+                  if cat == "OPENDISTRO_SECURITY_INDEX_ATTEMPT" { severity_id = 4; severity = "High"; denied = true }
               }
               if init_user != "" && init_user != uname && class_uid == 6003 { actor.user = { "name": init_user } }
           }
@@ -401,7 +427,7 @@ parser_vrl: |
       ocsf.status = status_str
       if status_detail != "" { ocsf.status_detail = status_detail }
       if message != "" { ocsf.message = message }
-      if (class_uid == 3002 || class_uid == 4001 || class_uid == 6003) && length(src_ep) > 0 { ocsf.src_endpoint = src_ep }
+      if (class_uid == 3002 || class_uid == 3007 || class_uid == 4001 || class_uid == 6003) && length(src_ep) > 0 { ocsf.src_endpoint = src_ep }
       if class_uid == 4001 && !exists(ocsf.src_endpoint) { ocsf.src_endpoint = { "name": "unknown" } }
       node_ep = {}
       if node_name != "" { node_ep.name = node_name }
@@ -829,6 +855,45 @@ samples:
     expect:
       class_uid: 0
       "unmapped.parse_fallback": "unparsable input"
+  # neon #79: User Management keeps the source address
+  - raw: "{\"type\":\"audit\", \"timestamp\":\"2020-12-30T22:35:21,481+0200\", \"node.id\":\"AAAAAAAAAAAAAAAAAAAAAA\", \"event.type\":\"security_config_change\", \"event.category\":\"user\", \"event.action\":\"put_user\", \"user.name\":\"elastic\", \"user.realm\":\"reserved\", \"origin.type\":\"rest\", \"origin.address\":\"[::1]:52520\", \"request.id\":\"VIiSvhp4Riim_tpkQCVSQA\", \"put\":{\"user\":{\"name\":\"user1\",\"enabled\":false,\"has_password\":true}}}"
+    expect:
+      "class_uid": 3007
+      "src_endpoint.ip": "::1"
+      "src_endpoint.port": 52520
+  # neon #79: user.run_by is the actor on an impersonated request
+  - raw: "{\"type\":\"audit\", \"timestamp\":\"2020-12-30T22:51:10,214+0200\", \"node.id\":\"AAAAAAAAAAAAAAAAAAAAAA\", \"event.type\":\"transport\", \"event.action\":\"access_denied\", \"authentication.type\":\"REALM\", \"user.name\":\"target_user\", \"user.realm\":\"default_native\", \"user.run_by.name\":\"service_acct\", \"user.run_by.realm\":\"default_file\", \"user.roles\":[\"read_only\"], \"origin.type\":\"rest\", \"origin.address\":\"192.0.2.33:52710\", \"request.id\":\"AAAAAAAAAAAAAAAAAAAAAA\", \"action\":\"indices:data/write/delete\", \"request.name\":\"DeleteRequest\", \"indices\":[\"orders\"]}"
+    expect:
+      "class_uid": 6003
+      "actor.user.name": "service_acct"
+      "actor.user.domain": "default_file"
+  # neon #79: user.run_by is the actor on an impersonated user change
+  - raw: "{\"type\":\"audit\", \"timestamp\":\"2020-12-30T22:52:01,003+0200\", \"node.id\":\"AAAAAAAAAAAAAAAAAAAAAA\", \"event.type\":\"security_config_change\", \"event.category\":\"user\", \"event.action\":\"put_user\", \"user.name\":\"target_user\", \"user.realm\":\"default_native\", \"user.run_by.name\":\"service_acct\", \"user.run_by.realm\":\"default_file\", \"origin.type\":\"rest\", \"origin.address\":\"192.0.2.33:52712\", \"request.id\":\"AAAAAAAAAAAAAAAAAAAAAB\", \"put\":{\"user\":{\"name\":\"user2\",\"enabled\":true,\"has_password\":true}}}"
+    expect:
+      "class_uid": 3007
+      "actor.user.name": "service_acct"
+      "user.name": "user2"
+      "src_endpoint.ip": "192.0.2.33"
+  # neon #79: OpenSearch <NONE> effective user falls back to the attempted user
+  - raw: "{\"@timestamp\":\"2024-03-01T10:00:10.000+00:00\",\"audit_format_version\":4,\"audit_category\":\"FAILED_LOGIN\",\"audit_request_origin\":\"REST\",\"audit_request_layer\":\"REST\",\"audit_rest_request_method\":\"GET\",\"audit_rest_request_path\":\"/_cluster/health\",\"audit_request_remote_address\":\"203.0.113.40\",\"audit_request_effective_user\":\"<NONE>\",\"audit_request_attempted_user\":\"bob\",\"audit_authentication_failure_reason\":\"WRONG_PASSWORD\",\"audit_request_effective_user_is_admin\":false,\"audit_node_id\":\"AAAAAAAAAAAAAAAAAAAAAA\",\"audit_node_name\":\"opensearch-node1\",\"audit_node_host_address\":\"192.0.2.2\",\"audit_node_host_name\":\"opensearch-node1\",\"audit_cluster_name\":\"opensearch-cluster\"}"
+    expect:
+      "class_uid": 3002
+      "status_id": 2
+      "user.name": "bob"
+  # neon #79: security index write attempt is a High denial
+  - raw: "{\"@timestamp\":\"2024-03-01T10:06:00.000+00:00\",\"audit_format_version\":4,\"audit_category\":\"OPENDISTRO_SECURITY_INDEX_ATTEMPT\",\"audit_request_origin\":\"REST\",\"audit_request_layer\":\"TRANSPORT\",\"audit_transport_request_type\":\"BulkShardRequest\",\"audit_transport_action\":\"indices:data/write/bulk[s]\",\"audit_trace_indices\":[\".opendistro_security\"],\"audit_request_remote_address\":\"198.51.100.41\",\"audit_request_effective_user\":\"analyst\",\"audit_request_initiating_user\":\"analyst\",\"audit_request_effective_user_is_admin\":false,\"audit_node_id\":\"AAAAAAAAAAAAAAAAAAAAAA\",\"audit_node_name\":\"opensearch-node1\",\"audit_node_host_address\":\"192.0.2.2\",\"audit_node_host_name\":\"opensearch-node1\",\"audit_cluster_name\":\"opensearch-cluster\"}"
+    expect:
+      "class_uid": 6003
+      "severity_id": 4
+      "action_id": 2
+      "src_endpoint.ip": "198.51.100.41"
+  # neon #79: SSL_EXCEPTION is a failed TLS logon with the source kept
+  - raw: "{\"@timestamp\":\"2024-03-01T10:05:12.000+00:00\",\"audit_format_version\":4,\"audit_category\":\"SSL_EXCEPTION\",\"audit_request_origin\":\"TRANSPORT\",\"audit_request_layer\":\"TRANSPORT\",\"audit_request_exception_stacktrace\":\"javax.net.ssl.SSLHandshakeException: Received fatal alert: certificate_unknown\",\"audit_request_remote_address\":\"198.51.100.40\",\"audit_node_id\":\"AAAAAAAAAAAAAAAAAAAAAA\",\"audit_node_name\":\"opensearch-node1\",\"audit_node_host_address\":\"192.0.2.2\",\"audit_node_host_name\":\"opensearch-node1\",\"audit_cluster_name\":\"opensearch-cluster\"}"
+    expect:
+      "class_uid": 3002
+      "status_id": 2
+      "auth_protocol": "TLS"
+      "src_endpoint.ip": "198.51.100.40"
   # NAN-3702: metadata.uid is sha256("elasticsearch|raw|" + raw), so the same
   # record parsed twice gets the same uid (a random uid could never match).
   - raw: "NAN-3702 determinism probe: not a elasticsearch record"

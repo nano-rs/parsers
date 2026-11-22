@@ -28,3 +28,11 @@ Sources:
 Principals, hosts and Kerberos realms are replaced with example values and
 addresses with documentation ranges (192.0.2.0/24, 198.51.100.0/24,
 203.0.113.0/24, 2001:db8::/32).
+
+Review additions (neon, #79), written in the same upstream formats:
+`authorizer_denied_mtls_dn_spaces` (an mTLS X.500 DN principal with spaces, as
+`DefaultKafkaPrincipalBuilder` logs it), `authorizer_denied_group_with_spaces`
+(a consumer group id with spaces), `authorizer_denied_simpleacl_legacy` (the
+pre-2.x SimpleAclAuthorizer line, which ends at the resource) and
+`sasl_success_authz_differs` (authorizationID different from authenticationID,
+`SaslServerCallbackHandler`).
