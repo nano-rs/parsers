@@ -86,7 +86,7 @@ parser_vrl: |
       if pv != 0 { port = pv }
       lf = to_string(e.last_found) ?? ""
       if lf != "" {
-          t, terr = parse_timestamp(lf, "%+")
+          t, terr = parse_timestamp(lf, "%+", timezone: "UTC")
           if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
       }
       cats = array(e.categories) ?? []
@@ -101,7 +101,7 @@ parser_vrl: |
       status_str = "Resolved"
       rd = to_string(e.remediated_date) ?? ""
       if rd != "" {
-          t, terr = parse_timestamp(rd, "%+")
+          t, terr = parse_timestamp(rd, "%+", timezone: "UTC")
           if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
       }
   } else if shape == "asset" {
@@ -114,7 +114,7 @@ parser_vrl: |
       if finding_uid == "" { finding_uid = asset_id }
       la = to_string(e.last_assessed_for_vulnerabilities) ?? ""
       if la != "" {
-          t, terr = parse_timestamp(la, "%+")
+          t, terr = parse_timestamp(la, "%+", timezone: "UTC")
           if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
       }
       v = object(e.vulnerabilities) ?? {}
@@ -317,7 +317,7 @@ parser_vrl: |
       | last_assessed_for_vulnerabilities
       )\z') {
           __value = value
-          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
               if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }

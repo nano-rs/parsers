@@ -168,6 +168,14 @@ class ConfigTests(unittest.TestCase):
                 generated({'mappings': bad})
         self.assertIn('resources.uid', generated({'mappings': {'a': 'resources.0.uid'}}))
 
+    def test_parse_timestamp_needs_timezone(self):
+        # Without timezone: VRL reads an offset-less clock in the HOST timezone.
+        naive = fcc.naive_timestamps
+        self.assertEqual(len(naive('t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S")')), 1)
+        self.assertEqual(len(naive('t = parse_timestamp!(replace(s, r\' Z$\', ""), "%Y (x)")')), 1)
+        self.assertEqual(naive('t, e = parse_timestamp(s, "%+", timezone: "UTC")'), [])
+        self.assertEqual(naive('t = parse_timestamp!(replace(s, r\')\', ""), "%Y", timezone: "UTC")'), [])
+
     def test_json_envelope_retired(self):
         with self.assertRaises(AssertionError):
             validate_config({'json_envelope': 'message'})
