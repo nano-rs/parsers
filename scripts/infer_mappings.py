@@ -50,7 +50,7 @@ def infer(path, all_keys=False):
         for source in resolve(rule['source']):
             rules.append({**rule, 'source': source})
     items = [(k, None) for k in keys] + [(r['source'], r) for r in rules]
-    found = provenance.probe(doc['parser_vrl'], samples, sources, outputs, items, per_key=12)
+    found = provenance.probe(doc['parser_vrl'], samples, sources, outputs, items, per_key=40, scope=path.parent.name)
     mappings = {}
     for key in keys:
         targets = sorted(found.get((key, None), {}))
