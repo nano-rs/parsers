@@ -150,15 +150,15 @@ for parser_file in "${PARSERS[@]}"; do
             find "$parser_dir/samples" -name '*.json' | sort
         )
     fi
+    # Inline samples are validated too, always: a sidecar file must never take
+    # a parser's inline corpus out of the gate.
     inline_dir="$WORK/inline"
     rm -rf "$inline_dir"
-    if [ "${#samples[@]}" -eq 0 ]; then
-        mkdir "$inline_dir"
-        if python3 "$CHECKS" extract-inline "$parser_file" "$inline_dir" 2>/dev/null; then
-            while IFS= read -r s; do samples+=("$s"); done < <(
-                find "$inline_dir" -name '*.json' | sort
-            )
-        fi
+    mkdir "$inline_dir"
+    if python3 "$CHECKS" extract-inline "$parser_file" "$inline_dir" 2>/dev/null; then
+        while IFS= read -r s; do samples+=("$s"); done < <(
+            find "$inline_dir" -name '*.json' | sort
+        )
     fi
 
     if [ "${#samples[@]}" -eq 0 ]; then

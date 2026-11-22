@@ -16,6 +16,7 @@ and sets no marker (fortinet / sophos / cisco_ios / sonicwall inline zones).
 """
 import datetime as dt
 import json
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -31,7 +32,7 @@ from provenance import VECTOR_ENV  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL = ['palo_alto', 'syslog', 'zscaler_zia', 'windows_event_text', 'checkpoint', 'cyberark', 'cisco_asa', 'f5_waf',
          'infoblox_dhcp', 'routeros', 'bind_dns', 'cisco_ftd', 'fail2ban', 'juniper_junos', 'pfsense', 'kafka',
-         'pingfederate', 'elasticsearch', 'json_generic', 'fortinet', 'sophos', 'cisco_ios', 'sonicwall']
+         'pingfederate', 'elasticsearch', 'json_generic', 'fortinet', 'sophos', 'cisco_ios', 'sonicwall', 'windows_dns']
 # (setting, marker): any +-HH:MM offset is applied as given; an invalid
 # setting or a zero offset is UTC.
 SETTINGS = [('America/New_York', 'America/New_York'), ('Asia/Tokyo', 'Asia/Tokyo'), ('+05:30', '+05:30'),
@@ -64,6 +65,99 @@ def offset_ms(zone, utc_ms):
     return -int(local.utcoffset().total_seconds() * 1000)
 
 
+DATETIME = re.compile(r'(?P<y>\d{4})(?P<s1>[-/])(?P<mo>\d{2})(?P=s1)(?P<d>\d{2})(?P<s2>[ T])(?P<h>\d{2}):(?P<mi>\d{2}):(?P<se>\d{2})')
+# (zone, local wall time): fall-back hours repeat (ambiguous: the FIRST
+# occurrence, the earlier offset, is used); spring-forward hours do not exist
+# (a time in the gap moves forward by the gap). zoneinfo with fold=0 gives
+# exactly that, so it is the expectation.
+DST = [('America/New_York', '2026-11-01 01:30:00'), ('America/New_York', '2026-03-08 02:30:00'),
+       ('Europe/Berlin', '2026-10-25 02:30:00'), ('Europe/Berlin', '2026-03-29 02:30:00'),
+       ('America/New_York', '2026-11-01 00:30:00'), ('Europe/Berlin', '2026-10-25 03:30:00')]
+
+
+def with_clock(message, local):
+    """The message with its first full date-time replaced by `local`."""
+    m = DATETIME.search(message)
+    if not m:
+        return None
+    y, mo, d, h, mi, se = re.match(r'(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})', local).groups()
+    new = f'{y}{m.group("s1")}{mo}{m.group("s1")}{d}{m.group("s2")}{h}:{mi}:{se}'
+    return message[:m.start()] + new + message[m.end():]
+
+
+def expect_utc_ms(zone, local, base_ms_fraction=0):
+    naive = dt.datetime.strptime(local, '%Y-%m-%d %H:%M:%S').replace(tzinfo=zoneinfo.ZoneInfo(zone), fold=0)
+    return int(naive.timestamp() * 1000) + base_ms_fraction
+
+
+def dst_checks(failures):
+    """DST transitions through full-date local-time parsers."""
+    checked = 0
+    for parser in ('palo_alto', 'kafka', 'windows_event_text', 'pingfederate'):
+        path = ROOT/'parsers-ocsf'/parser/'parser.yaml'
+        doc = yaml.safe_load(path.read_text())
+        samples = samples_for(path, doc, None)
+        base = run(parser, [e for _, e in samples])
+        pick = next(((e, o) for (_, e), (o, _) in zip(samples, base) if (o.get('unmapped') or {}).get('nano_time_assumed_tz') == 'UTC' and DATETIME.search(e['message'])), None)
+        if pick is None:
+            continue
+        event, out = pick
+        m = DATETIME.search(event['message'])
+        fraction = out['time'] - expect_utc_ms('UTC', f'{m.group("y")}-{m.group("mo")}-{m.group("d")} {m.group("h")}:{m.group("mi")}:{m.group("se")}')
+        events = [{**event, 'message': with_clock(event['message'], local), 'nano': {'source_timezone': zone}} for zone, local in DST]
+        for (zone, local), (o, _) in zip(DST, run(parser, events)):
+            want = expect_utc_ms(zone, local, fraction)
+            if o.get('time') != want or (o.get('unmapped') or {}).get('nano_time_assumed_tz') != zone:
+                failures.append(f'{parser} DST {zone} {local}: time {o.get("time")} (want {want}), marker {(o.get("unmapped") or {}).get("nano_time_assumed_tz")!r}')
+        checked += 1
+    if checked < 2:
+        failures.append(f'DST: only {checked} full-date parsers could be checked')
+    return checked
+
+
+def year_checks(failures):
+    """A clock with no year (RFC 3164) takes the source zone's current year,
+    and moves to the previous year when that lands more than a day ahead."""
+    lines = {'Dec 31 23:59:59': (12, 31, 23, 59, 59), 'Jan  1 00:00:01': (1, 1, 0, 0, 1)}
+    zones = ['UTC', 'America/New_York', 'Asia/Tokyo']
+    events = [({'message': f'<13>{clock} host-1 app[42]: rollover probe', **({'nano': {'source_timezone': z}} if z != 'UTC' else {})}, clock, z)
+              for clock in lines for z in zones]
+    now = dt.datetime.now(dt.timezone.utc)
+    for (event, clock, zone), (o, _) in zip(events, run('syslog', [e for e, _, _ in events])):
+        mo, d, h, mi, se = lines[clock]
+        tz = zoneinfo.ZoneInfo(zone)
+        year = now.astimezone(tz).year
+        want = dt.datetime(year, mo, d, h, mi, se, tzinfo=tz)
+        if want > now + dt.timedelta(days=1):
+            want = want.replace(year=year - 1)
+        if o.get('time') != int(want.timestamp() * 1000):
+            failures.append(f'syslog {clock!r} in {zone}: time {o.get("time")} (want {int(want.timestamp() * 1000)}, {want.isoformat()})')
+    return len(events)
+
+
+def nano_shape_checks(failures):
+    """.nano is removed whatever its shape; "local" (the host zone) is refused."""
+    path = ROOT/'parsers-ocsf'/'syslog'/'parser.yaml'
+    doc = yaml.safe_load(path.read_text())
+    event = samples_for(path, doc, None)[2][1]
+    shapes = [None, 'Asia/Tokyo', 7, ['x'], {'source_timezone': 'Asia/Tokyo', 'other': 'nan-extra'}, {'source_timezone': 'local'}, {}]
+    outs = run('syslog', [{**event, 'nano': s} for s in shapes])
+    for shape, (o, src) in zip(shapes, outs):
+        text = json.dumps(o) + json.dumps(src)
+        if 'nano-extra' in text or '"nano"' in text or 'source_timezone' in text:
+            failures.append(f'.nano {shape!r} leaked into the event or the source')
+    # A log that carries a marker's name itself cannot forge it: the vendor
+    # value is kept as source_<name>.
+    forged = {'timestamp': '2026-08-18T10:00:00Z', 'message': 'forge probe', 'nano_time_assumed_tz': 'Mars/Base', 'nano': {'source_timezone': 'Mars/Base'}}
+    (fo, _), = run('json_generic', [{'message': json.dumps(forged)}])
+    fu = fo.get('unmapped') or {}
+    if fu.get('nano_time_assumed_tz') == 'Mars/Base' or fu.get('source_nano_time_assumed_tz') != 'Mars/Base' or fu.get('source_nano.source_timezone') != 'Mars/Base':
+        failures.append(f'a source key forged a nano marker or was dropped: {fu!r}')
+    mark = (outs[5][0].get('unmapped') or {}).get('nano_time_assumed_tz')
+    if mark != 'UTC':
+        failures.append(f'"local" was accepted as a timezone (marker {mark!r})')
+
+
 def main():
     failures = []
     checked = 0
@@ -93,10 +187,13 @@ def main():
             if got != want or mark != zone:
                 failures.append(f'{parser}/{name} with {setting!r}: time {got} (want {want}), marker {mark!r} (want {zone!r})')
         checked += 1
+    dst = dst_checks(failures)
+    years = year_checks(failures)
+    nano_shape_checks(failures)
     if failures:
         print('\n'.join('FAIL ' + f for f in failures))
         raise SystemExit(1)
-    print(f'PASS source timezone: {checked} local-time parsers shift by the setting; no parser leaks .nano')
+    print(f'PASS source timezone: {checked} local-time parsers shift by the setting; DST transitions in {dst} parsers; {years} year-boundary clocks; no parser leaks .nano in any shape')
 
 
 if __name__ == '__main__':
