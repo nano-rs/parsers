@@ -11,4 +11,10 @@ and users are documentation values (192.0.2.0/24, 198.51.100.0/24).
 | `syslog_prefix_checkpoint.json` | `log_destination = syslog` with the `[line-seq]` prefix |
 | `csvlog_*.json` | csvlog column order from the logging docs (section "Using CSV-Format Log Output") |
 | `jsonlog_*.json` | jsonlog keys from the logging docs (Table "Keys and Values of JSON Log Entries"), wrapped in `{"message": ...}` because the record has its own `message` key |
+| `stderr_space_remote_prefix_auth_failed.json` | Space-delimited `%r` prefix (`%m [%p] %q%u@%d %r `), logging docs `log_line_prefix` |
+| `stderr_role_nologin.json` | `role "%s" is not permitted to log in` (NOLOGIN, SQLSTATE 28000), `src/backend/utils/init/miscinit.c` |
+| `stderr_privileged_error.json` | COPY TO/FROM PROGRAM privilege error, `src/backend/commands/copy.c` |
+| `stderr_iam_user_statement.json` | IAM / Entra ID style user name containing `@` (`%u@%d` then reads `user@domain@db`) |
+| `stderr_est_timezone.json` | `%m` with a named `log_timezone` abbreviation (EST) |
+| `stderr_long_statement_truncated.json` | Synthetic 12 KB bulk INSERT: query_info.query_string and message are bounded at 8192 characters, `metadata.is_truncated` set |
 | `junk.json` | Malformed input; must fall back without aborting |
