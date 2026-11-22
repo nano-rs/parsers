@@ -60,10 +60,19 @@ capture must equal the input after exactly those steps (`normalized_source` in
   parsed, to the top-level `target`, so a JSON
   log message spills field by field and is redacted; its raw text is removed
   from the source like the other envelope steps (it stays only in `raw_data`).
+  With `keep: [keys]`, only an object is moved (an already-decoded one too)
+  and it is cut to those keys' scalar values; every other field is withheld
+  together as `withheld_fields` (byte length and sha256). Fail closed for
+  payloads whose secrets have no secret-looking key (Keycloak's
+  `{type, value}` credentials, private keys).
+
 - `parse_kv_merge` `{path, match, key_value_delimiter, field_delimiter}`: a
   top-level string matching `match` is parsed with VRL `parse_key_value`
   (whitespace strict; the checker calls Vector for the exact result), removed,
-  and its pairs merged in (Keycloak's JSON log `message`).
+  and its pairs merged in (Keycloak's JSON log `message`). With `tail_key`,
+  everything after the first `<field_delimiter><tail_key><kv_delimiter>` is
+  that key's value verbatim (a JSON string literal is unquoted), so a JSON
+  tail such as Keycloak's `representation={...}` is never split.
 - `withhold` `{paths, match}`: at the first listed path that exists, a value
   whose text (the string itself, else its VRL `encode_json`) matches `match`
   is replaced by `{withheld: true, bytes, sha256}` of that text (UTF-8 bytes,
@@ -93,7 +102,7 @@ before flattening, then decoded for naming. Collisions receive `_2`, `_3`, etc.
 Scalar arrays retain their type/order; arrays containing objects or arrays use
 JSON strings. Fully represented scalar arrays are consumed. Partially mapped arrays remain
 intact to preserve their order and repeated elements. Secret-bearing keys
-(`password`, `secret`, `authorization`, `token`, `credential`, case-insensitive) are redacted
+(`password`, `secret`, `authorization`, `token`, case-insensitive, and credential VALUE keys: `credential`, `credentials`, `client_credential`, `credential_data` / `_value` / `_hash` / `_key` / `_blob`; never descriptive ones like `credential_type` or `credential_reads`) are redacted
 recursively before encoding; a sensitive object key redacts its whole value.
 Name/value and Key/Value header or parameter objects redact the payload when
 the name identifies a sensitive field.
