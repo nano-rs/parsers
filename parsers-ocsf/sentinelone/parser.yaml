@@ -653,6 +653,22 @@ parser_vrl: |
       }
   }
   __consumed = ""
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
   # BEGIN parser-specific transformations
   # agentComputerName: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
   # agentComputerName: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
@@ -676,7 +692,8 @@ parser_vrl: |
   # data.ipAddress: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
   # SrcIP: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
   # DstIP: Parser lowercases this hostname, address, identity or hash; consume only if the normalized value is emitted.
-  for_each(flatten(__source_kv)) -> |key, value| {
+  # createdAt: ISO clock converted to epoch milliseconds; only the selected successful clock is consumed.
+  for_each(__flat) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
         agentComputerName
@@ -816,33 +833,29 @@ parser_vrl: |
               if contains(__repr, "," + "\"dst_endpoint.ip\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
           }
       }
+      if match(key, r'(?x)
+      \A(?:
+        createdAt
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
   }
   # Declared source -> target mappings (field-coverage.yaml `mappings`).
   __decl = "\n\"DnsRequest\"\t[\"query.hostname\"]\n\"DstIP\"\t[\"dst_endpoint.ip\"]\n\"DstPort\"\t[\"dst_endpoint.port\"]\n\"EventType\"\t[\"metadata.event_code\"]\n\"FilePath\"\t[\"file.path\"]\n\"ParentProcessCommandLine\"\t[\"actor.process.cmd_line\"]\n\"ParentProcessId\"\t[\"actor.process.pid\"]\n\"ParentProcessImagePath\"\t[\"actor.process.file.path\"]\n\"ParentProcessName\"\t[\"actor.process.file.name\",\"actor.process.name\"]\n\"ProcessCommandLine\"\t[\"process.cmd_line\"]\n\"ProcessId\"\t[\"actor.process.pid\",\"process.pid\"]\n\"ProcessImagePath\"\t[\"actor.process.file.path\",\"process.file.path\"]\n\"ProcessName\"\t[\"actor.process.file.name\",\"actor.process.name\",\"process.file.name\",\"process.name\"]\n\"RegistryPath\"\t[\"reg_key.path\"]\n\"RegistryValue\"\t[\"reg_value.data\"]\n\"SrcIP\"\t[\"src_endpoint.ip\"]\n\"SrcPort\"\t[\"src_endpoint.port\"]\n\"activityType\"\t[\"api.operation\",\"metadata.event_code\"]\n\"agentComputerName\"\t[\"device.hostname\",\"evidences.device.hostname\",\"observables.value\"]\n\"agentId\"\t[\"device.uid\",\"evidences.device.uid\"]\n\"agentIp\"\t[\"device.ip\",\"evidences.device.ip\"]\n\"classification\"\t[\"finding_info.analytic.uid\",\"finding_info.types\",\"metadata.event_code\"]\n\"classificationSource\"\t[\"finding_info.analytic.name\"]\n\"data.ipAddress\"\t[\"src_endpoint.ip\"]\n\"data.username\"\t[\"actor.user.name\"]\n\"fileContentHash\"\t[\"actor.process.file.hashes.value\",\"observables.value\"]\n\"filePath\"\t[\"actor.process.file.path\",\"evidences.file.path\",\"observables.value\"]\n\"fileSize\"\t[\"actor.process.file.size\",\"evidences.file.size\"]\n\"id\"\t[\"api.request.uid\",\"metadata.original_event_uid\",\"metadata.uid\"]\n\"mitigationStatusDescription\"\t[\"status_detail\"]\n\"primaryDescription\"\t[\"status_detail\"]\n\"threatId\"\t[\"finding_info.uid\",\"metadata.correlation_uid\"]\n\"threatName\"\t[\"finding_info.title\"]\n\"userId\"\t[\"actor.user.uid\"]\n"
   __preserve = []
   # END parser-specific transformations
-  # Escape literal dots before flattening so dotted source keys cannot overwrite
-  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
-  # In compact JSON only an object key is followed by ':', so a source whose text
-  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
-  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
-  __escaped = object!(__copy.source)
-  __tilde = false
-  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
-      __escaped = map_keys(__escaped, recursive: true) -> |key| {
-          replace(replace(key, "~", "~0"), ".", "~1")
-      }
-      # Keys without a "~" decode to themselves, including the object keys inside
-      # an array that flatten leaves escaped; encode_json never escapes a "~".
-      __tilde = contains(encode_json(__escaped), "~")
-  }
-  __flat = flatten(__escaped)
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
   # target paths + "\n" per mapped source key (a raw newline never occurs in
   # compact JSON). A key is consumed when its value, or every element of a scalar
-  # array, is at one of its own targets.
+  # array, is at one of its own targets. Keys stay ESCAPED here and in __consumed:
+  # a literal dotted key ("a~1b") and the nested path ("a.b") are different
+  # fields, and mapping one never consumes the other.
   for_each(__flat) -> |key, value| {
-      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
       # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
       __kt = encode_json(key)
       if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
@@ -880,7 +893,6 @@ parser_vrl: |
   __names = {}
   if __distinct {
       __kept = filter(__flat) -> |key, value| {
-          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
           # A key is kept unless an explicit mapping or transformation consumed it.
           # Do not spill a copy of the raw body.
           value != __raw_body && !contains(__consumed, "," + encode_json(key))
@@ -914,13 +926,13 @@ parser_vrl: |
       # Slow path, in source key order: a name already taken gets the next free
       # _2, _3, ... suffix.
       for_each(__flat) -> |key, value| {
+          __token = "," + encode_json(key)
           key = replace(replace(key, "~1", "."), "~0", "~")
           if is_array(value) || is_object(value) {
               value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
                   replace(replace(inner, "~1", "."), "~0", "~")
               }, ["v"])
           }
-          __token = "," + encode_json(key)
           if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")

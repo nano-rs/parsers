@@ -39,6 +39,10 @@ class ResidualTests(unittest.TestCase):
             ({'Res': 'r1'}, {'resources': [{'uid': 'x'}, {'uid': 'r1'}]}, {}),
             ({'Res': 'r1'}, {'resources': [{'name': 'r1'}]}, {'res': 'r1'}),
             ({'cs(Host)': 'h'}, {'http_request': {'url': {'hostname': 'h'}}}, {}),
+            # A literal dotted key is not the nested path it spells: mapping the
+            # nested x.y never consumes the literal "x.y" (and vice versa).
+            ({'x.y': 'literal', 'x': {'y': 'nested'}}, {'nested_target': 'nested'}, {'x.y': 'literal'}),
+            ({'x.y': 'literal', 'x': {'y': 'nested'}}, {'literal_target': 'literal'}, {'x.y': 'nested'}),
             ({'DéjàVu': 'unicode', 'HTTPStatus200': 'code'}, {}, {'déjà_vu': 'unicode', 'http_status_200': 'code'}),
             ({}, {'unmapped': {'empty': ''}}, {}),
             ({'Headers': [{'Name': 'Authorization', 'Value': 'private'}]}, {}, {'headers': '[{"Name":"Authorization","Value":"private"}]'}),
@@ -49,7 +53,8 @@ class ResidualTests(unittest.TestCase):
             ({'Records': [{'http://a.example/claims/upn': 'u@example.com', 'x.y': {'p.q~r': 1}}]}, {}, {'records': '[{"http://a.example/claims/upn":"u@example.com","x.y":{"p.q~r":1}}]'}),
         ]
         rules = [{'source': 'Name', 'kind': 'lowercase', 'target': 'user.name', 'reason': 'Test normalization must exist in emitted branch.'}]
-        mappings = {'Known': ['message'], 'KnownList': ['a'], 'Res': ['resources.uid'], 'cs(Host)': ['http_request.url.hostname']}
+        mappings = {'Known': ['message'], 'KnownList': ['a'], 'Res': ['resources.uid'], 'cs(Host)': ['http_request.url.hostname'],
+                    'x.y': ['nested_target'], 'x~1y': ['literal_target']}
         program = '__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'transforms': rules, 'mappings': mappings})
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
@@ -406,6 +411,54 @@ class RunParserFidelityTests(unittest.TestCase):
         for raw in ('"MASKED"', 'strip_whitespace(raw_log) + "!"'):
             with self.subTest(raw=raw), self.assertRaisesRegex(AssertionError, 'raw_data is not the original'):
                 self.run_parser(raw=raw)
+
+
+JSON_PARSER = r"""
+raw = to_string(.message) ?? ""
+__raw_body = raw
+__source_kv = object(parse_json(raw) ?? {}) ?? {}
+. = {"class_uid": 0, "raw_data": raw, "message": to_string(__source_kv.msg) ?? "", "tags": STATIC}
+"""
+
+
+class ProvenanceTests(unittest.TestCase):
+    """A declaration needs real provenance: a static value never passes."""
+
+    def run_json(self, mappings, samples, static='[0, 1]'):
+        import residual_spill
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'probe'/'parser.yaml'
+            path.parent.mkdir()
+            (path.parent/'field-coverage.yaml').write_text(json.dumps({'source': 'json', 'mappings': mappings}))
+            body = ''.join('  ' + line + '\n' for line in JSON_PARSER.replace('STATIC', static).strip().splitlines())
+            path.write_text('parser_vrl: |\n' + body + 'samples: ' + json.dumps([{'raw': json.dumps(s)} for s in samples]) + '\n')
+            residual_spill.update(path)
+            fcc.run_parser(path)
+
+    def test_static_list_never_proves_a_mapping(self):
+        for static, flags in (('[0, 1]', [0, 1]), ('[true, false]', [True, False]), ('["a", "b"]', ['a']), ('["a", "b", "c"]', ['a', 'b'])):
+            with self.subTest(static=static), self.assertRaisesRegex(AssertionError, 'without provenance'):
+                self.run_json({'msg': 'message', 'flags': 'tags'}, [{'msg': 'hi', 'flags': flags}], static)
+
+    def test_real_mapping_passes(self):
+        self.run_json({'msg': 'message'}, [{'msg': 'hello', 'flags': [0, 1]}])
+
+    def test_sentinels_are_fresh_and_typed(self):
+        import provenance
+        for value in ('10.4.5.6', '2026-08-18T12:00:00.1234567Z', 'WKS-01.corp', 4812, 2.5, True, 'abc123'):
+            got = provenance.sentinels(value)
+            self.assertTrue(got, value)
+            for new in got:
+                self.assertIs(type(new), type(value))
+                self.assertNotEqual(new, value)
+        # A sub-millisecond clock moves by whole seconds; a us->ms scale moves the result.
+        rule = {'kind': 'epoch_ms', 'format': '%+'}
+        for new in provenance.rule_mutations(rule, '2026-08-18T12:00:00.1234567Z'):
+            self.assertNotEqual(provenance.transform_want(rule, new), provenance.transform_want(rule, '2026-08-18T12:00:00.1234567Z'))
+        scale = {'kind': 'scale', 'factor': 0.001}
+        for value in (1787043600123456, '1787043600.451'):
+            for new in provenance.rule_mutations(scale, value):
+                self.assertNotEqual(provenance.transform_want(scale, new), provenance.transform_want(scale, value))
 
 
 if __name__ == '__main__':
