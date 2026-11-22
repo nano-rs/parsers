@@ -80,17 +80,25 @@ parser_vrl: |
 
   # ---- key=value body: split on ", " only where a new key starts ----
   cmd = ""
-  cm, ce = parse_regex(kv, r'CmdSet=\x5B\s*CmdAV=(?P<cmd>.*?)\s*(?:<cr>)?\s*\x5D')
+  cm, ce = parse_regex(kv, r'CmdSet=\x5B(?P<set>[^\x5D]*)\x5D')
   if ce == null {
-      cmd = string!(cm.cmd)
-      __source_kv.cmd = cmd
-      kv = replace(kv, r'CmdSet=\x5B[^\x5D]*\x5D,?\s*', "")
+      # "CmdAV=show CmdArgAV=running-config <cr>": the command word and its
+      # arguments arrive as separate AV tokens; keep only their values.
+      cmd = replace(string!(cm.set), r'Cmd(?:Arg)?AV=', "")
+      cmd = replace(cmd, "<cr>", "")
+      cmd = strip_whitespace(replace(cmd, r'\s+', " "))
+      if cmd != "" { __source_kv.cmd = cmd }
+      # Remove the set with exactly one neighbouring ", " so no empty field is left behind.
+      kv = replace(kv, r'(?:,\s*)?CmdSet=\x5B[^\x5D]*\x5D', "")
+      kv = replace(kv, r'^\s*,\s*', "")
   }
   f = {}
   last = ""
   for_each(split(kv, ", ")) -> |_i, piece| {
       pm, pe = parse_regex(piece, r'^\s*(?P<k>[A-Za-z][A-Za-z0-9 _.:-]{0,63})=(?P<v>.*)$')
-      if pe == null {
+      # An empty trailing piece carries nothing; never glue ", " onto the last value.
+      blank = strip_whitespace(replace(piece, r',\s*$', "")) == ""
+      if !blank && pe == null {
           k = string!(pm.k)
           v = replace(string!(pm.v), r',\s*$', "")
           prev = get(f, [k]) ?? null
@@ -102,7 +110,7 @@ parser_vrl: |
               f = set!(f, [k], [prev, v])
           }
           last = k
-      } else if last != "" {
+      } else if !blank && last != "" {
           prev = get(f, [last]) ?? ""
           if is_string(prev) { f = set!(f, [last], string!(prev) + ", " + replace(piece, r',\s*$', "")) }
       }
@@ -257,7 +265,7 @@ parser_vrl: |
       adst = {}
       if nad_ip != "" { adst.ip = nad_ip }
       ndn = string(fv.NetworkDeviceName) ?? ""
-      if ndn != "" { adst.name = ndn }
+      if ndn != "" { adst.name = ndn; adst.hostname = ndn }
       if length(adst) > 0 { .dst_endpoint = adst }
       if length(session) > 0 { .actor.session = session }
   } else if route == "posture" {
@@ -291,6 +299,7 @@ parser_vrl: |
       }
       if text != "" { .message = text }
       if exists(dev.ip) || exists(dev.hostname) || exists(dev.uid) { .device = dev }
+      if user_name != "" { .actor = { "user": { "name": user_name } } }
   } else {
       . = {
           "class_uid": 0, "class_name": "Base Event",
@@ -664,7 +673,7 @@ samples:
       activity_id: 1
       status_id: 1
       user.name: 92-09-00-00-00-01
-      src_endpoint.mac: 92:09:00:00:00:01
+      src_endpoint.mac: "92:09:00:00:00:01"
       src_endpoint.intermediate_ips.0: 192.0.2.143
       dst_endpoint.ip: 192.0.2.193
       auth_protocol_id: 10
@@ -687,7 +696,7 @@ samples:
       status_detail: 12309 PEAP handshake failed
       action_id: 2
       user.name: testnac1
-      src_endpoint.mac: 00:23:df:00:00:01
+      src_endpoint.mac: "00:23:df:00:00:01"
   # Failed attempt with no user (RADIUS request dropped) -> Base Event
   - raw: '<181>Mar 2 09:09:13 ise01 CISE_Failed_Attempts 0000075134 1 0 2022-03-02 09:09:13.790 +00:00 0000075201 5405 NOTICE Failed-Attempt: RADIUS Request dropped, ConfigVersionId=1364, Device IP Address=192.0.2.193, Device Port=42946, DestinationIPAddress=192.0.2.145, DestinationPort=1812, Protocol=Radius, NetworkDeviceName=testDevice, FailureReason=11036 The Message-Authenticator RADIUS attribute is invalid, Step=11001, Step=11036, Step=5405,'
     expect:
@@ -713,6 +722,14 @@ samples:
       actor.user.name: netadmin
       src_endpoint.ip: 198.51.100.44
       dst_endpoint.name: wlnwan1
+      dst_endpoint.hostname: wlnwan1
+  # CmdSet last on the line, with the arguments as separate CmdArgAV tokens
+  - raw: '<181>Jul 12 08:50:05 ise01 CISE_TACACS_Accounting 0006616666 1 0 2024-07-12 08:50:05.018 +02:00 17627964200 3300 NOTICE Tacacs-Accounting: TACACS+ Accounting with Command, ConfigVersionId=280, Device IP Address=192.0.2.144, User=netadmin, Remote-Address=198.51.100.44, NetworkDeviceName=core-sw-01, CmdSet=[ CmdAV=show CmdArgAV=running-config CmdArgAV=<cr> ]'
+    expect:
+      class_uid: 6003
+      activity_id: 2
+      api.operation: show running-config
+      dst_endpoint.hostname: core-sw-01
   - raw: '<181>Jul 12 08:49:05 ise01 CISE_TACACS_Accounting 0006616665 1 0 2024-07-12 08:49:05.018 +02:00 17627964199 3300 NOTICE Tacacs-Accounting: TACACS+ Accounting with Command, ConfigVersionId=280, Device IP Address=192.0.2.144, CmdSet=[ CmdAV=no ip access-list extended MGMT-IN <cr> ], RequestLatency=5, NetworkDeviceName=core-sw1, Privilege-Level=15, User=netadmin, Remote-Address=198.51.100.44, AcctRequest-Flags=Stop,'
     expect:
       class_uid: 6003
@@ -730,6 +747,7 @@ samples:
       compliance.status_id: 3
       severity_id: 3
       device.hostname: WKS-0042
+      actor.user.name: alice
   # EPS operation audit (test-pipeline-posture-client-provisioning-audit.log) -> Base Event
   - raw: '<181>Feb 26 22:15:22 ise01 CISE_Posture_and_Client_Provisioning_Audit 0000000959 1 0 2021-02-26 22:15:22.379 +00:00 0000004348 87751 NOTICE EPS: Endpoint Protection Service has obtained the result of an operation, ConfigVersionId=88, OperationID=ise01.example.com:1, OperationType=CLEAR_POLICY_BY_IP:192.0.2.145, OperationStatus=RUNNING, AdminName=admin@example.com,'
     expect:

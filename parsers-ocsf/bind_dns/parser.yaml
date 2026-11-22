@@ -14,8 +14,8 @@ description: >
   usually mean reconnaissance. Response Policy Zone hits ("rpz QNAME
   NXDOMAIN rewrite ... via ...") become DNS Activity with the RPZ trigger and
   policy record in firewall_rule and an action that follows the policy
-  (NXDOMAIN / NODATA / DROP are Denied, Local-Data and CNAME rewrites are
-  Modified, PASSTHRU is Allowed). Every other named line (lame servers,
+  (NXDOMAIN / NODATA / DROP are Denied with status Failure, Local-Data and
+  CNAME rewrites are Modified, PASSTHRU is Allowed) and the rewritten rcode. Every other named line (lame servers,
   DNSSEC validation, zone maintenance, resolver errors) becomes Base Event
   (0) with the category and severity kept; an unrecognizable line is a Base
   Event marked with unmapped.parse_fallback.
@@ -108,6 +108,8 @@ parser_vrl: |
   opcode = ""
   view = ""
   flag_ids = []
+  rcode = ""
+  rcode_id = -1
 
   # ---- client-scoped messages ----
   km, ke = parse_regex(body, r'^client\s+(?:@(?P<handle>0x[0-9A-Fa-f]+)\s+)?(?P<ip>[0-9A-Fa-f.:]+)#(?P<port>\d+)(?:\s+\x28(?P<qname>[^\x29]*)\x29)?:\s+(?:view\s+(?P<view>[^:]+):\s+)?(?P<cmsg>.*)$')
@@ -175,8 +177,12 @@ parser_vrl: |
                       if severity_id < 3 { severity_id = 3; severity = "Medium" }
                   } else {
                       action_id = 2; action = "Denied"; disposition_id = 2; disposition = "Blocked"
+                      status_id = 2; status_str = "Failure"
                       if severity_id < 3 { severity_id = 3; severity = "Medium" }
                   }
+                  # the rewritten answer the client received
+                  if pol == "NXDOMAIN" { rcode = "NXDomain"; rcode_id = 3 }
+                  if pol == "NODATA" || pol == "Local-Data" || pol == "CNAME" { rcode = "NoError"; rcode_id = 0 }
               }
           }
       }
@@ -217,6 +223,7 @@ parser_vrl: |
       if length(conn) > 0 { .connection_info = conn }
       if length(flag_ids) > 0 { .flag_ids = flag_ids }
       if length(rule) > 0 { .firewall_rule = rule }
+      if rcode_id >= 0 { .rcode = rcode; .rcode_id = rcode_id }
       if opcode == "Update" { .opcode = "Update"; .opcode_id = 5 }
       if opcode == "Notify" { .opcode = "Notify"; .opcode_id = 4 }
       if view != "" { .policy = { "name": view, "type": "view" } }
@@ -631,6 +638,9 @@ samples:
       class_uid: 4003
       action_id: 2
       disposition_id: 2
+      status_id: 2
+      rcode_id: 3
+      rcode: NXDomain
       severity_id: 3
       firewall_rule.name: malware.example.net.rpz.example.com
       firewall_rule.type: RPZ QNAME
@@ -639,6 +649,15 @@ samples:
     expect:
       class_uid: 4003
       action_id: 1
+      status_id: 1
+      rcode_id: <missing>
+  # RPZ NODATA block: a denied, failed lookup answered with an empty NOERROR
+  - raw: '21-Nov-2026 10:00:06.500 rpz: info: client @0x7f9b4c0a9210 192.0.2.68#57153 (tracker.example.net): rpz QNAME NODATA rewrite tracker.example.net/AAAA/IN via tracker.example.net.rpz.example.com'
+    expect:
+      class_uid: 4003
+      action_id: 2
+      status_id: 2
+      rcode_id: 0
   # RPZ Local-Data rewrite (walled garden)
   - raw: '21-Nov-2026 10:00:08.000 rpz: info: client @0x7f9b4c0a9300 192.0.2.67#40000 (phish.example.com): rpz QNAME Local-Data rewrite phish.example.com/AAAA/IN via phish.example.com.rpz.example.com'
     expect:

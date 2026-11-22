@@ -144,7 +144,7 @@ parser_vrl: |
           "activity_id": 2, "activity_name": "Response",
           "type_uid": 400302,
           "severity_id": severity_id, "severity": severity,
-          "query": { "hostname": downcase(string(p.QueryName) ?? "") }
+          "query": { "hostname": replace(downcase(string(p.QueryName) ?? ""), r'\.$', "") }
       })
       qtn = string(p.QueryTypeName) ?? ""
       if qtn != "" { .query.type = qtn }
@@ -254,12 +254,17 @@ parser_vrl: |
       activity_id = 6
       activity_name = "Traffic"
       if action_id == 2 { activity_id = 5; activity_name = "Refuse" }
+      nstatus_id = 0
+      nstatus = "Unknown"
+      if action_id == 1 { nstatus_id = 1; nstatus = "Success" }
+      if action_id == 2 { nstatus_id = 2; nstatus = "Failure" }
       . = merge(base, {
           "class_uid": 4001, "class_name": "Network Activity",
           "category_uid": 4, "category_name": "Network Activity",
           "activity_id": activity_id, "activity_name": activity_name,
           "type_uid": 400100 + activity_id,
-          "severity_id": severity_id, "severity": severity
+          "severity_id": severity_id, "severity": severity,
+          "status_id": nstatus_id, "status": nstatus
       })
       src = {}
       sip = string(p.SourceIP) ?? ""
@@ -848,6 +853,7 @@ samples:
       activity_id: 6
       dst_endpoint.hostname: www.example.org
       connection_info.protocol_num: 6
+      status_id: 1
       time: 1684444377000
   # Gateway Network, blocked UDP flow
   - raw: '{"AccountID":"00000000000000000000000000000000","Action":"block","Datetime":"2026-04-29T08:04:00Z","DestinationIP":"203.0.113.91","DestinationPort":3389,"DeviceID":"00000000-0000-0000-0000-000000000001","DeviceName":"zt-test-vm1","Email":"user@example.com","PolicyID":"85063bec-74cb-4546-85a3-e0cde2cdfda3","PolicyName":"Block RDP","SessionID":"5f2d04be-3512-11e8-b467-0ed5f89f718c","SourceIP":"192.0.2.2","SourceInternalIP":"192.168.1.3","SourcePort":47925,"Transport":"udp","UserID":"00000000-0000-0000-0000-000000000003"}'
@@ -855,7 +861,13 @@ samples:
       class_uid: 4001
       activity_id: 5
       action_id: 2
+      status_id: 2
       firewall_rule.name: Block RDP
+  # Gateway DNS with a fully qualified (trailing-dot) query name
+  - raw: '{"ColoCode":"ORD","Datetime":"2026-04-29T08:02:00Z","DeviceName":"zt-test-vm1","DstIP":"198.51.100.53","DstPort":53,"Email":"user@example.com","QueryName":"Login.Example.COM.","QueryType":1,"QueryTypeName":"A","RCode":0,"ResolvedIPs":["203.0.113.45"],"ResolverDecision":"allowedOnNoPolicyMatch","SrcIP":"192.0.2.2","SrcPort":0,"UserID":"00000000-0000-0000-0000-000000000003"}'
+    expect:
+      class_uid: 4003
+      query.hostname: login.example.com
   # Access request, allowed one-time-PIN login
   - raw: '{"Action":"login","Allowed":true,"AppDomain":"app.example.com/warp","AppUUID":"00000000-0000-0000-0000-000000000004","Connection":"onetimepin","Country":"us","CreatedAt":"2023-05-24T02:48:33+09:30","Email":"user@example.com","IPAddress":"192.0.2.93","PurposeJustificationPrompt":"Please provide your reason for accessing the application.","PurposeJustificationResponse":"I need to access the application for work purposes.","RayID":"00c0ffeeabc12345","TemporaryAccessApprovers":["approver1@example.com","approver2@example.com"],"TemporaryAccessDuration":7200,"UserUID":"00000000-0000-0000-0000-000000000003"}'
     expect:
