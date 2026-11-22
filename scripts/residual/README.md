@@ -63,6 +63,14 @@ capture must equal the input after exactly those steps (`normalized_source` in
   top-level string matching `match` is parsed with VRL `parse_key_value`
   (whitespace strict; the checker calls Vector for the exact result), removed,
   and its pairs merged in (Keycloak's JSON log `message`).
+- `withhold` `{paths, match}`: at the first listed path that exists, a value
+  whose text (the string itself, else its VRL `encode_json`) matches `match`
+  is replaced by `{withheld: true, bytes, sha256}` of that text (UTF-8 bytes,
+  computed by Vector). For text that may carry credentials but that an earlier
+  step could not unpack, so key redaction cannot reach inside it: a Keycloak
+  event line that does not parse, a Pub/Sub body that does not decode, a
+  JSON log message that cannot be moved, a CloudWatch batch. It is kept only
+  in `raw_data`; its probe plants a secret in the value and requires it gone.
 
 No step ever overwrites a key: on a collision (a decoded or parsed key that
 already exists, or an existing `target`) the step is skipped and the input is
@@ -72,7 +80,10 @@ probed: the checker plants an unknown field and a secret inside the payload
 the step unwraps in a real sample, and requires the field to be captured and
 spilled and the secret redacted, and the secret may not appear anywhere in the
 event outside `raw_data` (the same holds for the JSON residual probe). A step
-no sample exercises fails the check.
+no sample exercises fails the check. The same holds for every sample: a
+credential written as `nan2421-secret` in a sample may appear only in
+`raw_data` (or a `message` that is the raw body), so a sample proves a
+fallback never keeps it.
 `transforms` and `source_normalize` are the only opt-ins; both are validated
 (`validate_config`) before any sample runs.
 
