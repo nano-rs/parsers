@@ -1,0 +1,853 @@
+name: aws_cloudfront_ocsf
+display_name: Amazon CloudFront Access Logs (OCSF)
+version: "1.0.0"
+ocsf_version: "1.9.0"
+description: >
+  Preserves unconsumed parsed fields, unaltered, in dotted snake_case unmapped keys.
+  Parses Amazon CloudFront access logs into complete OCSF 1.9.0 "HTTP Activity"
+  (class_uid 4002) records. Three wire forms are read onto one canonical field set:
+  the standard (legacy) log line (33 tab-separated W3C fields in the documented
+  order, older 24 to 32 field lines included), the real-time log record delivered
+  through Kinesis (epoch timestamp first, fields in the documented real-time order,
+  with or without s-ip), and standard logging v2 JSON output. The viewer is
+  src_endpoint (c-ip, c-port, c-country, asn), the edge is dst_endpoint (cs-host,
+  s-ip), the request lands on http_request (method, url from cs-protocol +
+  x-host-header + cs-uri-stem + cs-uri-query, URL-decoded user agent, referrer,
+  x-forwarded-for, x-edge-request-id), the response on http_response (sc-status,
+  content type and length, time-to-first-byte latency), plus tls, traffic and
+  duration. A geo-restricted or blocked request (x-edge-detailed-result-type
+  ClientGeoBlocked / InvalidRequestBlocked) carries action Denied and disposition
+  Blocked. The W3C "#Version" / "#Fields" directives become a Base Event with
+  log_level info. A real-time record whose field selection is not in the
+  documented order cannot be read positionally, so it is kept whole as a Base
+  Event with unmapped.parse_fallback rather than guessed; the closed-set fields
+  (cs-protocol, cs-protocol-version, c-ip-version, c-port, result types, c-country)
+  are checked so a configuration that omits a middle field falls back too. A JSON
+  object without CloudFront fields is not HTTP Activity. Samples are drawn from
+  the Elastic aws.cloudfront_logs pipeline fixtures and the AWS CloudFront
+  standard and real-time log references, with documentation addresses.
+match_values:
+  - aws_cloudfront
+category: cloud
+vendor: "Amazon"
+product: "CloudFront"
+parser_vrl: |
+  # Amazon CloudFront access log -> OCSF 1.9.0 HTTP Activity (class_uid 4002)
+  # Three wire forms land on one canonical field dict `f` (W3C names, snake_case):
+  #   standard (legacy) log line : 33 tab-separated fields in the documented order
+  #   real-time log record       : tab-separated, epoch timestamp first, fields in
+  #                                the documented real-time order
+  #   standard logging v2 JSON   : one object per request, W3C names as keys
+  raw_log = to_string(.message) ?? ""
+  __raw_body = raw_log
+  __source_kv = {}
+  class_uid = 4002
+
+  f = {}
+  form = ""
+  fallback = ""
+  is_header = false
+
+  std_names = ["date", "time", "x_edge_location", "sc_bytes", "c_ip", "cs_method", "cs_host", "cs_uri_stem", "sc_status", "cs_referer", "cs_user_agent", "cs_uri_query", "cs_cookie", "x_edge_result_type", "x_edge_request_id", "x_host_header", "cs_protocol", "cs_bytes", "time_taken", "x_forwarded_for", "ssl_protocol", "ssl_cipher", "x_edge_response_result_type", "cs_protocol_version", "fle_status", "fle_encrypted_fields", "c_port", "time_to_first_byte", "x_edge_detailed_result_type", "sc_content_type", "sc_content_len", "sc_range_start", "sc_range_end"]
+  rt_names = ["timestamp", "c_ip", "s_ip", "time_to_first_byte", "sc_status", "sc_bytes", "cs_method", "cs_protocol", "cs_host", "cs_uri_stem", "cs_bytes", "x_edge_location", "x_edge_request_id", "x_host_header", "time_taken", "cs_protocol_version", "c_ip_version", "cs_user_agent", "cs_referer", "cs_cookie", "cs_uri_query", "x_edge_response_result_type", "x_forwarded_for", "ssl_protocol", "ssl_cipher", "x_edge_result_type", "fle_encrypted_fields", "fle_status", "sc_content_type", "sc_content_len", "sc_range_start", "sc_range_end", "c_port", "x_edge_detailed_result_type", "c_country", "cs_accept_encoding", "cs_accept", "cache_behavior_path_pattern", "cs_headers", "cs_header_names", "cs_headers_count", "primary_distribution_id", "primary_distribution_dns_name", "origin_fbl", "origin_lbl", "asn"]
+
+  if starts_with(raw_log, "#") {
+      is_header = true
+  } else if match(raw_log, r'^\s*\x7B') {
+      parsed, jerr = parse_json(raw_log)
+      if jerr == null && is_object(parsed) {
+          __source_kv = object!(parsed)
+          form = "json"
+          # cs(User-Agent) -> cs_user_agent, timestamp(ms) -> timestamp_ms
+          f = map_keys(object!(parsed)) -> |k| {
+              replace(replace(replace(downcase(k), "(", "_"), ")", ""), "-", "_")
+          }
+          # "-" is the access log's empty value.
+          f = filter(f) -> |_k, v| { v != "-" && v != "" && v != null }
+          # Any JSON object is not a CloudFront record: require a v2 field.
+          if !(exists(f.c_ip) || exists(f.cs_method) || exists(f.sc_status) || exists(f.cs_uri_stem) || exists(f.x_edge_request_id) || exists(f.distributionid)) {
+              form = ""
+              fallback = "JSON is not a CloudFront v2 log record"
+          }
+      } else {
+          fallback = "unparsable JSON"
+      }
+  } else {
+      shape, serr = parse_regex(raw_log, r'^(?P<lead>\d{4}-\d{2}-\d{2}\t\d{2}:\d{2}:\d{2}|\d{9,11}(?:\.\d+)?)\t')
+      if serr != null {
+          fallback = "not a CloudFront access log line"
+      } else {
+          parts = split(raw_log, "\t")
+          lead = string!(shape.lead)
+          if contains(lead, "-") {
+              form = "standard"
+              for_each(parts) -> |i, v| {
+                  name = get(std_names, [i]) ?? null
+                  if name == null { name = "field_" + to_string(i + 1) }
+                  if v != "-" && v != "" { f = set!(f, [string!(name)], v) }
+              }
+          } else {
+              form = "realtime"
+              names = rt_names
+              # Older real-time records predate s-ip: field 3 is then
+              # time-to-first-byte (a decimal), never an IP address.
+              third = to_string(get(parts, [2]) ?? "") ?? ""
+              if match(third, r'^\d+(?:\.\d+)?$') { names = remove!(rt_names, [2]) }
+              for_each(parts) -> |i, v| {
+                  name = get(names, [i]) ?? null
+                  if name == null { name = "field_" + to_string(i + 1) }
+                  if v != "-" && v != "" { f = set!(f, [string!(name)], v) }
+              }
+          }
+      }
+  }
+
+  if form == "standard" {
+      # date + time are one UTC instant; capture them as one source field.
+      d = string(f.date) ?? ""
+      t = string(f.time) ?? ""
+      f = remove!(f, ["date"])
+      f = remove!(f, ["time"])
+      if d != "" && t != "" { f.timestamp = d + "T" + t + "Z" }
+  }
+  if form != "json" && form != "" {
+      # User-Agent is URL-encoded in the access log; decode it once.
+      ua_enc = string(f.cs_user_agent) ?? ""
+      if ua_enc != "" { f.cs_user_agent = decode_percent(ua_enc) }
+      __source_kv = f
+  }
+
+  method = upcase(string(f.cs_method) ?? "")
+  code = to_int(f.sc_status) ?? 0
+  if form == "realtime" {
+      # A real-time configuration that does not select the documented field
+      # order cannot be read positionally; keep every column, do not guess.
+      # Omitting a middle field shifts every later column, so the fields with a
+      # closed value set are checked wherever they land.
+      proto_rt = string(f.cs_protocol) ?? ""
+      pver_rt = string(f.cs_protocol_version) ?? ""
+      ipver_rt = string(f.c_ip_version) ?? ""
+      port_rt = string(f.c_port) ?? ""
+      result_rt = string(f.x_edge_result_type) ?? ""
+      resp_rt = string(f.x_edge_response_result_type) ?? ""
+      country_rt = string(f.c_country) ?? ""
+      results = ["Hit", "RefreshHit", "Miss", "LimitExceeded", "CapacityExceeded", "Error", "Redirect", "LambdaExecutionError", "LambdaGeneratedResponse", "LambdaValidationError", "OriginShieldHit", "MissGeneratedResponse", "FunctionGeneratedResponse", "FunctionExecutionError", "FunctionThrottledError", "FunctionValidationError"]
+      # A result type AWS adds later still has the documented shape: PascalCase
+      # ending in one of the documented outcome words. A shifted column (a
+      # country code, a host, a number) never does.
+      result_shape = r'^(?:[A-Z][a-z]+)+(?:Hit|Miss|Error|Response|Exceeded|Redirect)$'
+      # sc-status 000: the viewer closed the connection before a response was
+      # sent. cs-method "-" (read as empty): a malformed viewer request.
+      # Methods may carry '-' (M-SEARCH, VERSION-CONTROL).
+      sc_raw = string(f.sc_status) ?? ""
+      code_ok = (code >= 100 && code <= 599) || (code == 0 && (sc_raw == "000" || sc_raw == "0"))
+      aligned = code_ok && (method == "" || match(method, r'^[A-Z][A-Z0-9_-]*$'))
+      aligned = aligned && (proto_rt == "" || includes(["http", "https", "ws", "wss", "grpcs"], downcase(proto_rt)))
+      aligned = aligned && (pver_rt == "" || starts_with(pver_rt, "HTTP/"))
+      aligned = aligned && (ipver_rt == "" || ipver_rt == "IPv4" || ipver_rt == "IPv6")
+      aligned = aligned && (port_rt == "" || match(port_rt, r'^\d{1,5}$'))
+      aligned = aligned && (result_rt == "" || includes(results, result_rt) || match(result_rt, result_shape))
+      aligned = aligned && (resp_rt == "" || includes(results, resp_rt) || match(resp_rt, result_shape))
+      aligned = aligned && (country_rt == "" || match(country_rt, r'^[A-Z]{2}$'))
+      if !aligned { fallback = "real-time field selection not in the documented order" }
+  }
+
+  if is_header || fallback != "" || form == "" {
+      if fallback == "" && !is_header { fallback = "unparsable input" }
+      . = {
+          "class_uid": 0,
+          "class_name": "Base Event",
+          "category_uid": 0,
+          "category_name": "Uncategorized",
+          "activity_id": 0,
+          "activity_name": "Unknown",
+          "type_uid": 0,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": 0,
+          "status": "Unknown",
+          "time": to_unix_timestamp(now(), unit: "milliseconds"),
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": ["cloud"],
+              "uid": sha2("aws_cloudfront|raw|" + raw_log, variant: "SHA-256"),
+              "log_level": "info",
+              "log_name": "CloudFront",
+              "log_provider": "Amazon CloudFront",
+              "product": { "name": "CloudFront", "vendor_name": "Amazon" }
+          },
+          "cloud": { "provider": "AWS" }
+      }
+      if is_header {
+          # W3C directives (#Version / #Fields) head every standard log file.
+          .message = raw_log
+      } else {
+          .metadata.log_level = "error"
+          # NAN-5264: explicit fallback marker; nano parser health counts it.
+          . = set!(., ["unmapped", "parse_fallback"], fallback)
+      }
+  } else {
+      # ---- time ----
+      time_ms = 0
+      ts_ms = to_int(f.timestamp_ms) ?? 0
+      ts = string(f.timestamp) ?? to_string(f.timestamp) ?? ""
+      if ts_ms > 0 {
+          time_ms = ts_ms
+      } else if match(ts, r'^\d+(?:\.\d+)?$') {
+          time_ms = to_int((to_float(ts) ?? 0.0) * 1000.0)
+      } else if ts != "" {
+          tp, terr = parse_timestamp(ts, "%+")
+          if terr == null { time_ms = to_unix_timestamp(tp, unit: "milliseconds") }
+      } else {
+          dt = (string(f.date) ?? "") + " " + (string(f.time) ?? "")
+          tp, terr = parse_timestamp(dt, "%Y-%m-%d %H:%M:%S")
+          if terr == null { time_ms = to_unix_timestamp(tp, unit: "milliseconds") }
+      }
+
+      # ---- method -> activity_id ----
+      activity_id = 99
+      activity_name = "Other"
+      if method == "CONNECT" { activity_id = 1; activity_name = "Connect" }
+      if method == "DELETE"  { activity_id = 2; activity_name = "Delete" }
+      if method == "GET"     { activity_id = 3; activity_name = "Get" }
+      if method == "HEAD"    { activity_id = 4; activity_name = "Head" }
+      if method == "OPTIONS" { activity_id = 5; activity_name = "Options" }
+      if method == "POST"    { activity_id = 6; activity_name = "Post" }
+      if method == "PUT"     { activity_id = 7; activity_name = "Put" }
+      if method == "TRACE"   { activity_id = 8; activity_name = "Trace" }
+      if method == "PATCH"   { activity_id = 9; activity_name = "Patch" }
+
+      # ---- url ----
+      scheme = downcase(string(f.cs_protocol) ?? "")
+      edge_host = string(f.cs_host) ?? ""
+      host = string(f.x_host_header) ?? edge_host
+      path = string(f.cs_uri_stem) ?? ""
+      query = string(f.cs_uri_query) ?? ""
+      if query == "-" { query = "" }
+      url_obj = {}
+      if path != "" { url_obj.path = path }
+      if query != "" { url_obj.query_string = query }
+      if host != "" { url_obj.hostname = host }
+      if scheme != "" { url_obj.scheme = scheme }
+      if host != "" && scheme != "" {
+          url_obj.url_string = scheme + "://" + host + path
+          if query != "" { url_obj.url_string = url_obj.url_string + "?" + query }
+      }
+      if length(url_obj) == 0 { url_obj.path = "/" }
+
+      http_request = { "url": url_obj }
+      if method != "" { http_request.http_method = method }
+      ua = string(f.cs_user_agent) ?? ""
+      if ua != "" && ua != "-" { http_request.user_agent = ua }
+      ref = string(f.cs_referer) ?? ""
+      if ref != "" && ref != "-" { http_request.referrer = ref }
+      pver = string(f.cs_protocol_version) ?? ""
+      if pver != "" && pver != "-" { http_request.version = pver }
+      rid = string(f.x_edge_request_id) ?? ""
+      if rid != "" && rid != "-" { http_request.uid = rid }
+      xff = string(f.x_forwarded_for) ?? ""
+      if xff != "" && xff != "-" {
+          http_request.x_forwarded_for = map_values(split(xff, ",")) -> |v| { strip_whitespace(string!(v)) }
+      }
+
+      # ---- response ----
+      http_response = {}
+      if code > 0 { http_response.code = code }
+      ctype = string(f.sc_content_type) ?? ""
+      if ctype != "" && ctype != "-" { http_response.content_type = ctype }
+      if exists(f.sc_content_len) {
+          clen = to_int(f.sc_content_len) ?? -1
+          if clen >= 0 { http_response.length = clen }
+      }
+      if exists(f.time_to_first_byte) {
+          ttfb = to_float(f.time_to_first_byte) ?? -1.0
+          if ttfb >= 0.0 { http_response.latency = to_int(ttfb * 1000.0) }
+      }
+
+      status_id = 0
+      status_str = "Unknown"
+      if code > 0 {
+          if code < 400 { status_id = 1; status_str = "Success" } else { status_id = 2; status_str = "Failure" }
+          http_response.status = status_str
+      }
+
+      # ---- endpoints ----
+      src_endpoint = {}
+      cip = string(f.c_ip) ?? ""
+      if cip != "" { src_endpoint.ip = downcase(cip) }
+      cport = to_int(f.c_port) ?? 0
+      if cport > 0 { src_endpoint.port = cport }
+      country = string(f.c_country) ?? ""
+      if country != "" && country != "-" { src_endpoint.location = { "country": country } }
+      asn = to_int(f.asn) ?? 0
+      if asn > 0 { src_endpoint.autonomous_system = { "number": asn } }
+      if length(src_endpoint) == 0 { src_endpoint.ip = "0.0.0.0" }
+
+      dst_endpoint = {}
+      if edge_host != "" { dst_endpoint.hostname = edge_host }
+      sip = string(f.s_ip) ?? ""
+      if sip != "" && sip != "-" { dst_endpoint.ip = downcase(sip) }
+      if scheme == "https" || scheme == "wss" || scheme == "grpcs" { dst_endpoint.port = 443 }
+      if scheme == "http" || scheme == "ws" { dst_endpoint.port = 80 }
+
+      # ---- tls / traffic / duration ----
+      tls = {}
+      sslp = string(f.ssl_protocol) ?? ""
+      if sslp != "" && sslp != "-" { tls.version = sslp }
+      sslc = string(f.ssl_cipher) ?? ""
+      if sslc != "" && sslc != "-" { tls.cipher = sslc }
+
+      traffic = {}
+      if exists(f.sc_bytes) {
+          scb = to_int(f.sc_bytes) ?? -1
+          if scb >= 0 { traffic.bytes_in = scb }
+      }
+      if exists(f.cs_bytes) {
+          csb = to_int(f.cs_bytes) ?? -1
+          if csb >= 0 { traffic.bytes_out = csb }
+      }
+
+      # ---- edge verdict: geo restriction / blocked request ----
+      detailed = string(f.x_edge_detailed_result_type) ?? ""
+      result_type = string(f.x_edge_result_type) ?? ""
+      blocked = detailed == "ClientGeoBlocked" || detailed == "InvalidRequestBlocked"
+      severity_id = 1
+      severity = "Informational"
+      if result_type == "Error" && code >= 500 { severity_id = 2; severity = "Low" }
+
+      profiles = ["cloud"]
+      if blocked { profiles = push(profiles, "security_control") }
+
+      uid = rid
+      if uid == "" || uid == "-" { uid = sha2("aws_cloudfront|raw|" + raw_log, variant: "SHA-256") }
+
+      ocsf = {
+          "class_uid": class_uid,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": severity_id,
+          "severity": severity,
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "raw_data": raw_log,
+          "metadata": {
+              "version": "1.9.0",
+              "profiles": profiles,
+              "uid": uid,
+              "log_name": "CloudFront",
+              "log_provider": "Amazon CloudFront",
+              "product": { "name": "CloudFront", "vendor_name": "Amazon" }
+          },
+          "cloud": { "provider": "AWS" },
+          "src_endpoint": src_endpoint,
+          "http_request": http_request
+      }
+      if length(dst_endpoint) > 0 { ocsf.dst_endpoint = dst_endpoint }
+      if length(http_response) > 0 { ocsf.http_response = http_response }
+      if length(tls) > 0 { ocsf.tls = tls }
+      if length(traffic) > 0 { ocsf.traffic = traffic }
+      if exists(f.time_taken) {
+          tt = to_float(f.time_taken) ?? -1.0
+          if tt >= 0.0 { ocsf.duration = to_int(tt * 1000.0) }
+      }
+      if result_type != "" && result_type != "-" { ocsf.status_detail = result_type }
+      if blocked {
+          ocsf.action_id = 2
+          ocsf.action = "Denied"
+          ocsf.disposition_id = 2
+          ocsf.disposition = "Blocked"
+          ocsf.is_alert = false
+      }
+      if form == "realtime" { ocsf.metadata.log_name = "CloudFront real-time" }
+      . = ocsf
+  }
+
+  # NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+  # Values spill exactly as parsed: a parser never masks, redacts or withholds
+  # anything (masking is an opt-in pipeline step, never a parser concern).
+  # __source_kv is a local variable, never an OCSF attribute. The checker instruments
+  # this marker to observe the parsed source without changing production output.
+  # Exact value representation is evaluated AFTER branch selection. Numeric strings
+  # count as represented by their typed scalar; other transformations are explicit.
+  # NAN-5351: VRL copies a variable on every read, so an array or object used as a
+  # lookup set costs a full copy per lookup. The value sets below are strings
+  # instead (a read shares the buffer): "," + encode_json(member) per member, and
+  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
+  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
+  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
+  # set is a regex literal, compiled once with the program.
+  # __mapped holds only JSON types, so to_string equals encode_json for an integer
+  # or a boolean and only strings and floats add a second member.
+  # raw_data and unmapped are dropped before the JSON round trip, not after it.
+  __mapped = .
+  __discard = del(__mapped.raw_data)
+  __existing = del(__mapped.unmapped)
+  __existing = object(parse_json!(encode_json(__existing))) ?? {}
+  __mapped_json = encode_json(__mapped)
+  __mapped = object!(parse_json!(__mapped_json))
+  if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+  __copy = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
+  __copy_json = encode_json(__copy)
+  # Object and array members are encodings: an empty object, an object that
+  # opens with a quoted key, or an array. A lookup can ask for one only when some
+  # source or existing value is an array, or a string spelling one of those
+  # openings, and the regex below finds either in the JSON text (brackets are
+  # written as hex escapes because nano's deploy check counts them raw).
+  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
+  # with no quoted key, is no object member. The leaves of flatten(), with arrays
+  # flattened too, are every scalar node unless a key holds a literal '.' (in
+  # compact JSON only a key is followed by ':').
+  # Their encodings, unwrapped from the array, already are the string members.
+  __represented = ""
+  __nodes = __mapped
+  if !match(__copy_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
+      __leaves = flatten(values(flatten(__mapped)))
+      __leaves_json = encode_json(__leaves)
+      if match(__leaves_json, r'\x7B') {
+          # An object inside an array: walk the leaves, objects whole.
+          __nodes = __leaves
+      } else {
+          __nodes = []
+          __members = map_values(__leaves) -> |value| {
+              if is_float(value) {
+                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
+              } else {
+                  encode_json(encode_json(value))
+              }
+          }
+          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
+      }
+  }
+  __walk = map_values(__nodes, recursive: true) -> |value| {
+      __json = encode_json(value)
+      if is_string(value) {
+          # A string's second member is the string itself, encoded: __json.
+          __represented = __represented + ("," + encode_json(__json) + "," + __json)
+      } else if is_float(value) {
+          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
+      } else {
+          __represented = __represented + ("," + encode_json(__json))
+      }
+      value
+  }
+  __consumed = ""
+  # BEGIN parser-specific transformations
+  # timestamp: Standard log date + time captured as one UTC instant and converted to the emitted millisecond clock.
+  # timestamp: Real-time and v2 epoch-second timestamps converted to the emitted millisecond clock.
+  # time_taken: Seconds converted to the emitted millisecond duration.
+  # time-taken: Seconds converted to the emitted millisecond duration (v2 JSON key).
+  # time_to_first_byte: Seconds converted to the emitted millisecond response latency.
+  # time-to-first-byte: Seconds converted to the emitted millisecond response latency (v2 JSON key).
+  for_each(flatten(__source_kv)) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        timestamp
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if __mapped."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        timestamp
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if __mapped."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        time_taken
+      | time\-taken
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if __mapped."duration" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        time_to_first_byte
+      | time\-to\-first\-byte
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 1000.0)
+              if __mapped."http_response"."latency" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
+  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+  __candidates = r'(?x)
+  \A(?:
+    asn
+  | c\-country
+  | c\-ip
+  | c\-port
+  | c_country
+  | c_ip
+  | c_port
+  | cs\x28Host\x29
+  | cs\x28Referer\x29
+  | cs\x28User\-Agent\x29
+  | cs\-bytes
+  | cs\-method
+  | cs\-protocol
+  | cs\-protocol\-version
+  | cs\-uri\-query
+  | cs\-uri\-stem
+  | cs_bytes
+  | cs_host
+  | cs_method
+  | cs_protocol
+  | cs_protocol_version
+  | cs_referer
+  | cs_uri_query
+  | cs_uri_stem
+  | cs_user_agent
+  | s\-ip
+  | s_ip
+  | sc\-bytes
+  | sc\-content\-len
+  | sc\-content\-type
+  | sc\-status
+  | sc_bytes
+  | sc_content_len
+  | sc_content_type
+  | sc_status
+  | ssl\-cipher
+  | ssl\-protocol
+  | ssl_cipher
+  | ssl_protocol
+  | timestamp\x28ms\x29
+  | x\-edge\-request\-id
+  | x\-edge\-result\-type
+  | x\-forwarded\-for
+  | x\-host\-header
+  | x_edge_request_id
+  | x_edge_result_type
+  | x_forwarded_for
+  | x_host_header
+  )\z'
+  __preserve = []
+  # END parser-specific transformations
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
+  # Fast path: when no two source keys decode to the same key and no two spilled
+  # keys get the same name, each key's decision depends only on its own value, so
+  # one filter and one rename build the residual without copying it per key.
+  __distinct = true
+  if __tilde {
+      __distinct = length(map_keys(__flat) -> |key| { replace(replace(key, "~1", "."), "~0", "~") }) == length(__flat)
+  }
+  __kept = {}
+  __names = {}
+  if __distinct {
+      __kept = filter(__flat) -> |key, value| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          # A key is kept unless it is consumed: by a transformation above, or as a
+          # candidate whose value is represented. Do not spill a copy of the raw body.
+          if value == __raw_body {
+              false
+          } else if contains(__consumed, "," + encode_json(key)) {
+              false
+          } else if !match(key, __candidates) {
+              true
+          } else {
+              # flatten stops at arrays, so objects inside an array still carry the
+              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+              if __tilde && (is_array(value) || is_object(value)) {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __same = contains(__represented, "," + encode_json(encode_json(value)))
+              if !__same && (is_string(value) || is_float(value)) {
+                  __same = contains(__represented, "," + encode_json(to_string!(value)))
+              }
+              # A scalar array is consumed only if every element is represented. Preserve
+              # partially represented arrays intact, including their ordering and repeats.
+              if !__same && is_array(value) && !is_empty(array!(value)) {
+                  __same = true
+                  for_each(array!(value)) -> |_index, item| {
+                      if __same {
+                          if is_object(item) || is_array(item) {
+                              __same = false
+                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                          }
+                      }
+                  }
+              }
+              !__same
+          }
+      }
+      __names = map_keys(__kept) -> |key| {
+          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+          __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+          join!(__parts, ".")
+      }
+  }
+  __residual = {}
+  if __distinct && length(__names) == length(__kept) {
+      __residual = map_values(__names) -> |value| {
+          if is_array(value) || is_object(value) {
+              if __tilde {
+                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                      replace(replace(inner, "~1", "."), "~0", "~")
+                  }, ["v"])
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              if __complex { value = encode_json(value) }
+          }
+          value
+      }
+  } else {
+      # Slow path, in source key order: a decoded key consumed earlier stays
+      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      for_each(__flat) -> |key, value| {
+          key = replace(replace(key, "~1", "."), "~0", "~")
+          if is_array(value) || is_object(value) {
+              value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+                  replace(replace(inner, "~1", "."), "~0", "~")
+              }, ["v"])
+          }
+          __same = contains(__represented, "," + encode_json(encode_json(value)))
+          if !__same && (is_string(value) || is_float(value)) {
+              __same = contains(__represented, "," + encode_json(to_string!(value)))
+          }
+          if !__same && is_array(value) && !is_empty(array!(value)) {
+              __same = true
+              for_each(array!(value)) -> |_index, item| {
+                  if __same {
+                      if is_object(item) || is_array(item) {
+                          __same = false
+                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
+                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
+                      }
+                  }
+              }
+          }
+          __token = "," + encode_json(key)
+          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
+          if !contains(__consumed, __token) && value != __raw_body {
+              __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+              __base = join!(__parts, ".")
+              __key = __base
+              __suffix = 2
+              if includes(keys(__residual), __key) {
+                  for_each(__flat) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __key) {
+                          __key = __base + "_" + to_string(__suffix)
+                          __suffix = __suffix + 1
+                      }
+                  }
+              }
+              __complex = is_object(value)
+              if is_array(value) {
+                  for_each(array!(value)) -> |_index, item| {
+                      if is_object(item) || is_array(item) { __complex = true }
+                  }
+              }
+              __spill = if __complex { encode_json(value) } else { value }
+              __residual = set!(__residual, [__key], __spill)
+          }
+      }
+  }
+  # Keep existing derived evidence, but remove null placeholders and mapped copies.
+  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # The canonical source spill above is the authoritative representation of
+  # containers. The cheap conditions run first; the source value set is built on
+  # first use.
+  __original_values = null
+  for_each(flatten(__existing)) -> |key, value| {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body {
+          # Members for the value itself and for to_string(value), as above.
+          __json = encode_json(value)
+          __as_json = "," + encode_json(__json)
+          __as_string = __as_json
+          if is_string(value) { __as_string = "," + __json } else if is_float(value) { __as_string = "," + encode_json(to_string!(value)) }
+          if __original_values == null {
+              # __source_kv may hold non-JSON types (a timestamp), so only an
+              # integer or a boolean skips its to_string member here.
+              __original_values = join!(map_values(values(flatten(__source_kv))) -> |source_value| {
+                  __source_json = encode_json(source_value)
+                  __tokens = "," + encode_json(__source_json)
+                  if is_string(source_value) {
+                      __tokens = __tokens + "," + __source_json
+                  } else if !is_object(source_value) && !is_array(source_value) && !is_integer(source_value) && !is_boolean(source_value) {
+                      __tokens = __tokens + "," + encode_json(to_string(source_value) ?? "")
+                  }
+                  __tokens
+              }, "")
+          }
+          __source_set = string!(__original_values)
+          __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
+          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
+          # Only text opening an object or an array (after JSON whitespace)
+          # decodes to a container.
+          if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {
+              __decoded, __decode_err = parse_json(string!(value))
+              __keep = !(__decode_err == null && (is_object(__decoded) || is_array(__decoded)))
+          }
+          if __keep {
+              __key = snakecase(key)
+              if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+          }
+      }
+  }
+  # Parser-declared derived evidence is merged after source spill, as-is. These
+  # entries preserve meaning beyond source scalar value equality.
+  for_each(__preserve) -> |_index, key| {
+      __derived = get!(object!(__copy.existing), [string!(key)])
+      if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+  }
+  __discard = del(.unmapped)
+  if !is_empty(__residual) { .unmapped = __residual }
+  .
+  # END NAN-2421 residual spill
+
+samples:
+  # source: https://github.com/elastic/integrations/blob/main/packages/aws/data_stream/cloudfront_logs/_dev/test/pipeline/test-cloudfront.log
+  - raw: "2019-12-04\t21:02:31\tLAX1\t392\t192.0.2.100\tGET\td111111abcdef8.cloudfront.net\t/index.html\t200\t-\tMozilla/5.0%20(Windows%20NT%2010.0;%20Win64;%20x64)%20AppleWebKit/537.36%20(KHTML,%20like%20Gecko)%20Chrome/78.0.3904.108%20Safari/537.36\t-\t-\tHit\tSOX4xwn4XV6Q4rgb7XiVGOHms_BGlTAC4KyHmureZmBNrjGdRLiNIQ==\td111111abcdef8.cloudfront.net\thttps\t23\t0.001\t-\tTLSv1.2\tECDHE-RSA-AES128-GCM-SHA256\tHit\tHTTP/2.0\t-\t-\t11040\t0.001\tHit\ttext/html\t78\t-\t-"
+    expect:
+      "class_uid": "4002"
+      "activity_id": "3"
+      "status_id": "1"
+      "http_response.code": "200"
+      "src_endpoint.ip": "192.0.2.100"
+      "http_request.url.url_string": "https://d111111abcdef8.cloudfront.net/index.html"
+      "http_request.user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/78.0.3904.108 Safari/537.36"
+      "metadata.uid": "SOX4xwn4XV6Q4rgb7XiVGOHms_BGlTAC4KyHmureZmBNrjGdRLiNIQ=="
+      "time": "1575493351000"
+      "traffic.bytes_in": "392"
+      "duration": "1"
+  # source: https://github.com/elastic/integrations/blob/main/packages/aws/data_stream/cloudfront_logs/_dev/test/pipeline/test-cloudfront.log
+  - raw: "2019-12-13\t22:36:27\tSEA19-C1\t900\t192.0.2.100\tGET\td111111abcdef8.cloudfront.net\t/favicon.ico\t502\thttp://www.example.com/\tMozilla/5.0%20(Windows%20NT%2010.0;%20Win64;%20x64)%20AppleWebKit/537.36%20(KHTML,%20like%20Gecko)%20Chrome/78.0.3904.108%20Safari/537.36\t-\t-\tError\t1pkpNfBQ39sYMnjjUQjmH2w1wdJnbHYTbag21o_3OfcQgPzdL2RSSQ==\twww.example.com\thttp\t675\t0.102\t-\t-\t-\tError\tHTTP/1.1\t-\t-\t25260\t0.102\tOriginDnsError\ttext/html\t507\t-\t-"
+    expect:
+      "class_uid": "4002"
+      "status_id": "2"
+      "http_response.code": "502"
+      "severity_id": "2"
+      "status_detail": "Error"
+      "http_request.referrer": "http://www.example.com/"
+  # source: https://github.com/elastic/integrations/blob/main/packages/aws/data_stream/cloudfront_logs/_dev/test/pipeline/test-cloudfront.log
+  - raw: "2022-11-15\t08:43:04\tSEA19-C2\t10157\t198.51.100.23\tGET\td111111abcdef8.cloudfront.net\t/getApplications\t200\thttps://www.example.com/global\tMozilla/5.0%20(X11;%20Linux%20x86_64)%20AppleWebKit/537.36%20(KHTML,%20like%20Gecko)%20HeadlessChrome/100.0.4896.88%20Safari/537.36\t-\t-\tMiss\thrsHM5OM6sTIXUleC1G20YtDxMf5Cq0Jbz0pwhVpod2kgEn_W6akCQ==\twww.example.com\thttps\t1057\t0.093\t203.0.113.7, 203.0.113.56\tTLSv1.2\tECDHE-RSA-AES128-GCM-SHA256\tMiss\tHTTP/1.1\t-\t-\t33359\t0.093\tMiss\tapplication/javascript\t-\t-\t-"
+    expect:
+      "http_request.x_forwarded_for.0": "203.0.113.7"
+      "http_request.x_forwarded_for.1": "203.0.113.56"
+      "tls.version": "TLSv1.2"
+  # source: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/standard-logs-reference.html (x-edge-detailed-result-type ClientGeoBlocked)
+  - raw: "2026-11-02\t07:15:09\tFRA56-P3\t512\t198.51.100.90\tGET\td111111abcdef8.cloudfront.net\t/admin/login\t403\t-\tcurl/8.5.0\t-\t-\tError\tGeoBlk9xQ2k7mJxZ3p0ab3Rr1Example==\twww.example.com\thttps\t180\t0.001\t-\tTLSv1.3\tTLS_AES_128_GCM_SHA256\tError\tHTTP/1.1\t-\t-\t51514\t0.001\tClientGeoBlocked\ttext/html\t919\t-\t-"
+    expect:
+      "class_uid": "4002"
+      "action_id": "2"
+      "disposition_id": "2"
+      "status_id": "2"
+      "http_response.code": "403"
+  # source: https://github.com/elastic/integrations/blob/main/packages/aws/data_stream/cloudfront_logs/_dev/test/pipeline/test-cloudfront.log
+  - raw: "#Fields: date time x-edge-location sc-bytes c-ip cs-method cs(Host) cs-uri-stem sc-status cs(Referer) cs(User-Agent) cs-uri-query cs(Cookie) x-edge-result-type x-edge-request-id x-host-header cs-protocol cs-bytes time-taken x-forwarded-for ssl-protocol ssl-cipher x-edge-response-result-type cs-protocol-version fle-status fle-encrypted-fields c-port time-to-first-byte x-edge-detailed-result-type sc-content-type sc-content-len sc-range-start sc-range-end"
+    expect:
+      "class_uid": "0"
+      "metadata.log_level": "info"
+  # source: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/real-time-logs.html (documented field order)
+  - raw: "1762067709.123\t198.51.100.23\t192.0.2.200\t0.002\t200\t1650\tGET\thttps\td111111abcdef8.cloudfront.net\t/images/logo.png\t356\tIAD89-C1\trTmExampleReqId0001xYz==\twww.example.com\t0.004\tHTTP/2.0\tIPv4\tMozilla/5.0%20(Macintosh;%20Intel%20Mac%20OS%20X%2014_5)\thttps://www.example.com/\t-\tv=2\tHit\t-\tTLSv1.3\tTLS_AES_128_GCM_SHA256\tHit\t-\t-\timage/png\t1302\t-\t-\t52110\tHit\tUS\tgzip,%20br\timage/avif,image/webp,*/*\t/images/*\t-\t-"
+    expect:
+      "class_uid": "4002"
+      "activity_id": "3"
+      "time": "1762067709123"
+      "dst_endpoint.ip": "192.0.2.200"
+      "src_endpoint.location.country": "US"
+      "http_request.url.query_string": "v=2"
+      "http_response.latency": "2"
+      "metadata.log_name": "CloudFront real-time"
+  # source: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/real-time-logs.html (record without s-ip)
+  - raw: "1762067802.551\t203.0.113.7\t0.105\t504\t915\tPOST\thttps\td111111abcdef8.cloudfront.net\t/api/orders\t2210\tSEA19-C2\trTmExampleReqId0002aBc==\tapi.example.com\t0.110\tHTTP/1.1\tIPv4\tpython-requests/2.32.3\t-\t-\t-\tError\t-\tTLSv1.2\tECDHE-RSA-AES128-GCM-SHA256\tError"
+    expect:
+      "activity_id": "6"
+      "http_response.code": "504"
+      "src_endpoint.ip": "203.0.113.7"
+      "http_request.url.hostname": "api.example.com"
+  # source: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/real-time-logs.html (custom field selection)
+  - raw: "1762067900.010\t0.002\t200\tUS"
+    expect:
+      "class_uid": "0"
+      "unmapped.parse_fallback": "real-time field selection not in the documented order"
+  # source: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/standard-logs-reference.html (v2 JSON output, field names)
+  - raw: "{\"timestamp\": \"1762068000\", \"DistributionId\": \"E1EXAMPLE2DIST\", \"date\": \"2026-11-02\", \"time\": \"07:20:00\", \"x-edge-location\": \"LHR61-P1\", \"sc-bytes\": \"2381\", \"c-ip\": \"192.0.2.77\", \"cs-method\": \"GET\", \"cs(Host)\": \"d111111abcdef8.cloudfront.net\", \"cs-uri-stem\": \"/wp-login.php\", \"sc-status\": \"404\", \"cs(Referer)\": \"-\", \"cs(User-Agent)\": \"Mozilla/5.0 (compatible; scanner/1.0)\", \"cs-uri-query\": \"-\", \"cs(Cookie)\": \"-\", \"x-edge-result-type\": \"Error\", \"x-edge-request-id\": \"v2JsonExampleReqId003Qw==\", \"x-host-header\": \"www.example.com\", \"cs-protocol\": \"https\", \"cs-bytes\": \"241\", \"time-taken\": \"0.012\", \"x-forwarded-for\": \"-\", \"ssl-protocol\": \"TLSv1.3\", \"ssl-cipher\": \"TLS_AES_128_GCM_SHA256\", \"x-edge-response-result-type\": \"Error\", \"cs-protocol-version\": \"HTTP/1.1\", \"fle-status\": \"-\", \"fle-encrypted-fields\": \"-\", \"c-port\": \"40122\", \"time-to-first-byte\": \"0.012\", \"x-edge-detailed-result-type\": \"Error\", \"sc-content-type\": \"text/html\", \"sc-content-len\": \"1985\", \"sc-range-start\": \"-\", \"sc-range-end\": \"-\", \"timestamp(ms)\": \"1762068000123\", \"origin-fbl\": \"0.010\", \"origin-lbl\": \"0.011\", \"asn\": \"64500\", \"c-country\": \"GB\", \"cache-behavior-path-pattern\": \"*\"}"
+    expect:
+      "class_uid": "4002"
+      "time": "1762068000123"
+      "src_endpoint.autonomous_system.number": "64500"
+      "http_response.code": "404"
+      "http_request.url.path": "/wp-login.php"
+  # neon review #78: a real-time record missing a middle field (cs-cookie) falls back instead of shifting columns.
+  # source: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/real-time-logs.html
+  - raw: "1762067709.123\t198.51.100.23\t192.0.2.200\t0.002\t200\t1650\tGET\thttps\td111111abcdef8.cloudfront.net\t/images/logo.png\t356\tIAD89-C1\trTmExampleReqId0001xYz==\twww.example.com\t0.004\tHTTP/2.0\tIPv4\tMozilla/5.0%20(Macintosh;%20Intel%20Mac%20OS%20X%2014_5)\thttps://www.example.com/\tv=2\tHit\t-\tTLSv1.3\tTLS_AES_128_GCM_SHA256\tHit\t-\t-\timage/png\t1302\t-\t-\t52110\tHit\tUS\tgzip,%20br\timage/avif,image/webp,*/*\t/images/*\t-\t-"
+    expect:
+      "class_uid": "0"
+      "unmapped.parse_fallback": "real-time field selection not in the documented order"
+  # neon review #78: a JSON object without CloudFront fields is not HTTP Activity.
+  # source: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/standard-logs-reference.html
+  - raw: "{\"foo\":\"bar\",\"level\":\"info\"}"
+    expect:
+      "class_uid": "0"
+      "unmapped.parse_fallback": "JSON is not a CloudFront v2 log record"
+  # NAN-3702: an unparseable record gets the deterministic sha256("aws_cloudfront|raw|" + raw) uid.
+  - raw: "NAN-3702 determinism probe: not a aws_cloudfront record"
+    expect:
+      "class_uid": "0"
+      "metadata.uid": "3d310f50f62fb9fd9acdf91d6e26c3faf596a146959e62dc4c39194e3c5f4d3f"
+      "unmapped.parse_fallback": "not a CloudFront access log line"
+  # neon #78 r2: Lambda@Edge generated response is a documented result type
+  - raw: "1762067709.123\t198.51.100.23\t192.0.2.200\t0.002\t200\t1650\tGET\thttps\td111111abcdef8.cloudfront.net\t/images/logo.png\t356\tIAD89-C1\trTmExampleReqId0001xYz==\twww.example.com\t0.004\tHTTP/2.0\tIPv4\tMozilla/5.0%20(Macintosh;%20Intel%20Mac%20OS%20X%2014_5)\thttps://www.example.com/\t-\tv=2\tLambdaGeneratedResponse\t-\tTLSv1.3\tTLS_AES_128_GCM_SHA256\tLambdaGeneratedResponse\t-\t-\timage/png\t1302\t-\t-\t52110\tHit\tUS\tgzip,%20br\timage/avif,image/webp,*/*\t/images/*\t-\t-"
+    expect:
+      "class_uid": "4002"
+      "http_response.code": "200"
+  # neon #78 r2: CloudFront Functions validation error
+  - raw: "1762067709.123\t198.51.100.23\t192.0.2.200\t0.002\t200\t1650\tGET\thttps\td111111abcdef8.cloudfront.net\t/images/logo.png\t356\tIAD89-C1\trTmExampleReqId0001xYz==\twww.example.com\t0.004\tHTTP/2.0\tIPv4\tMozilla/5.0%20(Macintosh;%20Intel%20Mac%20OS%20X%2014_5)\thttps://www.example.com/\t-\tv=2\tFunctionValidationError\t-\tTLSv1.3\tTLS_AES_128_GCM_SHA256\tHit\t-\t-\timage/png\t1302\t-\t-\t52110\tHit\tUS\tgzip,%20br\timage/avif,image/webp,*/*\t/images/*\t-\t-"
+    expect:
+      "class_uid": "4002"
+  # neon #78 r2: sc-status 000 with cs-method "-" (viewer closed a malformed request)
+  - raw: "1762067709.123\t198.51.100.23\t192.0.2.200\t0.002\t000\t1650\t-\thttps\td111111abcdef8.cloudfront.net\t/images/logo.png\t356\tIAD89-C1\trTmExampleReqId0001xYz==\twww.example.com\t0.004\tHTTP/2.0\tIPv4\tMozilla/5.0%20(Macintosh;%20Intel%20Mac%20OS%20X%2014_5)\thttps://www.example.com/\t-\tv=2\tHit\t-\tTLSv1.3\tTLS_AES_128_GCM_SHA256\tHit\t-\t-\timage/png\t1302\t-\t-\t52110\tHit\tUS\tgzip,%20br\timage/avif,image/webp,*/*\t/images/*\t-\t-"
+    expect:
+      "class_uid": "4002"
+  # neon #78 r2: hyphenated method
+  - raw: "1762067709.123\t198.51.100.23\t192.0.2.200\t0.002\t200\t1650\tM-SEARCH\thttps\td111111abcdef8.cloudfront.net\t/images/logo.png\t356\tIAD89-C1\trTmExampleReqId0001xYz==\twww.example.com\t0.004\tHTTP/2.0\tIPv4\tMozilla/5.0%20(Macintosh;%20Intel%20Mac%20OS%20X%2014_5)\thttps://www.example.com/\t-\tv=2\tHit\t-\tTLSv1.3\tTLS_AES_128_GCM_SHA256\tHit\t-\t-\timage/png\t1302\t-\t-\t52110\tHit\tUS\tgzip,%20br\timage/avif,image/webp,*/*\t/images/*\t-\t-"
+    expect:
+      "class_uid": "4002"
+      "http_request.http_method": "M-SEARCH"
