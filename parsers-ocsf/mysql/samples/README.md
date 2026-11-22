@@ -18,5 +18,5 @@ documentation values (192.0.2.0/24, 198.51.100.0/24).
 | `audit_percona_connect_failed_bracketed.json` | Percona audit failed connect whose `user` is only `[root] @  [ip]` |
 | `genlog_connect_proxy_user.json` | General log Connect with the proxy clause (`user@host as proxied on db`): https://dev.mysql.com/doc/refman/8.4/en/proxy-users.html |
 | `audit_enterprise_query_data.json` | Enterprise Audit `class: query` record (`query_data`), same format page |
-| `genlog_long_query_truncated.json`, `slowlog_long_query_truncated.json` | Synthetic 12 KB bulk INSERT: query_info.query_string bounded at 8192 characters, `metadata.is_truncated` set |
+| `genlog_long_query_truncated.json`, `slowlog_long_query_truncated.json` | Synthetic 12 KB bulk INSERT: query_info.query_string holds the whole statement, never truncated |
 | `junk.json` | Malformed input; must fall back without aborting |

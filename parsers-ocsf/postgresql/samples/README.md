@@ -16,6 +16,6 @@ and users are documentation values (192.0.2.0/24, 198.51.100.0/24).
 | `stderr_privileged_error.json` | COPY TO/FROM PROGRAM privilege error, `src/backend/commands/copy.c` |
 | `stderr_iam_user_statement.json` | IAM / Entra ID style user name containing `@` (`%u@%d` then reads `user@domain@db`) |
 | `stderr_est_timezone.json` | `%m` with a named `log_timezone` abbreviation (EST) |
-| `stderr_long_statement_truncated.json` | Synthetic 12 KB bulk INSERT: query_info.query_string and message are bounded at 8192 characters, `metadata.is_truncated` set |
+| `stderr_long_statement_truncated.json` | Synthetic 12 KB bulk INSERT: query_info.query_string and message hold the whole statement, never truncated |
 | `rds_prefix_ipv6_auth_failed.json` | Amazon RDS default prefix with an IPv6 client (`%t:%r:` reads `UTC:2001:db8::1(port):`) |
 | `junk.json` | Malformed input; must fall back without aborting |
