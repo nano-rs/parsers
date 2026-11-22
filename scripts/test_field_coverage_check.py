@@ -440,6 +440,21 @@ class ProvenanceTests(unittest.TestCase):
             with self.subTest(static=static), self.assertRaisesRegex(AssertionError, 'without provenance'):
                 self.run_json({'msg': 'message', 'flags': 'tags'}, [{'msg': 'hi', 'flags': flags}], static)
 
+    def test_lookup_that_echoes_one_value_fails(self):
+        # category = 3 only for id 3: a lookup, not a copy. One sentinel may
+        # land on 3, but two distinct sentinels never both arrive.
+        program = JSON_PARSER.replace('"tags": STATIC', '"tags": [], "category_uid": 0') + 'if __source_kv.code == 3 { .category_uid = 3 }\n'
+        import residual_spill
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'probe'/'parser.yaml'
+            path.parent.mkdir()
+            (path.parent/'field-coverage.yaml').write_text(json.dumps({'source': 'json', 'mappings': {'msg': 'message', 'code': 'category_uid'}}))
+            body = ''.join('  ' + line + '\n' for line in program.strip().splitlines())
+            path.write_text('parser_vrl: |\n' + body + 'samples: ' + json.dumps([{'raw': json.dumps({'msg': 'hi', 'code': 0})}, {'raw': json.dumps({'msg': 'ho', 'code': 2})}]) + '\n')
+            residual_spill.update(path)
+            with self.assertRaisesRegex(AssertionError, 'without provenance'):
+                fcc.run_parser(path)
+
     def test_real_mapping_passes(self):
         self.run_json({'msg': 'message'}, [{'msg': 'hello', 'flags': [0, 1]}])
 
