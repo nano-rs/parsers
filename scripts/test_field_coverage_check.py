@@ -9,6 +9,7 @@ import tempfile
 import unittest
 import field_coverage_check as fcc
 from field_coverage_check import check, inject_probe, normalize_probes, normalized_source, validate_config
+import residual_spill
 from residual_spill import generated
 
 
@@ -55,7 +56,7 @@ class ResidualTests(unittest.TestCase):
         rules = [{'source': 'Name', 'kind': 'lowercase', 'target': 'user.name', 'reason': 'Test normalization must exist in emitted branch.'}]
         mappings = {'Known': ['message'], 'KnownList': ['a'], 'Res': ['resources.uid'], 'cs(Host)': ['http_request.url.hostname'],
                     'x.y': ['nested_target'], 'x~1y': ['literal_target']}
-        program = '__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'transforms': rules, 'mappings': mappings})
+        program = residual_spill.prelude() + '\n__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'transforms': rules, 'mappings': mappings})
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             (tmp/'p.vrl').write_text(program)
@@ -91,7 +92,7 @@ class TargetEvidenceTests(unittest.TestCase):
         rules = [{'source': 'Name', 'kind': 'lowercase', 'target': 'message', 'reason': 'r'}]
         cases = [({'Name': 'RAW INPUT'}, {'message': 'raw input'}, {'name': 'RAW INPUT'}),
                  ({'Name': 'HELLO'}, {'message': 'hello'}, {})]
-        program = '__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'transforms': rules})
+        program = residual_spill.prelude() + '\n__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'transforms': rules})
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             (tmp/'p.vrl').write_text(program)

@@ -291,10 +291,21 @@ and after a large rewrite. CI runs the check on every PR (job "Parser load budge
   spills to `unmapped`. `python3 scripts/infer_mappings.py parsers-ocsf/<name>`
   writes the declarations by perturbing each source value, and
   `field_coverage_check.py` re-verifies every one the same way.
-- **Every `parse_timestamp` names its timezone** (`timezone: "UTC"` unless the
-  source says otherwise). Without it VRL reads a clock that has no offset in
-  the Vector host's timezone, so one line gets a different time on every
-  host; `field_coverage_check.py` rejects such a call.
+- **Every `parse_timestamp` names its timezone.** Without one VRL reads a clock
+  that has no offset in the Vector host's timezone, so one line gets a
+  different time on every host; `field_coverage_check.py` rejects such a call.
+  The goal is proper UTC everywhere, even when the log is not: honor an inline
+  timezone or offset when the line carries one; for a clock without an offset
+  pass `timezone: __src_tz` (the log source's timezone setting, which nano
+  sends as `.nano.source_timezone`, an IANA name or any `+HH:MM` offset; UTC
+  if unset or invalid) and, when that parse succeeds, set
+  `__time_assumed = true` and subtract `__src_shift_ms` (non-zero for a fixed
+  offset), so the event records the zone used in
+  `unmapped.nano_time_assumed_tz`. The shared prelude that
+  `residual_spill.py` puts at the top of every parser
+  (`scripts/residual/source_tz.vrl`) resolves the setting and removes `.nano`
+  before the parser runs. Use `timezone: "UTC"` only for a format that is UTC
+  by specification.
 - UDM names do not exist in OCSF. `src_ip` is `src_endpoint.ip`, `user` is
   `actor.user.name` (the actor) or `user.name` (the subject, class-dependent),
   `timestamp` is `time`, `id` is `metadata.uid`, `ext.foo` is `unmapped.foo`.
