@@ -415,9 +415,26 @@ parser_vrl: |
       }
   }
   __consumed = ""
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
   # BEGIN parser-specific transformations
   # Datetime: RFC 3339 Logpush clock converted to event milliseconds.
   # Datetime: Unix-seconds Logpush clock converted to event milliseconds.
+  # Datetime: Unix-nanoseconds Logpush clock converted to event milliseconds.
   # CreatedAt: RFC 3339 Access clock converted to event milliseconds.
   # CreatedAt: Unix-seconds Access clock converted to event milliseconds.
   # QueryName: Query name lowercased into query.hostname.
@@ -427,7 +444,7 @@ parser_vrl: |
   # Action: Gateway / Access verdict normalized to the OCSF action; consume only when the expected ID is emitted.
   # ResolverDecision: Resolver decision normalized to the OCSF action; consume only when the expected ID is emitted.
   # Transport: Transport name normalized to the IANA protocol number.
-  for_each(flatten(__source_kv)) -> |key, value| {
+  for_each(__flat) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
         Datetime
@@ -449,6 +466,17 @@ parser_vrl: |
           __number, __number_err = to_float(__value)
           if __number_err == null && __value != null && !is_boolean(__value) {
               __expected = to_int(__number * 1000.0)
+              if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        Datetime
+      )\z') {
+          __value = value
+          __number, __number_err = to_float(__value)
+          if __number_err == null && __value != null && !is_boolean(__value) {
+              __expected = to_int(__number * 0.000001)
               if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
           }
       }
@@ -524,28 +552,13 @@ parser_vrl: |
   __decl = "\n\"AccountID\"\t[\"metadata.tenant_uid\"]\n\"AppDomain\"\t[\"dst_endpoint.hostname\",\"service.name\"]\n\"AppUUID\"\t[\"service.uid\"]\n\"BlockedFileHash\"\t[\"file.hashes.value\"]\n\"BlockedFileName\"\t[\"file.name\"]\n\"BlockedFileSize\"\t[\"file.size\"]\n\"DestinationIP\"\t[\"dst_endpoint.ip\"]\n\"DestinationIPCountryCode\"\t[\"dst_endpoint.location.country\"]\n\"DestinationPort\"\t[\"dst_endpoint.port\"]\n\"DeviceID\"\t[\"device.uid\"]\n\"DeviceName\"\t[\"device.hostname\",\"device.name\",\"src_endpoint.hostname\"]\n\"DstIP\"\t[\"dst_endpoint.ip\"]\n\"DstPort\"\t[\"dst_endpoint.port\"]\n\"Email\"\t[\"actor.user.email_addr\",\"actor.user.name\",\"user.email_addr\",\"user.name\"]\n\"HTTPHost\"\t[\"dst_endpoint.hostname\",\"http_request.url.hostname\"]\n\"HTTPMethod\"\t[\"http_request.http_method\"]\n\"HTTPStatusCode\"\t[\"http_response.code\",\"http_status\"]\n\"HTTPVersion\"\t[\"http_request.version\"]\n\"IPAddress\"\t[\"src_endpoint.ip\"]\n\"PolicyID\"\t[\"firewall_rule.uid\"]\n\"PolicyName\"\t[\"firewall_rule.name\"]\n\"Policy\"\t[\"firewall_rule.name\"]\n\"Protocol\"\t[\"app_name\"]\n\"QueryName\"\t[\"query.hostname\"]\n\"QuerySize\"\t[\"traffic.bytes_out\"]\n\"QueryTypeName\"\t[\"query.type\"]\n\"RCode\"\t[\"rcode_id\"]\n\"RayID\"\t[\"metadata.correlation_uid\"]\n\"Referer\"\t[\"http_request.referrer\"]\n\"RequestID\"\t[\"http_request.uid\",\"metadata.correlation_uid\"]\n\"ResolvedIPs\"\t[\"answers.rdata\"]\n\"SNI\"\t[\"dst_endpoint.hostname\"]\n\"SessionID\"\t[\"connection_info.uid\",\"metadata.correlation_uid\"]\n\"SourceIP\"\t[\"src_endpoint.ip\"]\n\"SourceIPCountryCode\"\t[\"src_endpoint.location.country\"]\n\"SourceInternalIP\"\t[\"device.ip\"]\n\"SourcePort\"\t[\"src_endpoint.port\"]\n\"SrcIP\"\t[\"src_endpoint.ip\"]\n\"URL\"\t[\"http_request.url.url_string\"]\n\"UserAgent\"\t[\"http_request.user_agent\"]\n\"UserID\"\t[\"actor.user.uid\"]\n\"UserUID\"\t[\"user.uid\"]\n"
   __preserve = []
   # END parser-specific transformations
-  # Escape literal dots before flattening so dotted source keys cannot overwrite
-  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
-  # In compact JSON only an object key is followed by ':', so a source whose text
-  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
-  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
-  __escaped = object!(__copy.source)
-  __tilde = false
-  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
-      __escaped = map_keys(__escaped, recursive: true) -> |key| {
-          replace(replace(key, "~", "~0"), ".", "~1")
-      }
-      # Keys without a "~" decode to themselves, including the object keys inside
-      # an array that flatten leaves escaped; encode_json never escapes a "~".
-      __tilde = contains(encode_json(__escaped), "~")
-  }
-  __flat = flatten(__escaped)
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
   # target paths + "\n" per mapped source key (a raw newline never occurs in
   # compact JSON). A key is consumed when its value, or every element of a scalar
-  # array, is at one of its own targets.
+  # array, is at one of its own targets. Keys stay ESCAPED here and in __consumed:
+  # a literal dotted key ("a~1b") and the nested path ("a.b") are different
+  # fields, and mapping one never consumes the other.
   for_each(__flat) -> |key, value| {
-      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
       # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
       __kt = encode_json(key)
       if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
@@ -583,7 +596,6 @@ parser_vrl: |
   __names = {}
   if __distinct {
       __kept = filter(__flat) -> |key, value| {
-          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
           # A key is kept unless an explicit mapping or transformation consumed it.
           # Do not spill a copy of the raw body.
           value != __raw_body && !contains(__consumed, "," + encode_json(key))
@@ -617,13 +629,13 @@ parser_vrl: |
       # Slow path, in source key order: a name already taken gets the next free
       # _2, _3, ... suffix.
       for_each(__flat) -> |key, value| {
+          __token = "," + encode_json(key)
           key = replace(replace(key, "~1", "."), "~0", "~")
           if is_array(value) || is_object(value) {
               value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
                   replace(replace(inner, "~1", "."), "~0", "~")
               }, ["v"])
           }
-          __token = "," + encode_json(key)
           if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")

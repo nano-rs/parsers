@@ -145,6 +145,8 @@ def check_target(source, target):
     assert isinstance(target, str) and target and all(target.split('.')), f'{source}: target must be a dotted path'
     assert norm_path(target), f'{source}: target must name an attribute'
     assert target.split('.')[0] not in ('unmapped', 'raw_data'), f'{source}: target may not be under unmapped or raw_data'
+    # OCSF attribute names never hold a bracket; __repr spells paths raw.
+    assert not any(c in target for c in '()[]{}'), f'{source}: target may not contain a bracket'
 
 
 def mappings_of(config):
@@ -196,7 +198,7 @@ def transformations(config):
     lines = ['# ' + rule['source'] + ': ' + rule['reason'] for rule in rules]
     groups = grouped(rules, templates)
     if groups:
-        lines.append('for_each(flatten(__source_kv)) -> |key, value| {')
+        lines.append('for_each(__flat) -> |key, value| {')
         for body, keys in groups:
             regex = key_regex(keys)
             lines.append("    if match(key, r'(?x)")

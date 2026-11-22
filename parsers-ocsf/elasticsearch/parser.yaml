@@ -513,27 +513,6 @@ parser_vrl: |
       }
   }
   __consumed = ""
-  # BEGIN parser-specific transformations
-  # @timestamp: ISO 8601 event clock converted to event milliseconds.
-  # timestamp: ISO 8601 event clock converted to event milliseconds (the comma-decimal form is normalized by the parser and stays residual when the generic parse rejects it).
-  for_each(flatten(__source_kv)) -> |key, value| {
-      if match(key, r'(?x)
-      \A(?:
-        @timestamp
-      | timestamp
-      )\z') {
-          __value = value
-          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
-          if __clock_err == null {
-              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-              if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
-          }
-      }
-  }
-  # Declared source -> target mappings (field-coverage.yaml `mappings`).
-  __decl = "\n\"action\"\t[\"api.operation\"]\n\"audit_authentication_failure_reason\"\t[\"status_detail\"]\n\"audit_category\"\t[\"message\",\"metadata.event_code\"]\n\"audit_node_host_address\"\t[\"dst_endpoint.ip\"]\n\"audit_node_name\"\t[\"dst_endpoint.name\"]\n\"audit_request_attempted_user\"\t[\"user.name\"]\n\"audit_request_effective_user\"\t[\"user.name\"]\n\"audit_request_initiating_user\"\t[\"actor.user.name\"]\n\"audit_request_remote_address\"\t[\"src_endpoint.ip\"]\n\"audit_rest_request_method\"\t[\"http_request.http_method\"]\n\"audit_rest_request_path\"\t[\"http_request.url.path\"]\n\"audit_trace_indices\"\t[\"resources.name\"]\n\"audit_transport_action\"\t[\"api.operation\"]\n\"cluster.name\"\t[\"database.name\"]\n\"cluster.uuid\"\t[\"metadata.tenant_uid\"]\n\"component\"\t[\"metadata.loggers.name\"]\n\"elasticsearch.cluster.name\"\t[\"database.name\"]\n\"elasticsearch.cluster.uuid\"\t[\"metadata.tenant_uid\"]\n\"elasticsearch.node.name\"\t[\"dst_endpoint.name\"]\n\"elasticsearch.slowlog.id\"\t[\"actor.app_uid\"]\n\"elasticsearch.slowlog.message\"\t[\"message\"]\n\"elasticsearch.slowlog.search_type\"\t[\"query_info.name\"]\n\"elasticsearch.slowlog.source\"\t[\"query_info.query_string\"]\n\"elasticsearch.slowlog.took_millis\"\t[\"duration\"]\n\"error.message\"\t[\"status_detail\"]\n\"event.action\"\t[\"message\",\"metadata.event_code\"]\n\"id\"\t[\"actor.app_uid\"]\n\"indices\"\t[\"resources.name\"]\n\"level\"\t[\"metadata.log_level\"]\n\"log.level\"\t[\"metadata.log_level\"]\n\"log.logger\"\t[\"metadata.loggers.name\"]\n\"message\"\t[\"message\"]\n\"node.name\"\t[\"dst_endpoint.name\"]\n\"put.user.name\"\t[\"user.name\"]\n\"request.id\"\t[\"api.request.uid\"]\n\"request.method\"\t[\"http_request.http_method\"]\n\"rule\"\t[\"status_detail\"]\n\"search_type\"\t[\"query_info.name\"]\n\"source\"\t[\"query_info.query_string\"]\n\"took_millis\"\t[\"duration\"]\n\"trace.id\"\t[\"metadata.correlation_uid\"]\n\"url.path\"\t[\"http_request.url.path\"]\n\"url.query\"\t[\"http_request.url.query_string\"]\n\"user.name\"\t[\"actor.user.name\",\"user.name\"]\n\"user.realm\"\t[\"actor.user.domain\",\"user.domain\"]\n\"user.roles\"\t[\"actor.user.groups.name\"]\n\"user.run_as.name\"\t[\"user.name\"]\n\"user.run_as.realm\"\t[\"user.domain\"]\n"
-  __preserve = []
-  # END parser-specific transformations
   # Escape literal dots before flattening so dotted source keys cannot overwrite
   # nested paths. Decode for naming, and disambiguate collisions with suffixes.
   # In compact JSON only an object key is followed by ':', so a source whose text
@@ -550,12 +529,34 @@ parser_vrl: |
       __tilde = contains(encode_json(__escaped), "~")
   }
   __flat = flatten(__escaped)
+  # BEGIN parser-specific transformations
+  # @timestamp: ISO 8601 event clock converted to event milliseconds.
+  # timestamp: ISO 8601 event clock converted to event milliseconds (the comma-decimal form is normalized by the parser and stays residual when the generic parse rejects it).
+  for_each(__flat) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        @timestamp
+      | timestamp
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+  }
+  # Declared source -> target mappings (field-coverage.yaml `mappings`).
+  __decl = "\n\"action\"\t[\"api.operation\"]\n\"audit_authentication_failure_reason\"\t[\"status_detail\"]\n\"audit_category\"\t[\"message\",\"metadata.event_code\"]\n\"audit_node_host_address\"\t[\"dst_endpoint.ip\"]\n\"audit_node_name\"\t[\"dst_endpoint.name\"]\n\"audit_request_attempted_user\"\t[\"user.name\"]\n\"audit_request_effective_user\"\t[\"user.name\"]\n\"audit_request_initiating_user\"\t[\"actor.user.name\"]\n\"audit_request_remote_address\"\t[\"src_endpoint.ip\"]\n\"audit_rest_request_method\"\t[\"http_request.http_method\"]\n\"audit_rest_request_path\"\t[\"http_request.url.path\"]\n\"audit_trace_indices\"\t[\"resources.name\"]\n\"audit_transport_action\"\t[\"api.operation\"]\n\"cluster~1name\"\t[\"database.name\"]\n\"cluster~1uuid\"\t[\"metadata.tenant_uid\"]\n\"component\"\t[\"metadata.loggers.name\"]\n\"elasticsearch~1cluster~1name\"\t[\"database.name\"]\n\"elasticsearch~1cluster~1uuid\"\t[\"metadata.tenant_uid\"]\n\"elasticsearch~1node~1name\"\t[\"dst_endpoint.name\"]\n\"elasticsearch~1slowlog~1id\"\t[\"actor.app_uid\"]\n\"elasticsearch~1slowlog~1message\"\t[\"message\"]\n\"elasticsearch~1slowlog~1search_type\"\t[\"query_info.name\"]\n\"elasticsearch~1slowlog~1source\"\t[\"query_info.query_string\"]\n\"elasticsearch~1slowlog~1took_millis\"\t[\"duration\"]\n\"error~1message\"\t[\"status_detail\"]\n\"event~1action\"\t[\"message\",\"metadata.event_code\"]\n\"id\"\t[\"actor.app_uid\"]\n\"indices\"\t[\"resources.name\"]\n\"level\"\t[\"metadata.log_level\"]\n\"log~1level\"\t[\"metadata.log_level\"]\n\"log~1logger\"\t[\"metadata.loggers.name\"]\n\"message\"\t[\"message\"]\n\"node~1name\"\t[\"dst_endpoint.name\"]\n\"put.user.name\"\t[\"user.name\"]\n\"request~1id\"\t[\"api.request.uid\"]\n\"request~1method\"\t[\"http_request.http_method\"]\n\"rule\"\t[\"status_detail\"]\n\"search_type\"\t[\"query_info.name\"]\n\"source\"\t[\"query_info.query_string\"]\n\"took_millis\"\t[\"duration\"]\n\"trace~1id\"\t[\"metadata.correlation_uid\"]\n\"url~1path\"\t[\"http_request.url.path\"]\n\"url~1query\"\t[\"http_request.url.query_string\"]\n\"user~1name\"\t[\"actor.user.name\",\"user.name\"]\n\"user~1realm\"\t[\"actor.user.domain\",\"user.domain\"]\n\"user~1roles\"\t[\"actor.user.groups.name\"]\n\"user~1run_as~1name\"\t[\"user.name\"]\n\"user~1run_as~1realm\"\t[\"user.domain\"]\n"
+  __preserve = []
+  # END parser-specific transformations
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
   # target paths + "\n" per mapped source key (a raw newline never occurs in
   # compact JSON). A key is consumed when its value, or every element of a scalar
-  # array, is at one of its own targets.
+  # array, is at one of its own targets. Keys stay ESCAPED here and in __consumed:
+  # a literal dotted key ("a~1b") and the nested path ("a.b") are different
+  # fields, and mapping one never consumes the other.
   for_each(__flat) -> |key, value| {
-      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
       # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
       __kt = encode_json(key)
       if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
@@ -593,7 +594,6 @@ parser_vrl: |
   __names = {}
   if __distinct {
       __kept = filter(__flat) -> |key, value| {
-          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
           # A key is kept unless an explicit mapping or transformation consumed it.
           # Do not spill a copy of the raw body.
           value != __raw_body && !contains(__consumed, "," + encode_json(key))
@@ -627,13 +627,13 @@ parser_vrl: |
       # Slow path, in source key order: a name already taken gets the next free
       # _2, _3, ... suffix.
       for_each(__flat) -> |key, value| {
+          __token = "," + encode_json(key)
           key = replace(replace(key, "~1", "."), "~0", "~")
           if is_array(value) || is_object(value) {
               value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
                   replace(replace(inner, "~1", "."), "~0", "~")
               }, ["v"])
           }
-          __token = "," + encode_json(key)
           if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")

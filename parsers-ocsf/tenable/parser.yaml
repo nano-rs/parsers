@@ -479,6 +479,22 @@ parser_vrl: |
       }
   }
   __consumed = ""
+  # Escape literal dots before flattening so dotted source keys cannot overwrite
+  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
+  # In compact JSON only an object key is followed by ':', so a source whose text
+  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
+  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
+  __escaped = object!(__copy.source)
+  __tilde = false
+  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
+      __escaped = map_keys(__escaped, recursive: true) -> |key| {
+          replace(replace(key, "~", "~0"), ".", "~1")
+      }
+      # Keys without a "~" decode to themselves, including the object keys inside
+      # an array that flatten leaves escaped; encode_json never escapes a "~".
+      __tilde = contains(encode_json(__escaped), "~")
+  }
+  __flat = flatten(__escaped)
   # BEGIN parser-specific transformations
   # first_found: Successful ISO timestamp conversion to the emitted millisecond clock.
   # last_found: Successful ISO timestamp conversion to the emitted millisecond clock.
@@ -505,7 +521,7 @@ parser_vrl: |
   # asset.ipv6: Parser lowercases the IPv6 address; consume only when the normalized value is emitted.
   # asset.ipv6: Parser lowercases the IPv6 address; consume only when the normalized value is emitted.
   # asset.ipv6: Parser lowercases the IPv6 address; consume only when the normalized value is emitted.
-  for_each(flatten(__source_kv)) -> |key, value| {
+  for_each(__flat) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
         first_found
@@ -699,28 +715,13 @@ parser_vrl: |
   __decl = "\n\"asset.fqdn\"\t[\"device.hostname\",\"observables.value\",\"resource.hostname\",\"resource.name\",\"resources.hostname\",\"resources.name\"]\n\"asset.ipv4\"\t[\"device.ip\",\"observables.value\",\"resource.ip\",\"resources.ip\"]\n\"asset.ipv6\"\t[\"device.ip\",\"observables.value\",\"resource.ip\",\"resources.ip\"]\n\"asset.mac_address\"\t[\"device.mac\"]\n\"asset.netbios_name\"\t[\"device.name\"]\n\"asset.operating_system\"\t[\"device.os.name\"]\n\"asset.uuid\"\t[\"device.uid\",\"resource.uid\",\"resources.uid\"]\n\"count\"\t[\"count\"]\n\"cve\"\t[\"observables.value\",\"vulnerabilities.cve.uid\"]\n\"description\"\t[\"vulnerabilities.desc\"]\n\"dnsName\"\t[\"device.hostname\",\"observables.value\",\"resource.hostname\",\"resource.name\",\"resources.hostname\",\"resources.name\"]\n\"family.name\"\t[\"finding_info.analytic.category\",\"vulnerabilities.category\"]\n\"finding_id\"\t[\"finding_info.uid\",\"metadata.original_event_uid\"]\n\"hostname\"\t[\"device.ip\",\"observables.value\",\"resource.ip\",\"resource.name\",\"resources.ip\",\"resources.name\"]\n\"ip\"\t[\"device.ip\",\"observables.value\",\"resource.ip\",\"resource.name\",\"resources.ip\",\"resources.name\"]\n\"macAddress\"\t[\"device.mac\"]\n\"netbiosName\"\t[\"device.name\",\"resource.name\",\"resources.name\"]\n\"operatingSystem\"\t[\"device.os.name\"]\n\"plugin.cve\"\t[\"observables.value\",\"vulnerabilities.cve.uid\"]\n\"plugin.description\"\t[\"vulnerabilities.desc\"]\n\"plugin.exploit_available\"\t[\"vulnerabilities.is_exploit_available\"]\n\"plugin.family\"\t[\"finding_info.analytic.category\",\"vulnerabilities.category\"]\n\"plugin.has_patch\"\t[\"vulnerabilities.is_fix_available\"]\n\"plugin.id\"\t[\"finding_info.analytic.uid\"]\n\"plugin.name\"\t[\"finding_info.analytic.name\",\"finding_info.title\",\"message\",\"vulnerabilities.title\"]\n\"plugin.risk_factor\"\t[\"vulnerabilities.severity\"]\n\"plugin.see_also\"\t[\"vulnerabilities.references\"]\n\"plugin.solution\"\t[\"vulnerabilities.remediation.desc\"]\n\"plugin.synopsis\"\t[\"finding_info.desc\"]\n\"plugin_family\"\t[\"finding_info.analytic.category\",\"vulnerabilities.category\"]\n\"plugin_id\"\t[\"finding_info.analytic.uid\",\"vulnerabilities.advisory.uid\"]\n\"plugin_name\"\t[\"finding_info.analytic.name\",\"finding_info.title\",\"message\",\"vulnerabilities.advisory.title\",\"vulnerabilities.title\"]\n\"pluginID\"\t[\"finding_info.analytic.uid\",\"vulnerabilities.advisory.uid\"]\n\"pluginName\"\t[\"finding_info.analytic.name\",\"finding_info.title\",\"message\",\"vulnerabilities.advisory.title\",\"vulnerabilities.title\"]\n\"port\"\t[\"observables.value\",\"resource.data.port\",\"resources.data.port\"]\n\"port.port\"\t[\"observables.value\",\"resource.data.port\",\"resources.data.port\"]\n\"port.protocol\"\t[\"resource.data.protocol\",\"resources.data.protocol\"]\n\"port.service\"\t[\"resource.data.service\",\"resources.data.service\"]\n\"protocol\"\t[\"resource.data.protocol\",\"resources.data.protocol\"]\n\"riskFactor\"\t[\"vulnerabilities.severity\"]\n\"seeAlso\"\t[\"vulnerabilities.references\"]\n\"solution\"\t[\"vulnerabilities.remediation.desc\"]\n\"synopsis\"\t[\"finding_info.desc\"]\n"
   __preserve = []
   # END parser-specific transformations
-  # Escape literal dots before flattening so dotted source keys cannot overwrite
-  # nested paths. Decode for naming, and disambiguate collisions with suffixes.
-  # In compact JSON only an object key is followed by ':', so a source whose text
-  # has no '.' or '~' followed by the rest of a string and then ':' has no key to
-  # escape. ('.' and '~' are never the escaped half of a JSON escape.)
-  __escaped = object!(__copy.source)
-  __tilde = false
-  if match(encode_json(__escaped), r'[.~](?:[^"\\]|\\.)*":') {
-      __escaped = map_keys(__escaped, recursive: true) -> |key| {
-          replace(replace(key, "~", "~0"), ".", "~1")
-      }
-      # Keys without a "~" decode to themselves, including the object keys inside
-      # an array that flatten leaves escaped; encode_json never escapes a "~".
-      __tilde = contains(encode_json(__escaped), "~")
-  }
-  __flat = flatten(__escaped)
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
   # target paths + "\n" per mapped source key (a raw newline never occurs in
   # compact JSON). A key is consumed when its value, or every element of a scalar
-  # array, is at one of its own targets.
+  # array, is at one of its own targets. Keys stay ESCAPED here and in __consumed:
+  # a literal dotted key ("a~1b") and the nested path ("a.b") are different
+  # fields, and mapping one never consumes the other.
   for_each(__flat) -> |key, value| {
-      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
       # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
       __kt = encode_json(key)
       if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
@@ -758,7 +759,6 @@ parser_vrl: |
   __names = {}
   if __distinct {
       __kept = filter(__flat) -> |key, value| {
-          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
           # A key is kept unless an explicit mapping or transformation consumed it.
           # Do not spill a copy of the raw body.
           value != __raw_body && !contains(__consumed, "," + encode_json(key))
@@ -792,13 +792,13 @@ parser_vrl: |
       # Slow path, in source key order: a name already taken gets the next free
       # _2, _3, ... suffix.
       for_each(__flat) -> |key, value| {
+          __token = "," + encode_json(key)
           key = replace(replace(key, "~1", "."), "~0", "~")
           if is_array(value) || is_object(value) {
               value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
                   replace(replace(inner, "~1", "."), "~0", "~")
               }, ["v"])
           }
-          __token = "," + encode_json(key)
           if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")

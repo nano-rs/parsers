@@ -356,26 +356,6 @@ parser_vrl: |
       }
   }
   __consumed = ""
-  # BEGIN parser-specific transformations
-  # priority: Falco rule priority normalized to the OCSF severity; consume only when the expected ID is emitted.
-  for_each(flatten(__source_kv)) -> |key, value| {
-      if match(key, r'(?x)
-      \A(?:
-        priority
-      )\z') {
-          __value = value
-          if __value != null {
-              __expected = get!({"emergency": 5, "alert": 5, "critical": 5, "error": 4, "warning": 3, "notice": 2, "informational": 1, "info": 1, "debug": 1}, [downcase(to_string(__value) ?? "")])
-              if __expected != null {
-                  if contains(__repr, "," + "\"severity_id\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
-              }
-          }
-      }
-  }
-  # Declared source -> target mappings (field-coverage.yaml `mappings`).
-  __decl = "\n\"hostname\"\t[\"device.hostname\"]\n\"output\"\t[\"message\"]\n\"output_fields.container.id\"\t[\"evidences.container.uid\"]\n\"output_fields.container.image.repository\"\t[\"evidences.container.image.name\",\"evidences.container.image.uid\"]\n\"output_fields.container.image.tag\"\t[\"evidences.container.image.tag\",\"evidences.container.tag\"]\n\"output_fields.container.name\"\t[\"evidences.container.name\"]\n\"output_fields.evt.type\"\t[\"evidences.name\"]\n\"output_fields.fd.name\"\t[\"evidences.file.path\"]\n\"output_fields.k8s.ns.name\"\t[\"resources.namespace\"]\n\"output_fields.k8s.pod.name\"\t[\"resources.name\"]\n\"output_fields.ka.target.name\"\t[\"resources.name\"]\n\"output_fields.ka.target.namespace\"\t[\"resources.namespace\"]\n\"output_fields.ka.target.resource\"\t[\"resources.type\"]\n\"output_fields.ka.user.name\"\t[\"actor.user.name\",\"evidences.actor.user.name\"]\n\"output_fields.proc.cmdline\"\t[\"actor.process.cmd_line\",\"evidences.process.cmd_line\"]\n\"output_fields.proc.exepath\"\t[\"actor.process.file.path\",\"evidences.process.file.path\"]\n\"output_fields.proc.name\"\t[\"actor.process.name\",\"evidences.process.name\"]\n\"output_fields.proc.pcmdline\"\t[\"actor.process.parent_process.cmd_line\",\"evidences.process.parent_process.cmd_line\"]\n\"output_fields.proc.pid\"\t[\"actor.process.pid\",\"evidences.process.pid\"]\n\"output_fields.proc.pname\"\t[\"actor.process.parent_process.name\",\"evidences.process.parent_process.name\"]\n\"output_fields.proc.ppid\"\t[\"actor.process.parent_process.pid\",\"evidences.process.parent_process.pid\"]\n\"output_fields.user.name\"\t[\"actor.process.user.name\",\"actor.user.name\",\"evidences.process.user.name\"]\n\"output_fields.user.uid\"\t[\"actor.process.user.uid\",\"actor.user.uid\",\"evidences.process.user.uid\"]\n\"rule\"\t[\"finding_info.analytic.name\",\"finding_info.title\",\"message\"]\n\"source\"\t[\"finding_info.data_sources\"]\n\"tags\"\t[\"metadata.labels\"]\n\"uuid\"\t[\"finding_info.uid\",\"metadata.original_event_uid\",\"metadata.uid\"]\n"
-  __preserve = []
-  # END parser-specific transformations
   # Escape literal dots before flattening so dotted source keys cannot overwrite
   # nested paths. Decode for naming, and disambiguate collisions with suffixes.
   # In compact JSON only an object key is followed by ':', so a source whose text
@@ -392,12 +372,45 @@ parser_vrl: |
       __tilde = contains(encode_json(__escaped), "~")
   }
   __flat = flatten(__escaped)
+  # BEGIN parser-specific transformations
+  # time: Successful RFC 3339 timestamp conversion to the selected event clock in milliseconds.
+  # priority: Falco rule priority normalized to the OCSF severity; consume only when the expected ID is emitted.
+  for_each(__flat) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        time
+      )\z') {
+          __value = value
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        priority
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"emergency": 5, "alert": 5, "critical": 5, "error": 4, "warning": 3, "notice": 2, "informational": 1, "info": 1, "debug": 1}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if contains(__repr, "," + "\"severity_id\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
+  }
+  # Declared source -> target mappings (field-coverage.yaml `mappings`).
+  __decl = "\n\"hostname\"\t[\"device.hostname\"]\n\"output\"\t[\"message\"]\n\"output_fields.container~1id\"\t[\"evidences.container.uid\"]\n\"output_fields.container~1image~1repository\"\t[\"evidences.container.image.name\",\"evidences.container.image.uid\"]\n\"output_fields.container~1image~1tag\"\t[\"evidences.container.image.tag\",\"evidences.container.tag\"]\n\"output_fields.container~1name\"\t[\"evidences.container.name\"]\n\"output_fields.evt~1type\"\t[\"evidences.name\"]\n\"output_fields.fd~1name\"\t[\"evidences.file.path\"]\n\"output_fields.k8s~1ns~1name\"\t[\"resources.namespace\"]\n\"output_fields.k8s~1pod~1name\"\t[\"resources.name\"]\n\"output_fields.ka~1target~1name\"\t[\"resources.name\"]\n\"output_fields.ka~1target~1namespace\"\t[\"resources.namespace\"]\n\"output_fields.ka~1target~1resource\"\t[\"resources.type\"]\n\"output_fields.ka~1user~1name\"\t[\"actor.user.name\",\"evidences.actor.user.name\"]\n\"output_fields.proc~1cmdline\"\t[\"actor.process.cmd_line\",\"evidences.process.cmd_line\"]\n\"output_fields.proc~1exepath\"\t[\"actor.process.file.path\",\"evidences.process.file.path\"]\n\"output_fields.proc~1name\"\t[\"actor.process.name\",\"evidences.process.name\"]\n\"output_fields.proc~1pcmdline\"\t[\"actor.process.parent_process.cmd_line\",\"evidences.process.parent_process.cmd_line\"]\n\"output_fields.proc~1pid\"\t[\"actor.process.pid\",\"evidences.process.pid\"]\n\"output_fields.proc~1pname\"\t[\"actor.process.parent_process.name\",\"evidences.process.parent_process.name\"]\n\"output_fields.proc~1ppid\"\t[\"actor.process.parent_process.pid\",\"evidences.process.parent_process.pid\"]\n\"output_fields.user~1name\"\t[\"actor.process.user.name\",\"actor.user.name\",\"evidences.process.user.name\"]\n\"output_fields.user~1uid\"\t[\"actor.process.user.uid\",\"actor.user.uid\",\"evidences.process.user.uid\"]\n\"rule\"\t[\"finding_info.analytic.name\",\"finding_info.title\",\"message\"]\n\"source\"\t[\"finding_info.data_sources\"]\n\"tags\"\t[\"metadata.labels\"]\n\"uuid\"\t[\"finding_info.uid\",\"metadata.original_event_uid\",\"metadata.uid\"]\n"
+  __preserve = []
+  # END parser-specific transformations
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
   # target paths + "\n" per mapped source key (a raw newline never occurs in
   # compact JSON). A key is consumed when its value, or every element of a scalar
-  # array, is at one of its own targets.
+  # array, is at one of its own targets. Keys stay ESCAPED here and in __consumed:
+  # a literal dotted key ("a~1b") and the nested path ("a.b") are different
+  # fields, and mapping one never consumes the other.
   for_each(__flat) -> |key, value| {
-      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
       # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
       __kt = encode_json(key)
       if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
@@ -435,7 +448,6 @@ parser_vrl: |
   __names = {}
   if __distinct {
       __kept = filter(__flat) -> |key, value| {
-          if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
           # A key is kept unless an explicit mapping or transformation consumed it.
           # Do not spill a copy of the raw body.
           value != __raw_body && !contains(__consumed, "," + encode_json(key))
@@ -469,13 +481,13 @@ parser_vrl: |
       # Slow path, in source key order: a name already taken gets the next free
       # _2, _3, ... suffix.
       for_each(__flat) -> |key, value| {
+          __token = "," + encode_json(key)
           key = replace(replace(key, "~1", "."), "~0", "~")
           if is_array(value) || is_object(value) {
               value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
                   replace(replace(inner, "~1", "."), "~0", "~")
               }, ["v"])
           }
-          __token = "," + encode_json(key)
           if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")
