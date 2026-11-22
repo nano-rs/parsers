@@ -1,4 +1,7 @@
 source: json
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
 transforms:
 - source: ts
   kind: scale
@@ -49,17 +52,10 @@ transforms:
     '52392': TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
     '52393': TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
   reason: Go crypto/tls numeric cipher suite (IANA value) decoded to its IANA name.
-mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
-  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
-  else spills to unmapped.
 mappings:
   bytes_read:
   - http_request.length
   - traffic.bytes_out
-  err_id:
-  - metadata.correlation_uid
-  error:
-  - status_detail
   level:
   - metadata.log_level
   logger:
@@ -69,10 +65,10 @@ mappings:
   - message
   request.client_ip:
   - src_endpoint.ip
-  request.headers.Referer:
-  - http_request.referrer
   request.headers.User-Agent:
   - http_request.user_agent
+  request.host:
+  - http_request.url.hostname
   request.method:
   - http_request.http_method
   request.proto:
@@ -81,6 +77,8 @@ mappings:
   - src_endpoint.port
   request.tls.server_name:
   - tls.sni
+  request.uri:
+  - http_request.url.path
   resp_headers.Content-Type:
   - http_response.content_type
   size:
@@ -90,3 +88,9 @@ mappings:
   - http_response.code
   user_id:
   - actor.user.name
+  request.headers.Referer:
+  - http_request.referrer
+  err_id:
+  - metadata.correlation_uid
+  error:
+  - status_detail
