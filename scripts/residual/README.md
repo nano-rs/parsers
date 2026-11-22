@@ -100,7 +100,10 @@ The flat dotted-key requirement applies to the new source residuals.
 
 Configured text probes inject unseen fields and password values through KV,
 CEF, XML, rendered Windows text, and multi-element syslog structured data. They
-assert successful capture and unaltered preservation. Probes are temporary
+assert successful capture and unaltered preservation: the probe's password
+value must reach the parsed source exactly, and check() then requires it
+mapped or spilled with that value. For every sample, an emitted `raw_data`
+must equal the original input byte for byte. Probes are temporary
 in-memory inputs; supplied samples remain unchanged.
 
 When adding a mapped field, update its consumed candidate and any transformation

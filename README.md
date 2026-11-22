@@ -109,6 +109,7 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Auth0](parsers-ocsf/auth0) | `auth0` | Okta | JSON | 20+ event types: login, signup, MFA, token exchange, management API |
 | [1Password](parsers-ocsf/onepassword) | `onepassword` | 1Password | JSON | Sign-in attempts, item usage, vault access events |
 | [CyberArk PAM](parsers-ocsf/cyberark) | `cyberark` | CyberArk | CEF syslog | Vault audit, PSM sessions, privileged access events |
+| [PingFederate](parsers-ocsf/pingfederate) | `pingfederate` | Ping Identity | Pipe-delimited audit.log (documented 15-field pattern) / CEF | Security audit log: SSO, SLO, OAuth, AUTHN_ATTEMPT and session events as Authentication with protocol, partner connection and tracking id |
 | [Keycloak](parsers-ocsf/keycloak) | `keycloak` | Keycloak | JSON / jboss-logging text | User events (LOGIN, LOGIN_ERROR, CODE_TO_TOKEN, ...) and admin events (users, roles, groups, clients) from the REST API, event listeners or the server log |
 | [Netskope](parsers-ocsf/netskope) | `netskope` | Netskope | JSON | CASB/SSE: app activity, alerts, DLP, network events |
 | [F5 BIG-IP ASM](parsers-ocsf/f5_waf) | `f5_waf` | F5 | JSON | Web application firewall: attacks, violations, security events |
