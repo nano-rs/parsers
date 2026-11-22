@@ -32,14 +32,17 @@ description: >
   PEM private key anywhere in the line, every non-HMAC client token, wrap
   token and accessor, every non-HMAC string at any depth of request.data,
   response.data, response.wrap_info, response.secret and every header but a
-  short allowlist (user-agent and the like), every auth / request / response
-  key outside the known envelope, and credential-named auth.metadata values
-  are replaced with "<redacted>" before mapping, and raw_data keeps the
+  short allowlist (user-agent and the like), every key outside the known
+  Vault envelope (top level and inside auth / request / response), nested or
+  credential-named auth.metadata values, the request_uri query string and
+  credentials in the syslog header are replaced with "<redacted>" before
+  mapping (only hmac-sha256:<64 hex> counts as HMAC'd), and raw_data keeps the
   scrubbed record (re-encoded only when something was scrubbed). Numbers,
   booleans and RFC 3339 timestamps are kept, as Vault never HMACs them.
   Anything else (including a truncated entry) falls back to Base Event with
-  the raw record kept only after its JSON string values outside an allowlist
-  and any key=value credential are redacted.
+  nothing spilled and the raw record kept only after its JSON string values
+  outside an envelope allowlist (all of them once a payload object opens) and
+  any key=value credential are redacted.
 match_values:
   - hashicorp_vault
 category: security
@@ -68,8 +71,10 @@ parser_vrl: |
   #      response.wrap_info except its timing fields, every header except a
   #      short allowlist such as user-agent) and in any auth / request /
   #      response key that is not on the known-envelope allowlist;
-  #   4. in auth.metadata (which Vault itself logs in clear) replaces any value
-  #      whose key names a credential;
+  #   4. wipes every top-level key outside the entry envelope the same way;
+  #   5. in auth.metadata (which Vault itself logs in clear) wipes any nested
+  #      value and any value whose key names a credential, and drops the query
+  #      string of request.request_uri;
   # and an unparsable or truncated line (the Base Event fallback) keeps only
   # allowlisted JSON string values and redacts key=value credentials, so a
   # line that fails to parse is never kept with clear secrets.
@@ -80,9 +85,17 @@ parser_vrl: |
   raw_log = replace(raw_log, r'(?P<pre>^|[^A-Za-z0-9])b\.[A-Za-z0-9_\-]{60,}', "${pre}<redacted>")
   raw_log = replace(raw_log, r'eyJ[A-Za-z0-9_\-=]{6,}\.(?:eyJ[A-Za-z0-9_\-=]{6,}\.[A-Za-z0-9_\-=]*|[A-Za-z0-9_\-=]*\.[A-Za-z0-9_\-=]+\.[A-Za-z0-9_\-=]+\.[A-Za-z0-9_\-=]+)', "<redacted>")
   raw_log = replace(raw_log, r'(?i)\b(?P<scheme>basic|bearer|negotiate)\s+[A-Za-z0-9+/=._~\-]{8,}', "${scheme} <redacted>")
-  raw_log = replace(raw_log, r'(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)', "<redacted>")
+  raw_log = replace(raw_log, r'(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|$)', "<redacted>")
   __source_kv = {}
   ip_re = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]{3,}$'
+  # Vault's audit HMAC is exactly hmac-sha256:<64 lowercase hex>; nothing else
+  # counts as hashed, so a secret that merely starts with "hmac-" is scrubbed.
+  hmac_re = r'^hmac-sha256:[0-9a-f]{64}$'
+  # key=value / key: value / "key":"value" credentials in free text, and an
+  # Authorization header whose scheme (Basic, Bearer, Token, Digest,
+  # AWS4-HMAC-SHA256, ...) is followed by the credential.
+  txt_auth = r'(?i)(?P<k>(?:proxy-)?authorization"?)(?P<sep>\s*[=:]\s*)(?:"(?:[^"\\]|\\.)*"|\x27[^\x27]*\x27|[A-Za-z0-9_\-]+\s+[^\s,;&"\x27]+|[^\s,;&"\x27]+)'
+  txt_cred = r'(?i)(?P<k>"?[A-Za-z0-9_.\-]*(?:pass|secret|token|api_?key|private_?key|accessor|authoriz|credential|signature|jwt|otp|cookie)[A-Za-z0-9_.\-]*"?)(?P<sep>\s*[=:]\s*)(?:"(?:[^"\\]|\\.)*(?:"|$)|\x27[^\x27]*(?:\x27|$)|[^\s,;&"\x27]+)'
 
   # A syslog audit device prefixes the JSON with a syslog header, which may
   # itself hold a brace (RFC 5424 structured data), so the JSON starts at the
@@ -93,6 +106,9 @@ parser_vrl: |
       jm, jerr = parse_regex(body, r'(?s)^(?P<header>.*?)(?P<json>\x7B\s*"(?:time|type|auth|request|response|error|forwarded_from)"\s*:.*)$')
       if jerr == null { body = string!(jm.json); header = string!(jm.header) }
   }
+  # Structured data in the header can carry credentials too.
+  header_in = header
+  header = replace(replace(header, txt_auth, "${k}${sep}<redacted>"), txt_cred, "${k}${sep}<redacted>")
   parsed, err = parse_json(body)
   e = object(parsed) ?? {}
   e_in = e
@@ -101,12 +117,19 @@ parser_vrl: |
   # Token and accessor fields: only an HMAC'd value is kept.
   for_each([["auth", "client_token"], ["auth", "accessor"], ["request", "client_token"], ["request", "client_token_accessor"], ["response", "auth", "client_token"], ["response", "auth", "accessor"], ["response", "auth", "accessor_token"]]) -> |_i, tp| {
       tv = get(e, array!(tp)) ?? null
-      if tv != null && tv != "" && !starts_with(to_string(tv) ?? "", "hmac-") {
+      if tv != null && tv != "" && !match(to_string(tv) ?? "", hmac_re) {
           e = set(e, array!(tp), "<redacted>") ?? e
       }
   }
   # Paths whose every non-HMAC string, at any depth, is replaced.
   wipe = [["request", "data"], ["response", "data"]]
+  # Top level: only the Vault entry envelope is kept; any other key, and an
+  # auth / request / response that is not an object, is wiped.
+  for_each(e) -> |k, v| {
+      if !match(k, r'^(?:time|type|auth|request|response|error|forwarded_from)$') || (match(k, r'^(?:auth|request|response)$') && !is_object(v)) {
+          wipe = push(wipe, [k])
+      }
+  }
   auth_keep = r'^(?:display_name|entity_id|entity_created|policies|token_policies|identity_policies|external_namespace_policies|no_default_policy|policy_results|token_type|token_ttl|token_issue_time|remaining_uses|num_uses|orphan|renewable|lease_duration|explicit_max_ttl|period|mfa_requirement|client_token|accessor|accessor_token|metadata)$'
   meta_secret = r'pass|secret|token|jwt|credential|private|key|signature|otp|cookie|bearer|authoriz|code'
   for_each([["auth"], ["response", "auth"]]) -> |_i, ap| {
@@ -116,8 +139,11 @@ parser_vrl: |
               if !match(k, auth_keep) {
                   wipe = push(wipe, append(array!(ap), [k]))
               } else if k == "metadata" && is_object(v) {
+                  # Flat string metadata (username, role, ...) is identity context
+                  # Vault logs in clear; a nested value, or a credential-named key,
+                  # is wiped.
                   for_each(object!(v)) -> |mk, mv| {
-                      if match(downcase(mk), meta_secret) && mv != null && mv != "" && !starts_with(to_string(mv) ?? "", "hmac-") {
+                      if is_object(mv) || is_array(mv) || (match(downcase(mk), meta_secret) && mv != null && mv != "" && !match(to_string(mv) ?? "", hmac_re)) {
                           wipe = push(wipe, append(array!(ap), ["metadata", mk]))
                       }
                   }
@@ -141,6 +167,13 @@ parser_vrl: |
           if !match(downcase(hk), hdr_keep) { wipe = push(wipe, [side, "headers", hk]) }
       }
   }
+  # The request URI's query string (an OIDC callback code, ?token=...) is never kept.
+  ruri = get(e, ["request", "request_uri"]) ?? null
+  if is_string(ruri) && contains(string!(ruri), "?") {
+      e = set(e, ["request", "request_uri"], replace(string!(ruri), r'\?.*$', "?<redacted>")) ?? e
+  } else if ruri != null && !is_string(ruri) {
+      wipe = push(wipe, ["request", "request_uri"])
+  }
   for_each(object(get(e, ["response", "wrap_info"]) ?? {}) ?? {}) -> |k, _v| {
       if !match(k, r'^(?:ttl|creation_time|creation_path|format|seal_wrap)$') { wipe = push(wipe, ["response", "wrap_info", k]) }
   }
@@ -150,7 +183,7 @@ parser_vrl: |
   # Kept inside a wiped region: an HMAC'd value, an empty string, and a bare
   # RFC 3339 timestamp (Vault leaves expire_time / issue_time unhashed; a
   # timestamp cannot carry a credential).
-  keep_val = r'^(?:hmac-|$|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$)'
+  keep_val = r'^(?:hmac-sha256:[0-9a-f]{64}$|$|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$)'
   for_each(wipe) -> |_i, wp| {
       d = get(e, array!(wp)) ?? null
       if is_object(d) {
@@ -166,7 +199,7 @@ parser_vrl: |
       }
       if d != null { e = set(e, array!(wp), d) ?? e }
   }
-  scrubbed = raw_log != raw_in || encode_json(e) != encode_json(e_in)
+  scrubbed = raw_log != raw_in || header != header_in || encode_json(e) != encode_json(e_in)
   if scrubbed && is_object(parsed) { raw_log = header + encode_json(e) }
   __raw_body = raw_log
   __source_kv = e
@@ -176,29 +209,35 @@ parser_vrl: |
   req_id = to_string(req.id) ?? ""
 
   if err != null || !is_object(parsed) || length(req) == 0 || (entry_type != "request" && entry_type != "response") {
-      # Fallback scrub, fail closed: a truncated or unrecognized record keeps a
-      # JSON string value only under an allowlisted key (HMAC'd values and
-      # empty strings are kept too), and key=value / key: value credentials in
-      # any text outside the JSON are redacted.
-      fb_keep = r'^"(?:time|type|path|operation|display_name|entity_id|mount_type|mount_point|mount_class|mount_accessor|mount_running_version|remote_address|id|error|policies|token_policies|identity_policies|token_type|token_issue_time|user-agent|username|email|role|name|namespace_id|namespace_path|creation_time|creation_path)"\s*:$'
-      fb_text = r'(?i)(?P<k>[A-Za-z0-9_.\-]*(?:pass|secret|token|api_?key|private_?key|accessor|authoriz|credential|jwt|otp|cookie)[A-Za-z0-9_.\-]*)(?P<sep>\s*[=:]\s*)[^\s,;&]+'
-      fm, fmerr = parse_regex(raw_log, r'(?s)^(?P<text>.*?)(?P<json>\x7B\s*".*)$')
+      # Fallback, fail closed. Nothing is spilled: an entry the parser does
+      # not recognize is kept only as the scrubbed raw_data.
+      __source_kv = {}
+      # In the JSON part a string value is kept only under an envelope key that
+      # cannot hold a payload, and only until the first payload object (data,
+      # secret, wrap_info, headers, metadata) opens: from there on every value
+      # is redacted. HMAC'd values and empty strings are kept. Free text
+      # outside the JSON has key=value credentials redacted. A truncated line
+      # that starts mid-object is treated as JSON from its first "key": on.
+      fb_keep = r'^"(?:time|type|operation|display_name|entity_id|mount_type|mount_point|mount_class|mount_accessor|mount_running_version|remote_address|policies|token_policies|identity_policies|token_type|token_issue_time|user-agent|namespace_id|namespace_path|creation_time|creation_path)"\s*:$'
+      fm, fmerr = parse_regex(raw_log, r'(?s)^(?P<text>.*?)(?P<json>(?:\x7B\s*"|"(?:[^"\\]|\\.)*"\s*:).*)$')
       fb_head = raw_log
       fb_json = ""
       if fmerr == null { fb_head = string!(fm.text); fb_json = string!(fm.json) }
       last_key = ""
+      in_payload = false
       fb_json = replace_with(fb_json, r'"(?:[^"\\]|\\.)*(?:"\s*:|"|$)') -> |m| {
           t = string!(m.string)
           if ends_with(t, ":") {
               last_key = t
+              if match(t, r'^"(?:data|secret|wrap_info|headers|metadata)"\s*:$') { in_payload = true }
               t
-          } else if starts_with(t, "\"hmac-") || t == "\"\"" || t == "\"<redacted>\"" || match(last_key, fb_keep) {
+          } else if match(t, r'^"hmac-sha256:[0-9a-f]{64}"$') || t == "\"\"" || t == "\"<redacted>\"" || (!in_payload && match(last_key, fb_keep)) {
               t
           } else {
               "\"<redacted>\""
           }
       }
-      raw_log = replace(fb_head, fb_text, "${k}${sep}<redacted>") + fb_json
+      raw_log = replace(replace(fb_head, txt_auth, "${k}${sep}<redacted>"), txt_cred, "${k}${sep}<redacted>") + fb_json
       . = {
           "class_uid": 0,
           "class_name": "Base Event",
@@ -282,9 +321,9 @@ parser_vrl: |
       if display != "" { user.name = display }
       if entity != "" { user.uid = entity }
       uname_meta = to_string(get(principal, ["metadata", "username"]) ?? "") ?? ""
-      if uname_meta != "" && !starts_with(uname_meta, "hmac-") { user.display_name = uname_meta }
+      if uname_meta != "" && !starts_with(uname_meta, "hmac-sha256:") { user.display_name = uname_meta }
       umail = to_string(get(principal, ["metadata", "email"]) ?? "") ?? ""
-      if umail != "" && !starts_with(umail, "hmac-") { user.email_addr = umail }
+      if umail != "" && !starts_with(umail, "hmac-sha256:") { user.email_addr = umail }
       if is_login && !exists(user.name) {
           # The login path names the user for userpass / ldap / okta / radius.
           lm, lerr = parse_regex(rel_path, r'(?:^|/)auth/.+/login/(?P<name>[^/]+)$')
@@ -295,11 +334,11 @@ parser_vrl: |
       session = {}
       acc = to_string(principal.accessor) ?? ""
       # Only an HMAC'd accessor is ever a column; a clear one was redacted above.
-      if starts_with(acc, "hmac-") { session.uid = acc }
+      if match(acc, hmac_re) { session.uid = acc }
       ctok = to_string(principal.client_token) ?? ""
       # Only a hashed token is ever copied into a column; with log_raw the
       # value would be a live token, so it is left to the redacted spill.
-      if starts_with(ctok, "hmac-") { session.credential_uid = ctok }
+      if match(ctok, hmac_re) { session.credential_uid = ctok }
       tissued = to_string(principal.token_issue_time) ?? ""
       if tissued != "" {
           it, iterr = parse_timestamp(tissued, "%+")
@@ -844,9 +883,8 @@ parser_vrl: |
 #   vault_response_kv_update_error_all_fields.json: Elastic integrations
 #     hashicorp_vault every-field fixture
 #     https://github.com/elastic/integrations/blob/main/packages/hashicorp_vault/data_stream/audit/_dev/test/pipeline/test-faked-all-fields.log
-#     behind an RFC 5424 syslog device header; its accessors are in clear
-#     (hmac_accessor=false) and its custom headers are not allowlisted, so
-#     they come out as "<redacted>"
+#     its accessors are in clear (hmac_accessor=false) and its custom
+#     headers are not allowlisted, so they come out as "<redacted>"
 #   vault_response_userpass_login_success.json,
 #   vault_response_userpass_login_failed.json, vault_request_approle_login.json:
 #     login entries built from the documented schema (auth / request /
@@ -854,15 +892,20 @@ parser_vrl: |
 #     https://github.com/hashicorp/web-unified-docs/blob/main/content/vault/v2.x/content/docs/audit/schema.mdx
 #     https://developer.hashicorp.com/vault/api-docs/auth/userpass#login
 #   vault_lograw_token_lookup_self.json, vault_lograw_jwt_login.json,
-#   vault_lograw_userpass_password.json: the same entries as a syslog audit
-#     device with log_raw=true writes them (live-looking but fake hvs. / s.
-#     tokens, a JWT and a plaintext password), built from the schema above and
+#   vault_lograw_userpass_password.json: the same entries as an audit device
+#     with log_raw=true writes them (live-looking but fake hvs. / s. tokens, a
+#     JWT and a plaintext password), built from the schema above and
 #     https://developer.hashicorp.com/vault/docs/audit#sensitive-information;
 #     every credential must come out as "<redacted>"
 #     (scripts/test_vault_token_redaction.py asserts none survives anywhere)
 #   vault_hcp_namespace_userpass_login.json: an HCP Vault / Enterprise child
 #     namespace login, whose request.path carries the namespace prefix
 #     https://developer.hashicorp.com/vault/docs/enterprise/namespaces
+#   vault_syslog_rfc5424_userpass_login_success.json,
+#   vault_syslog_lograw_userpass_password.json: the userpass entries above as
+#     the syslog audit device writes them (RFC 5424 with structured data
+#     holding a brace, and RFC 3164)
+#     https://developer.hashicorp.com/vault/docs/audit/syslog
 #   junk.json: a Vault server banner line, Base Event fallback
 samples:
   - raw: '{"auth":{"accessor":"hmac-sha256:3348fe9b24b078f97d747363dda2d55bb0445e90b512e9f68f48d289fed798b3","client_token":"hmac-sha256:c39c69748f0894cb4cd0333c779e72343ba45af287649d0fbcc37e9b079abe5d","display_name":"userpass-alice","entity_id":"62ff123b-7609-1ed9-5707-ea621da72de7","metadata":{"username":"alice"},"policies":["default"],"policy_results":{"allowed":true,"granting_policies":[{"type":""},{"name":"default","namespace_id":"root","type":"acl"}]},"token_policies":["default"],"token_issue_time":"2025-06-04T16:01:31-04:00","token_ttl":2764800,"token_type":"service"},"request":{"id":"79cc9b26-488f-eabf-2a97-303ed3bef0d6","mount_point":"auth/token/","mount_type":"token","namespace":{"id":"root"},"operation":"read","path":"auth/token/lookup-self","remote_address":"127.0.0.1","remote_port":64199},"time":"2025-06-04T20:02:46.117181Z","type":"request"}'
@@ -916,13 +959,13 @@ samples:
       status_id: 1
       user.name: userpass-alice
       metadata.tenant_uid: admin/
-  - raw: 'Jun  4 20:14:02 vault-0 vault[812]: {"time":"2025-06-04T20:14:02.100000Z","type":"response","auth":{"client_token":"s.FAKElegacyTOKEN0000doc1","accessor":"FAKEaccessorDOC0003","display_name":"userpass-bob"},"request":{"id":"aa11bb22-0000-4000-8000-000000000003","operation":"update","mount_type":"userpass","path":"auth/userpass/login/bob","data":{"password":"Sup3rS3cretDocPassw0rd"},"remote_address":"198.51.100.20"},"response":{"auth":{"client_token":"s.FAKElegacyTOKEN0000doc1","display_name":"userpass-bob"},"mount_type":"userpass"}}'
+  - raw: '{"time":"2025-06-04T20:14:02.100000Z","type":"response","auth":{"client_token":"s.FAKElegacyTOKEN0000doc1","accessor":"FAKEaccessorDOC0003","display_name":"userpass-bob"},"request":{"id":"aa11bb22-0000-4000-8000-000000000003","operation":"update","mount_type":"userpass","path":"auth/userpass/login/bob","data":{"password":"Sup3rS3cretDocPassw0rd"},"remote_address":"198.51.100.20"},"response":{"auth":{"client_token":"s.FAKElegacyTOKEN0000doc1","display_name":"userpass-bob"},"mount_type":"userpass"}}'
     expect:
       class_uid: 3002
       user.name: userpass-bob
       session.credential_uid: <missing>
       session.uid: <missing>
-      raw_data: 'Jun  4 20:14:02 vault-0 vault[812]: {"auth":{"accessor":"<redacted>","client_token":"<redacted>","display_name":"userpass-bob"},"request":{"data":{"password":"<redacted>"},"id":"aa11bb22-0000-4000-8000-000000000003","mount_type":"userpass","operation":"update","path":"auth/userpass/login/bob","remote_address":"198.51.100.20"},"response":{"auth":{"client_token":"<redacted>","display_name":"userpass-bob"},"mount_type":"userpass"},"time":"2025-06-04T20:14:02.100000Z","type":"response"}'
+      raw_data: '{"auth":{"accessor":"<redacted>","client_token":"<redacted>","display_name":"userpass-bob"},"request":{"data":{"password":"<redacted>"},"id":"aa11bb22-0000-4000-8000-000000000003","mount_type":"userpass","operation":"update","path":"auth/userpass/login/bob","remote_address":"198.51.100.20"},"response":{"auth":{"client_token":"<redacted>","display_name":"userpass-bob"},"mount_type":"userpass"},"time":"2025-06-04T20:14:02.100000Z","type":"response"}'
   # A path segment that merely starts with "s." is not a legacy token: the
   # clean, HMAC'd entry keeps its path and is not rewritten.
   - raw: '{"time":"2025-06-04T20:50:00Z","type":"response","auth":{"client_token":"hmac-sha256:c39c69748f0894cb4cd0333c779e72343ba45af287649d0fbcc37e9b079abe5d","accessor":"hmac-sha256:3348fe9b24b078f97d747363dda2d55bb0445e90b512e9f68f48d289fed798b3","display_name":"userpass-alice","policies":["default"]},"request":{"id":"aa11bb22-0000-4000-8000-000000000050","operation":"read","mount_type":"kv","path":"secret/data/s.payments-prod-us-east-1","remote_address":"192.0.2.80"},"response":{"mount_type":"kv","data":{"metadata":{"created_time":"hmac-sha256:9c910646d7399704ee015b4247b374bfb950282339d902a221b1ff4c83b13ee7","version":3}}}}'

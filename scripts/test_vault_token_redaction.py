@@ -8,6 +8,13 @@ text-indexed, so this test runs every hashicorp_vault sample, its inline
 samples and a few hostile variants through `vector vrl` and asserts that no
 token-shaped value, JWT or known plaintext secret appears anywhere in any
 emitted event.
+
+It also holds the strict source check field_coverage_check.py cannot run on
+this parser (field-coverage.yaml declares it a text source because the
+scrubbed source can never equal the input): for every entry the captured
+source must equal the input JSON (syslog header removed) except at
+"<redacted>" leaves, with exactly the same keys, and the shared no-loss
+check() and residual probe object run on the result.
 """
 import json
 import pathlib
@@ -18,13 +25,19 @@ import tempfile
 
 import yaml
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import field_coverage_check as fcc  # noqa: E402  (shared no-loss check, unmodified)
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PARSER = ROOT / 'parsers-ocsf/hashicorp_vault/parser.yaml'
 # Modern hv[sbr]. tokens are base64url; legacy s. / r. service tokens are
 # base62 (no '-'), so a hyphenated path segment such as s.payments-prod is not
 # one; legacy b. batch tokens are long.
 TOKEN = re.compile(r'(?<![A-Za-z0-9])(?:hv[sbr]\.[A-Za-z0-9_-]{8,}|[sr]\.[A-Za-z0-9]{20,}(?![A-Za-z0-9_-])|b\.[A-Za-z0-9_-]{60,})')
-JWT = re.compile(r'eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}')
+# A JWT (padding allowed) or a 5-part JWE, whose second segment is not eyJ.
+JWT = re.compile(r'eyJ[A-Za-z0-9_=-]{6,}\.(?:eyJ[A-Za-z0-9_=-]{6,}|[A-Za-z0-9_=-]*\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+\.)')
+HMAC = re.compile(r'^hmac-sha256:[0-9a-f]{64}$')
+VAULT_JSON = re.compile(r'\{\s*"(?:time|type|auth|request|response|error|forwarded_from)"\s*:')
 # Plaintext secrets the raw-mode samples carry in non-token-shaped fields.
 PLAINTEXT = ['Sup3rS3cretDocPassw0rd', 'plaintext-response-value-doc', 'FAKEaccessorDOC',
              'hostile-plaintext-password', 'hostile-kv-secret-value']
@@ -143,6 +156,43 @@ HOSTILE = [
           request={'data': {'jwt': 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJMRUFLLWs2In0=.c2lnLUxFQUs='}}),
     # PEM private key in an unknown top-level field (kept envelope; line-level scrub)
     entry(rid='pem', extra='-----BEGIN RSA PRIVATE KEY-----\nLEAKm1\n-----END RSA PRIVATE KEY-----'),
+    # --- neon round 3 ---
+    # unknown top-level keys on a parseable entry
+    entry(rid='top', extra={'password': 'LEAK-o1', 'api_key': 'LEAK-o2', 'secret_val': 'LEAK-o3'},
+          custom_blob='LEAK-o4', listed=['LEAK-o5', {'x': 'LEAK-o6'}]),
+    # the request URI query string (OIDC callback code, ?token=)
+    entry(rid='uri', request={'path': 'auth/oidc/oidc/callback', 'mount_type': 'oidc',
+                              'request_uri': '/v1/auth/oidc/oidc/callback?state=st1&code=LEAK-p1&token=LEAK-p2'}),
+    # truncated token lookup / KV v2 bodies whose secrets sit under id / name / username / path
+    entry(rid='trunc3', request={'path': 'auth/token/lookup-self', 'mount_type': 'token'},
+          response={'data': {'id': 'LEAK-q1-uuid-token', 'name': 'LEAK-q2', 'policies': ['default'],
+                             'blob': 'x' * 40}})[:-30],
+    entry(rid='trunc4', request={'data': {'data': {'id': 'LEAK-q3', 'name': 'LEAK-q4', 'username': 'LEAK-q5',
+                                                    'path': 'LEAK-q6', 'email': 'LEAK-q7', 'role': 'LEAK-q8',
+                                                    'error': 'LEAK-q9', 'blob': 'x' * 40}}})[:-30],
+    # a continuation fragment with no opening brace
+    '"password":"LEAK-r1","api_key":"LEAK-r2","token":"LEAK-r3","conn":"LEAK-r4"}',
+    # quoted values with spaces and non-Bearer Authorization schemes in free text
+    'vault: login failed password="LEAK-s1 LEAK-s2" Authorization: Token LEAK-s3 '
+    'authorization=Digest LEAK-s4 Proxy-Authorization: AWS4-HMAC-SHA256 LEAK-s5 secret=\'LEAK-s6 LEAK-s7\'',
+    # values that merely start with "hmac-" are not Vault HMACs
+    entry(rid='fakehmac', auth={'client_token': 'hmac-LEAK-t1', 'accessor': 'hmac-LEAK-t2'},
+          request={'data': {'signing_key': 'hmac-LEAK-t3', 'k2': 'hmac-sha256:LEAK-t4'}}),
+    # credentials in RFC 5424 structured data of a parseable syslog line
+    '<110>1 2025-06-04T20:30:00Z vault-0 vault - - [meta@1234 token="LEAK-u1" password=LEAK-u2] '
+    + entry(rid='sdtok'),
+    # nested auth.metadata, and a PGP private key block in a kept field
+    entry(rid='meta2', auth={'metadata': {'role': 'ci', 'custom': {'password': 'LEAK-v1', 'api_key': 'LEAK-v2'},
+                                          'list': ['LEAK-v3']}},
+          error='-----BEGIN PGP PRIVATE KEY BLOCK-----\nLEAK-w1\n-----END PGP PRIVATE KEY BLOCK-----'),
+]
+
+# Valid JSON the parser does not recognize: Base Event, nothing spilled.
+FALLBACK = [
+    json.dumps({'time': '2025-06-04T20:40:00Z', 'type': 'audit_custom', 'api_key': 'LEAK-n1', 'db_pass': 'LEAK-n2',
+                'secret_payload': 'LEAK-n3', 'conn': 'LEAK-n4'}),
+    json.dumps({'time': '2025-06-04T20:40:00Z', 'type': 'response', 'extra_secret': 'LEAK-n5', 'api_key': 'LEAK-n6',
+                'response': {'data': {'k': 'LEAK-n7'}}}),
 ]
 
 # Clean, HMAC'd entries must come through byte-for-byte: a path segment that
@@ -171,7 +221,51 @@ def events():
         lines.append({'message': sample['raw']})
     lines += [{'message': raw} for raw in HOSTILE]
     lines += [{'message': raw} for raw in CLEAN]
-    return doc['parser_vrl'], lines
+    lines += [{'message': raw} for raw in FALLBACK]
+    lines.append({'message': residual_probe()})
+    return doc['parser_vrl'] + '\n.__coverage_source = __source_kv\n', lines
+
+
+def residual_probe():
+    """The shared field_coverage_check residual probe object on a clean entry."""
+    obj = json.loads((PARSER.parent / 'samples/vault_response_userpass_login_success.json').read_text())
+    obj['ResidualProbe'] = {'UnknownLeaf': 'nan2421-unknown-5d38', 'Scalars': ['nan2421-a', 987654321, False], 'Objects': [{'Field': 'nan2421-b', 'apiToken': 'nan2421-secret'}, {'name': 'Authorization', 'value': 'nan2421-secret'}], 'Password': 'nan2421-secret', 'Deep': {'clientSecret': 'nan2421-secret'}}
+    obj['Dotted.Probe'] = 'nan2421-dotted'
+    obj['Dotted'] = {'Probe': 'nan2421-nested'}
+    obj['UnknownZero'] = 0
+    obj['UnknownFalse'] = False
+    obj['CollisionProbe'] = 'nan2421-first'
+    obj['collision_probe'] = 'nan2421-second'
+    return json.dumps(obj)
+
+
+def redaction_diff(src, orig, path=''):
+    """Differences between the captured source and the input other than redaction."""
+    if isinstance(orig, dict):
+        if not isinstance(src, dict) or set(src) != set(orig):
+            return [f'{path}: keys {sorted(src) if isinstance(src, dict) else src!r} != {sorted(orig)}']
+        return [d for k in orig for d in redaction_diff(src[k], orig[k], f'{path}.{k}' if path else k)]
+    if isinstance(orig, list):
+        if not isinstance(src, list) or len(src) != len(orig):
+            return [f'{path}: list changed']
+        return [d for i, (a, b) in enumerate(zip(src, orig)) for d in redaction_diff(a, b, f'{path}[{i}]')]
+    if src == orig and type(src) is type(orig):
+        return []
+    if isinstance(orig, str) and isinstance(src, str) and '<redacted>' in src:
+        return []
+    return [f'{path}: {orig!r} became {src!r}']
+
+
+def source_json(message):
+    """The input entry as JSON, syslog header removed; None when it is not JSON."""
+    match = VAULT_JSON.search(message)
+    if not match:
+        return None
+    try:
+        obj = json.loads(message[match.start():].strip(), strict=False)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
 
 
 def main():
@@ -185,20 +279,38 @@ def main():
     assert run.returncode == 0, run.stderr
     outputs = [line for line in run.stdout.splitlines() if line.startswith('{')]
     assert len(outputs) == len(inputs), f'{len(outputs)} events for {len(inputs)} inputs'
+    config = yaml.safe_load((PARSER.parent / 'field-coverage.yaml').read_text())
+    rules, candidates = config.get('transforms', []), config['consumed_candidates']
     failures = []
+    checked = 0
     for raw, out in zip(inputs, outputs):
+        event = json.loads(out, strict=False)
+        source = event.pop('__coverage_source')
+        original = source_json(raw['message'])
+        if event.get('class_uid') == 0:
+            if source != {}:
+                failures.append(f'{raw["message"][:80]}...: fallback still captures a source to spill')
+        elif original is None:
+            failures.append(f'{raw["message"][:80]}...: mapped, but the input is not JSON')
+        else:
+            failures += [f'{raw["message"][:60]}...: {d}' for d in redaction_diff(source, original)]
+            try:
+                fcc.check(source, event, raw['message'], rules, [], candidates)
+                checked += 1
+            except AssertionError as error:
+                failures.append(f'{raw["message"][:60]}...: no-loss check: {error}')
         leaks = TOKEN.findall(out) + JWT.findall(out) + [p for p in PLAINTEXT if p in out]
         leaks += re.findall(r'LEAK[A-Za-z0-9-]*', out) + re.findall(r'TEVBSy[A-Za-z0-9+/=]*', out)
+        leaks += re.findall(r'nan2421-[a-z0-9-]+', out)
         if leaks:
             failures.append(f'{raw["message"][:80]}...: leaked {sorted(set(leaks))}')
         if '"raw_data"' not in out:
             failures.append(f'{raw["message"][:80]}...: raw_data missing')
-        event = json.loads(out, strict=False)
         for path in (('session', 'uid'), ('actor', 'session', 'uid')):
             node = event
             for part in path:
                 node = node.get(part) if isinstance(node, dict) else None
-            if node is not None and not str(node).startswith('hmac-'):
+            if node is not None and not HMAC.match(str(node)):
                 failures.append(f'{raw["message"][:80]}...: {".".join(path)} is {node!r}, not an HMAC accessor')
         if raw['message'] in CLEAN:
             if event.get('raw_data') != raw['message']:
@@ -210,11 +322,13 @@ def main():
     # The source fixtures really do carry the secrets, so a pass is meaningful.
     corpus = ''.join(i['message'] for i in inputs)
     assert TOKEN.search(corpus) and JWT.search(corpus) and all(p in corpus for p in PLAINTEXT[:2])
-    assert corpus.count('LEAK') >= 60, corpus.count('LEAK')
+    assert corpus.count('LEAK') >= 100, corpus.count('LEAK')
+    assert checked >= 30, f'only {checked} mapped entries reached the strict source check'
     if failures:
         print('\n'.join(failures))
         sys.exit(1)
-    print(f'OK: {len(inputs)} Vault events, no token, JWT or plaintext secret in any output')
+    print(f'OK: {len(inputs)} Vault events, no token, JWT or plaintext secret in any output; '
+          f'{checked} mapped entries pass the strict redaction-only source check')
 
 
 if __name__ == '__main__':
