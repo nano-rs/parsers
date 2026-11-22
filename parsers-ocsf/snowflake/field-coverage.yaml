@@ -7,30 +7,43 @@ transforms:
     saml2_assertion: SAML
     oauth_access_token: OAUTH 2.0
   reason: SAML and OAuth first factors are the authentication protocol.
-consumed_candidates:
-- CLIENT_IP
-- DATABASE_NAME
-- ERROR_CODE
-- ERROR_MESSAGE
-- EVENT_ID
-- EVENT_TIMESTAMP
-- EVENT_TYPE
-- EXECUTION_STATUS
-- FIRST_AUTHENTICATION_FACTOR
-- IS_SUCCESS
-- QUERY_ID
-- QUERY_START_TIME
-- QUERY_TEXT
-- QUERY_TYPE
-- ROLE_NAME
-- SECOND_AUTHENTICATION_FACTOR
-- SESSION_ID
-- START_TIME
-- TOTAL_ELAPSED_TIME
-- USER_NAME
-consumed_reason: The row clocks (EVENT_TIMESTAMP, START_TIME, QUERY_START_TIME) are
-  parsed into time but always spill too, because Snowflake's space-separated form has no
-  format both Vector and the coverage checker parse identically. Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. The ACCESS_HISTORY object
-  columns are JSON text, so they always spill whole even though their tables, stages
-  and users are mapped.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  CLIENT_IP:
+  - src_endpoint.ip
+  DATABASE_NAME:
+  - database.name
+  ERROR_CODE:
+  - status_code
+  ERROR_MESSAGE:
+  - message
+  - status_detail
+  EVENT_ID:
+  - metadata.uid
+  EVENT_TYPE:
+  - message
+  - metadata.event_code
+  FIRST_AUTHENTICATION_FACTOR:
+  - auth_factors.factor_type
+  QUERY_ID:
+  - metadata.correlation_uid
+  - metadata.uid
+  - query_info.uid
+  QUERY_TEXT:
+  - query_info.query_string
+  QUERY_TYPE:
+  - message
+  - metadata.event_code
+  ROLE_NAME:
+  - actor.iam_role.name
+  SECOND_AUTHENTICATION_FACTOR:
+  - auth_factors.factor_type
+  SESSION_ID:
+  - actor.session.uid
+  TOTAL_ELAPSED_TIME:
+  - duration
+  USER_NAME:
+  - actor.user.name
+  - user.name
