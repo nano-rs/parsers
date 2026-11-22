@@ -19,6 +19,9 @@ Sources:
   `client_secret` detail is a synthetic redaction probe, not a Keycloak field.
 - `junk.json` is truncated JSON; `text_non_event_line` and `json_log_non_event`
   are Keycloak log lines that are not events (fallback branch).
+- `json_log_unparsable_kv_fallback` (review regression) is a native JSON log
+  record whose event line does not parse (a trailing `, `): it takes the
+  fallback branch with `message` kept, never a Success with empty fields.
 
 UUIDs are replaced with `00000000-0000-…` values, addresses with documentation
 ranges, users with example.com addresses.

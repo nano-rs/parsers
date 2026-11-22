@@ -12,7 +12,10 @@ START = '# NAN-2421 residual spill.'
 END = '# END NAN-2421 residual spill'
 
 
-KINDS = ('lowercase', 'epoch_ms', 'scale', 'enum', 'hex')
+KINDS = ('lowercase', 'epoch_ms', 'scale', 'enum', 'hex', 'truncate')
+# A truncate rule must keep a useful prefix: a tiny bound would let a parser
+# "consume" a field while keeping almost none of it outside raw_data.
+TRUNCATE_MIN_LENGTH = 256
 SENSITIVE = re.compile(r'[\x00-\x1f"\\\'{}]')
 
 
@@ -66,6 +69,8 @@ def rule_body(rule, templates):
         text = text.replace('__FORMAT__', vrl_string(fmt if isinstance(fmt, str) else '%+'))
     elif rule['kind'] == 'scale':
         text = text.replace('__FACTOR__', vrl_number(float(rule['factor'])))
+    elif rule['kind'] == 'truncate':
+        text = text.replace('__LENGTH__', str(rule['length']))
     elif rule['kind'] == 'enum':
         values = rule['values']
         # The template skips an absent source, which the old loop looked up as "".
@@ -121,11 +126,21 @@ def candidate_regex(candidates):
     return ["__candidates = r'(?x)"] + key_regex(candidates)
 
 
+def check_rule(rule):
+    """One `transforms` rule: a source, a known kind, its parameters, a reason."""
+    assert isinstance(rule, dict) and isinstance(rule.get('source'), str) and rule['source'], f'transform needs a source: {rule!r}'
+    assert isinstance(rule.get('reason'), str) and rule['reason'].strip(), f'every transformation needs a justification: {rule["source"]}'
+    assert rule.get('kind') in KINDS, f'{rule["source"]}: unknown transform kind {rule.get("kind")!r}'
+    if rule['kind'] == 'truncate':
+        assert isinstance(rule.get('target'), str) and rule['target'], f'{rule["source"]}: truncate needs a target'
+        length = rule.get('length')
+        assert type(length) is int and length >= TRUNCATE_MIN_LENGTH, f'{rule["source"]}: truncate length must be an integer >= {TRUNCATE_MIN_LENGTH}'
+
+
 def transformations(config):
     rules = config.get('transforms', [])
     for rule in rules:
-        assert rule.get('reason'), rule
-        assert rule['kind'] in KINDS, rule
+        check_rule(rule)
     templates = kind_templates()
     lines = ['# ' + rule['source'] + ': ' + rule['reason'] for rule in rules]
     groups = grouped(rules, templates)

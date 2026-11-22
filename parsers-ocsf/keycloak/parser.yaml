@@ -46,19 +46,31 @@ parser_vrl: |
   if err == null && is_object(parsed) {
       __source_kv = object!(parsed)
       pj = object!(parsed)
-      if exists(pj.type) || exists(pj.operationType) {
+      if is_string(pj.message) && match(string!(pj.message), r'^(type|operationType)=') {
+          # Keycloak JSON log handler: the jboss-logging line is in `message`.
+          # It is unpacked only when it parses to a non-empty set of pairs none of
+          # which the record already has (source_normalize parse_kv_merge in
+          # field-coverage.yaml); otherwise the record is kept whole.
+          jkv, jkverr = parse_key_value(string!(pj.message), key_value_delimiter: "=", field_delimiter: ", ", whitespace: "strict")
+          jrest = pj
+          __discard = del(jrest.message)
+          jrest_keys = keys(jrest)
+          jcollide = false
+          for_each(jkv) -> |k, _v| { if includes(jrest_keys, k) { jcollide = true } }
+          if jkverr == null && length(jkv) > 0 && !jcollide {
+              shape = "json_log"
+              kv_body = string!(pj.message)
+              # ECS layout (@timestamp, log.level) or Keycloak's native Quarkus
+              # JSON log (timestamp, level).
+              envelope_time = string(get(pj, ["@timestamp"]) ?? "") ?? ""
+              if envelope_time == "" { envelope_time = string(pj.timestamp) ?? "" }
+              log_level = string(get(pj, ["log.level"]) ?? "") ?? ""
+              if log_level == "" { log_level = string(pj.level) ?? "" }
+          }
+      }
+      if shape == "" && (exists(pj.type) || exists(pj.operationType)) {
           shape = "json"
           e = pj
-      } else if is_string(pj.message) && match(string!(pj.message), r'^(type|operationType)=') {
-          # Keycloak JSON log handler: the jboss-logging line is in `message`.
-          shape = "json_log"
-          kv_body = string!(pj.message)
-          # ECS layout (@timestamp, log.level) or Keycloak's native Quarkus
-          # JSON log (timestamp, level).
-          envelope_time = string(get(pj, ["@timestamp"]) ?? "") ?? ""
-          if envelope_time == "" { envelope_time = string(pj.timestamp) ?? "" }
-          log_level = string(get(pj, ["log.level"]) ?? "") ?? ""
-          if log_level == "" { log_level = string(pj.level) ?? "" }
       }
   } else {
       m, merr = parse_regex(raw_log, r'^(?P<log_time>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}[,.]\d{3})\s+(?P<log_level>[A-Z]+)\s+\x5B(?P<logger>[^\x5D]+)\x5D\s+\x28(?P<thread>[^\x29]*)\x29\s+(?P<body>(?:type|operationType)=.*)$')
@@ -74,8 +86,18 @@ parser_vrl: |
       }
   }
 
+  kv = {}
   if kv_body != "" {
-      kv = parse_key_value(kv_body, key_value_delimiter: "=", field_delimiter: ", ", whitespace: "strict") ?? {}
+      kv, kverr = parse_key_value(kv_body, key_value_delimiter: "=", field_delimiter: ", ", whitespace: "strict")
+      # A line that does not parse (or parses to nothing) is not an event: it
+      # takes the explicit fallback with its source kept whole, never a
+      # Success with empty fields.
+      if kverr != null || length(kv) == 0 {
+          shape = ""
+          kv = {}
+      }
+  }
+  if shape != "" && kv_body != "" {
       # The event's own fields are the source: for a JSON log envelope the
       # `message` they were unpacked from is replaced by them, so its details
       # spill as redacted keys instead of one raw string.

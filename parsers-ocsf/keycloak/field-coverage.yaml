@@ -1,7 +1,13 @@
 source: mixed
-# A Keycloak JSON log record carries the event line in `message`; the parser
-# replaces that key with the fields parsed from it (field_coverage_check.py).
-json_envelope: message
+source_normalize:
+- kind: parse_kv_merge
+  path: message
+  match: ^(type|operationType)=
+  key_value_delimiter: '='
+  field_delimiter: ', '
+  reason: A Keycloak JSON log record carries the event line in `message`; the parser
+    replaces that key with the pairs parsed from it, so its details spill as redacted
+    keys. Skipped on a parse error, an empty result or a key the record already has.
 transforms:
 - source: '@timestamp'
   kind: epoch_ms
