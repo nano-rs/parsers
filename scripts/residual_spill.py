@@ -2,6 +2,7 @@
 """Generate/check inlined residual VRL from the shared template and justified rules."""
 import argparse
 import decimal
+import math
 import json
 from pathlib import Path
 import re
@@ -137,6 +138,14 @@ def check_rule(rule):
         target = rule['target']
         assert isinstance(target, str) and target and all(target.split('.')), f'{rule["source"]}: target must be a dotted path'
         assert target.split('.')[0] not in ('unmapped', 'raw_data'), f'{rule["source"]}: target may not be under unmapped or raw_data'
+    if rule['kind'] == 'scale':
+        factor = rule.get('factor')
+        assert type(factor) in (int, float) and math.isfinite(factor) and factor != 0, f'{rule["source"]}: scale needs a finite, non-zero factor'
+    if rule['kind'] == 'enum':
+        values = rule.get('values')
+        assert isinstance(values, dict) and values, f'{rule["source"]}: enum needs a non-empty values mapping'
+    if rule['kind'] == 'epoch_ms':
+        assert 'format' not in rule or (isinstance(rule['format'], str) and rule['format']), f'{rule["source"]}: epoch_ms format must be a non-empty string'
     if rule['kind'] == 'truncate':
         assert isinstance(rule.get('target'), str) and rule['target'], f'{rule["source"]}: truncate needs a target'
         length = rule.get('length')

@@ -15,6 +15,20 @@ source_normalize:
   reason: An event line that could not be unpacked (parse error, empty, or a key the
     record already has) may carry credentials key redaction cannot reach, so only its
     byte length and sha256 stay (raw_data keeps it).
+- kind: parse_json_object
+  paths:
+  - representation
+  target: representation_json
+  arrays: true
+  reason: An admin event's representation is JSON text (a user with credentials, a client
+    with its secret); moved and parsed, every secret-named key in it is redacted at any
+    depth before it spills.
+- kind: withhold
+  paths:
+  - representation
+  match: '^[\s\S]'
+  reason: A representation that is not a JSON object or array cannot be key-redacted, so
+    only its byte length and sha256 stay (raw_data keeps it).
 transforms:
 - source: '@timestamp'
   kind: epoch_ms
@@ -39,6 +53,9 @@ probe:
   text: ', ResidualProbe="nan2421-text-unknown", password="nan2421-secret"'
   source: ResidualProbe
 consumed_candidates:
+- representation_json.email
+- representation_json.name
+- representation_json.username
 - authDetails.clientId
 - authDetails.ipAddress
 - authDetails.realmId

@@ -123,6 +123,30 @@ parser_vrl: |
       e.details = details
   }
 
+  # ---- admin-event representation (source_normalize in field-coverage.yaml) ----
+  # The representation is a JSON string (a user with credentials, a client with its
+  # secret, ...). Parsed, it moves to representation_json, where the spill redacts
+  # every secret-named key at any depth (credentials, credentialData, secretData,
+  # secret, password, ...). A string or array left there (not JSON, a JSON scalar, or
+  # an input that already has representation_json) is withheld: only its byte length
+  # and sha256 stay; an object is already structured and key-redacted as is.
+  # Mapping reads only named fields (username, email, name).
+  if exists(__source_kv.representation) {
+      rv = __source_kv.representation
+      if is_string(rv) {
+          rp, rperr = parse_json(string!(rv))
+          if rperr == null && (is_object(rp) || is_array(rp)) && !exists(__source_kv.representation_json) {
+              __discard = del(__source_kv.representation)
+              __source_kv.representation_json = rp
+          }
+      }
+      if is_string(__source_kv.representation) || is_array(__source_kv.representation) {
+          rw = __source_kv.representation
+          rt = if is_string(rw) { string!(rw) } else { encode_json(rw) }
+          if match(rt, r'^[\s\S]') { __source_kv.representation = {"withheld": true, "bytes": length(rt), "sha256": sha2(rt, variant: "SHA-256")} }
+      }
+  }
+
   if shape == "" {
       . = {
           "class_uid": 0,
@@ -510,7 +534,10 @@ parser_vrl: |
   # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
   __candidates = r'(?x)
   \A(?:
-    authDetails\.clientId
+    representation_json\.email
+  | representation_json\.name
+  | representation_json\.username
+  | authDetails\.clientId
   | authDetails\.ipAddress
   | authDetails\.realmId
   | authDetails\.userId
@@ -544,19 +571,19 @@ parser_vrl: |
   # Redact at every depth, including objects inside arrays, before serialization.
   # Redaction needs a sensitive word in a key or a name/key value, and encode_json
   # never escapes a letter, so text without one of the words needs no walk.
-  if match(downcase(__safe_json), r'password|secret|authorization|token') {
+  if match(downcase(__safe_json), r'password|secret|authorization|token|credential') {
       __safe = map_values(__safe, recursive: true) -> |value| {
           if is_object(value) {
               # Header/parameter arrays commonly encode sensitive keys as name/value
               # or Key/Value objects instead of using the secret name as an object key.
               __sensitive_pair = false
               for_each(object!(value)) -> |key, child| {
-                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                  if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token|credential') {
                       __sensitive_pair = true
                   }
               }
               for_each(object!(value)) -> |key, _child| {
-                  if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                  if match(downcase(key), r'password|secret|authorization|token|credential') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
                       value = set!(value, [key], "<redacted>")
                   }
               }
@@ -716,7 +743,7 @@ parser_vrl: |
   # conditions run first; the source value set is built on first use.
   __original_values = null
   for_each(flatten(__existing)) -> |key, value| {
-      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token') {
+      if !is_null(value) && value != "" && !is_array(value) && !is_object(value) && value != __raw_body && !match(downcase(key), r'password|secret|authorization|token|credential') {
           # Members for the value itself and for to_string(value), as above.
           __json = encode_json(value)
           __as_json = "," + encode_json(__json)
