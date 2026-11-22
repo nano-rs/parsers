@@ -701,68 +701,57 @@ parser_vrl: |
   # anything (masking is an opt-in pipeline step, never a parser concern).
   # __source_kv is a local variable, never an OCSF attribute. The checker instruments
   # this marker to observe the parsed source without changing production output.
-  # Exact value representation is evaluated AFTER branch selection. Numeric strings
-  # count as represented by their typed scalar; other transformations are explicit.
+  # A source field is consumed ONLY by an explicit mapping: a field-coverage.yaml
+  # `mappings` entry (source key -> target paths) or a `transforms` rule with a
+  # target, whose value is found AT THAT TARGET PATH of the selected branch. A
+  # value that merely appears somewhere else in the event never consumes a field
+  # (no coincidental consumption); everything else spills.
   # NAN-5351: VRL copies a variable on every read, so an array or object used as a
-  # lookup set costs a full copy per lookup. The value sets below are strings
-  # instead (a read shares the buffer): "," + encode_json(member) per member, and
-  # contains(set, "," + encode_json(x)) is exact membership. Every member is a
-  # JSON text, inside which a '"' is always escaped, so ',"' only ever starts a
-  # member, and a JSON string ends at its first unescaped '"'. The fixed candidate
-  # set is a regex literal, compiled once with the program.
-  # __mapped holds only JSON types, so to_string equals encode_json for an integer
-  # or a boolean and only strings and floats add a second member.
+  # lookup set costs a full copy per lookup. The sets below are strings instead
+  # (a read shares the buffer). __repr holds one member per mapped leaf:
+  # "," + encode_json(path) + "=" + encode_json(encode_json(value)), plus the
+  # to_string form for a string or a float, so a numeric string is represented by
+  # its typed scalar. Every part is a JSON text, inside which a '"' is always
+  # escaped, so a member is matched exactly. Paths drop array indices
+  # (resources.0.uid is resources.uid); arrays are walked two levels deep, and a
+  # leaf deeper than that is simply not mapping evidence (it can only spill more).
   # raw_data and unmapped are dropped before the JSON round trip, not after it.
   __mapped = .
   __discard = del(__mapped.raw_data)
   __existing = del(__mapped.unmapped)
   __existing = object(parse_json!(encode_json(__existing))) ?? {}
-  __mapped_json = encode_json(__mapped)
-  __mapped = object!(parse_json!(__mapped_json))
+  __mapped = object!(parse_json!(encode_json(__mapped)))
   if __mapped.message == __raw_body { __discard = del(__mapped.message) }
   __copy = object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing})))
-  __copy_json = encode_json(__copy)
-  # Object and array members are encodings: an empty object, an object that
-  # opens with a quoted key, or an array. A lookup can ask for one only when some
-  # source or existing value is an array, or a string spelling one of those
-  # openings, and the regex below finds either in the JSON text (brackets are
-  # written as hex escapes because nano's deploy check counts them raw).
-  # Otherwise the scalar nodes suffice; a Sysmon GUID, a brace-wrapped string
-  # with no quoted key, is no object member. The leaves of flatten(), with arrays
-  # flattened too, are every scalar node unless a key holds a literal '.' (in
-  # compact JSON only a key is followed by ':').
-  # Their encodings, unwrapped from the array, already are the string members.
-  __represented = ""
-  __nodes = __mapped
-  if !match(__copy_json, r'"(?:\x7B\\"|\x7B\x7D"|\x5B)|[:,\x5B]\x5B') && !match(__mapped_json, r'\.(?:[^"\\]|\\.)*":') {
-      __leaves = flatten(values(flatten(__mapped)))
-      __leaves_json = encode_json(__leaves)
-      if match(__leaves_json, r'\x7B') {
-          # An object inside an array: walk the leaves, objects whole.
-          __nodes = __leaves
-      } else {
-          __nodes = []
-          __members = map_values(__leaves) -> |value| {
-              if is_float(value) {
-                  encode_json(encode_json(value)) + "," + encode_json(to_string!(value))
-              } else {
-                  encode_json(encode_json(value))
+  __repr = ""
+  for_each(flatten(__mapped)) -> |path, value| {
+      __p = encode_json(path)
+      if is_array(value) {
+          for_each(array!(value)) -> |_i, item| {
+              if is_object(item) {
+                  for_each(flatten(object!(item))) -> |sub, leaf| {
+                      __q = encode_json(path + "." + sub)
+                      if is_array(leaf) {
+                          for_each(array!(leaf)) -> |_j, x| {
+                              if !is_object(x) && !is_array(x) {
+                                  __repr = __repr + ("," + __q + "=" + encode_json(encode_json(x)))
+                                  if is_string(x) || is_float(x) { __repr = __repr + ("," + __q + "=" + encode_json(to_string!(x))) }
+                              }
+                          }
+                      } else {
+                          __repr = __repr + ("," + __q + "=" + encode_json(encode_json(leaf)))
+                          if is_string(leaf) || is_float(leaf) { __repr = __repr + ("," + __q + "=" + encode_json(to_string!(leaf))) }
+                      }
+                  }
+              } else if !is_array(item) {
+                  __repr = __repr + ("," + __p + "=" + encode_json(encode_json(item)))
+                  if is_string(item) || is_float(item) { __repr = __repr + ("," + __p + "=" + encode_json(to_string!(item))) }
               }
           }
-          __represented = "," + join!(__members, ",") + "," + slice!(__leaves_json, 1, -1)
-      }
-  }
-  __walk = map_values(__nodes, recursive: true) -> |value| {
-      __json = encode_json(value)
-      if is_string(value) {
-          # A string's second member is the string itself, encoded: __json.
-          __represented = __represented + ("," + encode_json(__json) + "," + __json)
-      } else if is_float(value) {
-          __represented = __represented + ("," + encode_json(__json) + "," + encode_json(to_string!(value)))
       } else {
-          __represented = __represented + ("," + encode_json(__json))
+          __repr = __repr + ("," + __p + "=" + encode_json(encode_json(value)))
+          if is_string(value) || is_float(value) { __repr = __repr + ("," + __p + "=" + encode_json(to_string!(value))) }
       }
-      value
   }
   __consumed = ""
   # BEGIN parser-specific transformations
@@ -773,23 +762,15 @@ parser_vrl: |
   # ProcessedAt: Successful ISO timestamp conversion to the emitted millisecond clock.
   # Process.LaunchedAt: Successful ISO timestamp conversion to the emitted millisecond clock.
   # Process.TerminatedAt: Successful ISO timestamp conversion to the emitted millisecond clock.
-  # Network.Protocol: Parser lowercases this source value; consume only when the normalized value is emitted.
-  # Action.NetworkConnectionAction.Protocol: Parser lowercases this source value; consume only when the normalized value is emitted.
-  # Network.SourceMac: Parser lowercases this source value; consume only when the normalized value is emitted.
   # Severity.Label: The ASFF severity label normalized to the OCSF severity; consume only when the expected ID is emitted.
-  # FindingProviderFields.Severity.Label: The provider severity label, used when Severity.Label is absent; consume only when the expected ID is emitted.
   # Workflow.Status: The ASFF workflow status normalized to the OCSF finding status; consume only when the expected ID is emitted.
   # Compliance.Status: The ASFF compliance status normalized to the OCSF compliance status; consume only when the expected ID is emitted.
   # VerificationState: The ASFF verification state normalized to the OCSF verdict; consume only when the expected ID is emitted.
-  # Network.Direction: Connection direction normalized to the OCSF direction_id in the evidence; consume only when that ID is emitted.
-  # Action.NetworkConnectionAction.ConnectionDirection: Connection direction normalized to the OCSF direction_id in the evidence; consume only when that ID is emitted.
   # ProductFields.aws/guardduty/service/action/networkConnectionAction/protocol: Parser lowercases the GuardDuty protocol; consume only when the normalized value is emitted.
   # ProductFields.aws/guardduty/service/action/networkConnectionAction/connectionDirection: GuardDuty connection direction normalized to the OCSF direction_id in the evidence; consume only when that ID is emitted.
   # ProductFields.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV6: Parser lowercases the GuardDuty IPv6 address; consume only when the normalized value is emitted.
   # ProductFields.aws/guardduty/service/action/networkConnectionAction/localIpDetails/ipAddressV6: Parser lowercases the GuardDuty IPv6 address; consume only when the normalized value is emitted.
   # ProductFields.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/ipAddressV6: Parser lowercases the GuardDuty IPv6 address; consume only when the normalized value is emitted.
-  # ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/ipAddressV6: Parser lowercases the GuardDuty IPv6 address; consume only when the normalized value is emitted.
-  # ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localIpDetails/ipAddressV6: Parser lowercases the GuardDuty IPv6 address; consume only when the normalized value is emitted.
   for_each(flatten(__source_kv)) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
@@ -799,7 +780,7 @@ parser_vrl: |
           __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-              if __mapped."finding_info"."created_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              if contains(__repr, "," + "\"finding_info.created_time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
           }
       }
       if match(key, r'(?x)
@@ -810,7 +791,7 @@ parser_vrl: |
           __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-              if __mapped."time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
           }
       }
       if match(key, r'(?x)
@@ -821,7 +802,7 @@ parser_vrl: |
           __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-              if __mapped."finding_info"."first_seen_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              if contains(__repr, "," + "\"finding_info.first_seen_time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
           }
       }
       if match(key, r'(?x)
@@ -832,7 +813,7 @@ parser_vrl: |
           __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-              if __mapped."finding_info"."last_seen_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              if contains(__repr, "," + "\"finding_info.last_seen_time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
           }
       }
       if match(key, r'(?x)
@@ -843,49 +824,40 @@ parser_vrl: |
           __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-              if __mapped."metadata"."processed_time" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+              if contains(__repr, "," + "\"metadata.processed_time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
           }
       }
       if match(key, r'(?x)
       \A(?:
         Process\.LaunchedAt
-      | Process\.TerminatedAt
       )\z') {
           __value = value
           __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
-              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+              if contains(__repr, "," + "\"actor.process.created_time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
           }
       }
       if match(key, r'(?x)
       \A(?:
-        Network\.Protocol
-      | Action\.NetworkConnectionAction\.Protocol
-      | Network\.SourceMac
-      | ProductFields\.aws/guardduty/service/action/networkConnectionAction/protocol
-      | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV6
-      | ProductFields\.aws/guardduty/service/action/networkConnectionAction/localIpDetails/ipAddressV6
-      | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/ipAddressV6
-      | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/ipAddressV6
-      | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localIpDetails/ipAddressV6
+        Process\.TerminatedAt
       )\z') {
           __value = value
-          if is_string(__value) {
-              __expected = downcase(string!(__value))
-              if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          if __clock_err == null {
+              __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+              if contains(__repr, "," + "\"actor.process.terminated_time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
           }
       }
       if match(key, r'(?x)
       \A(?:
         Severity\.Label
-      | FindingProviderFields\.Severity\.Label
       )\z') {
           __value = value
           if __value != null {
               __expected = get!({"informational": 1, "low": 2, "medium": 3, "high": 4, "critical": 5}, [downcase(to_string(__value) ?? "")])
               if __expected != null {
-                  if __mapped."severity_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+                  if contains(__repr, "," + "\"severity_id\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
               }
           }
       }
@@ -897,7 +869,7 @@ parser_vrl: |
           if __value != null {
               __expected = get!({"new": 1, "notified": 2, "suppressed": 3, "resolved": 4}, [downcase(to_string(__value) ?? "")])
               if __expected != null {
-                  if __mapped."status_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+                  if contains(__repr, "," + "\"status_id\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
               }
           }
       }
@@ -909,7 +881,7 @@ parser_vrl: |
           if __value != null {
               __expected = get!({"passed": 1, "warning": 2, "failed": 3, "not_available": 99}, [downcase(to_string(__value) ?? "")])
               if __expected != null {
-                  if __mapped."compliance"."status_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+                  if contains(__repr, "," + "\"compliance.status_id\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
               }
           }
       }
@@ -921,21 +893,18 @@ parser_vrl: |
           if __value != null {
               __expected = get!({"unknown": 0, "false_positive": 1, "true_positive": 2, "benign_positive": 5}, [downcase(to_string(__value) ?? "")])
               if __expected != null {
-                  if __mapped."verdict_id" == __expected { __consumed = __consumed + ("," + encode_json(key)) }
+                  if contains(__repr, "," + "\"verdict_id\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
               }
           }
       }
       if match(key, r'(?x)
       \A(?:
-        Network\.Direction
-      | Action\.NetworkConnectionAction\.ConnectionDirection
+        ProductFields\.aws/guardduty/service/action/networkConnectionAction/protocol
       )\z') {
           __value = value
-          if __value != null {
-              __expected = get!({"in": 1, "out": 2, "inbound": 1, "outbound": 2}, [downcase(to_string(__value) ?? "")])
-              if __expected != null {
-                  if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
-              }
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__repr, "," + "\"evidences.connection_info.protocol_name\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
           }
       }
       if match(key, r'(?x)
@@ -946,124 +915,34 @@ parser_vrl: |
           if __value != null {
               __expected = get!({"inbound": 1, "outbound": 2}, [downcase(to_string(__value) ?? "")])
               if __expected != null {
-                  if contains(__represented, "," + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+                  if contains(__repr, "," + "\"evidences.connection_info.direction_id\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
               }
           }
       }
+      if match(key, r'(?x)
+      \A(?:
+        ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV6
+      | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/ipAddressV6
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__repr, "," + "\"evidences.src_endpoint.ip\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
+      if match(key, r'(?x)
+      \A(?:
+        ProductFields\.aws/guardduty/service/action/networkConnectionAction/localIpDetails/ipAddressV6
+      )\z') {
+          __value = value
+          if is_string(__value) {
+              __expected = downcase(string!(__value))
+              if contains(__repr, "," + "\"evidences.dst_endpoint.ip\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+          }
+      }
   }
-  # Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
-  __candidates = r'(?x)
-  \A(?:
-    Action\.ActionType
-  | Action\.AwsApiCallAction\.Api
-  | Action\.AwsApiCallAction\.RemoteIpDetails\.City\.CityName
-  | Action\.AwsApiCallAction\.RemoteIpDetails\.Country\.CountryName
-  | Action\.AwsApiCallAction\.RemoteIpDetails\.IpAddressV4
-  | Action\.AwsApiCallAction\.RemoteIpDetails\.Organization\.Asn
-  | Action\.AwsApiCallAction\.RemoteIpDetails\.Organization\.AsnOrg
-  | Action\.AwsApiCallAction\.RemoteIpDetails\.Organization\.Isp
-  | Action\.AwsApiCallAction\.RemoteIpDetails\.Organization\.Org
-  | Action\.AwsApiCallAction\.ServiceName
-  | Action\.DnsRequestAction\.Domain
-  | Action\.NetworkConnectionAction\.ConnectionDirection
-  | Action\.NetworkConnectionAction\.LocalIpDetails\.IpAddressV4
-  | Action\.NetworkConnectionAction\.LocalPortDetails\.Port
-  | Action\.NetworkConnectionAction\.Protocol
-  | Action\.NetworkConnectionAction\.RemoteIpDetails\.City\.CityName
-  | Action\.NetworkConnectionAction\.RemoteIpDetails\.Country\.CountryName
-  | Action\.NetworkConnectionAction\.RemoteIpDetails\.IpAddressV4
-  | Action\.NetworkConnectionAction\.RemoteIpDetails\.Organization\.Asn
-  | Action\.NetworkConnectionAction\.RemoteIpDetails\.Organization\.AsnOrg
-  | Action\.NetworkConnectionAction\.RemoteIpDetails\.Organization\.Isp
-  | Action\.NetworkConnectionAction\.RemoteIpDetails\.Organization\.Org
-  | Action\.NetworkConnectionAction\.RemotePortDetails\.Port
-  | AwsAccountId
-  | AwsAccountName
-  | CompanyName
-  | Compliance\.RelatedRequirements
-  | Compliance\.SecurityControlId
-  | Compliance\.Status
-  | Confidence
-  | CreatedAt
-  | Description
-  | FindingProviderFields\.Severity\.Label
-  | FirstObservedAt
-  | GeneratorId
-  | Id
-  | LastObservedAt
-  | Network\.DestinationDomain
-  | Network\.DestinationIpV4
-  | Network\.DestinationIpV6
-  | Network\.DestinationPort
-  | Network\.Direction
-  | Network\.Protocol
-  | Network\.SourceDomain
-  | Network\.SourceIpV4
-  | Network\.SourceIpV6
-  | Network\.SourceMac
-  | Network\.SourcePort
-  | Note\.Text
-  | Process\.LaunchedAt
-  | Process\.Name
-  | Process\.ParentPid
-  | Process\.Path
-  | Process\.Pid
-  | Process\.TerminatedAt
-  | ProcessedAt
-  | ProductArn
-  | ProductFields\.aws/guardduty/service/action/actionType
-  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/api
-  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/city/cityName
-  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/country/countryName
-  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/ipAddressV4
-  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/ipAddressV6
-  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/organization/asn
-  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/organization/asnOrg
-  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/organization/isp
-  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/organization/org
-  | ProductFields\.aws/guardduty/service/action/awsApiCallAction/serviceName
-  | ProductFields\.aws/guardduty/service/action/dnsRequestAction/domain
-  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/connectionDirection
-  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/localIpDetails/ipAddressV4
-  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/localIpDetails/ipAddressV6
-  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/localPortDetails/port
-  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/protocol
-  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/city/cityName
-  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/country/countryName
-  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV4
-  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV6
-  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/asn
-  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/asnOrg
-  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/isp
-  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/org
-  | ProductFields\.aws/guardduty/service/action/networkConnectionAction/remotePortDetails/port
-  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localIpDetails/ipAddressV4
-  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localIpDetails/ipAddressV6
-  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localPortDetails/port
-  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/city/cityName
-  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/country/countryName
-  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/ipAddressV4
-  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/ipAddressV6
-  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/asn
-  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/asnOrg
-  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/isp
-  | ProductFields\.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/org
-  | ProductFields\.aws/securityhub/CompanyName
-  | ProductFields\.aws/securityhub/ProductName
-  | ProductName
-  | Region
-  | Remediation\.Recommendation\.Text
-  | Remediation\.Recommendation\.Url
-  | SchemaVersion
-  | Severity\.Label
-  | Severity\.Normalized
-  | SourceUrl
-  | Title
-  | Types
-  | UpdatedAt
-  | VerificationState
-  | Workflow\.Status
-  )\z'
+  # Declared source -> target mappings (field-coverage.yaml `mappings`).
+  __decl = "\n\"Action.ActionType\"\t[\"evidences.name\"]\n\"Action.AwsApiCallAction.Api\"\t[\"api.operation\",\"evidences.api.operation\"]\n\"Action.AwsApiCallAction.RemoteIpDetails.Country.CountryName\"\t[\"evidences.src_endpoint.location.country\"]\n\"Action.AwsApiCallAction.RemoteIpDetails.IpAddressV4\"\t[\"evidences.src_endpoint.ip\"]\n\"Action.AwsApiCallAction.RemoteIpDetails.Organization.Asn\"\t[\"evidences.src_endpoint.autonomous_system.number\"]\n\"Action.AwsApiCallAction.RemoteIpDetails.Organization.AsnOrg\"\t[\"evidences.src_endpoint.autonomous_system.name\"]\n\"Action.AwsApiCallAction.ServiceName\"\t[\"api.service.name\",\"evidences.api.service.name\"]\n\"AwsAccountId\"\t[\"cloud.account.uid\"]\n\"CompanyName\"\t[\"finding_info.product.vendor_name\"]\n\"Compliance.RelatedRequirements\"\t[\"compliance.requirements\"]\n\"Compliance.SecurityControlId\"\t[\"compliance.control\"]\n\"Compliance.Status\"\t[\"compliance.status\"]\n\"Confidence\"\t[\"confidence_score\"]\n\"Description\"\t[\"finding_info.desc\",\"vulnerabilities.desc\"]\n\"GeneratorId\"\t[\"finding_info.analytic.name\",\"finding_info.analytic.uid\"]\n\"Id\"\t[\"finding_info.uid\",\"metadata.original_event_uid\",\"vulnerabilities.advisory.uid\"]\n\"Note.Text\"\t[\"comment\"]\n\"Process.Name\"\t[\"actor.process.name\",\"evidences.process.name\"]\n\"Process.ParentPid\"\t[\"actor.process.parent_process.pid\"]\n\"Process.Path\"\t[\"actor.process.file.path\",\"evidences.process.file.path\"]\n\"Process.Pid\"\t[\"actor.process.pid\"]\n\"ProductArn\"\t[\"finding_info.product.uid\",\"finding_info.product_uid\"]\n\"ProductFields.aws/guardduty/service/action/actionType\"\t[\"evidences.name\"]\n\"ProductFields.aws/guardduty/service/action/awsApiCallAction/api\"\t[\"api.operation\",\"evidences.api.operation\"]\n\"ProductFields.aws/guardduty/service/action/awsApiCallAction/remoteIpDetails/ipAddressV6\"\t[\"evidences.src_endpoint.ip\"]\n\"ProductFields.aws/guardduty/service/action/awsApiCallAction/serviceName\"\t[\"api.service.name\",\"evidences.api.service.name\"]\n\"ProductFields.aws/guardduty/service/action/networkConnectionAction/localIpDetails/ipAddressV4\"\t[\"evidences.dst_endpoint.ip\"]\n\"ProductFields.aws/guardduty/service/action/networkConnectionAction/localPortDetails/port\"\t[\"evidences.dst_endpoint.port\"]\n\"ProductFields.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/city/cityName\"\t[\"evidences.src_endpoint.location.city\"]\n\"ProductFields.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/country/countryName\"\t[\"evidences.src_endpoint.location.country\"]\n\"ProductFields.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/ipAddressV4\"\t[\"evidences.src_endpoint.ip\"]\n\"ProductFields.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/asn\"\t[\"evidences.src_endpoint.autonomous_system.number\"]\n\"ProductFields.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/asnOrg\"\t[\"evidences.src_endpoint.autonomous_system.name\"]\n\"ProductFields.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/isp\"\t[\"evidences.src_endpoint.isp\"]\n\"ProductFields.aws/guardduty/service/action/networkConnectionAction/remoteIpDetails/organization/org\"\t[\"evidences.src_endpoint.isp_org\"]\n\"ProductFields.aws/guardduty/service/action/networkConnectionAction/remotePortDetails/port\"\t[\"evidences.src_endpoint.port\"]\n\"ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localIpDetails/ipAddressV4\"\t[\"evidences.dst_endpoint.ip\"]\n\"ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/localPortDetails/port\"\t[\"evidences.dst_endpoint.port\"]\n\"ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/city/cityName\"\t[\"evidences.src_endpoint.location.city\"]\n\"ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/country/countryName\"\t[\"evidences.src_endpoint.location.country\"]\n\"ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/ipAddressV4\"\t[\"evidences.src_endpoint.ip\"]\n\"ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/asn\"\t[\"evidences.src_endpoint.autonomous_system.number\"]\n\"ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/asnOrg\"\t[\"evidences.src_endpoint.autonomous_system.name\"]\n\"ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/isp\"\t[\"evidences.src_endpoint.isp\"]\n\"ProductFields.aws/guardduty/service/action/portProbeAction/portProbeDetails/0/remoteIpDetails/organization/org\"\t[\"evidences.src_endpoint.isp_org\"]\n\"ProductFields.aws/securityhub/CompanyName\"\t[\"finding_info.product.vendor_name\"]\n\"ProductFields.aws/securityhub/ProductName\"\t[\"finding_info.data_sources\",\"finding_info.product.name\",\"metadata.product.feature.name\"]\n\"ProductName\"\t[\"finding_info.data_sources\",\"finding_info.product.name\",\"metadata.product.feature.name\"]\n\"Region\"\t[\"cloud.region\"]\n\"Remediation.Recommendation.Text\"\t[\"remediation.desc\",\"vulnerabilities.remediation.desc\"]\n\"Remediation.Recommendation.Url\"\t[\"remediation.references\",\"vulnerabilities.remediation.references\"]\n\"SchemaVersion\"\t[\"metadata.log_version\"]\n\"SourceUrl\"\t[\"finding_info.src_url\"]\n\"Title\"\t[\"finding_info.title\",\"message\",\"vulnerabilities.advisory.title\",\"vulnerabilities.title\"]\n\"Types\"\t[\"finding_info.types\"]\n"
   __preserve = []
   # END parser-specific transformations
   # Escape literal dots before flattening so dotted source keys cannot overwrite
@@ -1082,6 +961,38 @@ parser_vrl: |
       __tilde = contains(encode_json(__escaped), "~")
   }
   __flat = flatten(__escaped)
+  # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
+  # target paths + "\n" per mapped source key (a raw newline never occurs in
+  # compact JSON). A key is consumed when its value, or every element of a scalar
+  # array, is at one of its own targets.
+  for_each(__flat) -> |key, value| {
+      if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
+      # __decl spells a bracket inside a key as a \u escape (deploy bracket count).
+      __kt = encode_json(key)
+      if match(__kt, r'[\x28\x29\x5B\x5D\x7B\x7D]') {
+          __kt = replace(replace(replace(replace(replace(replace(__kt, r'\x28', "\\u0028"), r'\x29', "\\u0029"), r'\x5B', "\\u005b"), r'\x5D', "\\u005d"), r'\x7B', "\\u007b"), r'\x7D', "\\u007d")
+      }
+      __at = find(__decl, "\n" + __kt + "\t")
+      if is_integer(__at) && !is_object(value) {
+          __rest = slice!(__decl, int!(__at) + strlen(__kt) + 2)
+          __hit = false
+          for_each(array!(parse_json!(slice!(__rest, 0, int!(find(__rest, "\n")))))) -> |_i, target| {
+              __tok = "," + encode_json(target) + "="
+              if !__hit && is_array(value) {
+                  __all = !is_empty(array!(value))
+                  for_each(array!(value)) -> |_j, item| {
+                      if __all {
+                          __all = !is_object(item) && !is_array(item) && (contains(__repr, __tok + encode_json(encode_json(item))) || ((is_string(item) || is_float(item)) && contains(__repr, __tok + encode_json(to_string!(item)))))
+                      }
+                  }
+                  __hit = __all
+              } else if !__hit {
+                  __hit = contains(__repr, __tok + encode_json(encode_json(value))) || ((is_string(value) || is_float(value)) && contains(__repr, __tok + encode_json(to_string!(value))))
+              }
+          }
+          if __hit { __consumed = __consumed + ("," + encode_json(key)) }
+      }
+  }
   # Fast path: when no two source keys decode to the same key and no two spilled
   # keys get the same name, each key's decision depends only on its own value, so
   # one filter and one rename build the residual without copying it per key.
@@ -1094,42 +1005,9 @@ parser_vrl: |
   if __distinct {
       __kept = filter(__flat) -> |key, value| {
           if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
-          # A key is kept unless it is consumed: by a transformation above, or as a
-          # candidate whose value is represented. Do not spill a copy of the raw body.
-          if value == __raw_body {
-              false
-          } else if contains(__consumed, "," + encode_json(key)) {
-              false
-          } else if !match(key, __candidates) {
-              true
-          } else {
-              # flatten stops at arrays, so objects inside an array still carry the
-              # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
-              if __tilde && (is_array(value) || is_object(value)) {
-                  value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
-                      replace(replace(inner, "~1", "."), "~0", "~")
-                  }, ["v"])
-              }
-              __same = contains(__represented, "," + encode_json(encode_json(value)))
-              if !__same && (is_string(value) || is_float(value)) {
-                  __same = contains(__represented, "," + encode_json(to_string!(value)))
-              }
-              # A scalar array is consumed only if every element is represented. Preserve
-              # partially represented arrays intact, including their ordering and repeats.
-              if !__same && is_array(value) && !is_empty(array!(value)) {
-                  __same = true
-                  for_each(array!(value)) -> |_index, item| {
-                      if __same {
-                          if is_object(item) || is_array(item) {
-                              __same = false
-                          } else if !contains(__represented, "," + encode_json(encode_json(item))) {
-                              __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
-                          }
-                      }
-                  }
-              }
-              !__same
-          }
+          # A key is kept unless an explicit mapping or transformation consumed it.
+          # Do not spill a copy of the raw body.
+          value != __raw_body && !contains(__consumed, "," + encode_json(key))
       }
       __names = map_keys(__kept) -> |key| {
           if __tilde { key = replace(replace(key, "~1", "."), "~0", "~") }
@@ -1157,8 +1035,8 @@ parser_vrl: |
           value
       }
   } else {
-      # Slow path, in source key order: a decoded key consumed earlier stays
-      # consumed, and a name already taken gets the next free _2, _3, ... suffix.
+      # Slow path, in source key order: a name already taken gets the next free
+      # _2, _3, ... suffix.
       for_each(__flat) -> |key, value| {
           key = replace(replace(key, "~1", "."), "~0", "~")
           if is_array(value) || is_object(value) {
@@ -1166,24 +1044,7 @@ parser_vrl: |
                   replace(replace(inner, "~1", "."), "~0", "~")
               }, ["v"])
           }
-          __same = contains(__represented, "," + encode_json(encode_json(value)))
-          if !__same && (is_string(value) || is_float(value)) {
-              __same = contains(__represented, "," + encode_json(to_string!(value)))
-          }
-          if !__same && is_array(value) && !is_empty(array!(value)) {
-              __same = true
-              for_each(array!(value)) -> |_index, item| {
-                  if __same {
-                      if is_object(item) || is_array(item) {
-                          __same = false
-                      } else if !contains(__represented, "," + encode_json(encode_json(item))) {
-                          __same = (is_string(item) || is_float(item)) && contains(__represented, "," + encode_json(to_string!(item)))
-                      }
-                  }
-              }
-          }
           __token = "," + encode_json(key)
-          if __same && match(key, __candidates) { __consumed = __consumed + ("," + encode_json(key)) }
           if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")
@@ -1208,8 +1069,10 @@ parser_vrl: |
           }
       }
   }
-  # Keep existing derived evidence, but remove null placeholders and mapped copies.
-  # Source-derived aliases are replaced by canonical dotted source paths above.
+  # Keep existing derived evidence, but remove null placeholders and copies of a
+  # source value (that value is mapped or spilled above under its source path).
+  # A value merely equal to some mapped attribute is kept: equality with an
+  # unrelated attribute is no evidence that it is represented.
   # The canonical source spill above is the authoritative representation of
   # containers. The cheap conditions run first; the source value set is built on
   # first use.
@@ -1237,7 +1100,6 @@ parser_vrl: |
           }
           __source_set = string!(__original_values)
           __keep = !contains(__source_set, __as_json) && !contains(__source_set, __as_string)
-          __keep = __keep && !contains(__represented, __as_json) && !contains(__represented, __as_string)
           # Only text opening an object or an array (after JSON whitespace)
           # decodes to a container.
           if __keep && is_string(value) && match(string!(value), r'^[ \t\n\r]*[\x5B\x7B]') {

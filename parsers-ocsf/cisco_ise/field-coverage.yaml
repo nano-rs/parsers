@@ -2,38 +2,72 @@ source: text
 transforms:
 - source: fields.Calling-Station-ID
   kind: lowercase
+  target: src_endpoint.mac
   reason: Endpoint MAC lowercased (dashes become colons) into src_endpoint.mac; a dashed MAC remains residual.
-consumed_candidates:
-- header.host
-- header.category
-- header.code
-- header.severity
-- header.text
-- cmd
-- fields.UserName
-- fields.User-Name
-- fields.User
-- fields.Calling-Station-ID
-- fields.Framed-IP-Address
-- fields.Remote-Address
-- fields.Device IP Address
-- fields.NAS-IP-Address
-- fields.DestinationIPAddress
-- fields.DestinationPort
-- fields.Protocol
-- fields.Acct-Session-Id
-- fields.CPMSessionID
-- fields.SessionId
-- fields.AcsSessionID
-- fields.FailureReason
-- fields.SelectedAccessService
-- fields.AuthorizationPolicyMatchedRule
-- fields.NetworkDeviceName
-- fields.PostureStatus
-- fields.PosturePolicyMatched
-- fields.MacAddress
-- fields.IpAddress
-- fields.SystemName
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+- source: fields.Calling-Station-ID
+  kind: lowercase
+  target: src_endpoint.uid
+  reason: Endpoint MAC lowercased (dashes become colons) into src_endpoint.mac; a dashed MAC remains residual.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  header.host:
+  - device.hostname
+  - dst_endpoint.hostname
+  header.category:
+  - metadata.log_provider
+  header.code:
+  - metadata.event_code
+  header.severity:
+  - metadata.log_level
+  header.text:
+  - message
+  cmd:
+  - api.operation
+  fields.UserName:
+  - actor.user.name
+  - user.name
+  fields.User-Name:
+  - user.name
+  fields.User:
+  - actor.user.name
+  - user.name
+  fields.Calling-Station-ID:
+  - src_endpoint.mac
+  - src_endpoint.uid
+  fields.Framed-IP-Address:
+  - src_endpoint.ip
+  fields.Remote-Address:
+  - src_endpoint.ip
+  fields.Device IP Address:
+  - dst_endpoint.ip
+  - src_endpoint.intermediate_ips
+  fields.DestinationIPAddress:
+  - dst_endpoint.ip
+  fields.DestinationPort:
+  - dst_endpoint.port
+  fields.Acct-Session-Id:
+  - session.uid
+  fields.CPMSessionID:
+  - session.uid
+  fields.AcsSessionID:
+  - actor.session.uid_alt
+  - session.uid_alt
+  fields.FailureReason:
+  - status_detail
+  fields.SelectedAccessService:
+  - service.name
+  fields.AuthorizationPolicyMatchedRule:
+  - policy.name
+  fields.NetworkDeviceName:
+  - dst_endpoint.hostname
+  - dst_endpoint.name
+  fields.PostureStatus:
+  - compliance.status
+  fields.PosturePolicyMatched:
+  - compliance.control
+  fields.IpAddress:
+  - device.ip
+  fields.SystemName:
+  - device.hostname

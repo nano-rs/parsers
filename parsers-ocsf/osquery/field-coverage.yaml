@@ -20,11 +20,6 @@ transforms:
   factor: 1000
   target: session.created_time
   reason: Epoch seconds converted to the emitted OCSF millisecond timestamp.
-- source: columns.start_time
-  kind: scale
-  factor: 1000
-  target: process.created_time
-  reason: Epoch seconds converted to the emitted OCSF millisecond timestamp.
 - source: columns.mtime
   kind: scale
   factor: 1000
@@ -41,13 +36,8 @@ transforms:
   values:
     added: 1
     removed: 2
-  reason: Differential added / removed normalized to Launch / Terminate, Logon / Logoff or Close; consume only when the expected ID is emitted.
-- source: action
-  kind: enum
-  target: activity_id
-  values:
-    added: 7
-  reason: A listening_ports row that was added is a Listen; consume only when the expected ID is emitted.
+  reason: Differential added / removed normalized to Launch / Terminate, Logon / Logoff or Close; consume
+    only when the expected ID is emitted.
 - source: columns.action
   kind: enum
   target: activity_id
@@ -60,7 +50,8 @@ transforms:
     moved_to: 5
     attributes_modified: 6
     opened: 14
-  reason: The FIM action normalized to the OCSF File System Activity activity; consume only when the expected ID is emitted.
+  reason: The FIM action normalized to the OCSF File System Activity activity; consume only when the expected
+    ID is emitted.
 - source: severity
   kind: enum
   target: severity_id
@@ -69,43 +60,68 @@ transforms:
     '1': 3
     '2': 4
     '3': 6
-  reason: The glog status severity normalized to the OCSF severity; consume only when the expected ID is emitted.
-consumed_candidates:
-- action
-- columns.action
-- columns.address
-- columns.atime
-- columns.auid
-- columns.cmdline
-- columns.cwd
-- columns.host
-- columns.inode
-- columns.md5
-- columns.mtime
-- columns.name
-- columns.parent
-- columns.path
-- columns.pid
-- columns.port
-- columns.protocol
-- columns.sha1
-- columns.sha256
-- columns.sid
-- columns.size
-- columns.start_time
-- columns.target_path
-- columns.time
-- columns.tty
-- columns.uid
-- columns.user
-- decorations.host_uuid
-- decorations.hostname
-- hostIdentifier
-- message
-- name
-- severity
-- unixTime
-- version
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+  reason: The glog status severity normalized to the OCSF severity; consume only when the expected ID
+    is emitted.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  columns.address:
+  - dst_endpoint.ip
+  columns.auid:
+  - actor.user.uid
+  columns.cmdline:
+  - actor.process.cmd_line
+  - process.cmd_line
+  columns.cwd:
+  - process.working_directory
+  columns.host:
+  - src_endpoint.ip
+  columns.inode:
+  - file.uid
+  columns.md5:
+  - file.hashes.value
+  columns.name:
+  - actor.process.name
+  - process.name
+  columns.parent:
+  - actor.process.pid
+  - process.parent_process.pid
+  columns.path:
+  - actor.process.file.path
+  - process.file.path
+  columns.pid:
+  - actor.process.pid
+  - process.pid
+  columns.port:
+  - dst_endpoint.port
+  columns.protocol:
+  - connection_info.protocol_num
+  columns.sha1:
+  - file.hashes.value
+  columns.sha256:
+  - file.hashes.value
+  columns.size:
+  - file.size
+  columns.target_path:
+  - file.path
+  columns.tty:
+  - session.terminal
+  columns.uid:
+  - file.owner.uid
+  - process.user.uid
+  columns.user:
+  - user.name
+  decorations.host_uuid:
+  - device.uid
+  decorations.hostname:
+  - device.hostname
+  - dst_endpoint.hostname
+  hostIdentifier:
+  - device.hostname
+  message:
+  - message
+  name:
+  - metadata.event_code
+  version:
+  - metadata.product.version

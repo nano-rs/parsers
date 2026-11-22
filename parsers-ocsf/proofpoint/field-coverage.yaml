@@ -1,17 +1,5 @@
 source: json
 transforms:
-- source: filter.routeDirection
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: filter.modules.spam.disposition
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: threatStatus
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
 - source: ts
   kind: epoch_ms
   target: time
@@ -24,67 +12,54 @@ transforms:
   kind: epoch_ms
   target: time
   reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-- source: threatStatus
-  kind: enum
-  target: disposition
-  values:
-    blocked: Blocked
-  reason: Parser normalizes the caption case; verify the emitted caption.
-consumed_candidates:
-- campaignId
-- classification
-- clickIP
-- clickTime
-- connection
-- connection.country
-- connection.helo
-- connection.host
-- connection.ip
-- connection.protocol
-- envelope
-- envelope.from
-- envelope.rcpts
-- filter
-- filter.disposition
-- filter.modules
-- filter.modules.spam
-- filter.modules.spam.disposition
-- filter.modules.spam.scores
-- filter.modules.spam.scores.classifiers.malware
-- filter.modules.spam.scores.classifiers.phish
-- filter.modules.spam.scores.overall
-- filter.modules.spam.verdict
-- filter.modules.urldefense.counts.rewritten
-- filter.routeDirection
-- guid
-- headerFrom
-- impostorScore
-- malwareScore
-- messageID
-- messageParts
-- messageSize
-- messageTime
-- modulesRun
-- msg
-- msg.header.message-id
-- msg.normalizedHeader.subject
-- msg.sizeBytes
-- phishScore
-- quarantineFolder
-- quarantineRule
-- recipient
-- sender
-- senderIP
-- spamScore
-- subject
-- threatID
-- threatStatus
-- threatURL
-- threatsInfoMap
-- ts
-- type
-- url
-- userAgent
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  clickIP:
+  - src_endpoint.ip
+  connection.country:
+  - src_endpoint.location.country
+  connection.host:
+  - src_endpoint.hostname
+  connection.ip:
+  - src_endpoint.ip
+  envelope.from:
+  - email.from
+  envelope.rcpts:
+  - email.to
+  filter.modules.spam.scores.overall:
+  - risk_score
+  guid:
+  - email.uid
+  - metadata.original_event_uid
+  - metadata.uid
+  malwareScore:
+  - risk_score
+  messageID:
+  - email.message_uid
+  - metadata.original_event_uid
+  messageSize:
+  - email.size
+  msg.header.message-id:
+  - email.message_uid
+  msg.normalizedHeader.subject:
+  - email.subject
+  msg.sizeBytes:
+  - email.size
+  recipient:
+  - email.to
+  sender:
+  - email.from
+  senderIP:
+  - src_endpoint.ip
+  subject:
+  - email.subject
+  - message
+  threatURL:
+  - email.urls.url_string
+  type:
+  - message
+  - metadata.event_code
+  url:
+  - email.urls.url_string

@@ -1,4 +1,8 @@
 source: text
+probe:
+  raw: CEF:0|Ping Identity|PingFederate|12.0|SSO|SSO|0|rt=Feb 02 2024 15:49:15.178 duid=alice src=192.0.2.1
+    msg=success ResidualProbe=nan2421-text-unknown password=nan2421-secret
+  source: ResidualProbe
 transforms:
 - source: status
   kind: enum
@@ -27,7 +31,8 @@ transforms:
     saml11: 5
     oauth20: 6
     oidc: 4
-  reason: Identity protocol normalized to the OCSF auth protocol; consume only when the expected ID is emitted.
+  reason: Identity protocol normalized to the OCSF auth protocol; consume only when the expected ID is
+    emitted.
 - source: cs3
   kind: enum
   target: auth_protocol_id
@@ -36,40 +41,50 @@ transforms:
     saml11: 5
     oauth20: 6
     oidc: 4
-  reason: CEF cs3 (Protocol) normalized to the OCSF auth protocol; consume only when the expected ID is emitted.
-- source: event
-  kind: enum
-  target: metadata.event_code
-  values:
-    oauth: OAUTH
-  reason: Event type upper-cased onto metadata.event_code; consume only when the emitted code matches.
-probe:
-  raw: CEF:0|Ping Identity|PingFederate|12.0|SSO|SSO|0|rt=Feb 02 2024 15:49:15.178 duid=alice src=192.0.2.1 msg=success ResidualProbe=nan2421-text-unknown password=nan2421-secret
-  source: ResidualProbe
-consumed_candidates:
-- app
-- connectionid
-- cs1
-- cs2
-- cs4
-- description
-- deviceEventClassId
-- deviceProduct
-- deviceVendor
-- deviceVersion
-- duid
-- dvchost
-- event
-- externalId
-- host
-- ip
-- name
-- responsetime
-- src
-- subject
-- suser
-- trackingid
-- transactionid
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+  reason: CEF cs3 (Protocol) normalized to the OCSF auth protocol; consume only when the expected ID is
+    emitted.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  app:
+  - http_request.url.url_string
+  connectionid:
+  - service.name
+  - service.uid
+  cs1:
+  - http_request.url.url_string
+  cs2:
+  - service.name
+  - service.uid
+  description:
+  - status_detail
+  deviceVersion:
+  - metadata.product.version
+  duid:
+  - user.email_addr
+  - user.name
+  dvchost:
+  - dst_endpoint.hostname
+  event:
+  - metadata.event_code
+  externalId:
+  - metadata.correlation_uid
+  host:
+  - dst_endpoint.hostname
+  ip:
+  - src_endpoint.ip
+  name:
+  - message
+  - metadata.event_code
+  responsetime:
+  - duration
+  src:
+  - src_endpoint.ip
+  subject:
+  - user.email_addr
+  - user.name
+  trackingid:
+  - metadata.correlation_uid
+  transactionid:
+  - metadata.uid

@@ -1,19 +1,22 @@
 source: text
-transforms:
-- source: timestamp
-  kind: epoch_ms
-  target: time
-  reason: Built-in Apache timestamp converted to epoch milliseconds.
-consumed_candidates:
-- agent
-- host
-- method
-- path
-- referrer
-- size
-- status
-- timestamp
-- user
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  agent:
+  - http_request.user_agent
+  host:
+  - src_endpoint.ip
+  method:
+  - http_request.http_method
+  path:
+  - http_request.url.path
+  referrer:
+  - http_request.referrer
+  size:
+  - http_response.length
+  - traffic.bytes_in
+  status:
+  - http_response.code
+  user:
+  - actor.user.name

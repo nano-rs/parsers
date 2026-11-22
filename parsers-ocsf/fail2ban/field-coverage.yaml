@@ -4,16 +4,24 @@ transforms:
   kind: epoch_ms
   target: time
   format: '%+'
-  reason: RFC 3339 header clock with an offset converted to event milliseconds; the offset-less fail2ban.log clock remains residual.
-consumed_candidates:
-- header.host
-- header.jhost
-- header.logger
-- header.level
-- jail_event.jail
-- jail_event.verb
-- jail_event.ip
-- message
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+  reason: RFC 3339 header clock with an offset converted to event milliseconds; the offset-less fail2ban.log
+    clock remains residual.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  header.host:
+  - device.hostname
+  header.jhost:
+  - device.hostname
+  header.logger:
+  - metadata.log_provider
+  header.level:
+  - metadata.log_level
+  jail_event.jail:
+  - finding_info.analytic.name
+  jail_event.ip:
+  - evidences.src_endpoint.ip
+  - observables.value
+  message:
+  - message

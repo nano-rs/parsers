@@ -2,27 +2,36 @@ source: json
 transforms:
 - source: level
   kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
+  target: metadata.log_level
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
 - source: timestamp
   kind: epoch_ms
   target: time
   reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-consumed_candidates:
-- duration_ms
-- latency
-- level
-- message
-- method
-- service.name
-- service_name
-- span_id
-- status
-- target
-- timestamp
-- trace_id
-- uri
-- url
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  duration_ms:
+  - duration
+  message:
+  - message
+  method:
+  - http_request.http_method
+  service.name:
+  - actor.app_name
+  - api.service.name
+  - dst_endpoint.svc_name
+  - metadata.log_name
+  - src_endpoint.svc_name
+  - trace.service.name
+  status:
+  - api.response.code
+  - http_response.code
+  trace_id:
+  - trace.uid
+  uri:
+  - http_request.url.path
+  - http_request.url.url_string
+  url:
+  - http_request.url.url_string

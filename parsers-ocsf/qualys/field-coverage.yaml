@@ -2,8 +2,8 @@ source: json
 transforms:
 - source: severity
   kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
+  target: severity_id
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
 - source: LAST_SCAN_DATETIME
   kind: epoch_ms
   target: time
@@ -20,47 +20,52 @@ transforms:
   kind: epoch_ms
   target: time
   reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-consumed_candidates:
-- CATEGORY
-- CVE_LIST
-- CVSS_BASE
-- CVSS_V3_BASE
-- DETECTION_LIST
-- DNS
-- IP
-- LAST_SCAN_DATETIME
-- NETBIOS
-- OS
-- PUBLISHED_DATETIME
-- QID
-- SEVERITY
-- SOLUTION
-- TITLE
-- TRACKING_METHOD
-- VULN_TYPE
-- controlId
-- cvss_v3
-- cvss_v3.base
-- evidence
-- firstDetectedDate
-- hostIp
-- hostName
-- id
-- lastEvaluated
-- method
-- param
-- policyName
-- qid
-- rationale
-- severity
-- status
-- technology
-- title
-- uri
-- vulnType
-- webApp
-- webApp.name
-- webApp.url
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  CVE_LIST:
+  - observables.value
+  - vulnerabilities.cve.uid
+  DNS:
+  - evidences.dst_endpoint.hostname
+  - observables.value
+  - resources.hostname
+  - resources.name
+  IP:
+  - evidences.dst_endpoint.ip
+  - observables.value
+  - resources.ip
+  QID:
+  - finding_info.uid
+  SEVERITY:
+  - severity_id
+  SOLUTION:
+  - vulnerabilities.remediation.desc
+  TITLE:
+  - finding_info.title
+  - vulnerabilities.title
+  controlId:
+  - finding_info.uid
+  hostIp:
+  - evidences.dst_endpoint.ip
+  - observables.value
+  - resources.ip
+  hostName:
+  - evidences.dst_endpoint.hostname
+  - observables.value
+  - resources.hostname
+  - resources.name
+  method:
+  - evidences.http_request.http_method
+  qid:
+  - finding_info.uid
+  severity:
+  - severity_id
+  status:
+  - status_detail
+  title:
+  - finding_info.title
+  uri:
+  - evidences.url.url_string
+  - observables.value
