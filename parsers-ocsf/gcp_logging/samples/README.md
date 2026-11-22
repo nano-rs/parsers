@@ -7,7 +7,7 @@ https://cloud.google.com/logging/docs/reference/v2/rest/v2/LogEntry
 | File | Branch | Source |
 |------|--------|--------|
 | `text_payload_docs_pubsub.json` | textPayload, legacy `log` field, labels | decoded LogEntry from https://cloud.google.com/logging/docs/export/pubsub |
-| `pubsub_push_wrapper.json` | Pub/Sub push wrapper, base64 `message.data`; the decoded entry's jsonPayload (with a secret key), labels and resource labels spill, the base64 body does not | wrapper fields per https://cloud.google.com/pubsub/docs/push and the page above |
+| `pubsub_push_wrapper.json` | Pub/Sub push wrapper, base64 `message.data`; the decoded entry's jsonPayload (with a secret key, kept as-is), labels and resource labels spill, the base64 body does not | wrapper fields per https://cloud.google.com/pubsub/docs/push and the page above |
 | `cloud_run_request_200.json` | httpRequest (HTTP Activity), trace, spanId | Cloud Run request log fields: https://cloud.google.com/run/docs/logging and HttpRequest: https://cloud.google.com/logging/docs/reference/v2/rest/v2/LogEntry#HttpRequest |
 | `load_balancer_armor_deny_403.json` | LB httpRequest + LoadBalancerLogEntry, Cloud Armor deny | fields from https://cloud.google.com/load-balancing/docs/https/https-logging-monitoring and https://cloud.google.com/armor/docs/request-logging |
 | `load_balancer_backend_502.json` | LB 502, remoteIp with port, referer | same |
@@ -23,6 +23,6 @@ https://cloud.google.com/logging/docs/reference/v2/rest/v2/LogEntry
 | `json_without_logentry_fields.json` | JSON that is not a LogEntry (fallback) | synthetic |
 | `malformed.json` | not JSON (fallback) | synthetic |
 | `pubsub_push_wrapper_key_collision.json` | review regression: decoded LogEntry has a key the wrapper also has (`subscription`); the wrapper is kept whole, nothing is overwritten | constructed |
-| `pubsub_push_collision_secret_withheld.json` | review regression: an unmerged Pub/Sub body carrying a credential is withheld (byte length + sha256); the credential appears only in raw_data | constructed |
-| `pubsub_push_collision_textpayload_secret.json` | review regression: a colliding Pub/Sub entry is not mapped from its unmerged body (its credential never reaches `message`); it falls back with the body withheld | constructed |
-| `pubsub_push_object_data_secret.json`, `pubsub_push_array_data_secret.json` | review regression: an already-decoded object `data` spills key-redacted; an array `data` is withheld | constructed |
+| `pubsub_push_collision_secret_kept.json` | review regression: an unmerged Pub/Sub body carrying a credential spills as-is (base64 `message.data`), never overwritten | constructed |
+| `pubsub_push_collision_textpayload_secret.json` | review regression: a colliding Pub/Sub entry is not mapped from its unmerged body ; it falls back with the base64 body spilled as-is | constructed |
+| `pubsub_push_object_data_secret.json`, `pubsub_push_array_data_secret.json` | review regression: an already-decoded object `data` and an array `data` spill as-is | constructed |

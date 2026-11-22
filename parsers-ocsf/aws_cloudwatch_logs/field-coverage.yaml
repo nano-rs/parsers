@@ -36,19 +36,5 @@ source_normalize:
   target: message_json
   arrays: true
   reason: A JSON log message is moved under message_json so its fields spill one by
-    one and secret keys are redacted (its raw text stays only in raw_data); never
-    overwrites an existing message_json.
-- kind: withhold
-  paths:
-  - logEvents.message
-  - message
-  match: '^\uFEFF?\s*(?:\x7B|\x5B\s*(?:[\x7B\x5B\x22]|(?:-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)\s*(?:,|\x5D\s*$)))'
-  reason: Text that opens like a JSON object or array (a UTF-8 BOM allowed) but could not
-    be moved (invalid JSON, or an input message_json key) cannot be key-redacted, so only
-    its byte length and sha256 stay.
-- kind: withhold
-  paths:
-  - logEvents
-  match: '^\x5B[^\x5D]'
-  reason: A multi-event batch (nano cannot fan out) keeps its events only in raw_data;
-    their message text cannot be key-redacted, so only its byte length and sha256 stay.
+    one, as-is (its raw text stays in raw_data); never overwrites an existing
+    message_json.

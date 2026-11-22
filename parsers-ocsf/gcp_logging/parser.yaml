@@ -3,7 +3,7 @@ display_name: Google Cloud Logging (generic, OCSF)
 version: "1.0.0"
 ocsf_version: "1.9.0"
 description: >
-  Preserves unconsumed parsed fields in redacted, dotted snake_case unmapped keys.
+  Preserves unconsumed parsed fields, unaltered, in dotted snake_case unmapped keys.
   Generic parser for Google Cloud Logging LogEntry records from ANY log
   (Cloud Run, GKE, Compute Engine, App Engine, load balancers, Cloud
   Functions, custom application logs), as exported by a log sink to Pub/Sub
@@ -24,8 +24,8 @@ description: >
   App Engine request logs) is "HTTP Activity" (class_uid 4002); a bare IPv6
   remoteIp / serverIp is kept whole, a port is read only from `[v6]:port`
   or `v4:port`. With the push wrapper, the decoded LogEntry is the parsed
-  source, so its unmapped fields spill (redacted) and the base64 body does
-  not. Everything else
+  source, so its unmapped fields spill as-is and the base64 body is not
+  spilled a second time. Everything else
   (textPayload, jsonPayload, other protoPayloads) is "Base Event"
   (class_uid 0): textPayload or jsonPayload.message is the message and the
   rest of jsonPayload passes through under `unmapped.json_payload.*`.
@@ -58,11 +58,12 @@ parser_vrl: |
           dj, djerr = parse_json(dec)
           if djerr == null && is_object(dj) {
               de = object!(dj)
-              # The decoded LogEntry is the source, so its unmapped fields spill (and
-              # are redacted); the wrapper's own fields ride along without the base64 body.
+              # The decoded LogEntry is the source, so its unmapped fields spill as-is;
+              # the wrapper's own fields ride along without the base64 body.
               # A decoded key the wrapper also has would be overwritten, so then the
-              # wrapper is kept as captured (its body withheld below) and the record is
-              # not mapped from the unmerged body: it falls back as a non-LogEntry.
+              # wrapper is kept as captured (its base64 body spills as-is) and the
+              # record is not mapped from the unmerged body: it falls back as a
+              # non-LogEntry.
               w = p
               __discard = del(w.message.data)
               wkeys = keys(w)
@@ -73,17 +74,6 @@ parser_vrl: |
                   __source_kv = merge(de, w)
               }
           }
-      }
-      # A Pub/Sub body left in place (it did not decode to a LogEntry, or its keys
-      # collide with the wrapper) would spill base64 that redaction cannot see
-      # into, so it is withheld: only its size and sha256 stay (raw_data keeps it).
-      # A string or array body is withheld; an object is structured and spills
-      # key-redacted as is.
-      wd = get(__source_kv, ["message", "data"]) ?? null
-      wt = ""
-      if is_string(wd) { wt = string!(wd) } else if is_array(wd) { wt = encode_json(wd) }
-      if match(wt, r'^[\s\S]') {
-          __source_kv = set!(__source_kv, ["message", "data"], {"withheld": true, "bytes": length(wt), "sha256": sha2(wt, variant: "SHA-256")})
       }
       is_entry = exists(e.logName) || exists(e.insertId) || exists(e.textPayload) || exists(e.jsonPayload) || exists(e.protoPayload) || (exists(e.resource) && exists(e.timestamp))
   }
