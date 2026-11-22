@@ -1,4 +1,9 @@
 source: json
+source_normalize:
+- kind: base64_json_merge
+  path: message.data
+  reason: A Pub/Sub push wrapper's base64 LogEntry is the event; its fields spill as-is while the wrapper
+    keys ride along. Skipped when a decoded key collides.
 transforms:
 - source: timestamp
   kind: epoch_ms
@@ -22,44 +27,69 @@ transforms:
     alert: 5
     emergency: 6
   reason: Cloud Logging LogSeverity normalized to OCSF severity_id; consumed only when that ID is emitted.
-consumed_candidates:
-- httpRequest.protocol
-- httpRequest.referer
-- httpRequest.remoteIp
-- httpRequest.requestMethod
-- httpRequest.requestSize
-- httpRequest.requestUrl
-- httpRequest.responseSize
-- httpRequest.serverIp
-- httpRequest.status
-- httpRequest.userAgent
-- insertId
-- jsonPayload.message
-- jsonPayload.msg
-- jsonPayload.statusDetails
-- logName
-- operation.id
-- protoPayload.authenticationInfo.principalEmail
-- protoPayload.methodName
-- protoPayload.requestMetadata.callerIp
-- protoPayload.requestMetadata.callerSuppliedUserAgent
-- protoPayload.resourceName
-- protoPayload.serviceName
-- protoPayload.status.code
-- protoPayload.status.message
-- resource.labels.location
-- resource.labels.project_id
-- resource.labels.region
-- resource.labels.zone
-- resource.type
-- severity
-- textPayload
-- trace
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
-source_normalize:
-- kind: base64_json_merge
-  path: message.data
-  reason: A Pub/Sub push wrapper's base64 LogEntry is the event; its fields spill as-is
-    while the wrapper keys ride along. Skipped when a decoded key collides.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  httpRequest.protocol:
+  - http_request.version
+  httpRequest.referer:
+  - http_request.referrer
+  httpRequest.remoteIp:
+  - src_endpoint.ip
+  httpRequest.requestMethod:
+  - http_request.http_method
+  httpRequest.requestSize:
+  - http_request.length
+  - traffic.bytes_out
+  httpRequest.requestUrl:
+  - http_request.url.url_string
+  httpRequest.responseSize:
+  - http_response.length
+  - traffic.bytes_in
+  httpRequest.serverIp:
+  - dst_endpoint.ip
+  httpRequest.status:
+  - http_response.code
+  httpRequest.userAgent:
+  - http_request.user_agent
+  insertId:
+  - metadata.uid
+  jsonPayload.message:
+  - message
+  jsonPayload.statusDetails:
+  - http_response.message
+  logName:
+  - metadata.log_name
+  operation.id:
+  - metadata.correlation_uid
+  protoPayload.authenticationInfo.principalEmail:
+  - actor.user.email_addr
+  - actor.user.name
+  protoPayload.methodName:
+  - api.operation
+  protoPayload.requestMetadata.callerIp:
+  - src_endpoint.ip
+  protoPayload.requestMetadata.callerSuppliedUserAgent:
+  - http_request.user_agent
+  protoPayload.resourceName:
+  - resources.name
+  - resources.uid
+  protoPayload.serviceName:
+  - api.service.name
+  resource.labels.location:
+  - cloud.region
+  resource.labels.project_id:
+  - cloud.account.uid
+  - cloud.project_uid
+  resource.labels.region:
+  - cloud.region
+  resource.labels.zone:
+  - cloud.region
+  - cloud.zone
+  resource.type:
+  - resources.type
+  severity:
+  - metadata.log_level
+  textPayload:
+  - message

@@ -4,10 +4,6 @@ transforms:
   kind: epoch_ms
   target: time
   reason: Request start clock (RFC 3339) converted to event milliseconds.
-- source: StartLocal
-  kind: epoch_ms
-  target: time
-  reason: Request start clock (RFC 3339) converted to event milliseconds when StartUTC is absent.
 - source: time
   kind: epoch_ms
   target: time
@@ -19,14 +15,9 @@ transforms:
   reason: CLF timestamp with explicit offset converted to event milliseconds.
 - source: Duration
   kind: scale
-  factor: 0.000001
+  factor: 1.0e-06
   target: duration
   reason: Traefik reports Duration in nanoseconds; OCSF duration is milliseconds.
-- source: OriginDuration
-  kind: scale
-  factor: 0.000001
-  target: http_response.latency
-  reason: Traefik reports OriginDuration in nanoseconds; http_response.latency is milliseconds.
 - source: level
   kind: enum
   target: severity_id
@@ -47,51 +38,92 @@ transforms:
     panic: 6
     pnc: 6
   reason: Traefik log level normalized to OCSF severity_id; consumed only when that ID is emitted.
-consumed_candidates:
-- BackendName
-- BackendURL.Host
-- ClientAddr
-- ClientHost
-- ClientPort
-- ClientUsername
-- DownstreamContentSize
-- DownstreamStatus
-- FrontendName
-- RequestContentSize
-- RequestHost
-- RequestMethod
-- RequestPath
-- RequestPort
-- RequestProtocol
-- RequestScheme
-- RouterName
-- ServiceAddr
-- ServiceName
-- ServiceURL
-- ServiceURL.Host
-- TLSCipher
-- TLSVersion
-- downstream_Content-Type
-- client_host
-- client_username
-- downstream_content_size
-- downstream_status
-- duration
-- error
-- level
-- message
-- msg
-- request_Referer
-- request_User-Agent
-- request_method
-- request_path
-- request_protocol
-- request_referer
-- request_user_agent
-- router_name
-- service_url
-- start_local
-- trace_id
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  BackendName:
+  - dst_endpoint.svc_name
+  - load_balancer.dst_endpoint.svc_name
+  ClientAddr:
+  - src_endpoint.ip
+  ClientHost:
+  - src_endpoint.ip
+  ClientPort:
+  - src_endpoint.port
+  DownstreamContentSize:
+  - http_response.length
+  - traffic.bytes_in
+  DownstreamStatus:
+  - http_response.code
+  - load_balancer.code
+  FrontendName:
+  - load_balancer.name
+  RequestContentSize:
+  - http_request.length
+  - traffic.bytes_out
+  RequestHost:
+  - http_request.url.hostname
+  - tls.sni
+  RequestMethod:
+  - http_request.http_method
+  RequestPath:
+  - http_request.url.path
+  RequestPort:
+  - http_request.url.port
+  RequestProtocol:
+  - http_request.version
+  RequestScheme:
+  - http_request.url.scheme
+  RouterName:
+  - load_balancer.name
+  ServiceAddr:
+  - dst_endpoint.ip
+  - load_balancer.dst_endpoint.ip
+  ServiceName:
+  - dst_endpoint.svc_name
+  - load_balancer.dst_endpoint.svc_name
+  TLSCipher:
+  - tls.cipher
+  TLSVersion:
+  - tls.version
+  downstream_Content-Type:
+  - http_response.content_type
+  client_host:
+  - src_endpoint.ip
+  client_username:
+  - actor.user.name
+  downstream_content_size:
+  - http_response.length
+  - traffic.bytes_in
+  downstream_status:
+  - http_response.code
+  - load_balancer.code
+  duration:
+  - duration
+  error:
+  - status_detail
+  level:
+  - metadata.log_level
+  message:
+  - message
+  msg:
+  - message
+  request_User-Agent:
+  - http_request.user_agent
+  request_method:
+  - http_request.http_method
+  request_path:
+  - http_request.url.path
+  request_protocol:
+  - http_request.version
+  request_referer:
+  - http_request.referrer
+  request_user_agent:
+  - http_request.user_agent
+  router_name:
+  - load_balancer.name
+  start_local:
+  - metadata.original_time
+  trace_id:
+  - trace.uid

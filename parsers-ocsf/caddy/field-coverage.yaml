@@ -49,26 +49,44 @@ transforms:
     '52392': TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
     '52393': TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
   reason: Go crypto/tls numeric cipher suite (IANA value) decoded to its IANA name.
-consumed_candidates:
-- bytes_read
-- err_id
-- error
-- level
-- logger
-- msg
-- request.client_ip
-- request.headers.Content-Type
-- request.headers.Referer
-- request.headers.User-Agent
-- request.method
-- request.proto
-- request.remote_ip
-- request.remote_port
-- request.tls.server_name
-- resp_headers.Content-Type
-- size
-- status
-- user_id
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  bytes_read:
+  - http_request.length
+  - traffic.bytes_out
+  err_id:
+  - metadata.correlation_uid
+  error:
+  - status_detail
+  level:
+  - metadata.log_level
+  logger:
+  - metadata.log_name
+  msg:
+  - http_response.message
+  - message
+  request.client_ip:
+  - src_endpoint.ip
+  request.headers.Referer:
+  - http_request.referrer
+  request.headers.User-Agent:
+  - http_request.user_agent
+  request.method:
+  - http_request.http_method
+  request.proto:
+  - http_request.version
+  request.remote_port:
+  - src_endpoint.port
+  request.tls.server_name:
+  - tls.sni
+  resp_headers.Content-Type:
+  - http_response.content_type
+  size:
+  - http_response.length
+  - traffic.bytes_in
+  status:
+  - http_response.code
+  user_id:
+  - actor.user.name
