@@ -31,7 +31,12 @@ description: >
   row, including ProcessCommandLine) is also promoted to actor.process /
   actor.user (host profile), and Azure resource evidence to top-level
   resources, where nano's unified hunt columns read them. A missing clock
-  falls back to ingest time, never 1970.
+  falls back to ingest time, never 1970. An AlertEvidence process id is read
+  from the AdditionalFields JSON when present; otherwise, because OCSF needs
+  pid, uid or cpid, process.uid is a synthetic value prefixed
+  "synthetic:defender_xdr:" (16 hex chars of sha256 over alert id, device id
+  and command line). It is scoped to one alert and is NOT an OS process GUID,
+  so do not join it against EDR or Sysmon process_guid.
   Sample sources:
     https://learn.microsoft.com/en-us/graph/api/security-alert-get?view=graph-rest-1.0
     https://learn.microsoft.com/en-us/graph/api/resources/security-alert?view=graph-rest-1.0
@@ -386,7 +391,9 @@ parser_vrl: |
                   } else if etype == "fileEvidence" {
                       if fname != "" { ev.file = fobj }
                   } else if etype == "processEvidence" {
-                      pid = to_int(e.processId) ?? -1
+                      # to_int(null) is 0, not an error: guard null so a missing id
+                      # never fabricates pid 0 (Windows System Idle Process).
+                      pid = if e.processId != null { to_int(e.processId) ?? -1 } else { -1 }
                       if pid >= 0 {
                           pr = { "pid": pid }
                           cl = to_string(e.processCommandLine) ?? ""
@@ -394,7 +401,7 @@ parser_vrl: |
                           if fname != "" { pr.name = fname; pr.file = fobj }
                           pct, pcterr = parse_timestamp(to_string(e.processCreationDateTime) ?? "", "%+")
                           if pcterr == null { pr.created_time = to_unix_timestamp(pct, unit: "milliseconds") }
-                          ppid = to_int(e.parentProcessId) ?? -1
+                          ppid = if e.parentProcessId != null { to_int(e.parentProcessId) ?? -1 } else { -1 }
                           if ppid >= 0 {
                               pp = { "pid": ppid }
                               ppf = object(e.parentProcessImageFile) ?? {}
@@ -446,6 +453,10 @@ parser_vrl: |
                           arty = to_string(e.resourceType) ?? ""
                           if arty != "" { res.type = arty }
                           ev.resources = [res]
+                          # OCSF evidences need one of actor/data/device/...; resources
+                          # is not in that list, so data carries the compact resource
+                          # identity only, never the whole raw Graph entity.
+                          ev.data = res
                           top_resources = push(top_resources, res)
                       }
                   } else if etype == "ipEvidence" {
@@ -488,7 +499,7 @@ parser_vrl: |
                   }
                   # An entity this parser does not model keeps its type name and
                   # its whole body (also preserved in unmapped.evidence).
-                  if length(keys(ev)) <= 3 && !exists(ev.device) && !exists(ev.file) && !exists(ev.process) && !exists(ev.user) && !exists(ev.dst_endpoint) && !exists(ev.url) && !exists(ev.reg_key) && !exists(ev.email) {
+                  if length(keys(ev)) <= 3 && !exists(ev.device) && !exists(ev.file) && !exists(ev.process) && !exists(ev.user) && !exists(ev.dst_endpoint) && !exists(ev.url) && !exists(ev.reg_key) && !exists(ev.email) && !exists(ev.resources) {
                       ev.data = e
                   }
                   evidences = push(evidences, ev)
@@ -541,6 +552,7 @@ parser_vrl: |
                   ev = {}
                   if et != "" { ev.name = et }
                   fname = to_string(row.FileName) ?? ""
+                  fobj = {}
                   if fname != "" {
                       fobj = { "name": fname, "type_id": 1, "type": "Regular File" }
                       fp = to_string(row.FolderPath) ?? ""
@@ -556,19 +568,29 @@ parser_vrl: |
                       ev.file = fobj
                   }
                   pcl = to_string(row.ProcessCommandLine) ?? ""
-                  if pcl != "" {
-                      pr = { "cmd_line": pcl }
-                      if fname != "" { pr.name = fname; pr.file = ev.file }
-                      # OCSF requires pid, uid or cpid on a process. AlertEvidence has
-                      # no process id column, so a stable uid is derived from the
-                      # alert, device and command line (one value per entity).
-                      ppid_ = to_int(row.ProcessId) ?? -1
+                  # AlertEvidence carries the process id inside the AdditionalFields
+                  # JSON string, not as a column. to_int(null) is 0, so null is
+                  # guarded explicitly: a missing id never becomes pid 0.
+                  ppid_ = -1
+                  if row.ProcessId != null { ppid_ = to_int(row.ProcessId) ?? -1 }
+                  if ppid_ < 0 && is_string(row.AdditionalFields) {
+                      xaf = object(parse_json(string!(row.AdditionalFields)) ?? {}) ?? {}
+                      if xaf.ProcessId != null { ppid_ = to_int(xaf.ProcessId) ?? -1 }
+                  }
+                  has_proc = pcl != "" || (ppid_ >= 0 && downcase(et) == "process")
+                  pr = {}
+                  if has_proc {
+                      if pcl != "" { pr.cmd_line = pcl }
+                      if fname != "" { pr.name = fname; pr.file = fobj }
+                      # OCSF requires pid, uid or cpid on a process. Without a real
+                      # id the uid is explicitly synthetic ("synthetic:defender_xdr:"
+                      # prefix) and scoped to one alert, so it is never mistaken for
+                      # an OS process GUID in a correlation join.
                       if ppid_ >= 0 {
                           pr.pid = ppid_
                       } else {
-                          pr.uid = sha2("defender_xdr|process|" + (to_string(row.AlertId) ?? "") + "|" + (to_string(row.DeviceId) ?? "") + "|" + pcl, variant: "SHA-256")
+                          pr.uid = "synthetic:defender_xdr:" + slice!(sha2("defender_xdr|process|" + alert_uid + "|" + (to_string(row.DeviceId) ?? "") + "|" + pcl, variant: "SHA-256"), 0, 16)
                       }
-                      ev.process = pr
                   }
                   dname = to_string(row.DeviceName) ?? ""
                   did = to_string(row.DeviceId) ?? ""
@@ -596,9 +618,10 @@ parser_vrl: |
                       ev.user = us
                       actor_user = us
                   }
-                  if exists(ev.process) {
-                      if exists(ev.user) { ev.process.user = ev.user }
-                      actor_process = object(ev.process) ?? {}
+                  if has_proc {
+                      if length(keys(actor_user)) > 0 { pr.user = actor_user }
+                      ev.process = pr
+                      actor_process = pr
                   }
                   rip = to_string(row.RemoteIP) ?? ""
                   if rip != "" {
@@ -1176,6 +1199,8 @@ samples:
       "evidences.0.process.cmd_line": "rundll32.exe C:\\Users\\Public\\x.dll,Start"
       "metadata.profiles.2": "host"
       "device.hostname": "wks-02.corp.example.com"
+      "actor.process.uid": "synthetic:defender_xdr:bf7ce1dfa3c8aeab"
+      "actor.process.pid": "<missing>"
   # Review fix: cloud-only userEvidence (accountName null), deviceDnsName-only device,
   # azureResourceEvidence promoted to top-level resources.
   - raw: "{\"@odata.type\": \"#microsoft.graph.security.alert\", \"id\": \"da00000000-0000-4000-8000-000000000042\", \"providerAlertId\": \"aa00000000-0000-4000-8000-000000000042\", \"incidentId\": \"4242\", \"status\": \"new\", \"severity\": \"medium\", \"classification\": null, \"determination\": null, \"serviceSource\": \"microsoftDefenderForCloud\", \"detectionSource\": \"microsoftDefenderForCloud\", \"productName\": \"Microsoft Defender for Cloud\", \"detectorId\": \"K8S_ExposedDashboard\", \"tenantId\": \"00000000-0000-0000-0000-000000000000\", \"title\": \"Suspicious sign-in followed by storage key listing\", \"description\": \"A cloud-only account listed storage account keys from an unusual location.\", \"category\": \"CredentialAccess\", \"assignedTo\": null, \"alertWebUrl\": \"https://security.microsoft.com/alerts/da00000000-0000-4000-8000-000000000042\", \"mitreTechniques\": [\"T1552.001\"], \"createdDateTime\": \"2026-11-02T08:00:00.000Z\", \"lastUpdateDateTime\": \"2026-11-02T08:05:00.000Z\", \"firstActivityDateTime\": \"2026-11-02T07:55:00.000Z\", \"lastActivityDateTime\": \"2026-11-02T07:58:00.000Z\", \"comments\": [], \"evidence\": [{\"@odata.type\": \"#microsoft.graph.security.userEvidence\", \"createdDateTime\": \"2026-11-02T08:00:00.000Z\", \"verdict\": \"suspicious\", \"remediationStatus\": \"none\", \"roles\": [\"compromised\"], \"userAccount\": {\"accountName\": null, \"domainName\": null, \"userSid\": null, \"azureAdUserId\": \"00000000-0000-0000-0000-000000000001\", \"userPrincipalName\": \"cloudonly@example.com\", \"displayName\": \"Cloud Only\"}}, {\"@odata.type\": \"#microsoft.graph.security.deviceEvidence\", \"createdDateTime\": \"2026-11-02T08:00:00.000Z\", \"verdict\": \"unknown\", \"remediationStatus\": \"none\", \"hostName\": null, \"deviceDnsName\": \"vm-web-01.example.com\", \"mdeDeviceId\": \"3333333333333333333333333333333333333333\", \"azureAdDeviceId\": null, \"dnsDomain\": \"example.com\", \"ipInterfaces\": [\"192.0.2.30\"]}, {\"@odata.type\": \"#microsoft.graph.security.azureResourceEvidence\", \"createdDateTime\": \"2026-11-02T08:00:00.000Z\", \"verdict\": \"unknown\", \"remediationStatus\": \"none\", \"resourceId\": \"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-prod/providers/Microsoft.Storage/storageAccounts/stprod01\", \"resourceName\": \"stprod01\", \"resourceType\": \"Storage Accounts\"}]}"
@@ -1190,3 +1215,17 @@ samples:
     expect:
       "actor.user.name": "user3"
       "severity_id": 3
+  # Review fix: to_int(null) is 0; a missing parentProcessId / null processId never
+  # fabricates pid 0.
+  - raw: "{\"@odata.type\":\"#microsoft.graph.security.alert\",\"id\":\"da00000000-0000-4000-8000-000000000077\",\"status\":\"new\",\"severity\":\"low\",\"lastUpdateDateTime\":\"2026-10-05T11:00:00Z\",\"evidence\":[{\"@odata.type\":\"#microsoft.graph.security.processEvidence\",\"processId\":4000,\"imageFile\":{\"fileName\":\"a.exe\"}},{\"@odata.type\":\"#microsoft.graph.security.processEvidence\",\"processId\":null,\"imageFile\":{\"fileName\":\"b.exe\"}}]}"
+    expect:
+      "evidences.0.process.pid": 4000
+      "evidences.0.process.parent_process": "<missing>"
+      "evidences.1.process": "<missing>"
+      "evidences.1.file.name": "b.exe"
+  # Review fix: AlertEvidence process id read from the AdditionalFields JSON.
+  - raw: "{\"Timestamp\": \"2026-10-05T12:00:00Z\", \"AlertId\": \"da638638000000000003_9\", \"Title\": \"Suspicious process\", \"EntityType\": \"Process\", \"FileName\": \"powershell.exe\", \"ProcessCommandLine\": \"\", \"DeviceId\": \"3333333333333333333333333333333333333333\", \"DeviceName\": \"wks-03.corp.example.com\", \"AdditionalFields\": \"{\\\"ProcessId\\\": 4242}\", \"Severity\": \"Medium\"}"
+    expect:
+      "actor.process.pid": 4242
+      "actor.process.uid": "<missing>"
+      "evidences.0.process.name": "powershell.exe"
