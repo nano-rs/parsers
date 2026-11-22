@@ -55,7 +55,7 @@ parser_vrl: |
       host = string!(h5.host)
       msg = string!(h5.msg)
       sev_num = mod(to_int(h5.pri) ?? 6, 8)
-      t5, t5e = parse_timestamp(string!(h5.ts), "%+")
+      t5, t5e = parse_timestamp(string!(h5.ts), "%+", timezone: "UTC")
       if t5e == null { time_ms = to_unix_timestamp(t5, unit: "milliseconds") }
       if h5.sd != "-" {
           sdm, sde = parse_regex(string!(h5.sd), r'^\x5B(?P<sdid>[^\s\x5D]+)')
@@ -82,7 +82,7 @@ parser_vrl: |
           msg = string!(h3.msg)
           if h3.pri != null { sev_num = mod(to_int(h3.pri) ?? 6, 8) }
           ts_str = replace(string!(h3.ts), r'\s+', " ")
-          tsx, tsxe = parse_timestamp(ts_str, "%+")
+          tsx, tsxe = parse_timestamp(ts_str, "%+", timezone: "UTC")
           if tsxe != null { tsx, tsxe = parse_timestamp(ts_str, "%b %d %H:%M:%S %Y", timezone: "UTC") }
           if tsxe != null { tsx, tsxe = parse_timestamp(ts_str, "%b %d %Y %H:%M:%S", timezone: "UTC") }
           if tsxe != null { tsx, tsxe = parse_timestamp(ts_str + " " + format_timestamp!(now(), "%Y"), "%b %d %H:%M:%S%.f %Y", timezone: "UTC") }
@@ -426,7 +426,7 @@ parser_vrl: |
         header\.ts
       )\z') {
           __value = value
-          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
               if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }

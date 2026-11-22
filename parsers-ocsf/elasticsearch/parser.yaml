@@ -98,8 +98,8 @@ parser_vrl: |
       if tstr == "" { tstr = string(f.timestamp) ?? "" }
       time_ms = 0
       tnorm = replace(tstr, ",", ".")
-      tp, tperr = parse_timestamp(tnorm, "%+")
-      if tperr != null { tp, tperr = parse_timestamp(tnorm, "%Y-%m-%dT%H:%M:%S%.f%z") }
+      tp, tperr = parse_timestamp(tnorm, "%+", timezone: "UTC")
+      if tperr != null { tp, tperr = parse_timestamp(tnorm, "%Y-%m-%dT%H:%M:%S%.f%z", timezone: "UTC") }
       if tperr != null { tp, tperr = parse_timestamp(tnorm, "%Y-%m-%dT%H:%M:%S%.f", timezone: "UTC") }
       if tperr == null { time_ms = to_unix_timestamp(tp, unit: "milliseconds") }
 
@@ -523,7 +523,7 @@ parser_vrl: |
       | timestamp
       )\z') {
           __value = value
-          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
               if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }

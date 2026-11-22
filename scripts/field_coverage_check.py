@@ -34,7 +34,7 @@ import tempfile
 import yaml
 from residual_spill import ROOT, check_rule, mappings_of, norm_path, update
 import provenance
-from provenance import MISSING, at, leaf_index, same, transform_want
+from provenance import MISSING, VECTOR_ENV, at, leaf_index, same, transform_want
 
 # source_normalize step kinds and their required parameters (and types).
 NORMALIZE_KINDS = {
@@ -233,7 +233,7 @@ def vrl_parse_kv(items):
             tmp = Path(tmp)
             (tmp/'kv.vrl').write_text(KV_PROGRAM)
             (tmp/'kv.json').write_text(''.join(json.dumps({'s': s, 'k': k, 'f': f})+'\n' for s, k, f in todo))
-            run = subprocess.run(['vector', 'vrl', '--program', str(tmp/'kv.vrl'), '--input', str(tmp/'kv.json'), '--print-object'], text=True, capture_output=True, timeout=180)
+            run = subprocess.run(['vector', 'vrl', '--program', str(tmp/'kv.vrl'), '--input', str(tmp/'kv.json'), '--print-object'], text=True, capture_output=True, timeout=180, env=VECTOR_ENV)
         assert run.returncode == 0, run.stderr
         outputs = [json.loads(line, strict=False) for line in run.stdout.splitlines() if line.startswith('{')]
         assert len(outputs) == len(todo), f'Vector returned {len(outputs)} KV parses for {len(todo)} inputs'
@@ -465,6 +465,8 @@ def run_parser(path, supplied=None, output_dir=None):
     assert config_path.exists(), f'{path.parent.name}: missing field-coverage.yaml'
     config = yaml.safe_load(config_path.read_text())
     update(path, check=True)
+    naive = naive_timestamps(doc_text := path.read_text())
+    assert not naive, f'{path.parent.name}: parse_timestamp without timezone: "UTC" reads a clock in the host timezone: {naive[:3]}'
     rules, steps = validate_config(config)
     mappings = mappings_of(config)
     doc = yaml.safe_load(path.read_text())
@@ -514,7 +516,7 @@ def run_parser(path, supplied=None, output_dir=None):
         tmp = Path(tmp)
         (tmp/'parser.vrl').write_text(program)
         (tmp/'input.json').write_text(''.join(json.dumps(event)+'\n' for _, event in samples))
-        run = subprocess.run(['vector', 'vrl', '--program', str(tmp/'parser.vrl'), '--input', str(tmp/'input.json'), '--print-object'], text=True, capture_output=True, timeout=180)
+        run = subprocess.run(['vector', 'vrl', '--program', str(tmp/'parser.vrl'), '--input', str(tmp/'input.json'), '--print-object'], text=True, capture_output=True, timeout=180, env=VECTOR_ENV)
         assert run.returncode == 0, run.stderr
         outputs = []
         for line in run.stdout.splitlines():
@@ -565,6 +567,36 @@ def run_parser(path, supplied=None, output_dir=None):
         assert count > 0, f'{path.parent.name}: no parsed source fields were assessed'
         verify_provenance(path, doc['parser_vrl'], samples, outputs_sources, mappings, rules)
         print(f'PASS {path.parent.name}: {len(samples)} samples, {count} source fields; spilled: {", ".join(sorted(spill_keys))}')
+
+
+TIMESTAMP_CALL = re.compile(r'parse_timestamp!?\(')
+
+
+def naive_timestamps(text):
+    """parse_timestamp(...) calls with no explicit timezone argument. Without
+    one VRL reads an offset-less clock in the HOST timezone, so the same line
+    gets a different time on every Vector host."""
+    bad = []
+    for m in TIMESTAMP_CALL.finditer(text):
+        i, depth = m.end(), 1
+        while i < len(text) and depth:
+            c = text[i]
+            if c == '"':
+                i += 1
+                while i < len(text) and text[i] != '"':
+                    i += 2 if text[i] == '\\' else 1
+            elif c == "'" and text[i - 1] == 'r':
+                i += 1
+                while i < len(text) and text[i] != "'":
+                    i += 1
+            elif c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+            i += 1
+        if 'timezone' not in text[m.end():i]:
+            bad.append(text[m.start():i][:80])
+    return bad
 
 
 PROBES = ('residual_probe', 'text_residual_probe')
