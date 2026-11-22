@@ -291,7 +291,9 @@ parser_vrl: |
       if length(user) == 0 { user = { "name": "unknown" } }
       src_ep = { "hostname": "unknown" }
       if is_ipv4(src_ip) || is_ipv6(src_ip) { src_ep = { "ip": src_ip } }
-      if length(loc) > 0 { src_ep.location = loc }
+      # OCSF location needs a place (at_least_one city / country / postal_code
+      # / region): bare coordinates stay in unmapped as written.
+      if exists(loc.city) || exists(loc.country) || exists(loc.postal_code) || exists(loc.region) { src_ep.location = loc }
       session = {}
       if session_key != "" { session.uid = session_key }
       if login_key != "" {
@@ -971,7 +973,7 @@ samples:
     expect:
       "metadata.event_code": "LightningUriEvent"
   # #77 P2-1: integer login coordinates are mapped
-  - raw: "{\"EventDate\": \"2026-08-18T10:05:00Z\", \"EventIdentifier\": \"evt-login-2\", \"Username\": \"jdoe@example.com\", \"UserId\": \"005000000000111AAA\", \"LoginType\": \"Application\", \"Status\": \"Success\", \"LoginLatitude\": 1, \"LoginLongitude\": 0, \"SourceIp\": \"203.0.113.15\"}"
+  - raw: "{\"EventDate\": \"2026-08-18T10:05:00Z\", \"EventIdentifier\": \"evt-login-2\", \"Username\": \"jdoe@example.com\", \"UserId\": \"005000000000111AAA\", \"LoginType\": \"Application\", \"Status\": \"Success\", \"LoginLatitude\": 1, \"LoginLongitude\": 0, \"SourceIp\": \"203.0.113.15\", \"CountryIso\": \"US\"}"
     expect:
       "src_endpoint.location.lat": 1
       "src_endpoint.location.long": 0
@@ -979,3 +981,10 @@ samples:
   - raw: "{\"EventDate\": \"2026-08-18T10:06:00Z\", \"Username\": \"jdoe@example.com\", \"UserId\": \"005000000000111AAA\", \"Query\": \"SELECT Id FROM Account\", \"QueriedEntities\": \"Account\", \"ApiType\": \"REST\", \"SourceIp\": \"203.0.113.16\"}"
     expect:
       "class_uid": 6005
+  # #77 r2 P1: coordinates with no place stay in unmapped (OCSF location needs city / country / postal_code / region)
+  - raw: "{\"EventDate\": \"2026-08-18T10:07:00Z\", \"EventIdentifier\": \"evt-login-3\", \"Username\": \"jdoe@example.com\", \"UserId\": \"005000000000111AAA\", \"LoginType\": \"Application\", \"Status\": \"Success\", \"LoginLatitude\": 21.1888, \"LoginLongitude\": 72.8293, \"SourceIp\": \"203.0.113.17\"}"
+    expect:
+      "class_uid": 3002
+      "src_endpoint.location": "<missing>"
+      "unmapped.login_latitude": 21.1888
+      "unmapped.login_longitude": 72.8293

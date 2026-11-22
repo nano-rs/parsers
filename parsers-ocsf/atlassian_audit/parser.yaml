@@ -98,10 +98,16 @@ parser_vrl: |
       actor_user = {}
       if actor_name != "" { actor_user.name = actor_name }
       if actor_id != "" { actor_user.uid = actor_id }
-      if match(actor_email, r'^[^@\s]+@[^@\s]+\.[^@\s]+$') { actor_user.email_addr = actor_email }
+      # OCSF user needs a name or uid (at_least_one account / name / uid): an
+      # email or token alone does not identify one, so those then stay in
+      # unmapped and the actor is the "unknown" user.
       token_id = string(actor_auth.tokenId) ?? ""
-      if token_id != "" { actor_user.credential_uid = token_id }
-      if length(actor_user) == 0 { actor_user = { "name": "unknown" } }
+      if length(actor_user) > 0 {
+          if match(actor_email, r'^[^@\s]+@[^@\s]+\.[^@\s]+$') { actor_user.email_addr = actor_email }
+          if token_id != "" { actor_user.credential_uid = token_id }
+      } else {
+          actor_user = { "name": "unknown" }
+      }
       actor = { "user": actor_user }
       app_id = string(actor_app.id) ?? ""
       if app_id != "" {
@@ -706,3 +712,9 @@ samples:
   - raw: "{\"message\":null}"
     expect:
       "class_uid": 0
+  # #77 r2 P2: an actor known only by email (and a token) is no OCSF user; both stay in unmapped
+  - raw: "{\"type\": \"events\", \"id\": \"a9000009-0000-4000-8000-000000000009\", \"attributes\": {\"time\": \"2026-05-19T11:00:00.000Z\", \"processedAt\": \"2026-05-19T11:00:01.000Z\", \"action\": \"api_token_created\", \"actor\": {\"email\": \"ci-bot@example.com\", \"auth\": {\"tokenId\": \"tok-0001\"}}, \"location\": {\"ip\": \"198.51.100.21\"}}, \"message\": {\"content\": \"API token created\", \"format\": \"simple\"}}"
+    expect:
+      "actor.user.name": "unknown"
+      "actor.user.email_addr": "<missing>"
+      "actor.user.credential_uid": "<missing>"

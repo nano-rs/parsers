@@ -53,7 +53,7 @@ parser_vrl: |
           kind = "login"
       } else if exists(parsed.QUERY_ID) && exists(parsed.QUERY_TEXT) {
           kind = "query"
-      } else if exists(parsed.QUERY_ID) && (exists(parsed.DIRECT_OBJECTS_ACCESSED) || exists(parsed.BASE_OBJECTS_ACCESSED) || exists(parsed.OBJECT_MODIFIED_BY_DDL)) {
+      } else if exists(parsed.QUERY_ID) && (exists(parsed.DIRECT_OBJECTS_ACCESSED) || exists(parsed.BASE_OBJECTS_ACCESSED) || exists(parsed.OBJECTS_MODIFIED) || exists(parsed.OBJECT_MODIFIED_BY_DDL)) {
           kind = "access"
       }
   }
@@ -235,11 +235,14 @@ parser_vrl: |
           ddl = p.OBJECT_MODIFIED_BY_DDL
           if is_string(ddl) { ddl = parse_json(string!(ddl)) ?? {} }
           ddl = object(ddl) ?? {}
-          objects = array(direct) ?? []
-          if length(objects) == 0 { objects = array(base) ?? [] }
-          # A write that reads no table (INSERT ... VALUES) names its target only
-          # in OBJECTS_MODIFIED.
-          if length(objects) == 0 { objects = array(modified) ?? [] }
+          reads = array(direct) ?? []
+          if length(reads) == 0 { reads = array(base) ?? [] }
+          # A write names its target in OBJECTS_MODIFIED: that is the table or
+          # stage the event is about (INSERT ... SELECT, COPY INTO either way).
+          # The read sources then fill whichever of table / stage is still
+          # empty; every read object stays in unmapped as written (Datastore
+          # Activity has no resources list).
+          objects = append(array(modified) ?? [], reads)
           n_modified = length(array(modified) ?? [])
 
           tbl = {}
@@ -725,6 +728,7 @@ samples:
     expect:
       "class_uid": 6005
       "activity_id": 5
+      "table.name": "EXAMPLE_DB.PUBLIC.ORDERS_ARCHIVE"
       "metadata.version": "1.9.0"
   # ACCESS_HISTORY ALTER TABLE via DDL, source: https://github.com/elastic/integrations/blob/main/packages/snowflake/data_stream/access_history/_dev/test/pipeline/test-snowflake-access-history-sample.log, columns per https://docs.snowflake.com/en/sql-reference/account-usage/access_history
   - raw: "{\"QUERY_ID\":\"01b5a1c2-0000-1a2b-0000-000100000012\",\"QUERY_START_TIME\":\"2020-06-15 16:30:00.000 Z\",\"USER_NAME\":\"dave.wilson\",\"DIRECT_OBJECTS_ACCESSED\":\"[]\",\"BASE_OBJECTS_ACCESSED\":\"[]\",\"OBJECTS_MODIFIED\":\"[]\",\"OBJECT_MODIFIED_BY_DDL\":\"{\\n  \\\"objectDomain\\\": \\\"Table\\\",\\n  \\\"objectId\\\": \\\"66564\\\",\\n  \\\"objectName\\\": \\\"EXAMPLE_DB.PUBLIC.ORDERS\\\",\\n  \\\"operationType\\\": \\\"ALTER\\\",\\n  \\\"properties\\\": {\\n    \\\"columns\\\": {\\n      \\\"CONTENT\\\": {\\n        \\\"dataType\\\": {\\n          \\\"value\\\": \\\"VARCHAR(16777216)\\\"\\n        },\\n        \\\"objectId\\\": {\\n          \\\"value\\\": 68610\\n        },\\n        \\\"subOperationType\\\": \\\"ALTER\\\"\\n      }\\n    }\\n  }\\n}\",\"POLICIES_REFERENCED\":\"[]\",\"PARENT_QUERY_ID\":null,\"ROOT_QUERY_ID\":null,\"EVENT_SOURCE\":\"horizon_irc\",\"ADDITIONAL_PROPERTIES\":null,\"INVOKER_IDENTITY\":null,\"AGENTS_INFO\":null}"
@@ -815,3 +819,23 @@ samples:
     expect:
       "class_uid": 6005
       "query_info.query_string": "SELECT 1"
+  # #77 r2 P2: COPY INTO @stage FROM table maps the written stage and the read table
+  - raw: "{\"QUERY_ID\": \"01b2c3d4-0000-1111-0000-000000000079\", \"QUERY_START_TIME\": \"2026-08-18 10:03:00.000 Z\", \"USER_NAME\": \"ETL_USER\", \"DIRECT_OBJECTS_ACCESSED\": [{\"objectDomain\": \"Table\", \"objectName\": \"PROD_DB.PUBLIC.CUSTOMERS\", \"objectId\": 501, \"columns\": [{\"columnName\": \"EMAIL\"}]}], \"BASE_OBJECTS_ACCESSED\": [{\"objectDomain\": \"Table\", \"objectName\": \"PROD_DB.PUBLIC.CUSTOMERS\", \"objectId\": 501, \"columns\": [{\"columnName\": \"EMAIL\"}]}], \"OBJECTS_MODIFIED\": [{\"objectDomain\": \"Stage\", \"objectName\": \"PROD_DB.PUBLIC.EXFIL_STAGE\", \"objectId\": 77, \"locations\": [\"/export/\"]}], \"OBJECT_MODIFIED_BY_DDL\": null}"
+    expect:
+      "class_uid": 6005
+      "activity_id": 5
+      "databucket.name": "PROD_DB.PUBLIC.EXFIL_STAGE"
+      "table.name": "PROD_DB.PUBLIC.CUSTOMERS"
+  # #77 r2 P2: COPY INTO table FROM @stage maps the written table and the read stage
+  - raw: "{\"QUERY_ID\": \"01b2c3d4-0000-1111-0000-000000000080\", \"QUERY_START_TIME\": \"2026-08-18 10:04:00.000 Z\", \"USER_NAME\": \"ETL_USER\", \"DIRECT_OBJECTS_ACCESSED\": [{\"objectDomain\": \"Stage\", \"objectName\": \"PROD_DB.PUBLIC.INGEST_STAGE\", \"objectId\": 78, \"locations\": [\"/in/\"]}], \"BASE_OBJECTS_ACCESSED\": [], \"OBJECTS_MODIFIED\": [{\"objectDomain\": \"Table\", \"objectName\": \"PROD_DB.PUBLIC.CUSTOMERS\", \"objectId\": 501, \"columns\": [{\"columnName\": \"EMAIL\"}]}], \"OBJECT_MODIFIED_BY_DDL\": null}"
+    expect:
+      "class_uid": 6005
+      "activity_id": 5
+      "table.name": "PROD_DB.PUBLIC.CUSTOMERS"
+      "databucket.name": "PROD_DB.PUBLIC.INGEST_STAGE"
+  # #77 r2 P2: an export with only OBJECTS_MODIFIED is still ACCESS_HISTORY
+  - raw: "{\"QUERY_ID\": \"01b2c3d4-0000-1111-0000-000000000081\", \"QUERY_START_TIME\": \"2026-08-18 10:05:00.000 Z\", \"USER_NAME\": \"ETL_USER\", \"OBJECTS_MODIFIED\": [{\"objectDomain\": \"Table\", \"objectName\": \"PROD_DB.PUBLIC.ORDERS\", \"objectId\": 1234, \"columns\": [{\"columnName\": \"ID\"}]}]}"
+    expect:
+      "class_uid": 6005
+      "activity_id": 5
+      "table.name": "PROD_DB.PUBLIC.ORDERS"

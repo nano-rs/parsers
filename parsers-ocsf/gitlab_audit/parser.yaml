@@ -118,8 +118,13 @@ parser_vrl: |
           actor_user.name = author_name
       }
       if author_id != "" && author_id != "-1" { actor_user.uid = author_id }
-      if match(author_email, r'^[^@\s]+@[^@\s]+\.[^@\s]+$') { actor_user.email_addr = author_email }
-      if length(actor_user) == 0 { actor_user = { "name": "unknown" } }
+      # OCSF user needs a name or uid (at_least_one account / name / uid): an
+      # email alone stays in unmapped and the actor is the "unknown" user.
+      if length(actor_user) > 0 {
+          if match(author_email, r'^[^@\s]+@[^@\s]+\.[^@\s]+$') { actor_user.email_addr = author_email }
+      } else {
+          actor_user = { "name": "unknown" }
+      }
 
       # ---- target (acted on) and entity (scope recorded on) ----
       target_id = to_string(p.target_id) ?? ""
@@ -825,3 +830,8 @@ samples:
     expect:
       "class_uid": 0
       "metadata.version": "1.9.0"
+  # #77 r2 P2: an author known only by email (author_id -1) is no OCSF user; the email stays in unmapped
+  - raw: "{\"severity\": \"INFO\", \"time\": \"2026-08-18T19:00:00.000Z\", \"correlation_id\": \"01HXHSTQ5A02PJVVW2H8FZZ77Z\", \"author_id\": -1, \"entity_id\": 7, \"entity_type\": \"Project\", \"created_at\": \"2026-08-18T19:00:00.000+00:00\", \"target_id\": 7, \"target_type\": \"Project\", \"target_details\": \"group/app\", \"details\": {\"author_email\": \"deploy@example.com\", \"custom_message\": \"Project archived\"}}"
+    expect:
+      "actor.user.name": "unknown"
+      "actor.user.email_addr": "<missing>"
