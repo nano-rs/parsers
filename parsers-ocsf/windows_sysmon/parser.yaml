@@ -72,27 +72,27 @@ parser_vrl: |
       time_ms = 0
       ts_str = string(p.timestamp) ?? ""
       if ts_str != "" {
-          t, terr = parse_timestamp(ts_str, "%+")
+          t, terr = parse_timestamp(ts_str, "%+", timezone: "UTC")
           if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
       }
       if time_ms == 0 {
           ts_str = string(p.time_created) ?? ""
           if ts_str != "" {
-              t, terr = parse_timestamp(ts_str, "%+")
+              t, terr = parse_timestamp(ts_str, "%+", timezone: "UTC")
               if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
           }
       }
       if time_ms == 0 {
           ts_str = string(ed.UtcTime) ?? ""
           if ts_str != "" {
-              t, terr = parse_timestamp(ts_str, "%+")
+              t, terr = parse_timestamp(ts_str, "%+", timezone: "UTC")
               if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds"); consumed = push(consumed, "UtcTime") }
               if terr != null {
                   # EventData.UtcTime omits an explicit zone but is UTC by
                   # contract. Add it before parsing so host timezone cannot
                   # shift the event clock.
                   utc_ts = replace(ts_str, " ", "T") + "Z"
-                  t2, terr2 = parse_timestamp(utc_ts, "%+")
+                  t2, terr2 = parse_timestamp(utc_ts, "%+", timezone: "UTC")
                   if terr2 == null { time_ms = to_unix_timestamp(t2, unit: "milliseconds"); consumed = push(consumed, "UtcTime") }
               }
           }
@@ -432,8 +432,8 @@ parser_vrl: |
       }
       if eid == 11 {
           created_raw = string(ed.CreationUtcTime) ?? ""
-          created, created_err = parse_timestamp(created_raw, "%+")
-          if created_err != null { created, created_err = parse_timestamp(replace(created_raw, " ", "T") + "Z", "%+") }
+          created, created_err = parse_timestamp(created_raw, "%+", timezone: "UTC")
+          if created_err != null { created, created_err = parse_timestamp(replace(created_raw, " ", "T") + "Z", "%+", timezone: "UTC") }
           if created_err == null {
               ocsf.file.created_time = to_unix_timestamp(created, unit: "milliseconds")
               consumed = push(consumed, "CreationUtcTime")
@@ -676,7 +676,7 @@ parser_vrl: |
       | time_created
       )\z') {
           __value = value
-          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+")
+          __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
               if contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
