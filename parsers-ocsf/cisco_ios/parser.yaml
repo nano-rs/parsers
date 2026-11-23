@@ -116,8 +116,16 @@ parser_vrl: |
   seq = -1
   if tagged {
       # device clock: [*|.][YYYY ]Mon dd[ YYYY] hh:mm:ss[.fff][ TZ]:
-      dm, de = parse_regex(head, r'^(?P<head>.*?)[*.]?(?:(?P<year1>\d{4})\s+)?(?P<mon>[A-Z][a-z]{2})\s+(?P<day>\d{1,2})(?:\s+(?P<year>\d{4}))?\s+(?P<hms>\d{2}:\d{2}:\d{2})(?P<frac>\.\d+)?(?:\s+(?P<tz>[A-Za-z][A-Za-z0-9+:_/-]*))?:\s*(?P<tail>.*?)\s*$')
-      if de == null {
+      dm, de = parse_regex(head, r'^(?P<head>.*?)[*.]?(?:(?P<year1>\d{4})\s+)?(?P<mon>[A-Z][a-z]{2})\s+(?P<day>\d{1,2})(?:\s+(?P<year>\d{4}))?\s+(?P<hms>\d{2}:\d{2}:\d{2})(?P<frac>\.\d+)?(?:\s+(?P<tz>[+-]\d{2}:?\d{2}|[A-Za-z]{1,6}|[A-Za-z]+/[A-Za-z0-9_+-]+(?:/[A-Za-z0-9_+-]+)?))?:\s*(?P<tail>.*?)\s*$')
+      # A slash token that is not a zone the database knows is a host or an
+      # IOS-XR location (router/edge1, RP/0/RSP0/CPU0), not a timezone: the line
+      # is then a relayed BSD header, read below with its host.
+      dm_ok = de == null
+      if dm_ok && contains(string(dm.tz) ?? "", "/") {
+          dm_probe, dm_probe_err = parse_timestamp("2000-01-01 00:00:00", "%Y-%m-%d %H:%M:%S", timezone: string(dm.tz) ?? "")
+          if dm_probe_err != null { dm_ok = false }
+      }
+      if dm_ok {
           head = string!(dm.head)
           ts_text = string!(dm.mon) + " " + string!(dm.day) + " " + string!(dm.hms) + (string(dm.frac) ?? "")
           hdr.ts = ts_text
@@ -143,9 +151,12 @@ parser_vrl: |
               # An inline offset: the local-clock block applies it, so a no-year
               # clock still rolls over and Feb 29 still lands in a leap year.
               tz_m = parse_regex(tz_off, r'^(?P<s>[+-])(?P<h>\d{2})(?P<m>\d{2})$') ?? {}
-              if !is_empty(tz_m) {
+              tz_h = to_int(tz_m.h) ?? 99
+              tz_min = to_int(tz_m.m) ?? 99
+              # An out-of-range offset is not an offset: the source setting applies (marked).
+              if !is_empty(tz_m) && tz_h <= 14 && tz_min <= 59 {
                   __src_tz = "UTC"
-                  __src_shift_ms = ((to_int(tz_m.h) ?? 0) * 3600 + (to_int(tz_m.m) ?? 0) * 60) * 1000
+                  __src_shift_ms = (tz_h * 3600 + tz_min * 60) * 1000
                   if tz_m.s == "-" { __src_shift_ms = 0 - __src_shift_ms }
                   __src_tz_label = tz_off
                   __time_inline = true
@@ -749,7 +760,8 @@ parser_vrl: |
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
               # A clock the local-clock block moved to real UTC (the log source's
-              # timezone, a year rollover) is matched by its converted value.
+              # timezone, a year rollover) is matched by its converted value. Emitted
+              # only for a parser with a local-clock block (compile cost, NAN-5298).
               if __lc_shifted != "" && !(contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected)))) {
                   __lc_at = find(__lc_shifted, "\n" + to_string(__expected) + "\t")
                   if is_integer(__lc_at) {
@@ -1202,4 +1214,17 @@ samples:
   # show-timezone offset abbreviation on a no-year Feb 29 (lands in the latest leap year)
   - raw: "<189>124: Feb 29 12:00:00.000 EST: %SYS-5-CONFIG_I: Configured from console by admin on vty0 (192.0.2.10)"
     expect:
+      "unmapped.nano_time_assumed_tz": "<missing>"
+  # relayed BSD header whose host holds a slash: the host survives
+  - raw: "<189>Jul  1 12:00:00 router/edge1: %SYS-5-CONFIG_I: Configured from console by admin on vty0 (192.0.2.10)"
+    expect:
+      "device.hostname": "router/edge1"
+  # IOS-XR location token before the colon (not a timezone)
+  - raw: "<189>Jul  1 12:00:00 RP/0/RSP0/CPU0: %SYS-5-CONFIG_I: Configured from console by admin on vty0 (192.0.2.10)"
+    expect:
+      "device.hostname": "RP/0/RSP0/CPU0"
+  # show-timezone as a numeric offset
+  - raw: "<189>125: Jul  1 2026 12:00:00.000 +0500: %SYS-5-CONFIG_I: Configured from console by admin on vty0 (192.0.2.10)"
+    expect:
+      "time": 1782889200000
       "unmapped.nano_time_assumed_tz": "<missing>"
