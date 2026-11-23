@@ -542,8 +542,13 @@ parser_vrl: |
       }
 
       ev = {}
-      if length(keys(src_ep)) > 0 { ev.src_endpoint = src_ep }
-      if length(keys(dst_ep)) > 0 { ev.dst_endpoint = dst_ep }
+      # OCSF needs an endpoint to name something (ip, hostname, uid, ...): a
+      # bare port (GuardDuty LocalPortDetails without LocalIpDetails) is not
+      # an endpoint, so it stays as sent in unmapped.
+      src_named = src_ep.ip != null || src_ep.hostname != null || src_ep.uid != null || src_ep.name != null || src_ep.instance_uid != null || src_ep.domain != null || src_ep.svc_name != null
+      dst_named = dst_ep.ip != null || dst_ep.hostname != null || dst_ep.uid != null || dst_ep.name != null || dst_ep.instance_uid != null || dst_ep.domain != null || dst_ep.svc_name != null
+      if src_named { ev.src_endpoint = src_ep }
+      if dst_named { ev.dst_endpoint = dst_ep }
       if length(keys(conn)) > 0 { ev.connection_info = conn }
       if length(keys(api)) > 0 { ev.api = api }
       if length(keys(query)) > 0 { ev.query = query }
@@ -1232,7 +1237,8 @@ samples:
       severity_id: 3
       evidences.0.src_endpoint.ip: 198.51.100.23
       evidences.0.src_endpoint.port: 46717
-      evidences.0.dst_endpoint.port: 22
+      # A port with no IP is no OCSF endpoint: it stays in unmapped (detail.findings).
+      evidences.0.dst_endpoint: "<missing>"
       evidences.0.connection_info.direction_id: 1
       metadata.product.feature.name: GuardDuty
   # Review P1: GuardDuty imported into Security Hub has no Action object; ProductFields carry it. The EC2 resource is the device.
