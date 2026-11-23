@@ -232,18 +232,86 @@ parser_vrl: |
       tp, tperr = parse_regex(ts, r'^(?P<d>\d{4}-\d{2}-\d{2})[ T](?P<t>\d{2}:\d{2}:\d{2}(?:\.\d+)?) ?(?P<tz>.*)$')
       if tperr == null {
           tz = string(tp.tz) ?? ""
-          off = "+0000"
           # log_timezone abbreviations PostgreSQL prints for %m / %t on non-UTC hosts
           # Ambiguous abbreviations are pinned: CST = US Central -0600 (not China
           # +0800), IST = India +0530 (not Israel +0200 or Ireland +0100), BST =
           # UK +0100 (not Bangladesh +0600). Hosts in the other zones must log in
           # UTC or a numeric offset; this table cannot tell them apart.
           tzmap = {"UTC": "+0000", "GMT": "+0000", "Z": "+0000", "EST": "-0500", "EDT": "-0400", "CST": "-0600", "CDT": "-0500", "MST": "-0700", "MDT": "-0600", "PST": "-0800", "PDT": "-0700", "AKST": "-0900", "AKDT": "-0800", "HST": "-1000", "WET": "+0000", "WEST": "+0100", "BST": "+0100", "CET": "+0100", "CEST": "+0200", "EET": "+0200", "EEST": "+0300", "MSK": "+0300", "IST": "+0530", "SGT": "+0800", "AWST": "+0800", "JST": "+0900", "KST": "+0900", "AEST": "+1000", "AEDT": "+1100", "NZST": "+1200", "NZDT": "+1300"}
-          mo = string(get(tzmap, [tz]) ?? null) ?? ""
-          if mo != "" { off = mo }
+          off = string(get(tzmap, [upcase(tz)]) ?? null) ?? ""
           if match(tz, r'^[+-]\d{2}$') { off = tz + "00" }
           if match(tz, r'^[+-]\d{2}:?\d{2}$') { off = replace(tz, ":", "") }
-          t, terr = parse_timestamp((string(tp.d) ?? "") + " " + (string(tp.t) ?? "") + " " + off, "%Y-%m-%d %H:%M:%S%.f %z", timezone: "UTC")
+          # The clock itself, read as UTC; the local-clock block below makes it real
+          # UTC with the inline zone when it is valid, otherwise with the log
+          # source's timezone setting (UTC if unset), marked as assumed.
+          t, terr = parse_timestamp((string(tp.d) ?? "") + " " + (string(tp.t) ?? ""), "%Y-%m-%d %H:%M:%S%.f", timezone: "UTC")
+          if terr == null { __lc_pending = true }
+          if off != "" {
+              tz_m = parse_regex(off, r'^(?P<s>[+-])(?P<h>\d{2})(?P<m>\d{2})$') ?? {}
+              tz_h = to_int(tz_m.h) ?? 99
+              tz_min = to_int(tz_m.m) ?? 99
+              # An out-of-range offset is not an offset: the source setting applies (marked).
+              if !is_empty(tz_m) && tz_h <= 14 && tz_min <= 59 {
+                  __src_tz = "UTC"
+                  __src_shift_ms = (tz_h * 3600 + tz_min * 60) * 1000
+                  if tz_m.s == "-" { __src_shift_ms = 0 - __src_shift_ms }
+                  __src_tz_label = off
+                  __time_inline = true
+              }
+          } else if match(tz, r'^[A-Za-z]+/[A-Za-z0-9_+\-]+(?:/[A-Za-z0-9_+\-]+)?$') {
+              # An inline IANA zone VRL knows converts with its DST rules; an unknown name keeps the setting.
+              tz_probe, tz_probe_err = parse_timestamp("2000-01-01 00:00:00", "%Y-%m-%d %H:%M:%S", timezone: tz)
+              if tz_probe_err == null { __src_tz = tz; __src_shift_ms = 0; __src_tz_label = tz; __time_inline = true }
+          }
+          # NAN local clock: t
+          # t was just parsed from a clock WITHOUT an offset, read as UTC
+          # (__lc_pending). It becomes real UTC here, at the site, with the log source's
+          # timezone (__src_tz / __src_shift_ms from the prelude, or an inline IANA zone
+          # the parser validated): a fixed offset by arithmetic; an IANA zone with its DST
+          # rules, probed 18 h either side (wider than any UTC offset), an ambiguous
+          # fall-back time taking its FIRST occurrence (the earlier offset), a time in a
+          # spring-forward gap moving forward by the gap. __NOYEAR__: a clock with no
+          # year is tried in its year, the year before and the year after (each with its
+          # own DST rules); more than a day in the future means last year, more than 180
+          # days in the past means next year when that is not in the future.
+          if __lc_pending {
+              __lc_pending = false
+              __time_assumed = true
+              __lc_l = to_unix_timestamp(t, unit: "milliseconds")
+              __lc_cands = [__lc_l]
+              __lc_us = map_values(__lc_cands) -> |l| {
+                  if l == null {
+                      null
+                  } else {
+                      __u = int!(l) - __src_shift_ms
+                      if __src_tz != "UTC" {
+                          __offs = map_values([int!(l) - 64800000, int!(l) + 64800000]) -> |at| {
+                              __z = format_timestamp(from_unix_timestamp!(at, unit: "milliseconds"), "%z", timezone: __src_tz) ?? "+0000"
+                              __o = ((to_int(slice(__z, 1, 3) ?? "0") ?? 0) * 3600 + (to_int(slice(__z, 3, 5) ?? "0") ?? 0) * 60) * 1000
+                              if starts_with(__z, "-") { 0 - __o } else { __o }
+                          }
+                          __oa = int!(__offs[0])
+                          __ob = int!(__offs[1])
+                          __u = int!(l) - __oa
+                          if __oa != __ob {
+                              __ok = map_values([int!(l) - __oa, int!(l) - __ob]) -> |at| {
+                                  __z = format_timestamp(from_unix_timestamp!(at, unit: "milliseconds"), "%z", timezone: __src_tz) ?? "+0000"
+                                  __o = ((to_int(slice(__z, 1, 3) ?? "0") ?? 0) * 3600 + (to_int(slice(__z, 3, 5) ?? "0") ?? 0) * 60) * 1000
+                                  if starts_with(__z, "-") { 0 - __o } else { __o }
+                              }
+                              if int!(__ok[0]) != __oa && int!(__ok[1]) == __ob { __u = int!(l) - __ob }
+                          }
+                      }
+                      __u
+                  }
+              }
+              __lc_u = int!(__lc_us[0])
+              # Remembered (local -> UTC) so a transforms rule on the same source clock
+              # still finds it at its target.
+              if __lc_u != __lc_l { __lc_shifted = __lc_shifted + "\n" + to_string(__lc_l) + "\t" + to_string(__lc_u) + "\n" }
+              t = from_unix_timestamp!(__lc_u, unit: "milliseconds")
+          }
+          # END NAN local clock
           if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
       }
   }
