@@ -296,20 +296,21 @@ and after a large rewrite. CI runs the check on every PR (job "Parser load budge
   that has no offset in the Vector host's timezone, so one line gets a
   different time on every host; `field_coverage_check.py` rejects such a call.
   The goal is proper UTC everywhere, even when the log is not: honor an inline
-  timezone or offset when the line carries one. For a clock without an offset,
-  parse it with `timezone: "UTC"` and, when the parse succeeds, set
-  `__time_assumed = true` and append its ms to `__time_local`
-  (`__time_local = __time_local + "," + to_string(ms)`; a clock with no year
-  uses `__src_year` and appends to `__time_noyear` too). The shared spill block
-  then converts every `*time` field holding that value with the log source's
-  timezone setting (`.nano.source_timezone`: an IANA name with its DST rules,
-  or any `+HH:MM` offset; UTC if unset, invalid or "local"), resolves
-  ambiguous fall-back times to their first occurrence and gap times forward,
-  moves a no-year clock more than a day in the future to last year, and
-  records the zone used in `unmapped.nano_time_assumed_tz`. The shared prelude
-  (`scripts/residual/source_tz.vrl`) resolves the setting and removes `.nano`
-  before the parser runs. A UTC-by-specification format just uses
-  `timezone: "UTC"` and records nothing.
+  timezone or offset when the line carries one (validate an inline zone name
+  before using it). For a clock without an offset, parse it with
+  `timezone: "UTC"`, set `__lc_pending = true` when the parse succeeds, and
+  follow it with a marker line `# NAN local clock: <var>` (`<var> noyear` for
+  a clock without a year, whose parse uses `__src_year` and retries with
+  `__src_leap_year`). `residual_spill.py` expands the marker into the shared
+  conversion (`scripts/residual/local_clock.vrl`): the log source's timezone
+  setting (`.nano.source_timezone`: an IANA name with its DST rules, or any
+  `+HH:MM` offset; UTC if unset, invalid or "local") turns that timestamp into
+  real UTC at the site; an ambiguous fall-back time takes its first
+  occurrence, a gap time moves forward; a no-year clock takes the nearest
+  year (back a year when more than a day ahead, forward when more than 180
+  days back). The zone used is recorded in `unmapped.nano_time_assumed_tz`.
+  A UTC-by-specification format just uses `timezone: "UTC"` and records
+  nothing.
 - UDM names do not exist in OCSF. `src_ip` is `src_endpoint.ip`, `user` is
   `actor.user.name` (the actor) or `user.name` (the subject, class-dependent),
   `timestamp` is `time`, `id` is `metadata.uid`, `ext.foo` is `unmapped.foo`.
