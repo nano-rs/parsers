@@ -117,13 +117,25 @@ parser_vrl: |
   if tagged {
       # device clock: [*|.][YYYY ]Mon dd[ YYYY] hh:mm:ss[.fff][ TZ]:
       dm, de = parse_regex(head, r'^(?P<head>.*?)[*.]?(?:(?P<year1>\d{4})\s+)?(?P<mon>[A-Z][a-z]{2})\s+(?P<day>\d{1,2})(?:\s+(?P<year>\d{4}))?\s+(?P<hms>\d{2}:\d{2}:\d{2})(?P<frac>\.\d+)?(?:\s+(?P<tz>[+-]\d{2}:?\d{2}|[A-Za-z]{1,6}|[A-Za-z]+/[A-Za-z0-9_+-]+(?:/[A-Za-z0-9_+-]+)?))?:\s*(?P<tail>.*?)\s*$')
-      # A slash token that is not a zone the database knows is a host or an
-      # IOS-XR location (router/edge1, RP/0/RSP0/CPU0), not a timezone: the line
-      # is then a relayed BSD header, read below with its host.
+      # Abbreviations read as a fixed offset (CET +0100, EDT -0400, ...).
+      ios_tzmap = {"UTC": "+0000", "GMT": "+0000", "Z": "+0000", "UT": "+0000", "WET": "+0000", "WEST": "+0100", "BST": "+0100", "IST": "+0530", "CET": "+0100", "CEST": "+0200", "MET": "+0100", "MEST": "+0200", "EET": "+0200", "EEST": "+0300", "MSK": "+0300", "EST": "-0500", "EDT": "-0400", "CST": "-0600", "CDT": "-0500", "MST": "-0700", "MDT": "-0600", "PST": "-0800", "PDT": "-0700", "AKST": "-0900", "AKDT": "-0800", "HST": "-1000", "JST": "+0900", "KST": "+0900", "HKT": "+0800", "SGT": "+0800", "AWST": "+0800", "ACST": "+0930", "AEST": "+1000", "AEDT": "+1100", "NZST": "+1200", "NZDT": "+1300"}
+      # A relayed BSD header (Mon dd hh:mm:ss host:) has the same shape as a
+      # device clock with a zone (Mon dd hh:mm:ss TZ:). It is the device clock
+      # only when the token is a zone (a valid offset, a known abbreviation or an
+      # IANA name VRL knows), or the clock carries what a relay never writes: a
+      # sequence number, a year or fractional seconds. Otherwise the token is
+      # the host (router, router/edge1, RP/0/RSP0/CPU0), read below.
       dm_ok = de == null
-      if dm_ok && contains(string(dm.tz) ?? "", "/") {
-          dm_probe, dm_probe_err = parse_timestamp("2000-01-01 00:00:00", "%Y-%m-%d %H:%M:%S", timezone: string(dm.tz) ?? "")
-          if dm_probe_err != null { dm_ok = false }
+      if dm_ok && dm.tz != null && (string(dm.head) ?? "") == "" && dm.year == null && dm.year1 == null && dm.frac == null {
+          dm_tok = string(dm.tz) ?? ""
+          dm_zone = (get(ios_tzmap, [upcase(dm_tok)]) ?? null) != null
+          dm_off = parse_regex(dm_tok, r'^[+-](?P<h>\d{2}):?(?P<m>\d{2})$') ?? {}
+          if !is_empty(dm_off) && (to_int(dm_off.h) ?? 99) <= 14 && (to_int(dm_off.m) ?? 99) <= 59 { dm_zone = true }
+          if !dm_zone && contains(dm_tok, "/") {
+              dm_probe, dm_probe_err = parse_timestamp("2000-01-01 00:00:00", "%Y-%m-%d %H:%M:%S", timezone: dm_tok)
+              if dm_probe_err == null { dm_zone = true }
+          }
+          if !dm_zone { dm_ok = false }
       }
       if dm_ok {
           head = string!(dm.head)
@@ -140,7 +152,7 @@ parser_vrl: |
           tz_in = strip_whitespace(string(dm.tz) ?? "")
           tz_off = ""
           if match(tz_in, r'^[+-]\d{2}:?\d{2}$') { tz_off = replace(tz_in, ":", "") }
-          if tz_off == "" { tz_off = string(get({"UTC": "+0000", "GMT": "+0000", "Z": "+0000", "UT": "+0000", "WET": "+0000", "WEST": "+0100", "BST": "+0100", "IST": "+0530", "CET": "+0100", "CEST": "+0200", "MET": "+0100", "MEST": "+0200", "EET": "+0200", "EEST": "+0300", "MSK": "+0300", "EST": "-0500", "EDT": "-0400", "CST": "-0600", "CDT": "-0500", "MST": "-0700", "MDT": "-0600", "PST": "-0800", "PDT": "-0700", "AKST": "-0900", "AKDT": "-0800", "HST": "-1000", "JST": "+0900", "KST": "+0900", "HKT": "+0800", "SGT": "+0800", "AWST": "+0800", "ACST": "+0930", "AEST": "+1000", "AEDT": "+1100", "NZST": "+1200", "NZDT": "+1300"}, [upcase(tz_in)]) ?? "") ?? "" }
+          if tz_off == "" { tz_off = string(get(ios_tzmap, [upcase(tz_in)]) ?? "") ?? "" }
           tz_name = "UTC"
           if tz_off == "" && match(tz_in, r'^[A-Za-z]+/[A-Za-z0-9_+\-]+(?:/[A-Za-z0-9_+\-]+)?$') { tz_name = tz_in }
           ios_clock = string!(dm.mon) + " " + string!(dm.day) + " " + year + " " + string!(dm.hms) + (string(dm.frac) ?? "")
@@ -1228,3 +1240,16 @@ samples:
     expect:
       "time": 1782889200000
       "unmapped.nano_time_assumed_tz": "<missing>"
+  # relayed BSD header with a short alphabetic host: the host is not a timezone
+  - raw: "<189>Jul  1 12:00:00 router: %SYS-5-CONFIG_I: Configured from console by admin on vty0 (192.0.2.10)"
+    expect:
+      "device.hostname": "router"
+  # relayed BSD header, two-letter host
+  - raw: "<189>Jul  1 12:00:00 fw: %SYS-5-CONFIG_I: Configured from console by admin on vty0 (192.0.2.10)"
+    expect:
+      "device.hostname": "fw"
+  # device clock with an unknown zone name: the clock stays, the source setting applies (UTC here), marked
+  - raw: "<189>123: Jul  1 2026 12:00:00.000 Mars/Base: %SYS-5-CONFIG_I: Configured from console by admin on vty0 (192.0.2.10)"
+    expect:
+      "time": 1782907200000
+      "unmapped.nano_time_assumed_tz": "UTC"

@@ -659,6 +659,33 @@ def split_args(args):
     return parts
 
 
+def call_args(text, start):
+    """The argument text of the call whose "(" ends at start, and the index
+    after its closing ")": balanced parentheses, quoted and raw strings skipped,
+    across lines."""
+    i, depth = start, 1
+    while i < len(text) and depth:
+        c = text[i]
+        if c == '"':
+            i += 1
+            while i < len(text) and text[i] != '"':
+                i += 2 if text[i] == '\\' else 1
+        elif c == "'" and text[i - 1] == 'r':
+            i += 1
+            while i < len(text) and text[i] != "'":
+                i += 1
+        elif c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+        i += 1
+    return text[start:i - 1], i
+
+
+def named_args(parts):
+    return {p.split(':', 1)[0].strip(): p.split(':', 1)[1].strip() for p in parts if re.match(r'\s*\w+\s*:', p)}
+
+
 def naive_timestamps(vrl):
     """parse_timestamp(...) calls (comments ignored) without a named timezone:
     argument. Without one VRL reads an offset-less clock in the HOST timezone,
@@ -667,26 +694,10 @@ def naive_timestamps(vrl):
     text = strip_comments(vrl)
     bad = []
     for m in TIMESTAMP_CALL.finditer(text):
-        i, depth = m.end(), 1
-        while i < len(text) and depth:
-            c = text[i]
-            if c == '"':
-                i += 1
-                while i < len(text) and text[i] != '"':
-                    i += 2 if text[i] == '\\' else 1
-            elif c == "'" and text[i - 1] == 'r':
-                i += 1
-                while i < len(text) and text[i] != "'":
-                    i += 1
-            elif c == '(':
-                depth += 1
-            elif c == ')':
-                depth -= 1
-            i += 1
-        args = text[m.end():i - 1]
+        args, i = call_args(text, m.end())
         parts = split_args(args)
         fmt = parts[1].strip() if len(parts) > 1 else ''
-        named = {p.split(':', 1)[0].strip(): p.split(':', 1)[1].strip() for p in parts[2:] if re.match(r'\s*\w+\s*:', p)}
+        named = named_args(parts[2:])
         # "local" is the Vector host's zone: the host-dependence the rule exists to stop.
         if named.get('timezone', '').strip('"').lower() == 'local':
             bad.append(text[m.start():i][:80])
@@ -703,19 +714,28 @@ RESERVED = {'nano', 'nano_time_assumed_tz', 'nano_time_source', 'nano_operationa
 GENERATED = [(r'# NAN source timezone\.', r'# END NAN source timezone'), (r'# NAN-2421 residual spill\.', r'# END NAN-2421 residual spill')]
 
 
+# A format that carries its own zone: an offset (%z, %:z, %::z, %#z), RFC 3339
+# (%+), epoch seconds (%s), or a literal Z closing it.
+ZONED_FORMAT = re.compile(r'"(?:[^"]*(?:%\+|%:{0,2}z|%#z|%s)[^"]*|[^"]*(?<!%)Z)"')
+UTC_BY_SPEC = re.compile(r'#\s*utc-by-spec:\s*\S')
+NO_STRINGS = re.compile(r'"(?:\\.|[^"\\])*"|r\'[^\']*\'')
+
+
 def unconverted_clocks(vrl):
     """Offset-less clocks that skip the local-clock contract.
 
-    A parse_timestamp(..., timezone: "UTC") whose format carries no offset
-    (%z, %:z, %+ or a literal Z) reads a LOCAL clock as UTC. It must be followed
-    by a `# NAN local clock: <var>` marker for the variable it assigns (so the
-    log source's timezone setting turns it into real UTC), or be annotated
-    `# utc-by-spec: <reason>` on that line or the line before when the source's
-    format is UTC by specification. Generated blocks are ignored.
+    A parse_timestamp(...) with a fixed timezone literal ("UTC", "Etc/UTC",
+    "+00:00", ...) whose format carries no zone reads a LOCAL clock in that
+    zone, ignoring the log source's timezone setting. Unless the line (or the
+    one before) carries `# utc-by-spec: <reason>`, the call must assign its
+    result to a variable, and on the same branch before that variable is used,
+    reassigned (other than by a retry parse) or its branch left, the parser must
+    set `__lc_pending = true` and place `# NAN local clock: <var>`. Generated
+    blocks are ignored. A variable timezone (the source's own field, the
+    prelude's __src_tz) is the source's zone and passes.
     """
-    lines = vrl.split('\n')
     keep, skip = [], False
-    for line in lines:
+    for line in vrl.split('\n'):
         s = line.strip()
         if any(re.match(a, s) for a, _ in GENERATED):
             skip = True
@@ -723,29 +743,72 @@ def unconverted_clocks(vrl):
             keep.append(line)
         if any(re.match(b, s) for _, b in GENERATED):
             skip = False
-    text = '\n'.join(keep)
+    raw = '\n'.join(keep)
     # The expanded local-clock bodies are generated too: keep only the markers.
-    text = re.sub(r'(# NAN local clock: [^\n]*\n).*?# END NAN local clock\n', r'\1', text, flags=re.S)
+    raw = re.sub(r'(# NAN local clock: [^\n]*\n).*?# END NAN local clock\n', r'\1', raw, flags=re.S)
+    lines = raw.split('\n')
+    code_lines = [strip_comments(l) for l in lines]
+    code = '\n'.join(code_lines)
+    starts = [0]
+    for l in code_lines:
+        starts.append(starts[-1] + len(l) + 1)
+    line_of = lambda off: max(k for k, st in enumerate(starts) if st <= off)
     bad = []
-    lines = text.split('\n')
-    for i, line in enumerate(lines):
-        code = strip_comments(line)
-        for m in TIMESTAMP_CALL.finditer(code):
-            args = code[m.end():]
-            parts = split_args(args.rsplit(')', 1)[0] if ')' in args else args)
-            named = {p.split(':', 1)[0].strip(): p.split(':', 1)[1].strip() for p in parts[2:] if re.match(r'\s*\w+\s*:', p)}
-            if named.get('timezone') != '"UTC"':
-                continue
-            fmt = parts[1].strip() if len(parts) > 1 else ''
-            if re.fullmatch(r'"[^"]*(?:%\+|%:?z|Z)[^"]*"', fmt):
-                continue
-            if 'utc-by-spec:' in line or (i and 'utc-by-spec:' in lines[i - 1]):
-                continue
-            var = re.match(r'\s*(?:if [^{]*\{\s*)?(\w+)\s*(?:,\s*\w+)?\s*=', code)
-            # A marker for the assigned variable at or after the call converts it.
-            if var and any(re.match(r'\s*# NAN local clock: ' + re.escape(var.group(1)) + r'\b', l) for l in lines[i:]):
-                continue
-            bad.append(code.strip()[:90])
+    for m in TIMESTAMP_CALL.finditer(code):
+        args, end = call_args(code, m.end())
+        parts = split_args(args)
+        named = named_args(parts[2:])
+        tz = named.get('timezone', '')
+        if not tz.startswith('"'):
+            continue  # no timezone (naive_timestamps) or a variable one
+        fmt = parts[1].strip() if len(parts) > 1 else ''
+        if ZONED_FORMAT.fullmatch(fmt):
+            continue
+        li = line_of(m.start())
+        if UTC_BY_SPEC.search(lines[li]) or (li and UTC_BY_SPEC.search(lines[li - 1])):
+            continue
+        call = ' '.join(code[m.start():end].split())[:90]
+        prefix = code[starts[li]:m.start()]
+        var = re.search(r'(?:^|[{;]|\bthen\b)\s*(\w+)\s*(?:,\s*\w+)?\s*=\s*$', prefix)
+        if not var:
+            bad.append(call + ' (result not assigned to a variable)')
+            continue
+        v = re.escape(var.group(1))
+        retry = re.compile(r'\b' + v + r'\s*(?:,\s*\w+)?\s*=\s*parse_timestamp\b')
+        # Walk forward: brace depth relative to the call; the base is the
+        # shallower of the call and the end of its line (a one-line retry block).
+        end_line = line_of(end - 1)
+        rest = [code[end:starts[end_line + 1] - 1]] + code_lines[end_line + 1:]
+        depth, base, pending, why = 0, None, False, 'no `# NAN local clock: ' + var.group(1) + '` marker follows'
+        for k, chunk in enumerate(rest):
+            j = end_line + k
+            if k and re.match(r'\s*# NAN local clock: ' + v + r'\b', lines[j]):
+                why = None if pending else 'marker without `__lc_pending = true` before it'
+                break
+            flat = NO_STRINGS.sub('""', chunk)
+            if re.search(r'__lc_pending\s*=\s*true', flat):
+                pending = True
+            if re.search(r'\b' + v + r'\b', flat) and not retry.search(flat):
+                why = f'{var.group(1)} is used before its local-clock marker'
+                break
+            if re.search(r'(?<![\w.])' + v + r'\s*(?:,\s*\w+)?\s*=(?!=)', flat) and not retry.search(flat):
+                why = f'{var.group(1)} is reassigned before its local-clock marker'
+                break
+            left = False
+            for tok in re.findall(r'[{}]|\belse\b', flat):
+                if tok == '{':
+                    depth += 1
+                elif tok == '}':
+                    depth -= 1
+                elif base is not None and depth < base:
+                    left = True
+            if k == 0:
+                base = min(0, depth)
+            if left:
+                why = 'the branch ends before its local-clock marker'
+                break
+        if why:
+            bad.append(f'{call} ({why})')
     return bad
 
 
