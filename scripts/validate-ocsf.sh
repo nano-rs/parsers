@@ -39,8 +39,10 @@
 # The OCSF contract binary is a nano build artifact and is not vendored here.
 # Point OCSF_VALIDATOR at it (or put `ocsf_event_validate` on PATH) to run
 # gate 2's schema half. In CI (or with OCSF_VALIDATOR_REQUIRED=1) a missing
-# validator FAILS the gate (NAN-3680); locally it reports SKIPPED loudly.
-# scripts/fetch-ocsf-validator.sh fetches the pinned binary.
+# validator FAILS the gate (NAN-3680). Locally the pinned binary is fetched
+# (scripts/fetch-ocsf-validator.sh, cached) and run, in a linux/amd64 container
+# when the host is not linux x86_64; only when that cannot work (no token, no
+# Docker) is the schema half SKIPPED, loudly.
 
 set -euo pipefail
 
@@ -76,12 +78,57 @@ elif [ "$#" -eq 1 ] && [ -f "$1" ] && [ "$(basename "$1")" != "parser.yaml" ]; t
         case "$line" in parsers-ocsf/*|*/parsers-ocsf/*) PARSERS+=("$line") ;; esac
     done < "$1"
 else
-    PARSERS=("$@")
+    # A parser directory means its parser.yaml. A path that is neither FAILS:
+    # skipping it silently made a run that checked nothing report a pass.
+    for arg in "$@"; do
+        if [ -d "$arg" ] && [ -f "$arg/parser.yaml" ]; then
+            PARSERS+=("$arg/parser.yaml")
+        elif [ -f "$arg" ]; then
+            PARSERS+=("$arg")
+        else
+            echo "ERROR: $arg is not a parser.yaml or a parser directory." >&2
+            exit 1
+        fi
+    done
 fi
 
 if [ "${#PARSERS[@]}" -eq 0 ]; then
     echo "No parsers-ocsf/ parsers to validate."
     exit 0
+fi
+
+# Locally, fetch the pinned validator instead of skipping gate 2 (a local pass
+# with it skipped hid schema failures CI then caught). The token is
+# OCSF_VALIDATOR_TOKEN or, when gh is logged in, gh's own. The binary is linux
+# x86_64: on any other host it runs in a throwaway linux/amd64 container (no
+# network, the binary mounted read-only) kept for this run only.
+# OCSF_VALIDATOR_AUTO=0 turns this off.
+VALIDATOR_BASE_IMAGE="debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc"
+if ! { [ -n "${OCSF_VALIDATOR:-}" ] && [ -x "${OCSF_VALIDATOR}" ]; } && ! command -v ocsf_event_validate >/dev/null 2>&1 \
+    && [ -z "${CI:-}" ] && [ "${OCSF_VALIDATOR_AUTO:-1}" != "0" ]; then
+    want_sha=$(sed -n 's/^sha256=//p' "$REPO_ROOT/scripts/ocsf-validator.lock")
+    cache="${XDG_CACHE_HOME:-$HOME/.cache}/nano-parsers/ocsf-validator-${want_sha:0:12}"
+    if [ ! -x "$cache/ocsf_event_validate" ]; then
+        token="${OCSF_VALIDATOR_TOKEN:-$(gh auth token 2>/dev/null || true)}"
+        OCSF_VALIDATOR_TOKEN="$token" bash "$REPO_ROOT/scripts/fetch-ocsf-validator.sh" "$cache" >/dev/null 2>"$WORK/fetch.err" \
+            || echo "OCSF contract validator: fetch failed ($(head -1 "$WORK/fetch.err"))"
+    fi
+    if [ -x "$cache/ocsf_event_validate" ]; then
+        if [ "$(uname -sm)" = "Linux x86_64" ]; then
+            export OCSF_VALIDATOR="$cache/ocsf_event_validate"
+        elif docker info >/dev/null 2>&1; then
+            vname="ocsf-validate-$$"
+            if docker run -d --rm --name "$vname" --platform linux/amd64 --network none \
+                -v "$cache:/v:ro" "$VALIDATOR_BASE_IMAGE" sleep 86400 >/dev/null 2>"$WORK/docker.err"; then
+                trap 'docker rm -f "$vname" >/dev/null 2>&1; rm -rf "$WORK"' EXIT
+                printf '#!/bin/sh\nexec docker exec -i %s /v/ocsf_event_validate "$@"\n' "$vname" > "$WORK/ocsf_event_validate"
+                chmod +x "$WORK/ocsf_event_validate"
+                export OCSF_VALIDATOR="$WORK/ocsf_event_validate"
+            else
+                echo "OCSF contract validator: container failed ($(head -1 "$WORK/docker.err"))"
+            fi
+        fi
+    fi
 fi
 
 if { [ -n "${OCSF_VALIDATOR:-}" ] && [ -x "${OCSF_VALIDATOR}" ]; } || command -v ocsf_event_validate >/dev/null 2>&1; then
