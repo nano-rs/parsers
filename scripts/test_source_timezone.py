@@ -30,9 +30,10 @@ from field_coverage_check import samples_for  # noqa: E402
 from provenance import VECTOR_ENV  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-LOCAL = ['palo_alto', 'syslog', 'zscaler_zia', 'windows_event_text', 'checkpoint', 'cyberark', 'cisco_asa', 'f5_waf',
-         'infoblox_dhcp', 'routeros', 'bind_dns', 'cisco_ftd', 'fail2ban', 'juniper_junos', 'pfsense', 'kafka',
-         'pingfederate', 'elasticsearch', 'json_generic', 'fortinet', 'sophos', 'cisco_ios', 'sonicwall', 'windows_dns']
+# Every parser that reads a clock without an offset marks it for the local-clock
+# block (field_coverage_check enforces that), so the marker IS the list: a new
+# local-clock parser is tested without editing this file.
+LOCAL = sorted(p.parent.name for p in (ROOT/'parsers-ocsf').glob('*/parser.yaml') if '# NAN local clock:' in p.read_text())
 # (setting, marker): any +-HH:MM offset is applied as given; an invalid
 # setting or a zero offset is UTC.
 SETTINGS = [('America/New_York', 'America/New_York'), ('Asia/Tokyo', 'Asia/Tokyo'), ('+05:30', '+05:30'),
@@ -206,6 +207,8 @@ def ios_checks(failures):
         ('2026-06-01T12:00:00+00:00', 'Feb 29 12:00:00.000 EST', '-05:00'),
         ('2027-01-01T00:00:05-05:00', 'Dec 31 23:59:59.000 EST', '-05:00'),
         ('2026-11-22T12:00:00+00:00', 'Nov 22 11:00:00.000 CET', '+01:00'),
+        ('2026-07-02T00:00:00+00:00', 'Jul  1 2026 12:00:00.000 +0500', '+05:00'),
+        ('2026-07-02T00:00:00+00:00', 'Jul  1 2026 12:00:00.000 -04:00', '-04:00'),
     ]
     for now_iso, clock, zone in cases:
         now = dt.datetime.fromisoformat(now_iso)
@@ -221,14 +224,22 @@ def ios_checks(failures):
         mark = (o.get('unmapped') or {}).get('nano_time_assumed_tz')
         if o.get('time') != want or mark is not None:
             failures.append(f'cisco_ios {clock!r} at {now_iso}: time {o.get("time")} (want {want}), marker {mark!r} (want none)')
-    return len(cases)
+    # A slash token that is no zone is a host (relayed BSD header) or an IOS-XR
+    # location: the hostname survives, the clock uses the source setting.
+    for line, host in [('<189>Jul  1 12:00:00 router/edge1: %SYS-5-CONFIG_I: Configured from console by admin on vty0 (192.0.2.10)', 'router/edge1'),
+                       ('<189>Jul  1 12:00:00 RP/0/RSP0/CPU0: %SYS-5-CONFIG_I: Configured from console by admin on vty0 (192.0.2.10)', 'RP/0/RSP0/CPU0')]:
+        (o, _), = run('cisco_ios', [{'message': line, 'nano': {'source_timezone': 'Asia/Tokyo'}}])
+        if (o.get('device') or {}).get('hostname') != host or (o.get('unmapped') or {}).get('nano_time_assumed_tz') != 'Asia/Tokyo':
+            failures.append(f'cisco_ios {line[:40]!r}: hostname {(o.get("device") or {}).get("hostname")!r}, marker {(o.get("unmapped") or {}).get("nano_time_assumed_tz")!r}')
+    return len(cases) + 2
 
 
 def inline_checks(failures):
     """An inline timezone the zone database does not know never drops the
     event: the clock uses the log source's setting, marked as assumed."""
     garbage = [('fortinet', 'tz="Mars/Base"'), ('fortinet', 'tz="GMT/UTC"'), ('fortinet', 'tz="America/NewYork"'),
-               ('sophos', 'timezone="Mars/Base"'), ('sonicwall', 'Mars/Base')]
+               ('fortinet', 'tz="+9999"'), ('fortinet', 'tz="-2500"'), ('fortinet', 'tz="+1460"'),
+               ('sophos', 'timezone="Mars/Base"'), ('sophos', 'timezone="+9999"'), ('sonicwall', 'Mars/Base'), ('sonicwall', '+9999')]
     for parser, inline in garbage:
         path = ROOT/'parsers-ocsf'/parser/'parser.yaml'
         doc = yaml.safe_load(path.read_text())
