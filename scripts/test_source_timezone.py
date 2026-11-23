@@ -227,11 +227,13 @@ def ios_checks(failures):
     # A slash token that is no zone is a host (relayed BSD header) or an IOS-XR
     # location: the hostname survives, the clock uses the source setting.
     for line, host in [('<189>Jul  1 12:00:00 router/edge1: %SYS-5-CONFIG_I: Configured from console by admin on vty0 (192.0.2.10)', 'router/edge1'),
-                       ('<189>Jul  1 12:00:00 RP/0/RSP0/CPU0: %SYS-5-CONFIG_I: Configured from console by admin on vty0 (192.0.2.10)', 'RP/0/RSP0/CPU0')]:
+                       ('<189>Jul  1 12:00:00 RP/0/RSP0/CPU0: %SYS-5-CONFIG_I: Configured from console by admin on vty0 (192.0.2.10)', 'RP/0/RSP0/CPU0'),
+                       ('<189>Jul  1 12:00:00 router: %SYS-5-CONFIG_I: Configured from console by admin on vty0 (192.0.2.10)', 'router'),
+                       ('<189>Jul  1 12:00:00 core: %SYS-5-CONFIG_I: Configured from console by admin on vty0 (192.0.2.10)', 'core')]:
         (o, _), = run('cisco_ios', [{'message': line, 'nano': {'source_timezone': 'Asia/Tokyo'}}])
         if (o.get('device') or {}).get('hostname') != host or (o.get('unmapped') or {}).get('nano_time_assumed_tz') != 'Asia/Tokyo':
             failures.append(f'cisco_ios {line[:40]!r}: hostname {(o.get("device") or {}).get("hostname")!r}, marker {(o.get("unmapped") or {}).get("nano_time_assumed_tz")!r}')
-    return len(cases) + 2
+    return len(cases) + 4
 
 
 def inline_checks(failures):
@@ -239,12 +241,14 @@ def inline_checks(failures):
     event: the clock uses the log source's setting, marked as assumed."""
     garbage = [('fortinet', 'tz="Mars/Base"'), ('fortinet', 'tz="GMT/UTC"'), ('fortinet', 'tz="America/NewYork"'),
                ('fortinet', 'tz="+9999"'), ('fortinet', 'tz="-2500"'), ('fortinet', 'tz="+1460"'),
-               ('sophos', 'timezone="Mars/Base"'), ('sophos', 'timezone="+9999"'), ('sonicwall', 'Mars/Base'), ('sonicwall', '+9999')]
+               ('cisco_ios', '<189>123: Jul  1 2026 12:00:00.000 Mars/Base: %SYS-5-CONFIG_I: Configured from console by admin on vty0 (192.0.2.10)'), ('sophos', 'timezone="Mars/Base"'), ('sophos', 'timezone="+9999"'), ('sonicwall', 'Mars/Base'), ('sonicwall', '+9999')]
     for parser, inline in garbage:
         path = ROOT/'parsers-ocsf'/parser/'parser.yaml'
         doc = yaml.safe_load(path.read_text())
         samples = samples_for(path, doc, None)
-        if parser == 'sonicwall':
+        if parser == 'cisco_ios':
+            event, msg = {'message': inline}, inline
+        elif parser == 'sonicwall':
             event = next(e for _, e in samples if '09:47:12 UTC' in e['message'])
             msg = event['message'].replace('09:47:12 UTC', '09:47:12 ' + inline)
         elif parser == 'sophos':
@@ -256,6 +260,9 @@ def inline_checks(failures):
         outs = run(parser, [{**event, 'message': msg, 'nano': {'source_timezone': 'Asia/Tokyo'}}])
         if len(outs) != 1 or (outs[0][0].get('unmapped') or {}).get('nano_time_assumed_tz') != 'Asia/Tokyo':
             failures.append(f'{parser} inline {inline!r}: event dropped or not marked with the source zone ({outs[:1]!r})')
+        # The device clock is kept (12:00 Tokyo), never replaced by now().
+        if parser == 'cisco_ios' and outs and outs[0][0].get('time') != 1782874800000:
+            failures.append(f'cisco_ios inline {inline[:40]!r}: time {outs[0][0].get("time")!r}, want the clock in Asia/Tokyo')
     # fail2ban: a header clock WITH an offset and an offset-less "Found" clock
     # holding the same instant: only the offset-less one is converted.
     line = '2026-07-01T12:00:00+02:00 fail2ban.filter [1234]: INFO [sshd] Found 203.0.113.5 - 2026-07-01 10:00:00'

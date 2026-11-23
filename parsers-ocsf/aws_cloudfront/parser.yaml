@@ -272,7 +272,9 @@ parser_vrl: |
       if length(url_obj) == 0 { url_obj.path = "/" }
 
       http_request = { "url": url_obj }
-      if method != "" { http_request.http_method = method }
+      # http_method is an OCSF enum with no "Other": a method outside it
+      # (M-SEARCH, PROPFIND, ...) stays as sent in unmapped.cs_method.
+      if includes(["CONNECT", "DELETE", "GET", "HEAD", "OPTIONS", "POST", "PUT", "TRACE", "PATCH"], method) { http_request.http_method = method }
       ua = string(f.cs_user_agent) ?? ""
       if ua != "" && ua != "-" { http_request.user_agent = ua }
       ref = string(f.cs_referer) ?? ""
@@ -288,7 +290,9 @@ parser_vrl: |
 
       # ---- response ----
       http_response = {}
-      if code > 0 { http_response.code = code }
+      # sc-status 000 (no response was sent) is the code the source wrote: 0.
+      sc_text = string(f.sc_status) ?? ""
+      if code > 0 || sc_text == "000" || sc_text == "0" { http_response.code = code }
       ctype = string(f.sc_content_type) ?? ""
       if ctype != "" && ctype != "-" { http_response.content_type = ctype }
       if exists(f.sc_content_len) {
@@ -478,12 +482,27 @@ parser_vrl: |
   }
   __flat = flatten(__escaped)
   # BEGIN parser-specific transformations
+  # cs-method: The OCSF http_method enum; a method outside it (M-SEARCH, PROPFIND) is not emitted and stays in unmapped as sent.
+  # cs_method: The OCSF http_method enum; a method outside it (M-SEARCH, PROPFIND) is not emitted and stays in unmapped as sent.
   # timestamp: Real-time and v2 epoch-second timestamps converted to the emitted millisecond clock.
   # time_taken: Seconds converted to the emitted millisecond duration.
   # time-taken: Seconds converted to the emitted millisecond duration (v2 JSON key).
   # time_to_first_byte: Seconds converted to the emitted millisecond response latency.
   # time-to-first-byte: Seconds converted to the emitted millisecond response latency (v2 JSON key).
   for_each(__flat) -> |key, value| {
+      if match(key, r'(?x)
+      \A(?:
+        cs\-method
+      | cs_method
+      )\z') {
+          __value = value
+          if __value != null {
+              __expected = get!({"connect": "CONNECT", "delete": "DELETE", "get": "GET", "head": "HEAD", "options": "OPTIONS", "post": "POST", "put": "PUT", "trace": "TRACE", "patch": "PATCH"}, [downcase(to_string(__value) ?? "")])
+              if __expected != null {
+                  if contains(__repr, "," + "\"http_request.http_method\"" + "=" + encode_json(encode_json(__expected))) { __consumed = __consumed + ("," + encode_json(key)) }
+              }
+          }
+      }
       if match(key, r'(?x)
       \A(?:
         timestamp
@@ -521,7 +540,7 @@ parser_vrl: |
       }
   }
   # Declared source -> target mappings (field-coverage.yaml `mappings`).
-  __decl = "\n\"asn\"\t[\"src_endpoint.autonomous_system.number\"]\n\"c-country\"\t[\"src_endpoint.location.country\"]\n\"c-ip\"\t[\"src_endpoint.ip\"]\n\"c-port\"\t[\"src_endpoint.port\"]\n\"c_country\"\t[\"src_endpoint.location.country\"]\n\"c_ip\"\t[\"src_endpoint.ip\"]\n\"c_port\"\t[\"src_endpoint.port\"]\n\"cs\\u0028Host\\u0029\"\t[\"dst_endpoint.hostname\"]\n\"cs\\u0028User-Agent\\u0029\"\t[\"http_request.user_agent\"]\n\"cs-bytes\"\t[\"traffic.bytes_out\"]\n\"cs-method\"\t[\"http_request.http_method\"]\n\"cs-protocol\"\t[\"http_request.url.scheme\"]\n\"cs-protocol-version\"\t[\"http_request.version\"]\n\"cs-uri-stem\"\t[\"http_request.url.path\"]\n\"cs_bytes\"\t[\"traffic.bytes_out\"]\n\"cs_host\"\t[\"dst_endpoint.hostname\"]\n\"cs_method\"\t[\"http_request.http_method\"]\n\"cs_protocol\"\t[\"http_request.url.scheme\"]\n\"cs_protocol_version\"\t[\"http_request.version\"]\n\"cs_referer\"\t[\"http_request.referrer\"]\n\"cs_uri_query\"\t[\"http_request.url.query_string\"]\n\"cs_uri_stem\"\t[\"http_request.url.path\"]\n\"cs_user_agent\"\t[\"http_request.user_agent\"]\n\"s_ip\"\t[\"dst_endpoint.ip\"]\n\"sc-bytes\"\t[\"traffic.bytes_in\"]\n\"sc-content-len\"\t[\"http_response.length\"]\n\"sc-content-type\"\t[\"http_response.content_type\"]\n\"sc-status\"\t[\"http_response.code\"]\n\"sc_bytes\"\t[\"traffic.bytes_in\"]\n\"sc_content_len\"\t[\"http_response.length\"]\n\"sc_content_type\"\t[\"http_response.content_type\"]\n\"sc_status\"\t[\"http_response.code\"]\n\"ssl-cipher\"\t[\"tls.cipher\"]\n\"ssl-protocol\"\t[\"tls.version\"]\n\"ssl_cipher\"\t[\"tls.cipher\"]\n\"ssl_protocol\"\t[\"tls.version\"]\n\"timestamp\\u0028ms\\u0029\"\t[\"time\"]\n\"x-edge-request-id\"\t[\"http_request.uid\",\"metadata.uid\"]\n\"x-edge-result-type\"\t[\"status_detail\"]\n\"x-host-header\"\t[\"http_request.url.hostname\"]\n\"x_edge_request_id\"\t[\"http_request.uid\",\"metadata.uid\"]\n\"x_edge_result_type\"\t[\"status_detail\"]\n\"x_host_header\"\t[\"http_request.url.hostname\"]\n"
+  __decl = "\n\"asn\"\t[\"src_endpoint.autonomous_system.number\"]\n\"c-country\"\t[\"src_endpoint.location.country\"]\n\"c-ip\"\t[\"src_endpoint.ip\"]\n\"c-port\"\t[\"src_endpoint.port\"]\n\"c_country\"\t[\"src_endpoint.location.country\"]\n\"c_ip\"\t[\"src_endpoint.ip\"]\n\"c_port\"\t[\"src_endpoint.port\"]\n\"cs\\u0028Host\\u0029\"\t[\"dst_endpoint.hostname\"]\n\"cs\\u0028User-Agent\\u0029\"\t[\"http_request.user_agent\"]\n\"cs-bytes\"\t[\"traffic.bytes_out\"]\n\"cs-protocol\"\t[\"http_request.url.scheme\"]\n\"cs-protocol-version\"\t[\"http_request.version\"]\n\"cs-uri-stem\"\t[\"http_request.url.path\"]\n\"cs_bytes\"\t[\"traffic.bytes_out\"]\n\"cs_host\"\t[\"dst_endpoint.hostname\"]\n\"cs_protocol\"\t[\"http_request.url.scheme\"]\n\"cs_protocol_version\"\t[\"http_request.version\"]\n\"cs_referer\"\t[\"http_request.referrer\"]\n\"cs_uri_query\"\t[\"http_request.url.query_string\"]\n\"cs_uri_stem\"\t[\"http_request.url.path\"]\n\"cs_user_agent\"\t[\"http_request.user_agent\"]\n\"s_ip\"\t[\"dst_endpoint.ip\"]\n\"sc-bytes\"\t[\"traffic.bytes_in\"]\n\"sc-content-len\"\t[\"http_response.length\"]\n\"sc-content-type\"\t[\"http_response.content_type\"]\n\"sc-status\"\t[\"http_response.code\"]\n\"sc_bytes\"\t[\"traffic.bytes_in\"]\n\"sc_content_len\"\t[\"http_response.length\"]\n\"sc_content_type\"\t[\"http_response.content_type\"]\n\"sc_status\"\t[\"http_response.code\"]\n\"ssl-cipher\"\t[\"tls.cipher\"]\n\"ssl-protocol\"\t[\"tls.version\"]\n\"ssl_cipher\"\t[\"tls.cipher\"]\n\"ssl_protocol\"\t[\"tls.version\"]\n\"timestamp\\u0028ms\\u0029\"\t[\"time\"]\n\"x-edge-request-id\"\t[\"http_request.uid\",\"metadata.uid\"]\n\"x-edge-result-type\"\t[\"status_detail\"]\n\"x-host-header\"\t[\"http_request.url.hostname\"]\n\"x_edge_request_id\"\t[\"http_request.uid\",\"metadata.uid\"]\n\"x_edge_result_type\"\t[\"status_detail\"]\n\"x_host_header\"\t[\"http_request.url.hostname\"]\n"
   __preserve = []
   # END parser-specific transformations
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
@@ -815,8 +834,11 @@ samples:
   - raw: "1762067709.123\t198.51.100.23\t192.0.2.200\t0.002\t000\t1650\t-\thttps\td111111abcdef8.cloudfront.net\t/images/logo.png\t356\tIAD89-C1\trTmExampleReqId0001xYz==\twww.example.com\t0.004\tHTTP/2.0\tIPv4\tMozilla/5.0%20(Macintosh;%20Intel%20Mac%20OS%20X%2014_5)\thttps://www.example.com/\t-\tv=2\tHit\t-\tTLSv1.3\tTLS_AES_128_GCM_SHA256\tHit\t-\t-\timage/png\t1302\t-\t-\t52110\tHit\tUS\tgzip,%20br\timage/avif,image/webp,*/*\t/images/*\t-\t-"
     expect:
       "class_uid": "4002"
+      "http_response.code": 0
   # neon #78 r2: hyphenated method
   - raw: "1762067709.123\t198.51.100.23\t192.0.2.200\t0.002\t200\t1650\tM-SEARCH\thttps\td111111abcdef8.cloudfront.net\t/images/logo.png\t356\tIAD89-C1\trTmExampleReqId0001xYz==\twww.example.com\t0.004\tHTTP/2.0\tIPv4\tMozilla/5.0%20(Macintosh;%20Intel%20Mac%20OS%20X%2014_5)\thttps://www.example.com/\t-\tv=2\tHit\t-\tTLSv1.3\tTLS_AES_128_GCM_SHA256\tHit\t-\t-\timage/png\t1302\t-\t-\t52110\tHit\tUS\tgzip,%20br\timage/avif,image/webp,*/*\t/images/*\t-\t-"
     expect:
       "class_uid": "4002"
-      "http_request.http_method": "M-SEARCH"
+      # No OCSF method value for it: kept as sent.
+      "http_request.http_method": "<missing>"
+      "unmapped.cs_method": "M-SEARCH"
