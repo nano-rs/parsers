@@ -200,6 +200,16 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(naive('t = parse_timestamp(s + " +0000", "%Y %z")'), [])
         self.assertEqual(len(naive('t = parse_timestamp(s, "%Y") # timezone: "UTC"')), 1)
 
+    def test_offset_less_clock_needs_the_local_clock_contract(self):
+        bad = fcc.unconverted_clocks
+        self.assertEqual(len(bad('t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\n')), 1)
+        self.assertEqual(bad('t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\nif e == null { __lc_pending = true }\n# NAN local clock: t\n'), [])
+        self.assertEqual(bad('# utc-by-spec: the API writes UTC\nt, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\n'), [])
+        # A format with an offset, or a literal Z, is not a local clock.
+        self.assertEqual(bad('t, e = parse_timestamp(s, "%+", timezone: "UTC")\nu, f = parse_timestamp(s, "%Y-%m-%dT%H:%M:%SZ", timezone: "UTC")\n'), [])
+        # The marker must name the variable the call assigns.
+        self.assertEqual(len(bad('t, e = parse_timestamp(s, "%Y", timezone: "UTC")\n# NAN local clock: other\n')), 1)
+
     def test_json_envelope_retired(self):
         with self.assertRaises(AssertionError):
             validate_config({'json_envelope': 'message'})
