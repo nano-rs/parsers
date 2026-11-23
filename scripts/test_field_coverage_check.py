@@ -210,6 +210,34 @@ class ConfigTests(unittest.TestCase):
         # The marker must name the variable the call assigns.
         self.assertEqual(len(bad('t, e = parse_timestamp(s, "%Y", timezone: "UTC")\n# NAN local clock: other\n')), 1)
 
+    def test_local_clock_contract_bypasses_are_caught(self):
+        bad = fcc.unconverted_clocks
+        ok = 'if e == null { __lc_pending = true }\n# NAN local clock: t\n'
+        # A marker on another branch for a reused name does not convert this one.
+        self.assertEqual(len(bad('if a {\n    t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\n    ms = to_unix_timestamp(t)\n} else {\n    t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\n    ' + ok.replace('\n', '\n    ') + '}\n')), 1)
+        self.assertEqual(len(bad('if a {\n    t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\n} else {\n    ' + ok.replace('\n', '\n    ') + '}\n')), 1)
+        # Used, or overwritten, before the marker.
+        self.assertEqual(len(bad('t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\nms = to_unix_timestamp(t)\n' + ok)), 1)
+        self.assertEqual(len(bad('t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\nt = now()\n' + ok)), 1)
+        # The marker needs __lc_pending = true before it.
+        self.assertEqual(len(bad('t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\n# NAN local clock: t\n')), 1)
+        # Wrapped and multi-line calls.
+        self.assertEqual(len(bad('ms = to_unix_timestamp(parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC") ?? now(), unit: "milliseconds")\n')), 1)
+        self.assertEqual(len(bad('t, e = parse_timestamp(\n    s, "%Y-%m-%d %H:%M:%S",\n    timezone: "UTC"\n)\nms = to_unix_timestamp(t)\n')), 1)
+        # Any fixed zone literal, not only "UTC".
+        for tz in ('"Etc/UTC"', '"GMT"', '"+00:00"'):
+            self.assertEqual(len(bad(f't, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: {tz})\n')), 1, tz)
+        # A Z is a zone only when it closes the format; %Z is a name, not an offset.
+        self.assertEqual(len(bad('t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S Zone", timezone: "UTC")\n')), 1)
+        self.assertEqual(len(bad('t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S %Z", timezone: "UTC")\n')), 1)
+        # utc-by-spec needs a comment with a reason.
+        self.assertEqual(len(bad('# utc-by-spec:\nt, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\n')), 1)
+        self.assertEqual(len(bad('x = "utc-by-spec: no"; t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\n')), 1)
+        # Still allowed: a one-line retry, a variable zone, a multi-line call with its marker.
+        self.assertEqual(bad('t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\nif e != null { t, e = parse_timestamp(s2, "%Y-%m-%d %H:%M:%S", timezone: "UTC") }\nif x { y = 1 } else { y = 2 }\n' + ok), [])
+        self.assertEqual(bad('t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: tz_name)\n'), [])
+        self.assertEqual(bad('t, e = parse_timestamp(\n    s, "%Y-%m-%d %H:%M:%S",\n    timezone: "UTC"\n)\n' + ok), [])
+
     def test_json_envelope_retired(self):
         with self.assertRaises(AssertionError):
             validate_config({'json_envelope': 'message'})
