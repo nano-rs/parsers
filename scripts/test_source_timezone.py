@@ -178,6 +178,52 @@ def year_checks(failures):
     return checked
 
 
+def unmapped_checks(failures):
+    """A source timezone changes the time, never what spills: the unmapped key
+    set of every sample is the same under UTC, a zone and a fixed offset."""
+    checked = 0
+    for parser in LOCAL:
+        path = ROOT/'parsers-ocsf'/parser/'parser.yaml'
+        doc = yaml.safe_load(path.read_text())
+        samples = samples_for(path, doc, None)
+        events = [{k: v for k, v in e.items() if k != 'nano'} for _, e in samples]
+        base = run(parser, events)
+        for zone in ('America/New_York', '+05:30'):
+            for (name, _), (b, _), (o, _) in zip(samples, base, run(parser, [{**e, 'nano': {'source_timezone': zone}} for e in events])):
+                keys_b = set(b.get('unmapped') or {}) - {'nano_time_assumed_tz'}
+                keys_o = set(o.get('unmapped') or {}) - {'nano_time_assumed_tz'}
+                if keys_b != keys_o:
+                    failures.append(f'{parser}/{name} under {zone}: unmapped keys differ from UTC: +{sorted(keys_o - keys_b)} -{sorted(keys_b - keys_o)}')
+        checked += 1
+    return checked
+
+
+def ios_checks(failures):
+    """cisco_ios show-timezone: an inline zone name, and an inline offset that
+    still gets the no-year rollover and the Feb 29 leap year."""
+    cases = [  # (pinned now, header clock, zone the clock is in)
+        ('2026-07-02T00:00:00+00:00', 'Jul  1 2026 12:00:00.000 America/New_York', 'America/New_York'),
+        ('2026-06-01T12:00:00+00:00', 'Feb 29 12:00:00.000 EST', '-05:00'),
+        ('2027-01-01T00:00:05-05:00', 'Dec 31 23:59:59.000 EST', '-05:00'),
+        ('2026-11-22T12:00:00+00:00', 'Nov 22 11:00:00.000 CET', '+01:00'),
+    ]
+    for now_iso, clock, zone in cases:
+        now = dt.datetime.fromisoformat(now_iso)
+        line = f'<189>123: {clock}: %SYS-5-CONFIG_I: Configured from console by admin on vty0 (192.0.2.10)'
+        (o, _), = run('cisco_ios', [{'message': line, 'nano': {'source_timezone': 'Asia/Tokyo'}}], now_ms=int(now.timestamp() * 1000))
+        parts = clock.split()
+        mon, d = parts[0], int(parts[1])
+        year = int(parts[2]) if len(parts) == 5 else None
+        h, mi, se = (int(float(x)) for x in parts[-2].split(':'))
+        tz = zoneinfo.ZoneInfo(zone) if '/' in zone else dt.timezone(dt.timedelta(hours=int(zone[:3]), minutes=int(zone[0] + zone[4:])))
+        months = {m: i for i, m in enumerate(['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'], 1)}
+        want = int(dt.datetime(year, months[mon], d, h, mi, se, tzinfo=tz).timestamp() * 1000) if year else nearest_year(now, months[mon], d, h, mi, se, tz)
+        mark = (o.get('unmapped') or {}).get('nano_time_assumed_tz')
+        if o.get('time') != want or mark is not None:
+            failures.append(f'cisco_ios {clock!r} at {now_iso}: time {o.get("time")} (want {want}), marker {mark!r} (want none)')
+    return len(cases)
+
+
 def inline_checks(failures):
     """An inline timezone the zone database does not know never drops the
     event: the clock uses the log source's setting, marked as assumed."""
@@ -264,11 +310,13 @@ def main():
     dst = dst_checks(failures)
     years = year_checks(failures)
     inline = inline_checks(failures)
+    same = unmapped_checks(failures)
+    ios = ios_checks(failures)
     nano_shape_checks(failures)
     if failures:
         print('\n'.join('FAIL ' + f for f in failures))
         raise SystemExit(1)
-    print(f'PASS source timezone: {checked} local-time parsers shift by the setting; DST transitions in {dst} parsers; {years} year-boundary clocks; {inline} garbage inline zones; no parser leaks .nano in any shape')
+    print(f'PASS source timezone: {checked} local-time parsers shift by the setting; DST transitions in {dst} parsers; {years} year-boundary clocks; {inline} garbage inline zones; {ios} cisco_ios inline clocks; unmapped unchanged by the setting in {same} parsers; no parser leaks .nano in any shape')
 
 
 if __name__ == '__main__':

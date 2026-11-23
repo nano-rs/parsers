@@ -38,6 +38,7 @@ parser_vrl: |
   __time_assumed = false
   __time_inline = false
   __lc_pending = false
+  __lc_shifted = ""
   __src_off = parse_regex(__src_tz_in, r'^(?P<sign>[+-])(?P<h>\d{2}):?(?P<m>\d{2})$') ?? {}
   if !is_empty(__src_off) {
       __src_h = to_int(__src_off.h) ?? 99
@@ -154,6 +155,9 @@ parser_vrl: |
                       __lc_u = int!(__lc_us[2])
                   }
               }
+              # Remembered (local -> UTC) so a transforms rule on the same source clock
+              # still finds it at its target.
+              if __lc_u != __lc_l { __lc_shifted = __lc_shifted + "\n" + to_string(__lc_l) + "\t" + to_string(__lc_u) + "\n" }
               ts = from_unix_timestamp!(__lc_u, unit: "milliseconds")
           }
           # END NAN local clock
