@@ -501,8 +501,11 @@ def run_parser(path, supplied=None, output_dir=None):
     assert config_path.exists(), f'{path.parent.name}: missing field-coverage.yaml'
     config = yaml.safe_load(config_path.read_text())
     update(path, check=True)
-    naive = naive_timestamps(yaml.safe_load(path.read_text())['parser_vrl'])
+    vrl = yaml.safe_load(path.read_text())['parser_vrl']
+    naive = naive_timestamps(vrl)
     assert not naive, f'{path.parent.name}: parse_timestamp without timezone: "UTC" reads a clock in the host timezone: {naive[:3]}'
+    local = unconverted_clocks(vrl)
+    assert not local, f'{path.parent.name}: an offset-less clock read as UTC without the local-clock contract (add `# NAN local clock: <var>`, or `# utc-by-spec: <reason>` when the format is UTC by specification): {local[:3]}'
     rules, steps = validate_config(config)
     mappings = mappings_of(config)
     doc = yaml.safe_load(path.read_text())
@@ -696,6 +699,55 @@ def naive_timestamps(vrl):
 
 # Names nano owns in unmapped: parser markers and the nano.* namespace.
 RESERVED = {'nano', 'nano_time_assumed_tz', 'nano_time_source', 'nano_operational'}
+
+GENERATED = [(r'# NAN source timezone\.', r'# END NAN source timezone'), (r'# NAN-2421 residual spill\.', r'# END NAN-2421 residual spill')]
+
+
+def unconverted_clocks(vrl):
+    """Offset-less clocks that skip the local-clock contract.
+
+    A parse_timestamp(..., timezone: "UTC") whose format carries no offset
+    (%z, %:z, %+ or a literal Z) reads a LOCAL clock as UTC. It must be followed
+    by a `# NAN local clock: <var>` marker for the variable it assigns (so the
+    log source's timezone setting turns it into real UTC), or be annotated
+    `# utc-by-spec: <reason>` on that line or the line before when the source's
+    format is UTC by specification. Generated blocks are ignored.
+    """
+    lines = vrl.split('\n')
+    keep, skip = [], False
+    for line in lines:
+        s = line.strip()
+        if any(re.match(a, s) for a, _ in GENERATED):
+            skip = True
+        if not skip:
+            keep.append(line)
+        if any(re.match(b, s) for _, b in GENERATED):
+            skip = False
+    text = '\n'.join(keep)
+    # The expanded local-clock bodies are generated too: keep only the markers.
+    text = re.sub(r'(# NAN local clock: [^\n]*\n).*?# END NAN local clock\n', r'\1', text, flags=re.S)
+    bad = []
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        code = strip_comments(line)
+        for m in TIMESTAMP_CALL.finditer(code):
+            args = code[m.end():]
+            parts = split_args(args.rsplit(')', 1)[0] if ')' in args else args)
+            named = {p.split(':', 1)[0].strip(): p.split(':', 1)[1].strip() for p in parts[2:] if re.match(r'\s*\w+\s*:', p)}
+            if named.get('timezone') != '"UTC"':
+                continue
+            fmt = parts[1].strip() if len(parts) > 1 else ''
+            if re.fullmatch(r'"[^"]*(?:%\+|%:?z|Z)[^"]*"', fmt):
+                continue
+            if 'utc-by-spec:' in line or (i and 'utc-by-spec:' in lines[i - 1]):
+                continue
+            var = re.match(r'\s*(?:if [^{]*\{\s*)?(\w+)\s*(?:,\s*\w+)?\s*=', code)
+            # A marker for the assigned variable at or after the call converts it.
+            if var and any(re.match(r'\s*# NAN local clock: ' + re.escape(var.group(1)) + r'\b', l) for l in lines[i:]):
+                continue
+            bad.append(code.strip()[:90])
+    return bad
+
 
 PROBES = ('residual_probe', 'text_residual_probe')
 
