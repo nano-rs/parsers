@@ -472,7 +472,8 @@ parser_vrl: |
           if __clock_err == null {
               __expected = to_unix_timestamp(__clock, unit: "milliseconds")
               # A clock the local-clock block moved to real UTC (the log source's
-              # timezone, a year rollover) is matched by its converted value.
+              # timezone, a year rollover) is matched by its converted value. Emitted
+              # only for a parser with a local-clock block (compile cost, NAN-5298).
               if __lc_shifted != "" && !(contains(__repr, "," + "\"time\"" + "=" + encode_json(encode_json(__expected)))) {
                   __lc_at = find(__lc_shifted, "\n" + to_string(__expected) + "\t")
                   if is_integer(__lc_at) {
@@ -829,3 +830,8 @@ samples:
       "class_uid": 0
       "unmapped.parse_fallback": "unparsable input"
       "metadata.uid": "dc38da827e34901cf20aad67d0884ec6f174734e4b7cc2459596527f5290a8b3"
+  # an operation-log time without an offset: the log source's timezone setting applies (UTC if unset), marked
+  - raw: "{\"email\":\"carol@example.com\",\"time\":\"2024-06-07 10:00:00\",\"type\":\"Sign in\"}"
+    expect:
+      "time": 1717754400000
+      "unmapped.nano_time_assumed_tz": "UTC"
