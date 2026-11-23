@@ -27,6 +27,15 @@ __value = value
 __clock, __clock_err = parse_timestamp(string(__value) ?? "", __FORMAT__, timezone: "UTC")
 if __clock_err == null {
     __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+    # A clock the local-clock block moved to real UTC (the log source's
+    # timezone, a year rollover) is matched by its converted value.
+    if __lc_shifted != "" && !(__MATCH__) {
+        __lc_at = find(__lc_shifted, "\n" + to_string(__expected) + "\t")
+        if is_integer(__lc_at) {
+            __lc_rest = slice!(__lc_shifted, int!(__lc_at) + strlen(to_string(__expected)) + 2)
+            __expected = to_int(slice!(__lc_rest, 0, int!(find(__lc_rest, "\n")))) ?? __expected
+        }
+    }
     if __MATCH__ { __consumed = __consumed + ("," + encode_json(key)) }
 }
 # kind: scale
