@@ -4,15 +4,17 @@
 prelude (`source_tz.vrl`): it removes `.nano` whole and resolves
 `.nano.source_timezone` (the log source's timezone setting: an IANA name, or
 any `+HH:MM` offset; UTC if absent, invalid or "local") into `__src_tz` /
-`__src_shift_ms`, and `__src_year`, the current year in that zone. A parser
-reads an offset-less clock as UTC and records its ms in `__time_local`
-(`__time_noyear` for a clock without a year). Before anything else the spill
-block converts every `*time` field holding a recorded value to real UTC (DST:
-an ambiguous time takes its first occurrence, a gap time moves forward; a
-no-year clock more than a day ahead moves to last year) and records the zone
-in `unmapped.nano_time_assumed_tz`. `scripts/test_source_timezone.py` checks
-the shift, the DST transitions, the year boundary and that `.nano` never
-leaks.
+`__src_shift_ms` (and `__src_year` / `__src_leap_year` for a parser that reads
+a clock without a year). A parser reads an offset-less clock as UTC, sets
+`__lc_pending`, and marks the site `# NAN local clock: <var> [noyear]`; the
+generator expands each marker into `local_clock.vrl`, which converts that
+timestamp to real UTC at the site (DST: an ambiguous time takes its first
+occurrence, a gap time moves forward; a no-year clock takes the nearest
+year), so nothing is matched by value. The spill records the zone in
+`unmapped.nano_time_assumed_tz`, and renames a vendor key that uses a nano
+marker name (or `nano`, `nano.*`) to `source_<name>`, suffixed `_2`, `_3`, ...
+when taken. `scripts/test_source_timezone.py` checks the shift, DST, the
+year boundary, garbage inline zones and that `.nano` never leaks.
 
 **Parsers never mask, redact or withhold anything.** A parser converts raw to
 real: every source field is mapped faithfully into OCSF or spilled into

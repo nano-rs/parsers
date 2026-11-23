@@ -44,6 +44,8 @@ class ResidualTests(unittest.TestCase):
             # kept, renamed source_<name>: a log cannot forge a marker.
             ({'nano_time_assumed_tz': 'Mars/Base', 'nano': {'x': 1}, 'nano_operational': True}, {},
              {'source_nano_time_assumed_tz': 'Mars/Base', 'source_nano.x': 1, 'source_nano_operational': True}),
+            # ...and never over a vendor key that already holds that name.
+            ({'nano_operational': 'v1', 'source_nano_operational': 'v2'}, {}, {'source_nano_operational': 'v2', 'source_nano_operational_2': 'v1'}),
             # A literal dotted key is not the nested path it spells: mapping the
             # nested x.y never consumes the literal "x.y" (and vice versa).
             ({'x.y': 'literal', 'x': {'y': 'nested'}}, {'nested_target': 'nested'}, {'x.y': 'literal'}),

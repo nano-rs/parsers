@@ -28,17 +28,11 @@ parser_vrl: |
   # name such as "America/New_York", or any fixed offset such as "+05:30"), set
   # by nano at ingest. .nano is nano's input, never part of the log: it is
   # removed whole before anything else, whatever its shape.
-  # A parser reads a clock that carries no offset AS UTC (timezone: "UTC", never
-  # ambiguous) and records it: __time_assumed = true and the clock's ms in
-  # __time_local (",<ms>" per clock). The spill block then turns every *time
-  # field holding a recorded value into real UTC with the setting: a fixed
-  # offset by arithmetic, an IANA zone with its DST rules (an ambiguous
-  # fall-back time takes its FIRST occurrence, the earlier offset; a time in a
-  # spring-forward gap moves forward by the gap), and records the zone used as
-  # unmapped.nano_time_assumed_tz (the name, the offset as +HH:MM, or "UTC" when
-  # the setting is absent or invalid). A clock with no year uses __src_year (the
-  # current year in the source's zone) and records its ms in __time_noyear too:
-  # a result more than a day in the future moves to the previous year.
+  # For a clock that carries no offset a parser parses it AS UTC and sets
+  # __lc_pending; the generated local-clock block that follows the parse
+  # (local_clock.vrl) turns it into real UTC with this setting, and the spill
+  # records the zone used as unmapped.nano_time_assumed_tz (the name, the offset
+  # as +HH:MM, or "UTC" when the setting is absent, invalid or "local").
   __src_nano = del(.nano)
   __src_tz_in = ""
   if is_object(__src_nano) { __src_tz_in = strip_whitespace(to_string(object!(__src_nano).source_timezone) ?? "") }
@@ -47,8 +41,7 @@ parser_vrl: |
   __src_tz_label = "UTC"
   __time_assumed = false
   __time_inline = false
-  __time_local = ""
-  __time_noyear = ""
+  __lc_pending = false
   __src_off = parse_regex(__src_tz_in, r'^(?P<sign>[+-])(?P<h>\d{2}):?(?P<m>\d{2})$') ?? {}
   if !is_empty(__src_off) {
       __src_h = to_int(__src_off.h) ?? 99
@@ -63,8 +56,6 @@ parser_vrl: |
       __src_probe, __src_probe_err = parse_timestamp("2000-01-01 00:00:00", "%Y-%m-%d %H:%M:%S", timezone: __src_tz_in)
       if __src_probe_err == null { __src_tz = __src_tz_in; __src_tz_label = __src_tz_in }
   }
-  __src_now_ms = to_unix_timestamp(now(), unit: "milliseconds")
-  __src_year = format_timestamp!(from_unix_timestamp!(__src_now_ms + __src_shift_ms, unit: "milliseconds"), "%Y", timezone: __src_tz)
   # END NAN source timezone
   # Slack team.accessLogs record -> OCSF 1.9.0 Authentication (3002).
   raw_log = string!(.message)
@@ -215,51 +206,6 @@ parser_vrl: |
   # (resources.0.uid is resources.uid); arrays are walked two levels deep, and a
   # leaf deeper than that is simply not mapping evidence (it can only spill more).
   # raw_data and unmapped are dropped before the JSON round trip, not after it.
-  # Clocks read without an offset (recorded as local ms in __time_local) become
-  # real UTC: every *time field holding one is converted with the log source's
-  # timezone (see source_tz.vrl), and the zone used is recorded, so source
-  # health can tell assumed times apart. An inline IANA zone (__time_inline)
-  # converts the same way but is not an assumption.
-  if __time_local != "" {
-      __time_fix = filter(flatten(object!(parse_json!(encode_json(.))))) -> |path, value| {
-          is_integer(value) && match(path, r'(?:^|[._])time$') && contains(__time_local + ",", "," + to_string!(value) + ",")
-      }
-      for_each(__time_fix) -> |path, value| {
-          __l = int!(value)
-          __u = __l - __src_shift_ms
-          if __src_tz != "UTC" {
-              # The zone's offsets 12 h either side; equal offsets (no transition
-              # that day) give the answer directly.
-              __offs = map_values([__l - 43200000, __l + 43200000]) -> |at| {
-                  __z = format_timestamp!(from_unix_timestamp!(at, unit: "milliseconds"), "%z", timezone: __src_tz)
-                  __o = ((to_int(slice!(__z, 1, 3)) ?? 0) * 3600 + (to_int(slice!(__z, 3, 5)) ?? 0) * 60) * 1000
-                  if starts_with(__z, "-") { 0 - __o } else { __o }
-              }
-              __oa = int!(__offs[0])
-              __ob = int!(__offs[1])
-              __u = __l - __oa
-              if __oa != __ob {
-                  # A candidate is valid when the zone has that offset at that
-                  # instant. Both valid: ambiguous, keep the first occurrence
-                  # (__oa, the earlier offset). Neither: a gap, __oa moves the
-                  # time forward by the gap.
-                  __ok = map_values([__l - __oa, __l - __ob]) -> |at| {
-                      __z = format_timestamp!(from_unix_timestamp!(at, unit: "milliseconds"), "%z", timezone: __src_tz)
-                      __o = ((to_int(slice!(__z, 1, 3)) ?? 0) * 3600 + (to_int(slice!(__z, 3, 5)) ?? 0) * 60) * 1000
-                      if starts_with(__z, "-") { 0 - __o } else { __o }
-                  }
-                  if int!(__ok[0]) != __oa && int!(__ok[1]) == __ob { __u = __l - __ob }
-              }
-          }
-          # No year in the clock: more than a day in the future is last year.
-          if contains(__time_noyear + ",", "," + to_string(__l) + ",") && __u > __src_now_ms + 86400000 {
-              __s = format_timestamp!(from_unix_timestamp!(__l, unit: "milliseconds"), "%Y-%m-%d %H:%M:%S%.3f")
-              __prev, __prev_err = parse_timestamp(to_string((to_int(slice!(__s, 0, 4)) ?? 0) - 1) + slice!(__s, 4), "%Y-%m-%d %H:%M:%S%.3f", timezone: "UTC")
-              if __prev_err == null { __u = __u - (__l - to_unix_timestamp(__prev, unit: "milliseconds")) }
-          }
-          . = set!(., split(path, "."), __u)
-      }
-  }
   __mapped = .
   __discard = del(__mapped.raw_data)
   __existing = del(__mapped.unmapped)
@@ -447,8 +393,20 @@ parser_vrl: |
   if match(encode_json(keys(__residual)), r'"nano(?:"|\.|_time_assumed_tz"|_time_source"|_operational")') {
       for_each(object!(__residual)) -> |key, value| {
           if includes(["nano", "nano_time_assumed_tz", "nano_time_source", "nano_operational"], key) || starts_with(key, "nano.") {
+              # source_<name>, or the next free _2, _3, ... when a vendor key
+              # already holds that name: nothing is lost.
+              __rk = "source_" + key
+              __rn = 2
+              if includes(keys(__residual), __rk) {
+                  for_each(__residual) -> |_other_key, _other_value| {
+                      if includes(keys(__residual), __rk) {
+                          __rk = "source_" + key + "_" + to_string(__rn)
+                          __rn = __rn + 1
+                      }
+                  }
+              }
               __residual = remove!(__residual, [key])
-              __residual = set!(__residual, ["source_" + key], value)
+              __residual = set!(__residual, [__rk], value)
           }
       }
   }
