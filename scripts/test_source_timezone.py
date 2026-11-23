@@ -40,11 +40,19 @@ SETTINGS = [('America/New_York', 'America/New_York'), ('Asia/Tokyo', 'Asia/Tokyo
             ('+0000', 'UTC'), ('+15:00', 'UTC'), ('+05:61', 'UTC'), ('Mars/Olympus_Mons', 'UTC'), ('', 'UTC')]
 
 
-def run(parser, events):
+NOW = '__src_now_ms = to_unix_timestamp(now(), unit: "milliseconds")'
+
+
+def run(parser, events, now_ms=None):
+    """Run a parser; now_ms pins the prelude's "now" (the no-year decision)."""
     doc = yaml.safe_load((ROOT/'parsers-ocsf'/parser/'parser.yaml').read_text())
+    program = doc['parser_vrl']
+    if now_ms is not None:
+        assert NOW in program, f'{parser}: no pinnable now'
+        program = program.replace(NOW, f'__src_now_ms = {now_ms}')
     with tempfile.TemporaryDirectory(prefix='source-tz-') as tmp:
         tmp = Path(tmp)
-        (tmp/'p.vrl').write_text(doc['parser_vrl'] + '\n.__coverage_source = __source_kv\n')
+        (tmp/'p.vrl').write_text(program + '\n.__coverage_source = __source_kv\n')
         (tmp/'in.json').write_text(''.join(json.dumps(e) + '\n' for e in events))
         out = subprocess.run(['vector', 'vrl', '--program', str(tmp/'p.vrl'), '--input', str(tmp/'in.json'), '--print-object'],
                              text=True, capture_output=True, timeout=300, env=VECTOR_ENV)
@@ -72,7 +80,12 @@ DATETIME = re.compile(r'(?P<y>\d{4})(?P<s1>[-/])(?P<mo>\d{2})(?P=s1)(?P<d>\d{2})
 # exactly that, so it is the expectation.
 DST = [('America/New_York', '2026-11-01 01:30:00'), ('America/New_York', '2026-03-08 02:30:00'),
        ('Europe/Berlin', '2026-10-25 02:30:00'), ('Europe/Berlin', '2026-03-29 02:30:00'),
-       ('America/New_York', '2026-11-01 00:30:00'), ('Europe/Berlin', '2026-10-25 03:30:00')]
+       ('America/New_York', '2026-11-01 00:30:00'), ('Europe/Berlin', '2026-10-25 03:30:00'),
+       # Offsets beyond +12: the probe window must still bracket the instant.
+       ('Pacific/Auckland', '2026-04-05 02:30:00'), ('Pacific/Auckland', '2026-09-27 02:30:00'),
+       ('Pacific/Auckland', '2026-07-01 12:00:00'), ('Pacific/Chatham', '2026-04-05 02:15:00'),
+       ('Pacific/Chatham', '2026-04-05 03:15:00'), ('Pacific/Chatham', '2026-09-27 03:15:00'),
+       ('Pacific/Kiritimati', '2026-07-01 12:00:00'), ('Antarctica/McMurdo', '2026-04-05 02:30:00')]
 
 
 def with_clock(message, local):
@@ -115,24 +128,85 @@ def dst_checks(failures):
     return checked
 
 
+def nearest_year(now, mo, d, h, mi, se, tz):
+    """The expected year for a clock without one: this year in the source's
+    zone; more than a day ahead is last year, more than 180 days back is next
+    year when that is not ahead; Feb 29 takes the latest leap year."""
+    import calendar
+    year = now.astimezone(tz).year
+    base = year if not (mo == 2 and d == 29) or calendar.isleap(year) else max(y for y in range(year - 4, year + 1) if calendar.isleap(y))
+    def at(y):
+        try:
+            return dt.datetime(y, mo, d, h, mi, se, tzinfo=tz)
+        except ValueError:
+            return None
+    want = at(base)
+    if want > now + dt.timedelta(days=1) and at(base - 1):
+        want = at(base - 1)
+    elif want < now - dt.timedelta(days=180) and at(base + 1) and at(base + 1) <= now + dt.timedelta(days=1):
+        want = at(base + 1)
+    return int(want.timestamp() * 1000)
+
+
 def year_checks(failures):
-    """A clock with no year (RFC 3164) takes the source zone's current year,
-    and moves to the previous year when that lands more than a day ahead."""
-    lines = {'Dec 31 23:59:59': (12, 31, 23, 59, 59), 'Jan  1 00:00:01': (1, 1, 0, 0, 1)}
-    zones = ['UTC', 'America/New_York', 'Asia/Tokyo']
-    events = [({'message': f'<13>{clock} host-1 app[42]: rollover probe', **({'nano': {'source_timezone': z}} if z != 'UTC' else {})}, clock, z)
-              for clock in lines for z in zones]
-    now = dt.datetime.now(dt.timezone.utc)
-    for (event, clock, zone), (o, _) in zip(events, run('syslog', [e for e, _, _ in events])):
-        mo, d, h, mi, se = lines[clock]
-        tz = zoneinfo.ZoneInfo(zone)
-        year = now.astimezone(tz).year
-        want = dt.datetime(year, mo, d, h, mi, se, tzinfo=tz)
-        if want > now + dt.timedelta(days=1):
-            want = want.replace(year=year - 1)
-        if o.get('time') != int(want.timestamp() * 1000):
-            failures.append(f'syslog {clock!r} in {zone}: time {o.get("time")} (want {int(want.timestamp() * 1000)}, {want.isoformat()})')
-    return len(events)
+    """No-year clocks against a pinned "now": New Year in both directions (a
+    sender a little fast or slow), Feb 29 in a non-leap year, and a replayed
+    clock whose DST offset differs between the two years."""
+    cases = [
+        ('2026-12-31T23:59:58-05:00', 'Jan  1 00:00:01', 'America/New_York'),
+        ('2027-01-01T00:00:05-05:00', 'Dec 31 23:59:59', 'America/New_York'),
+        ('2026-12-31T19:05:00-05:00', 'Dec 31 19:05:00', 'America/New_York'),
+        ('2027-01-01T00:05:00+09:00', 'Jan  1 00:05:00', 'Asia/Tokyo'),
+        ('2027-03-10T12:00:00+00:00', 'Mar 12 12:00:00', 'America/New_York'),
+        ('2026-06-01T12:00:00+00:00', 'Feb 29 12:00:00', 'UTC'),
+        ('2028-03-01T12:00:00+00:00', 'Feb 29 12:00:00', 'Europe/Berlin'),
+        ('2026-11-22T12:00:00+00:00', 'Dec 31 23:59:59', 'UTC'),
+        ('2026-11-22T12:00:00+00:00', 'Jan  1 00:00:01', 'Asia/Tokyo'),
+    ]
+    months = {m: i for i, m in enumerate(['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'], 1)}
+    checked = 0
+    for now_iso, clock, zone in cases:
+        now = dt.datetime.fromisoformat(now_iso)
+        event = {'message': f'<13>{clock} host-1 app[42]: rollover probe', **({'nano': {'source_timezone': zone}} if zone != 'UTC' else {})}
+        (o, _), = run('syslog', [event], now_ms=int(now.timestamp() * 1000))
+        mon, d, hms = clock.split()
+        h, mi, se = map(int, hms.split(':'))
+        want = nearest_year(now, months[mon], int(d), h, mi, se, zoneinfo.ZoneInfo(zone))
+        if o.get('time') != want:
+            failures.append(f'syslog {clock!r} in {zone} at {now_iso}: time {o.get("time")} (want {want})')
+        checked += 1
+    return checked
+
+
+def inline_checks(failures):
+    """An inline timezone the zone database does not know never drops the
+    event: the clock uses the log source's setting, marked as assumed."""
+    garbage = [('fortinet', 'tz="Mars/Base"'), ('fortinet', 'tz="GMT/UTC"'), ('fortinet', 'tz="America/NewYork"'),
+               ('sophos', 'timezone="Mars/Base"'), ('sonicwall', 'Mars/Base')]
+    for parser, inline in garbage:
+        path = ROOT/'parsers-ocsf'/parser/'parser.yaml'
+        doc = yaml.safe_load(path.read_text())
+        samples = samples_for(path, doc, None)
+        if parser == 'sonicwall':
+            event = next(e for _, e in samples if '09:47:12 UTC' in e['message'])
+            msg = event['message'].replace('09:47:12 UTC', '09:47:12 ' + inline)
+        elif parser == 'sophos':
+            event = next(e for _, e in samples if 'timezone="UTC"' in e['message'])
+            msg = event['message'].replace('timezone="UTC"', inline)
+        else:
+            event = next(e for _, e in samples if 'time=09:54:00' in e['message'] and 'tz=' not in e['message'])
+            msg = event['message'].replace('time=09:54:00', 'time=09:54:00 ' + inline)
+        outs = run(parser, [{**event, 'message': msg, 'nano': {'source_timezone': 'Asia/Tokyo'}}])
+        if len(outs) != 1 or (outs[0][0].get('unmapped') or {}).get('nano_time_assumed_tz') != 'Asia/Tokyo':
+            failures.append(f'{parser} inline {inline!r}: event dropped or not marked with the source zone ({outs[:1]!r})')
+    # fail2ban: a header clock WITH an offset and an offset-less "Found" clock
+    # holding the same instant: only the offset-less one is converted.
+    line = '2026-07-01T12:00:00+02:00 fail2ban.filter [1234]: INFO [sshd] Found 203.0.113.5 - 2026-07-01 10:00:00'
+    (o, _), = run('fail2ban', [{'message': line, 'nano': {'source_timezone': 'America/New_York'}}])
+    first_seen = (o.get('finding_info') or {}).get('first_seen_time')
+    if o.get('time') != expect_utc_ms('UTC', '2026-07-01 10:00:00') or first_seen != expect_utc_ms('America/New_York', '2026-07-01 10:00:00'):
+        failures.append(f'fail2ban: header time {o.get("time")} (must stay 10:00Z), Found clock {first_seen} (want 14:00Z)')
+    return len(garbage)
 
 
 def nano_shape_checks(failures):
@@ -189,11 +263,12 @@ def main():
         checked += 1
     dst = dst_checks(failures)
     years = year_checks(failures)
+    inline = inline_checks(failures)
     nano_shape_checks(failures)
     if failures:
         print('\n'.join('FAIL ' + f for f in failures))
         raise SystemExit(1)
-    print(f'PASS source timezone: {checked} local-time parsers shift by the setting; DST transitions in {dst} parsers; {years} year-boundary clocks; no parser leaks .nano in any shape')
+    print(f'PASS source timezone: {checked} local-time parsers shift by the setting; DST transitions in {dst} parsers; {years} year-boundary clocks; {inline} garbage inline zones; no parser leaks .nano in any shape')
 
 
 if __name__ == '__main__':
