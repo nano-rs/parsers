@@ -102,9 +102,12 @@ parser_vrl: |
               # An inline offset: the local-clock block applies it, so a no-year
               # clock still rolls over and Feb 29 still lands in a leap year.
               tz_m = parse_regex(tz_off, r'^(?P<s>[+-])(?P<h>\d{2})(?P<m>\d{2})$') ?? {}
-              if !is_empty(tz_m) {
+              tz_h = to_int(tz_m.h) ?? 99
+              tz_min = to_int(tz_m.m) ?? 99
+              # An out-of-range offset is not an offset: the source setting applies (marked).
+              if !is_empty(tz_m) && tz_h <= 14 && tz_min <= 59 {
                   __src_tz = "UTC"
-                  __src_shift_ms = ((to_int(tz_m.h) ?? 0) * 3600 + (to_int(tz_m.m) ?? 0) * 60) * 1000
+                  __src_shift_ms = (tz_h * 3600 + tz_min * 60) * 1000
                   if tz_m.s == "-" { __src_shift_ms = 0 - __src_shift_ms }
                   __src_tz_label = tz_off
                   __time_inline = true
