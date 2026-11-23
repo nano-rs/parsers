@@ -3,17 +3,11 @@
 # name such as "America/New_York", or any fixed offset such as "+05:30"), set
 # by nano at ingest. .nano is nano's input, never part of the log: it is
 # removed whole before anything else, whatever its shape.
-# A parser reads a clock that carries no offset AS UTC (timezone: "UTC", never
-# ambiguous) and records it: __time_assumed = true and the clock's ms in
-# __time_local (",<ms>" per clock). The spill block then turns every *time
-# field holding a recorded value into real UTC with the setting: a fixed
-# offset by arithmetic, an IANA zone with its DST rules (an ambiguous
-# fall-back time takes its FIRST occurrence, the earlier offset; a time in a
-# spring-forward gap moves forward by the gap), and records the zone used as
-# unmapped.nano_time_assumed_tz (the name, the offset as +HH:MM, or "UTC" when
-# the setting is absent or invalid). A clock with no year uses __src_year (the
-# current year in the source's zone) and records its ms in __time_noyear too:
-# a result more than a day in the future moves to the previous year.
+# For a clock that carries no offset a parser parses it AS UTC and sets
+# __lc_pending; the generated local-clock block that follows the parse
+# (local_clock.vrl) turns it into real UTC with this setting, and the spill
+# records the zone used as unmapped.nano_time_assumed_tz (the name, the offset
+# as +HH:MM, or "UTC" when the setting is absent, invalid or "local").
 __src_nano = del(.nano)
 __src_tz_in = ""
 if is_object(__src_nano) { __src_tz_in = strip_whitespace(to_string(object!(__src_nano).source_timezone) ?? "") }
@@ -22,8 +16,7 @@ __src_shift_ms = 0
 __src_tz_label = "UTC"
 __time_assumed = false
 __time_inline = false
-__time_local = ""
-__time_noyear = ""
+__lc_pending = false
 __src_off = parse_regex(__src_tz_in, r'^(?P<sign>[+-])(?P<h>\d{2}):?(?P<m>\d{2})$') ?? {}
 if !is_empty(__src_off) {
     __src_h = to_int(__src_off.h) ?? 99
@@ -38,6 +31,13 @@ if !is_empty(__src_off) {
     __src_probe, __src_probe_err = parse_timestamp("2000-01-01 00:00:00", "%Y-%m-%d %H:%M:%S", timezone: __src_tz_in)
     if __src_probe_err == null { __src_tz = __src_tz_in; __src_tz_label = __src_tz_in }
 }
+#year{
+# A clock with no year: the current year in the source's zone, and the latest
+# leap year for a Feb 29 (the local-clock block then picks the nearest year).
 __src_now_ms = to_unix_timestamp(now(), unit: "milliseconds")
-__src_year = format_timestamp!(from_unix_timestamp!(__src_now_ms + __src_shift_ms, unit: "milliseconds"), "%Y", timezone: __src_tz)
+__src_year = format_timestamp(from_unix_timestamp!(__src_now_ms + __src_shift_ms, unit: "milliseconds"), "%Y", timezone: __src_tz) ?? format_timestamp!(now(), "%Y")
+__src_leap_year = to_int(__src_year) ?? 2000
+if mod(__src_leap_year, 4) != 0 || (mod(__src_leap_year, 100) == 0 && mod(__src_leap_year, 400) != 0) { __src_leap_year = __src_leap_year - mod(__src_leap_year, 4) }
+__src_leap_year = to_string(__src_leap_year)
+#}year
 # END NAN source timezone

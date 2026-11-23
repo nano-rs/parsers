@@ -220,9 +220,64 @@ def generated(config):
     return (ROOT / 'scripts/residual/spill.vrl').read_text().replace('__TRANSFORMS__', transformations(config)).rstrip()
 
 
-def prelude():
-    """The shared source-timezone block every parser starts with."""
-    return (ROOT / 'scripts/residual/source_tz.vrl').read_text().rstrip()
+LC_START = '# NAN local clock:'
+LC_END = '# END NAN local clock'
+
+
+def _section(text, name, keep):
+    """Keep or drop the lines between '#name{' and '#}name' (markers removed)."""
+    out, inside = [], False
+    for line in text.splitlines():
+        if line.strip() == '#' + name + '{':
+            inside = True
+            continue
+        if line.strip() == '#}' + name:
+            inside = False
+            continue
+        if not inside or keep:
+            out.append(line)
+    return '\n'.join(out)
+
+
+def prelude(body=''):
+    """The shared source-timezone block every parser starts with; the
+    no-year variables only for a parser that reads a clock without a year."""
+    text = (ROOT / 'scripts/residual/source_tz.vrl').read_text().rstrip()
+    return _section(text, 'year', '__src_year' in body or ' noyear' in body)
+
+
+def local_clock(var, noyear):
+    """noyear: False, True, or the name of a variable holding the decision."""
+    """The generated conversion that follows an offset-less clock's parse."""
+    lines = (ROOT / 'scripts/residual/local_clock.vrl').read_text().rstrip().splitlines()[1:-1]
+    text = '\n'.join(lines).replace('__VAR__', var)
+    if not noyear:
+        # Drop each `if __NOYEAR__ { ... }` block (matched by indentation).
+        out, skip = [], None
+        for line in text.splitlines():
+            if skip is not None:
+                if line.startswith(skip + '}') and line.strip() == '}':
+                    skip = None
+                continue
+            if line.strip() == 'if __NOYEAR__ {':
+                skip = line[:len(line) - len(line.lstrip())]
+                continue
+            out.append(line)
+        text = '\n'.join(out)
+    else:
+        text = text.replace('if __NOYEAR__ {', 'if ' + (noyear if isinstance(noyear, str) else 'true') + ' {')
+    return text
+
+
+def expand_local_clocks(text):
+    """Re-expand every '# NAN local clock: VAR [noyear]' marker in parser_vrl."""
+    pat = re.compile(r'^(?P<ind>[ \t]*)' + re.escape(LC_START) + r' (?P<var>\w+)(?P<noyear> noyear(?:=\w+)?)?[ \t]*\n(?:.*?^[ \t]*' + re.escape(LC_END) + r'[ \t]*\n)?', re.M | re.S)
+    def sub(m):
+        ind = m.group('ind')
+        ny = m.group('noyear')
+        body = local_clock(m.group('var'), (ny.split('=', 1)[1] if ny and '=' in ny else bool(ny)))
+        return ind + LC_START + ' ' + m.group('var') + (m.group('noyear') or '') + '\n' + ''.join(ind + l + '\n' if l else '\n' for l in body.splitlines()) + ind + LC_END + '\n'
+    return pat.sub(sub, text)
 
 
 def update(path, check=False):
@@ -230,9 +285,10 @@ def update(path, check=False):
     # The source-timezone prelude opens parser_vrl, before the parser reads
     # anything (it removes .nano, nano's own input, from the event).
     tz_pattern = r'  ' + re.escape(TZ_START) + r'.*?  ' + re.escape(TZ_END) + r'\n'
-    tz_block = '\n'.join('  ' + s if s else '' for s in prelude().splitlines()) + '\n'
     assert re.search(tz_pattern, text, re.S) or not check, f'{path}: missing source-timezone prelude'
-    text_wo = re.sub(tz_pattern, '', text, flags=re.S)
+    text_wo = expand_local_clocks(re.sub(tz_pattern, '', text, flags=re.S))
+    body = text_wo[text_wo.index('parser_vrl:'):text_wo.find(START) if START in text_wo else len(text_wo)]
+    tz_block = '\n'.join('  ' + s if s else '' for s in prelude(body).splitlines()) + '\n'
     head = text_wo.index('\n', text_wo.index('parser_vrl:')) + 1
     text = text_wo[:head] + tz_block + text_wo[head:]
     config = yaml.safe_load(path.with_name('field-coverage.yaml').read_text())
