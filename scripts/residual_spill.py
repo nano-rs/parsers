@@ -88,12 +88,12 @@ def vrl_text(text):
     return '"' + text.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\t', '\\t') + '"'
 
 
-def rule_body(rule, templates):
+def rule_body(rule, templates, local=False):
     """One rule's body, written against the loop's `key` and `value`."""
     # Against __repr: the value must be AT the rule's target path of the mapped
     # event (no raw_data, unmapped, or raw-body message), never just anywhere.
     match = 'contains(__repr, "," + ' + vrl_text(json_text(norm_path(rule['target']))) + ' + "=" + encode_json(encode_json(__expected)))'
-    text = templates[rule['kind']]
+    text = _section(templates[rule['kind']], 'local_clock', local)
     if rule['kind'] == 'epoch_ms':
         fmt = rule.get('format', '%+')
         text = text.replace('__FORMAT__', vrl_string(fmt if isinstance(fmt, str) else '%+'))
@@ -107,7 +107,7 @@ def rule_body(rule, templates):
     return text.replace('__MATCH__', match)
 
 
-def grouped(rules, templates):
+def grouped(rules, templates, local=False):
     """Rules that render to the same body, in first-appearance order.
 
     NAN-5298: one `if` per rule made the program's statement count, and with it
@@ -116,7 +116,7 @@ def grouped(rules, templates):
     """
     groups = {}
     for rule in rules:
-        keys = groups.setdefault(rule_body(rule, templates), [])
+        keys = groups.setdefault(rule_body(rule, templates, local), [])
         if rule['source'] not in keys:
             keys.append(rule['source'])
     return list(groups.items())
@@ -192,13 +192,13 @@ def check_rule(rule):
         assert 'format' not in rule or (isinstance(rule['format'], str) and rule['format']), f'{rule["source"]}: epoch_ms format must be a non-empty string'
 
 
-def transformations(config):
+def transformations(config, local=False):
     rules = config.get('transforms', [])
     for rule in rules:
         check_rule(rule)
     templates = kind_templates()
     lines = ['# ' + rule['source'] + ': ' + rule['reason'] for rule in rules]
-    groups = grouped(rules, templates)
+    groups = grouped(rules, templates, local)
     if groups:
         lines.append('for_each(__flat) -> |key, value| {')
         for body, keys in groups:
@@ -216,8 +216,9 @@ def transformations(config):
     return '\n'.join(lines)
 
 
-def generated(config):
-    return (ROOT / 'scripts/residual/spill.vrl').read_text().replace('__TRANSFORMS__', transformations(config)).rstrip()
+def generated(config, local=False):
+    """The spill block; local: the parser has a local-clock block."""
+    return (ROOT / 'scripts/residual/spill.vrl').read_text().replace('__TRANSFORMS__', transformations(config, local)).rstrip()
 
 
 LC_START = '# NAN local clock:'
@@ -243,6 +244,7 @@ def prelude(body=''):
     """The shared source-timezone block every parser starts with; the
     no-year variables only for a parser that reads a clock without a year."""
     text = (ROOT / 'scripts/residual/source_tz.vrl').read_text().rstrip()
+    text = _section(text, 'local_clock', LC_START in body)
     return _section(text, 'year', '__src_year' in body or ' noyear' in body)
 
 
@@ -292,7 +294,7 @@ def update(path, check=False):
     head = text_wo.index('\n', text_wo.index('parser_vrl:')) + 1
     text = text_wo[:head] + tz_block + text_wo[head:]
     config = yaml.safe_load(path.with_name('field-coverage.yaml').read_text())
-    block = '\n'.join('  ' + s if s else '' for s in generated(config).splitlines()) + '\n'
+    block = '\n'.join('  ' + s if s else '' for s in generated(config, LC_START in text).splitlines()) + '\n'
     pattern = r'  ' + re.escape(START) + r'.*?  ' + re.escape(END) + r'\n'
     present = re.search(pattern, text, re.S)
     assert present or not check, f'{path}: missing spill block'
