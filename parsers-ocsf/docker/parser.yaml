@@ -9,7 +9,7 @@ description: >
   json-file logging driver (`{"log","stream","time"}`) or from Vector's
   docker_logs source (plain `message` plus container_name / container_id /
   image), become Base Event (class_uid 0) with the container on
-  device.container (image as device.container.image.name); a JSON application
+  device.container (the image name, which has no ID here, in unmapped); a JSON application
   body is moved, parsed, to log_json (its msg/level are mapped, every other key
   lands in unmapped.log_json.*), and every other collector envelope field
   (stream, file, label.*, created time) is kept in unmapped.envelope.*. A JSON
@@ -259,8 +259,9 @@ parser_vrl: |
   container = {}
   if container_id != "" { container.uid = container_id }
   if container_name != "" { container.name = container_name }
-  if image_name != "" { container.image = { "name": image_name } }
-  if exists(container.uid) || exists(container.name) || exists(container.image) { container.runtime = "docker" }
+  # OCSF requires an image uid (its ID) and the driver sends only the image
+  # name: the name stays as sent in unmapped.image, never an invented uid.
+  if exists(container.uid) || exists(container.name) || image_name != "" { container.runtime = "docker" }
   device = {}
   if hostname != "" { device.hostname = hostname }
   # OCSF device needs an identifier. With no Docker host named, the container
@@ -280,7 +281,7 @@ parser_vrl: |
   # above are left out only when their value IS the mapped attribute.
   envelope = {}
   for_each(__envelope) -> |ek, ev| {
-      mapped_here = (ek == "host" && ev == hostname && hostname != "") || (ek == "container_id" && ev == container_id && container_id != "") || (ek == "container_name" && ev == container_name && container_name != "") || (ek == "image" && ev == image_name && image_name != "")
+      mapped_here = (ek == "host" && ev == hostname && hostname != "") || (ek == "container_id" && ev == container_id && container_id != "") || (ek == "container_name" && ev == container_name && container_name != "")
       if !mapped_here { envelope = set!(envelope, [ek], ev) }
   }
   if length(envelope) > 0 { .unmapped = { "envelope": envelope } }

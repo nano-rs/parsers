@@ -118,6 +118,8 @@ parser_vrl: |
               k8s.container = string(jk.container_name) ?? string(k8s.container) ?? ""
               k8s.container_id = string(jk.docker_id) ?? string(k8s.container_id) ?? ""
               k8s.image = string(jk.container_image) ?? string(k8s.image) ?? ""
+              # fluent-bit names the image ID (its digest) container_hash.
+              k8s.image_id = string(jk.container_hash) ?? string(k8s.image_id) ?? ""
               k8s.node = string(jk.host) ?? string(k8s.node) ?? ""
           }
           fj = string(jo.file) ?? ""
@@ -267,7 +269,8 @@ parser_vrl: |
       .metadata.profiles = ["host"]
       if length(container) > 0 { .metadata.profiles = ["host", "container"] }
   }
-  if image != "" && image_id == "" && length(container) > 0 { .device.container.image = { "name": image } }
+  # Without its image ID there is no OCSF image (uid is required): the name
+  # stays as sent in unmapped.
   # Every collector envelope field (stream, file, Vector kubernetes metadata,
   # ...) is kept as written under unmapped.envelope; a kubernetes field is
   # left out only when its value IS the attribute it was mapped to.
@@ -362,7 +365,7 @@ parser_vrl: |
   __flat = flatten(__escaped)
   # BEGIN parser-specific transformations
   # Declared source -> target mappings (field-coverage.yaml `mappings`).
-  __decl = "\n\"log\"\t[\"message\"]\n\"time\"\t[\"metadata.original_time\"]\n\"log_json.level\"\t[\"metadata.log_level\"]\n\"log_json.msg\"\t[\"message\"]\n\"kubernetes.container_image\"\t[\"device.container.image.name\"]\n\"kubernetes.container_name\"\t[\"device.container.name\"]\n\"kubernetes.docker_id\"\t[\"device.container.uid\"]\n\"kubernetes.host\"\t[\"device.hostname\"]\n\"kubernetes.namespace_name\"\t[\"device.container.tags.value\"]\n\"kubernetes.pod_id\"\t[\"device.container.pod_uuid\"]\n\"kubernetes.pod_name\"\t[\"device.container.tags.value\"]\n\"level\"\t[\"metadata.log_level\"]\n\"msg\"\t[\"message\"]\n"
+  __decl = "\n\"log\"\t[\"message\"]\n\"time\"\t[\"metadata.original_time\"]\n\"log_json.level\"\t[\"metadata.log_level\"]\n\"log_json.msg\"\t[\"message\"]\n\"kubernetes.container_hash\"\t[\"device.container.image.uid\"]\n\"kubernetes.container_image\"\t[\"device.container.image.name\"]\n\"kubernetes.container_name\"\t[\"device.container.name\"]\n\"kubernetes.docker_id\"\t[\"device.container.uid\"]\n\"kubernetes.host\"\t[\"device.hostname\"]\n\"kubernetes.namespace_name\"\t[\"device.container.tags.value\"]\n\"kubernetes.pod_id\"\t[\"device.container.pod_uuid\"]\n\"kubernetes.pod_name\"\t[\"device.container.tags.value\"]\n\"level\"\t[\"metadata.log_level\"]\n\"msg\"\t[\"message\"]\n"
   __preserve = []
   # END parser-specific transformations
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
@@ -592,3 +595,8 @@ samples:
     expect:
       "class_uid": 0
       "unmapped.parse_fallback": "unparsable input"
+  # the image with its ID (fluent-bit container_hash): an OCSF image (uid required)
+  - raw: "{\"log\": \"INFO  Started OrdersApplication in 4.2 seconds\\n\", \"stream\": \"stdout\", \"time\": \"2026-11-20T10:00:04.000000000Z\", \"kubernetes\": {\"pod_name\": \"orders-5f9c8d7b6-abcde\", \"namespace_name\": \"shop\", \"pod_id\": \"7a1c2e3f-4b5d-4e6f-8a9b-0c1d2e3f4a5b\", \"labels\": {\"app\": \"orders\"}, \"host\": \"node-a.example.com\", \"container_name\": \"orders\", \"docker_id\": \"b5e1f0c2d3a4958677e6f5d4c3b2a1908f7e6d5c4b3a29180f7e6d5c4b3a2918\", \"container_image\": \"registry.example.com/shop/orders:2.4.1\", \"container_hash\": \"docker.io/example/orders@sha256:3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f\"}}"
+    expect:
+      "device.container.image.name": "registry.example.com/shop/orders:2.4.1"
+      "device.container.image.uid": "docker.io/example/orders@sha256:3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f"
