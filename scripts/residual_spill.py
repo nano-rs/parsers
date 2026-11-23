@@ -11,6 +11,8 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 START = '# NAN-2421 residual spill.'
 END = '# END NAN-2421 residual spill'
+TZ_START = '# NAN source timezone.'
+TZ_END = '# END NAN source timezone'
 
 
 KINDS = ('lowercase', 'epoch_ms', 'scale', 'enum', 'hex')
@@ -54,16 +56,44 @@ def kind_templates():
     return {kind: '\n'.join(lines) for kind, lines in templates.items()}
 
 
-def rule_body(rule, templates):
+def norm_path(path):
+    """A target path as __repr names it: dotted, array indices dropped."""
+    return '.'.join(part for part in path.split('.') if not part.isdigit())
+
+
+BRACKETS = {char: '\\u%04x' % ord(char) for char in '()[]{}'}
+
+
+def json_text(value):
+    """Compact JSON whose brackets inside strings are \\u escapes: nano's deploy
+    validator counts raw ()[]{} characters across the whole VRL."""
+    text = json.dumps(value, ensure_ascii=False, separators=(',', ':'))
+    out, in_string, escaped = [], False, False
+    for char in text:
+        if in_string and not escaped and char in BRACKETS:
+            out.append(BRACKETS[char].replace('\\\\', '\\'))
+            continue
+        out.append(char)
+        if escaped:
+            escaped = False
+        elif char == '\\':
+            escaped = in_string
+        elif char == '"':
+            in_string = not in_string
+    return ''.join(out)
+
+
+def vrl_text(text):
+    """Any text as a VRL string literal (no raw brackets expected inside)."""
+    return '"' + text.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\t', '\\t') + '"'
+
+
+def rule_body(rule, templates, local=False):
     """One rule's body, written against the loop's `key` and `value`."""
-    if isinstance(rule.get('target'), str):
-        # Against __mapped (no raw_data, unmapped, or raw-body message), like
-        # every other piece of coverage evidence.
-        path = '__mapped' + ''.join('.' + vrl_string(part) for part in rule['target'].split('.'))
-        match = path + ' == __expected'
-    else:
-        match = 'contains(__represented, "," + encode_json(encode_json(__expected)))'
-    text = templates[rule['kind']]
+    # Against __repr: the value must be AT the rule's target path of the mapped
+    # event (no raw_data, unmapped, or raw-body message), never just anywhere.
+    match = 'contains(__repr, "," + ' + vrl_text(json_text(norm_path(rule['target']))) + ' + "=" + encode_json(encode_json(__expected)))'
+    text = _section(templates[rule['kind']], 'local_clock', local)
     if rule['kind'] == 'epoch_ms':
         fmt = rule.get('format', '%+')
         text = text.replace('__FORMAT__', vrl_string(fmt if isinstance(fmt, str) else '%+'))
@@ -77,7 +107,7 @@ def rule_body(rule, templates):
     return text.replace('__MATCH__', match)
 
 
-def grouped(rules, templates):
+def grouped(rules, templates, local=False):
     """Rules that render to the same body, in first-appearance order.
 
     NAN-5298: one `if` per rule made the program's statement count, and with it
@@ -86,7 +116,7 @@ def grouped(rules, templates):
     """
     groups = {}
     for rule in rules:
-        keys = groups.setdefault(rule_body(rule, templates), [])
+        keys = groups.setdefault(rule_body(rule, templates, local), [])
         if rule['source'] not in keys:
             keys.append(rule['source'])
     return list(groups.items())
@@ -113,15 +143,35 @@ def key_regex(keys):
     return lines + [")\\z'"]
 
 
-def candidate_regex(candidates):
-    """The candidate set as a whole-key regex literal, one candidate per line.
+def check_target(source, target):
+    assert isinstance(target, str) and target and all(target.split('.')), f'{source}: target must be a dotted path'
+    assert norm_path(target), f'{source}: target must name an attribute'
+    assert target.split('.')[0] not in ('unmapped', 'raw_data'), f'{source}: target may not be under unmapped or raw_data'
+    # OCSF attribute names never hold a bracket; __repr spells paths raw.
+    assert not any(c in target for c in '()[]{}'), f'{source}: target may not contain a bracket'
 
-    A regex literal compiles once with the program, so a lookup reads no copy
-    of the set (NAN-5351). Verbose mode ignores the layout whitespace.
-    """
-    if not candidates:
-        return ["__candidates = r'\\b\\B'"]  # matches nothing
-    return ["__candidates = r'(?x)"] + key_regex(candidates)
+
+def mappings_of(config):
+    """field-coverage.yaml `mappings`: source key -> list of normalized targets."""
+    assert 'consumed_candidates' not in config, 'consumed_candidates is replaced by `mappings` (source key -> target paths)'
+    raw = config.get('mappings') or {}
+    assert isinstance(raw, dict), 'mappings must map a source key to its target path(s)'
+    out = {}
+    for key, targets in raw.items():
+        assert isinstance(key, str) and key, f'mapping source must be a key: {key!r}'
+        targets = [targets] if isinstance(targets, str) else targets
+        assert isinstance(targets, list) and targets, f'{key}: mapping needs one or more target paths'
+        for target in targets:
+            check_target(key, target)
+        out[key] = list(dict.fromkeys(norm_path(t) for t in targets))
+    return out
+
+
+def decl_literal(mappings):
+    """The declared mappings as one VRL string: "\\n" + key JSON + "\\t" + target
+    array JSON per key, then "\\n". Looked up with find() (NAN-5351)."""
+    text = ''.join('\n' + json_text(key) + '\t' + json_text(targets) for key, targets in mappings.items()) + '\n'
+    return vrl_text(text)
 
 
 def check_rule(rule):
@@ -129,10 +179,9 @@ def check_rule(rule):
     assert isinstance(rule, dict) and isinstance(rule.get('source'), str) and rule['source'], f'transform needs a source: {rule!r}'
     assert isinstance(rule.get('reason'), str) and rule['reason'].strip(), f'every transformation needs a justification: {rule["source"]}'
     assert rule.get('kind') in KINDS, f'{rule["source"]}: unknown transform kind {rule.get("kind")!r}'
-    if 'target' in rule:
-        target = rule['target']
-        assert isinstance(target, str) and target and all(target.split('.')), f'{rule["source"]}: target must be a dotted path'
-        assert target.split('.')[0] not in ('unmapped', 'raw_data'), f'{rule["source"]}: target may not be under unmapped or raw_data'
+    # Every rule names the attribute its converted value lands in: a value found
+    # anywhere else is no evidence (no coincidental consumption).
+    check_target(rule['source'], rule.get('target'))
     if rule['kind'] == 'scale':
         factor = rule.get('factor')
         assert type(factor) in (int, float) and math.isfinite(factor) and factor != 0, f'{rule["source"]}: scale needs a finite, non-zero factor'
@@ -143,15 +192,15 @@ def check_rule(rule):
         assert 'format' not in rule or (isinstance(rule['format'], str) and rule['format']), f'{rule["source"]}: epoch_ms format must be a non-empty string'
 
 
-def transformations(config):
+def transformations(config, local=False):
     rules = config.get('transforms', [])
     for rule in rules:
         check_rule(rule)
     templates = kind_templates()
     lines = ['# ' + rule['source'] + ': ' + rule['reason'] for rule in rules]
-    groups = grouped(rules, templates)
+    groups = grouped(rules, templates, local)
     if groups:
-        lines.append('for_each(flatten(__source_kv)) -> |key, value| {')
+        lines.append('for_each(__flat) -> |key, value| {')
         for body, keys in groups:
             regex = key_regex(keys)
             lines.append("    if match(key, r'(?x)")
@@ -162,19 +211,90 @@ def transformations(config):
         lines.append('}')
     if config.get('reference') == 'windows_sysmon':
         lines += ['# ' + config['reference_reason'], 'for_each(array!(__reference_consumed)) -> |_index, key| {', '    __consumed = __consumed + ("," + encode_json(key))', '}']
-    lines += ['# ' + config.get('consumed_reason', 'Explicit source candidates.')] + candidate_regex(config.get('consumed_candidates', []))
+    lines += ['# Declared source -> target mappings (field-coverage.yaml `mappings`).', '__decl = ' + decl_literal(mappings_of(config))]
     lines += ['__preserve = ' + json.dumps(list(config.get('preserve_unmapped', {})))]
     return '\n'.join(lines)
 
 
-def generated(config):
-    return (ROOT / 'scripts/residual/spill.vrl').read_text().replace('__TRANSFORMS__', transformations(config)).rstrip()
+def generated(config, local=False):
+    """The spill block; local: the parser has a local-clock block."""
+    return (ROOT / 'scripts/residual/spill.vrl').read_text().replace('__TRANSFORMS__', transformations(config, local)).rstrip()
+
+
+LC_START = '# NAN local clock:'
+LC_END = '# END NAN local clock'
+
+
+def _section(text, name, keep):
+    """Keep or drop the lines between '#name{' and '#}name' (markers removed)."""
+    out, inside = [], False
+    for line in text.splitlines():
+        if line.strip() == '#' + name + '{':
+            inside = True
+            continue
+        if line.strip() == '#}' + name:
+            inside = False
+            continue
+        if not inside or keep:
+            out.append(line)
+    return '\n'.join(out)
+
+
+def prelude(body=''):
+    """The shared source-timezone block every parser starts with; the
+    no-year variables only for a parser that reads a clock without a year."""
+    text = (ROOT / 'scripts/residual/source_tz.vrl').read_text().rstrip()
+    text = _section(text, 'local_clock', LC_START in body)
+    return _section(text, 'year', '__src_year' in body or ' noyear' in body)
+
+
+def local_clock(var, noyear):
+    """noyear: False, True, or the name of a variable holding the decision."""
+    """The generated conversion that follows an offset-less clock's parse."""
+    lines = (ROOT / 'scripts/residual/local_clock.vrl').read_text().rstrip().splitlines()[1:-1]
+    text = '\n'.join(lines).replace('__VAR__', var)
+    if not noyear:
+        # Drop each `if __NOYEAR__ { ... }` block (matched by indentation).
+        out, skip = [], None
+        for line in text.splitlines():
+            if skip is not None:
+                if line.startswith(skip + '}') and line.strip() == '}':
+                    skip = None
+                continue
+            if line.strip() == 'if __NOYEAR__ {':
+                skip = line[:len(line) - len(line.lstrip())]
+                continue
+            out.append(line)
+        text = '\n'.join(out)
+    else:
+        text = text.replace('if __NOYEAR__ {', 'if ' + (noyear if isinstance(noyear, str) else 'true') + ' {')
+    return text
+
+
+def expand_local_clocks(text):
+    """Re-expand every '# NAN local clock: VAR [noyear]' marker in parser_vrl."""
+    pat = re.compile(r'^(?P<ind>[ \t]*)' + re.escape(LC_START) + r' (?P<var>\w+)(?P<noyear> noyear(?:=\w+)?)?[ \t]*\n(?:.*?^[ \t]*' + re.escape(LC_END) + r'[ \t]*\n)?', re.M | re.S)
+    def sub(m):
+        ind = m.group('ind')
+        ny = m.group('noyear')
+        body = local_clock(m.group('var'), (ny.split('=', 1)[1] if ny and '=' in ny else bool(ny)))
+        return ind + LC_START + ' ' + m.group('var') + (m.group('noyear') or '') + '\n' + ''.join(ind + l + '\n' if l else '\n' for l in body.splitlines()) + ind + LC_END + '\n'
+    return pat.sub(sub, text)
 
 
 def update(path, check=False):
     text = path.read_text()
+    # The source-timezone prelude opens parser_vrl, before the parser reads
+    # anything (it removes .nano, nano's own input, from the event).
+    tz_pattern = r'  ' + re.escape(TZ_START) + r'.*?  ' + re.escape(TZ_END) + r'\n'
+    assert re.search(tz_pattern, text, re.S) or not check, f'{path}: missing source-timezone prelude'
+    text_wo = expand_local_clocks(re.sub(tz_pattern, '', text, flags=re.S))
+    body = text_wo[text_wo.index('parser_vrl:'):text_wo.find(START) if START in text_wo else len(text_wo)]
+    tz_block = '\n'.join('  ' + s if s else '' for s in prelude(body).splitlines()) + '\n'
+    head = text_wo.index('\n', text_wo.index('parser_vrl:')) + 1
+    text = text_wo[:head] + tz_block + text_wo[head:]
     config = yaml.safe_load(path.with_name('field-coverage.yaml').read_text())
-    block = '\n'.join('  ' + s if s else '' for s in generated(config).splitlines()) + '\n'
+    block = '\n'.join('  ' + s if s else '' for s in generated(config, LC_START in text).splitlines()) + '\n'
     pattern = r'  ' + re.escape(START) + r'.*?  ' + re.escape(END) + r'\n'
     present = re.search(pattern, text, re.S)
     assert present or not check, f'{path}: missing spill block'
@@ -186,7 +306,7 @@ def update(path, check=False):
     if index < len(stripped):
         new += '\n' + stripped[index:]
     if check:
-        assert new == text, f'{path}: generated spill is stale; run scripts/residual_spill.py {path}'
+        assert new == path.read_text(), f'{path}: generated spill is stale; run scripts/residual_spill.py {path}'
     else:
         path.write_text(new)
 

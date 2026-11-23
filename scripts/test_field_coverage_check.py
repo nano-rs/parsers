@@ -9,6 +9,7 @@ import tempfile
 import unittest
 import field_coverage_check as fcc
 from field_coverage_check import check, inject_probe, normalize_probes, normalized_source, validate_config
+import residual_spill
 from residual_spill import generated
 
 
@@ -26,8 +27,29 @@ class ResidualTests(unittest.TestCase):
             ({'Password': 'private', 'Nested': {'clientSecret': 'private'}}, {}, {'password': 'private', 'nested.client_secret': 'private'}),
             ({'Name': 'UPPER'}, {'user': {'name': 'upper'}}, {}),
             ({'Name': 'UPPER'}, {}, {'name': 'UPPER'}),
-            ({'KnownList': ['one', 2]}, {'a': 'one', 'b': 2}, {}),
-            ({'KnownList': ['one', 'unseen']}, {'a': 'one'}, {'known_list': ['one', 'unseen']}),
+            # No coincidental consumption: a value equal to an attribute that is
+            # not the key's declared target (or the rule's target) still spills.
+            ({'Known': 'mapped'}, {'other': 'mapped'}, {'known': 'mapped'}),
+            ({'Known': 1}, {'activity_id': 1, 'message': 2}, {'known': 1}),
+            ({'Name': 'UPPER'}, {'actor': {'user': {'name': 'upper'}}}, {'name': 'UPPER'}),
+            ({'Known': '42'}, {'message': 42}, {}),
+            ({'KnownList': ['one', 2]}, {'a': ['one', 2]}, {}),
+            ({'KnownList': ['one', 2]}, {'a': 'one', 'b': 2}, {'known_list': ['one', 2]}),
+            ({'KnownList': ['one', 'unseen']}, {'a': ['one']}, {'known_list': ['one', 'unseen']}),
+            # A target inside an array of objects (indices dropped).
+            ({'Res': 'r1'}, {'resources': [{'uid': 'x'}, {'uid': 'r1'}]}, {}),
+            ({'Res': 'r1'}, {'resources': [{'name': 'r1'}]}, {'res': 'r1'}),
+            ({'cs(Host)': 'h'}, {'http_request': {'url': {'hostname': 'h'}}}, {}),
+            # A source key named like a nano marker or the nano.* namespace is
+            # kept, renamed source_<name>: a log cannot forge a marker.
+            ({'nano_time_assumed_tz': 'Mars/Base', 'nano': {'x': 1}, 'nano_operational': True}, {},
+             {'source_nano_time_assumed_tz': 'Mars/Base', 'source_nano.x': 1, 'source_nano_operational': True}),
+            # ...and never over a vendor key that already holds that name.
+            ({'nano_operational': 'v1', 'source_nano_operational': 'v2'}, {}, {'source_nano_operational': 'v2', 'source_nano_operational_2': 'v1'}),
+            # A literal dotted key is not the nested path it spells: mapping the
+            # nested x.y never consumes the literal "x.y" (and vice versa).
+            ({'x.y': 'literal', 'x': {'y': 'nested'}}, {'nested_target': 'nested'}, {'x.y': 'literal'}),
+            ({'x.y': 'literal', 'x': {'y': 'nested'}}, {'literal_target': 'literal'}, {'x.y': 'nested'}),
             ({'DéjàVu': 'unicode', 'HTTPStatus200': 'code'}, {}, {'déjà_vu': 'unicode', 'http_status_200': 'code'}),
             ({}, {'unmapped': {'empty': ''}}, {}),
             ({'Headers': [{'Name': 'Authorization', 'Value': 'private'}]}, {}, {'headers': '[{"Name":"Authorization","Value":"private"}]'}),
@@ -37,8 +59,10 @@ class ResidualTests(unittest.TestCase):
             # NAN-3604: dotted keys inside objects inside arrays keep their dots.
             ({'Records': [{'http://a.example/claims/upn': 'u@example.com', 'x.y': {'p.q~r': 1}}]}, {}, {'records': '[{"http://a.example/claims/upn":"u@example.com","x.y":{"p.q~r":1}}]'}),
         ]
-        rules = [{'source': 'Name', 'kind': 'lowercase', 'reason': 'Test normalization must exist in emitted branch.'}]
-        program = '__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'transforms': rules, 'consumed_candidates': ['Known', 'KnownList', 'Name']})
+        rules = [{'source': 'Name', 'kind': 'lowercase', 'target': 'user.name', 'reason': 'Test normalization must exist in emitted branch.'}]
+        mappings = {'Known': ['message'], 'KnownList': ['a'], 'Res': ['resources.uid'], 'cs(Host)': ['http_request.url.hostname'],
+                    'x.y': ['nested_target'], 'x~1y': ['literal_target']}
+        program = residual_spill.prelude() + '\n__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'transforms': rules, 'mappings': mappings})
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             (tmp/'p.vrl').write_text(program)
@@ -50,12 +74,12 @@ class ResidualTests(unittest.TestCase):
             for (source, mapped, expected), output in zip(cases, outputs):
                 with self.subTest(source=source):
                     self.assertEqual(output.get('unmapped', {}), expected)
-                    check(source, output, 'raw input', rules, candidates=['Known', 'KnownList', 'Name'])
+                    check(source, output, 'raw input', rules, mappings=mappings)
                     if expected:
                         broken = copy.deepcopy(output)
                         del broken['unmapped'][next(iter(expected))]
                         with self.assertRaises(AssertionError):
-                            check(source, broken, 'raw input', rules, candidates=['Known', 'KnownList', 'Name'])
+                            check(source, broken, 'raw input', rules, mappings=mappings)
 
 
 class TargetEvidenceTests(unittest.TestCase):
@@ -74,7 +98,7 @@ class TargetEvidenceTests(unittest.TestCase):
         rules = [{'source': 'Name', 'kind': 'lowercase', 'target': 'message', 'reason': 'r'}]
         cases = [({'Name': 'RAW INPUT'}, {'message': 'raw input'}, {'name': 'RAW INPUT'}),
                  ({'Name': 'HELLO'}, {'message': 'hello'}, {})]
-        program = '__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'transforms': rules, 'consumed_candidates': []})
+        program = residual_spill.prelude() + '\n__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'transforms': rules})
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             (tmp/'p.vrl').write_text(program)
@@ -136,13 +160,83 @@ class ConfigTests(unittest.TestCase):
                     generated({'transforms': [rule]})
 
     def test_transform_parameters(self):
-        base = {'source': 'S', 'reason': 'r'}
+        base = {'source': 'S', 'target': 't', 'reason': 'r'}
         for rule in ({'kind': 'scale', 'factor': 0}, {'kind': 'scale'}, {'kind': 'scale', 'factor': float('inf')},
                      {'kind': 'scale', 'factor': '2'}, {'kind': 'enum', 'values': {}}, {'kind': 'enum'},
                      {'kind': 'epoch_ms', 'format': ''}, {'kind': 'epoch_ms', 'format': 5}):
             with self.subTest(rule=rule), self.assertRaises(AssertionError):
                 validate_config({'transforms': [{**base, **rule}]})
         validate_config({'transforms': [{**base, 'kind': 'scale', 'factor': 0.001}, {**base, 'kind': 'enum', 'values': {'a': 1}}, {**base, 'kind': 'epoch_ms'}]})
+
+    def test_explicit_targets_required(self):
+        # No coincidental consumption: a rule without a target, or the old
+        # value-anywhere candidate list, is rejected.
+        with self.assertRaises(AssertionError):
+            validate_config({'transforms': [{'source': 'S', 'kind': 'lowercase', 'reason': 'r'}]})
+        with self.assertRaises(AssertionError):
+            generated({'consumed_candidates': ['a']})
+        for bad in ({'a': []}, {'a': 'unmapped.a'}, {'a': ['raw_data']}, {'a': ''}, {'': 'x'}, ['a']):
+            with self.subTest(bad=bad), self.assertRaises(AssertionError):
+                generated({'mappings': bad})
+        self.assertIn('resources.uid', generated({'mappings': {'a': 'resources.0.uid'}}))
+
+    def test_parse_timestamp_needs_timezone(self):
+        # Without timezone: VRL reads an offset-less clock in the HOST timezone.
+        naive = fcc.naive_timestamps
+        self.assertEqual(len(naive('t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S")')), 1)
+        self.assertEqual(len(naive('t = parse_timestamp!(replace(s, r\' Z$\', ""), "%Y (x)")')), 1)
+        self.assertEqual(naive('t, e = parse_timestamp(s, "%+", timezone: "UTC")'), [])
+        self.assertEqual(naive('t = parse_timestamp!(replace(s, r\')\', ""), "%Y", timezone: "UTC")'), [])
+        # Comments never count, either way; a timezone variable is fine; a
+        # word "timezone" elsewhere in the call is not the argument.
+        self.assertEqual(naive('# t = parse_timestamp(s, "%Y")\nx = 1'), [])
+        self.assertEqual(naive('t = parse_timestamp(s, "%Y", timezone: tz) # local'), [])
+        self.assertEqual(naive('t = parse_timestamp(p.timezone, "%+")'), [])
+        self.assertEqual(naive('t = parse_timestamp(s, "%d/%b/%Y:%H:%M:%S %z")'), [])
+        self.assertEqual(len(naive('t = parse_timestamp(timezone, fmt)')), 1)
+        # "local" is the host's zone; an offset elsewhere in the call is not the format.
+        self.assertEqual(len(naive('t = parse_timestamp(s, "%Y", timezone: "local")')), 1)
+        self.assertEqual(len(naive('t = parse_timestamp(s + " %z", "%Y")')), 1)
+        self.assertEqual(naive('t = parse_timestamp(s + " +0000", "%Y %z")'), [])
+        self.assertEqual(len(naive('t = parse_timestamp(s, "%Y") # timezone: "UTC"')), 1)
+
+    def test_offset_less_clock_needs_the_local_clock_contract(self):
+        bad = fcc.unconverted_clocks
+        self.assertEqual(len(bad('t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\n')), 1)
+        self.assertEqual(bad('t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\nif e == null { __lc_pending = true }\n# NAN local clock: t\n'), [])
+        self.assertEqual(bad('# utc-by-spec: the API writes UTC\nt, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\n'), [])
+        # A format with an offset, or a literal Z, is not a local clock.
+        self.assertEqual(bad('t, e = parse_timestamp(s, "%+", timezone: "UTC")\nu, f = parse_timestamp(s, "%Y-%m-%dT%H:%M:%SZ", timezone: "UTC")\n'), [])
+        # The marker must name the variable the call assigns.
+        self.assertEqual(len(bad('t, e = parse_timestamp(s, "%Y", timezone: "UTC")\n# NAN local clock: other\n')), 1)
+
+    def test_local_clock_contract_bypasses_are_caught(self):
+        bad = fcc.unconverted_clocks
+        ok = 'if e == null { __lc_pending = true }\n# NAN local clock: t\n'
+        # A marker on another branch for a reused name does not convert this one.
+        self.assertEqual(len(bad('if a {\n    t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\n    ms = to_unix_timestamp(t)\n} else {\n    t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\n    ' + ok.replace('\n', '\n    ') + '}\n')), 1)
+        self.assertEqual(len(bad('if a {\n    t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\n} else {\n    ' + ok.replace('\n', '\n    ') + '}\n')), 1)
+        # Used, or overwritten, before the marker.
+        self.assertEqual(len(bad('t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\nms = to_unix_timestamp(t)\n' + ok)), 1)
+        self.assertEqual(len(bad('t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\nt = now()\n' + ok)), 1)
+        # The marker needs __lc_pending = true before it.
+        self.assertEqual(len(bad('t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\n# NAN local clock: t\n')), 1)
+        # Wrapped and multi-line calls.
+        self.assertEqual(len(bad('ms = to_unix_timestamp(parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC") ?? now(), unit: "milliseconds")\n')), 1)
+        self.assertEqual(len(bad('t, e = parse_timestamp(\n    s, "%Y-%m-%d %H:%M:%S",\n    timezone: "UTC"\n)\nms = to_unix_timestamp(t)\n')), 1)
+        # Any fixed zone literal, not only "UTC".
+        for tz in ('"Etc/UTC"', '"GMT"', '"+00:00"'):
+            self.assertEqual(len(bad(f't, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: {tz})\n')), 1, tz)
+        # A Z is a zone only when it closes the format; %Z is a name, not an offset.
+        self.assertEqual(len(bad('t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S Zone", timezone: "UTC")\n')), 1)
+        self.assertEqual(len(bad('t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S %Z", timezone: "UTC")\n')), 1)
+        # utc-by-spec needs a comment with a reason.
+        self.assertEqual(len(bad('# utc-by-spec:\nt, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\n')), 1)
+        self.assertEqual(len(bad('x = "utc-by-spec: no"; t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\n')), 1)
+        # Still allowed: a one-line retry, a variable zone, a multi-line call with its marker.
+        self.assertEqual(bad('t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: "UTC")\nif e != null { t, e = parse_timestamp(s2, "%Y-%m-%d %H:%M:%S", timezone: "UTC") }\nif x { y = 1 } else { y = 2 }\n' + ok), [])
+        self.assertEqual(bad('t, e = parse_timestamp(s, "%Y-%m-%d %H:%M:%S", timezone: tz_name)\n'), [])
+        self.assertEqual(bad('t, e = parse_timestamp(\n    s, "%Y-%m-%d %H:%M:%S",\n    timezone: "UTC"\n)\n' + ok), [])
 
     def test_json_envelope_retired(self):
         with self.assertRaises(AssertionError):
@@ -340,18 +434,18 @@ __source_kv = kv
 class RunParserFidelityTests(unittest.TestCase):
     """End to end: raw_data is the original, and a probe password survives."""
 
-    def run_parser(self, mask='', raw='raw_log'):
+    def run_parser(self, mask='', raw='raw_log', mappings=None, sample='msg=hello user=alice'):
         import residual_spill
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)/'probe'/'parser.yaml'
             path.parent.mkdir()
             (path.parent/'field-coverage.yaml').write_text(json.dumps({
-                'source': 'text', 'consumed_candidates': ['msg'],
+                'source': 'text', 'mappings': mappings or {'msg': 'message'},
                 'probe': {'mode': 'after', 'require': 'msg=', 'source': 'ResidualProbe',
                           'text': ' ResidualProbe=nan2421-text-unknown password=nan2421-secret'}}))
             program = TEXT_PARSER.replace('MASK', mask).replace('RAW', raw)
             body = ''.join('  ' + line + '\n' if line else '\n' for line in program.strip().splitlines())
-            path.write_text('parser_vrl: |\n' + body + 'samples: ' + json.dumps([{'raw': 'msg=hello user=alice'}]) + '\n')
+            path.write_text('parser_vrl: |\n' + body + 'samples: ' + json.dumps([{'raw': sample}]) + '\n')
             residual_spill.update(path)
             fcc.run_parser(path)
 
@@ -363,10 +457,123 @@ class RunParserFidelityTests(unittest.TestCase):
             with self.subTest(mask=mask), self.assertRaisesRegex(AssertionError, 'credential value'):
                 self.run_parser(mask=mask)
 
+    def test_coincidental_mapping_fails_provenance(self):
+        # user=alice is declared to map to message, but message carries msg:
+        # a sample where both equal would consume user by coincidence. The
+        # perturbation check finds no provenance and fails the parser.
+        with self.assertRaisesRegex(AssertionError, 'without provenance'):
+            self.run_parser(mappings={'msg': 'message', 'user': 'message'}, sample='msg=alice user=alice')
+
     def test_rewritten_raw_data_fails(self):
         for raw in ('"MASKED"', 'strip_whitespace(raw_log) + "!"'):
             with self.subTest(raw=raw), self.assertRaisesRegex(AssertionError, 'raw_data is not the original'):
                 self.run_parser(raw=raw)
+
+
+JSON_PARSER = r"""
+raw = to_string(.message) ?? ""
+__raw_body = raw
+__source_kv = object(parse_json(raw) ?? {}) ?? {}
+. = {"class_uid": 0, "raw_data": raw, "message": to_string(__source_kv.msg) ?? "", "tags": STATIC}
+"""
+
+
+class ProvenanceTests(unittest.TestCase):
+    """A declaration needs real provenance: a static value never passes."""
+
+    def run_json(self, mappings, samples, static='[0, 1]'):
+        import residual_spill
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'probe'/'parser.yaml'
+            path.parent.mkdir()
+            (path.parent/'field-coverage.yaml').write_text(json.dumps({'source': 'json', 'mappings': mappings}))
+            body = ''.join('  ' + line + '\n' for line in JSON_PARSER.replace('STATIC', static).strip().splitlines())
+            path.write_text('parser_vrl: |\n' + body + 'samples: ' + json.dumps([{'raw': json.dumps(s)} for s in samples]) + '\n')
+            residual_spill.update(path)
+            fcc.run_parser(path)
+
+    def test_static_list_never_proves_a_mapping(self):
+        for static, flags in (('[0, 1]', [0, 1]), ('[true, false]', [True, False]), ('["a", "b"]', ['a']), ('["a", "b", "c"]', ['a', 'b'])):
+            with self.subTest(static=static), self.assertRaisesRegex(AssertionError, 'without provenance'):
+                self.run_json({'msg': 'message', 'flags': 'tags'}, [{'msg': 'hi', 'flags': flags}], static)
+
+    def test_lookup_that_echoes_one_value_fails(self):
+        # category = 3 only for id 3: a lookup, not a copy. One sentinel may
+        # land on 3, but two distinct sentinels never both arrive.
+        program = JSON_PARSER.replace('"tags": STATIC', '"tags": [], "category_uid": 0') + 'if __source_kv.code == 3 { .category_uid = 3 }\n'
+        import residual_spill
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'probe'/'parser.yaml'
+            path.parent.mkdir()
+            (path.parent/'field-coverage.yaml').write_text(json.dumps({'source': 'json', 'mappings': {'msg': 'message', 'code': 'category_uid'}}))
+            body = ''.join('  ' + line + '\n' for line in program.strip().splitlines())
+            path.write_text('parser_vrl: |\n' + body + 'samples: ' + json.dumps([{'raw': json.dumps({'msg': 'hi', 'code': 0})}, {'raw': json.dumps({'msg': 'ho', 'code': 2})}]) + '\n')
+            residual_spill.update(path)
+            with self.assertRaisesRegex(AssertionError, 'without provenance'):
+                fcc.run_parser(path)
+
+    def test_small_identity_lookup_fails(self):
+        # 0->0, 1->1, 2->2, else 99 is a lookup: draws come from outside the
+        # values the field takes in the samples, so it never echoes them.
+        program = JSON_PARSER.replace('"tags": STATIC', '"tags": [], "category_uid": 99') + 'if includes([0, 1, 2], __source_kv.code) { .category_uid = __source_kv.code }\n'
+        import residual_spill
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'probe'/'parser.yaml'
+            path.parent.mkdir()
+            (path.parent/'field-coverage.yaml').write_text(json.dumps({'source': 'json', 'mappings': {'msg': 'message', 'code': 'category_uid'}}))
+            body = ''.join('  ' + line + '\n' for line in program.strip().splitlines())
+            path.write_text('parser_vrl: |\n' + body + 'samples: ' + json.dumps([{'raw': json.dumps({'msg': m, 'code': c})} for m, c in (('a', 0), ('b', 1), ('c', 2))]) + '\n')
+            residual_spill.update(path)
+            with self.assertRaisesRegex(AssertionError, 'without provenance.*PROVENANCE_SEED='):
+                fcc.run_parser(path)
+
+    def test_small_text_code_lookup_fails(self):
+        # The same 4-entry identity lookup over codes written as text.
+        program = JSON_PARSER.replace('"tags": STATIC', '"tags": [], "severity_id": 99') + 'if includes(["0", "1", "2", "3"], __source_kv.sev) { .severity_id = to_int!(__source_kv.sev) }\n'
+        import residual_spill
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'probe'/'parser.yaml'
+            path.parent.mkdir()
+            (path.parent/'field-coverage.yaml').write_text(json.dumps({'source': 'json', 'mappings': {'msg': 'message', 'sev': 'severity_id'}}))
+            body = ''.join('  ' + line + '\n' for line in program.strip().splitlines())
+            path.write_text('parser_vrl: |\n' + body + 'samples: ' + json.dumps([{'raw': json.dumps({'msg': m, 'sev': c})} for m, c in (('a', '0'), ('b', '1'), ('c', '2'), ('d', '3'))]) + '\n')
+            residual_spill.update(path)
+            with self.assertRaisesRegex(AssertionError, 'without provenance'):
+                fcc.run_parser(path)
+
+    def test_draws_are_deterministic(self):
+        import provenance
+        draws = []
+        for _ in range(2):
+            provenance.seed_draw('parser', 'sample', 'key', '', 0)
+            draws.append((provenance.sentinels('10.4.5.6'), provenance.sentinels(4812), provenance.sentinels('vty0')))
+        self.assertEqual(draws[0], draws[1])
+        provenance.seed_draw('parser', 'sample', 'other', '', 0)
+        self.assertNotEqual(provenance.sentinels('10.4.5.6'), draws[0][0])
+        # A lone digit always changes.
+        for draw in range(20):
+            provenance.seed_draw('p', 's', 'by', '', draw)
+            self.assertTrue(all(v != 'vty0' and v[:3] == 'vty' or not v.startswith('vty') for v in provenance.sentinels('vty0')))
+
+    def test_real_mapping_passes(self):
+        self.run_json({'msg': 'message'}, [{'msg': 'hello', 'flags': [0, 1]}])
+
+    def test_sentinels_are_fresh_and_typed(self):
+        import provenance
+        for value in ('10.4.5.6', '2026-08-18T12:00:00.1234567Z', 'WKS-01.corp', 4812, 2.5, True, 'abc123'):
+            got = provenance.sentinels(value)
+            self.assertTrue(got, value)
+            for new in got:
+                self.assertIs(type(new), type(value))
+                self.assertNotEqual(new, value)
+        # A sub-millisecond clock moves by whole seconds; a us->ms scale moves the result.
+        rule = {'kind': 'epoch_ms', 'format': '%+'}
+        for new in provenance.rule_mutations(rule, '2026-08-18T12:00:00.1234567Z'):
+            self.assertNotEqual(provenance.transform_want(rule, new), provenance.transform_want(rule, '2026-08-18T12:00:00.1234567Z'))
+        scale = {'kind': 'scale', 'factor': 0.001}
+        for value in (1787043600123456, '1787043600.451'):
+            for new in provenance.rule_mutations(scale, value):
+                self.assertNotEqual(provenance.transform_want(scale, new), provenance.transform_want(scale, value))
 
 
 if __name__ == '__main__':

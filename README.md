@@ -284,6 +284,32 @@ and after a large rewrite. CI runs the check on every PR (job "Parser load budge
   parser concern. Review rejects parser-level redaction.
 - Emit the **complete OCSF object on the root** (`. = ocsf`) so it lands in
   the lake and every canonical path is stored as its own queryable column.
+- **Declare every mapping explicitly.** `field-coverage.yaml` `mappings` lists
+  each source key with the OCSF path(s) it is copied to, and each `transforms`
+  rule names its target. A source field counts as mapped only when its value is
+  at one of its own targets; a value that merely equals some other attribute
+  spills to `unmapped`. `python3 scripts/infer_mappings.py parsers-ocsf/<name>`
+  writes the declarations by perturbing each source value, and
+  `field_coverage_check.py` re-verifies every one the same way.
+- **Every `parse_timestamp` names its timezone.** Without one VRL reads a clock
+  that has no offset in the Vector host's timezone, so one line gets a
+  different time on every host; `field_coverage_check.py` rejects such a call.
+  The goal is proper UTC everywhere, even when the log is not: honor an inline
+  timezone or offset when the line carries one (validate an inline zone name
+  before using it). For a clock without an offset, parse it with
+  `timezone: "UTC"`, set `__lc_pending = true` when the parse succeeds, and
+  follow it with a marker line `# NAN local clock: <var>` (`<var> noyear` for
+  a clock without a year, whose parse uses `__src_year` and retries with
+  `__src_leap_year`). `residual_spill.py` expands the marker into the shared
+  conversion (`scripts/residual/local_clock.vrl`): the log source's timezone
+  setting (`.nano.source_timezone`: an IANA name with its DST rules, or any
+  `+HH:MM` offset; UTC if unset, invalid or "local") turns that timestamp into
+  real UTC at the site; an ambiguous fall-back time takes its first
+  occurrence, a gap time moves forward; a no-year clock takes the nearest
+  year (back a year when more than a day ahead, forward when more than 180
+  days back). The zone used is recorded in `unmapped.nano_time_assumed_tz`.
+  A UTC-by-specification format just uses `timezone: "UTC"` and records
+  nothing.
 - UDM names do not exist in OCSF. `src_ip` is `src_endpoint.ip`, `user` is
   `actor.user.name` (the actor) or `user.name` (the subject, class-dependent),
   `timestamp` is `time`, `id` is `metadata.uid`, `ext.foo` is `unmapped.foo`.

@@ -1,4 +1,10 @@
 source: text
+probe:
+  mode: before
+  anchor: </EventData>
+  require: </EventData>
+  text: <Data Name="ResidualProbe">nan2421-text-unknown</Data><Data Name="Password">nan2421-secret</Data>
+  source: event_data.ResidualProbe
 transforms:
 - source: system.TimeCreated.@SystemTime
   kind: epoch_ms
@@ -13,61 +19,53 @@ transforms:
     icmp: 1
     icmpv6: 58
     ipv6-icmp: 58
-  reason: Named vendor outcome/protocol/severity normalized by the existing mapping;
-    consume only when the expected ID is emitted.
-probe:
-  mode: before
-  anchor: </EventData>
-  require: </EventData>
-  text: <Data Name="ResidualProbe">nan2421-text-unknown</Data><Data Name="Password">nan2421-secret</Data>
-  source: event_data.ResidualProbe
-consumed_candidates:
-- event_data.CommandLine
-- event_data.Configuration
-- event_data.ConfigurationFileHash
-- event_data.CreationUtcTime
-- event_data.CurrentDirectory
-- event_data.DestinationHostname
-- event_data.DestinationIp
-- event_data.DestinationIsIpv6
-- event_data.DestinationPort
-- event_data.DestinationPortName
-- event_data.Hashes
-- event_data.Image
-- event_data.Initiated
-- event_data.IntegrityLevel
-- event_data.IsExecutable
-- event_data.LogonId
-- event_data.ParentCommandLine
-- event_data.ParentImage
-- event_data.ParentProcessGuid
-- event_data.ParentProcessId
-- event_data.ParentUser
-- event_data.PreviousCreationUtcTime
-- event_data.ProcessGuid
-- event_data.ProcessId
-- event_data.Protocol
-- event_data.RuleName
-- event_data.SchemaVersion
-- event_data.SourceHostname
-- event_data.SourceIp
-- event_data.SourceIsIpv6
-- event_data.SourcePort
-- event_data.SourcePortName
-- event_data.State
-- event_data.TargetFilename
-- event_data.TerminalSessionId
-- event_data.User
-- event_data.Version
-- event_data.X
-- system.Channel
-- system.Computer
-- system.EventID
-- system.EventID.text
-- system.EventRecordID
-- system.Level
-- system.Provider.@Name
-- system.TimeCreated.@SystemTime
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+  reason: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when
+    the expected ID is emitted.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  event_data.CommandLine:
+  - actor.process.cmd_line
+  - process.cmd_line
+  event_data.DestinationIp:
+  - dst_endpoint.ip
+  event_data.DestinationPort:
+  - dst_endpoint.port
+  event_data.Image:
+  - actor.process.file.path
+  - process.file.path
+  event_data.ParentCommandLine:
+  - actor.process.cmd_line
+  event_data.ParentImage:
+  - actor.process.file.path
+  event_data.ParentProcessGuid:
+  - actor.process.uid
+  event_data.ParentProcessId:
+  - actor.process.pid
+  event_data.ProcessGuid:
+  - actor.process.uid
+  - process.uid
+  event_data.ProcessId:
+  - actor.process.pid
+  - process.pid
+  event_data.SourceIp:
+  - src_endpoint.ip
+  event_data.SourcePort:
+  - src_endpoint.port
+  event_data.TargetFilename:
+  - file.path
+  event_data.User:
+  - actor.user.name
+  event_data.Version:
+  - app.version
+  system.Channel:
+  - metadata.log_name
+  system.Computer:
+  - device.hostname
+  system.EventID:
+  - metadata.event_code
+  system.EventRecordID:
+  - metadata.original_event_uid
+  system.Provider.@Name:
+  - metadata.log_provider

@@ -29,7 +29,7 @@ elif [[ "$url" == https://api.github.com/repos/nano-rs/ocsf-validator-dist/* ]];
 else
     curl -fsSL -o "$out" "$url"
 fi
-got=$(sha256sum "$out" | cut -d' ' -f1)
+got=$( { sha256sum "$out" 2>/dev/null || shasum -a 256 "$out"; } | cut -d" " -f1)
 if [ "$got" != "$want" ]; then
     echo "ocsf_event_validate sha256 mismatch: got $got, want $want" >&2
     rm -f "$out"

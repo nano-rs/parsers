@@ -1,5 +1,21 @@
 # Residual source preservation
 
+`residual_spill.py` also opens every parser with the shared source-timezone
+prelude (`source_tz.vrl`): it removes `.nano` whole and resolves
+`.nano.source_timezone` (the log source's timezone setting: an IANA name, or
+any `+HH:MM` offset; UTC if absent, invalid or "local") into `__src_tz` /
+`__src_shift_ms` (and `__src_year` / `__src_leap_year` for a parser that reads
+a clock without a year). A parser reads an offset-less clock as UTC, sets
+`__lc_pending`, and marks the site `# NAN local clock: <var> [noyear]`; the
+generator expands each marker into `local_clock.vrl`, which converts that
+timestamp to real UTC at the site (DST: an ambiguous time takes its first
+occurrence, a gap time moves forward; a no-year clock takes the nearest
+year), so nothing is matched by value. The spill records the zone in
+`unmapped.nano_time_assumed_tz`, and renames a vendor key that uses a nano
+marker name (or `nano`, `nano.*`) to `source_<name>`, suffixed `_2`, `_3`, ...
+when taken. `scripts/test_source_timezone.py` checks the shift, DST, the
+year boundary, garbage inline zones and that `.nano` never leaks.
+
 **Parsers never mask, redact or withhold anything.** A parser converts raw to
 real: every source field is mapped faithfully into OCSF or spilled into
 `unmapped` exactly as parsed, `raw_data` is the untouched original, and
@@ -26,25 +42,61 @@ The checker appends `.__coverage_source = __source_kv` to a temporary copy of
 the program and removes that diagnostic attribute before checking the event.
 Production parser definitions never emit the diagnostic attribute.
 
-The shared block runs after the mapping branch completes. It restricts exact-value consumption to each parser's explicit
-`consumed_candidates`, then records paths whose values actually occur in the
-selected output branch, including lossless scalar string/number conversion.
-Unknown keys always spill, including values equal to defaults such as 0/false. It excludes `raw_data`, pre-existing `unmapped`, and a `message`
-that equals the whole raw body. A human-readable mapped message is evidence.
-It does not use substring matching. A field merely read in an unused helper is
-not consumed unless its value actually appears in the selected branch.
+The shared block runs after the mapping branch completes. **A source field is
+consumed only by an explicit mapping**: a `mappings` entry in
+`field-coverage.yaml` (`source key: [target path, ...]`) or a `transforms`
+rule with its `target`, whose value (lossless scalar string/number conversion
+allowed) is found AT THAT TARGET PATH of the selected branch. A value that
+merely appears somewhere else in the event never consumes a field: no
+coincidental consumption (a `TokenType` of `1` is not `activity_id: 1`).
+Everything else spills, including values equal to defaults such as 0/false.
+Target paths drop array indices (`resources.uid` covers every resource), and
+`raw_data`, `unmapped` and a `message` equal to the whole raw body are never
+targets. A human-readable mapped message is a target like any other.
+
+`field_coverage_check.py` verifies every declaration by provenance: in at
+least one sample, replacing that source value with a sentinel of the same type and
+shape must move the value at the declared target from the old value to
+exactly the sentinel, converted by the rule if there is one. Sentinels are
+deterministic but unguessable: each draw is seeded with SHA-256 of (base seed,
+parser, sample, field, draw), so every run gives the same verdict (no flaky
+check), and a parser cannot depend on the values. A clock moves by whole
+seconds, a `scale` source by a whole number of result units, and a small code
+is drawn from outside the values the field takes in any sample (a short
+lookup table cannot echo it). A plain mapping needs two distinct sentinels
+to arrive (a lookup that happens to output one is not a copy); a boolean or
+an enum rule needs one.
+Lists are compared element by element as multisets, so a static list never
+passes. Only that source field may change (a longer text containing it, such
+as a raw message, may change with it). A declaration that only matches by
+coincidence, or that no sample exercises, fails the parser.
+`scripts/infer_mappings.py <parser>` writes the declarations the same way
+(review its output); `--all-keys` considers every captured key for a new
+parser. `PROVENANCE_SEED` overrides the base seed (`random` draws a fresh
+one, for fuzzing); a failure prints the seed it used.
+
+Source keys are flattened with escaped segments: a nested path is `a.b`, a
+literal dotted key is `a~1b` (and a literal `~` is `~0`), so the two are
+different fields, mapped and spilled independently. Declare a literal dotted
+key in its escaped form.
 
 Every additional normalization has a per-parser `field-coverage.yaml` entry:
-source path, transform kind, optional destination path, and a one-line reason.
-Rules are conditional: the transformed value must actually match emitted
-output. Malformed timestamps, unsupported enums, and unused fallback values
+source path, transform kind, destination path, and a one-line reason.
+Rules are conditional: the transformed value must be at the destination.
+Malformed timestamps, unsupported enums, and unused fallback values
 remain residual. These are executable expectations, not unconditional waivers.
 No missing source is accepted just because a path is listed.
+
+Existing derived evidence (what the parser wrote to `unmapped` itself) is kept
+unless it is null, empty, a container text, or a copy of a source value (that
+value is mapped or spilled under its source path); equality with an unrelated
+mapped attribute is no reason to drop it.
 
 Residual objects flatten into dotted snake_case paths. Literal dots are escaped
 before flattening, then decoded for naming. Collisions receive `_2`, `_3`, etc.
 Scalar arrays retain their type/order; arrays containing objects or arrays use
-JSON strings. Fully represented scalar arrays are consumed. Partially mapped arrays remain
+JSON strings. A scalar array is consumed only when every element is at one of
+its declared targets. Partially mapped arrays remain
 intact to preserve their order and repeated elements. Every value spills
 as-is, whatever its key is called (a `password` or `token` key is no
 different from any other). An empty residual is omitted. Existing derived scalar evidence is retained when
@@ -67,7 +119,8 @@ size. The generated block therefore:
 
 - holds value sets in strings (`"," + encode_json(member)` per member) and
   tests membership with `contains`; a string read shares its buffer;
-- turns `consumed_candidates` into a regex literal, compiled once;
+- holds the declared mappings in one string literal (`__decl`) looked up with
+  `find`, and the mapped leaves as path-qualified members (`__repr`);
 - groups the `transforms` rules that render to the same body (templates in
   `transforms.vrl`) and runs them in ONE loop over the flattened source, each
   group a whole-key regex literal around its body, instead of parsing a rule
@@ -106,6 +159,7 @@ mapped or spilled with that value. For every sample, an emitted `raw_data`
 must equal the original input byte for byte. Probes are temporary
 in-memory inputs; supplied samples remain unchanged.
 
-When adding a mapped field, update its consumed candidate and any transformation
-rule. A candidate alone never waives coverage: its actual value must appear in
-the selected branch. Do not add wildcard candidates for entire source objects.
+When adding a mapped field, declare its mapping (or transformation rule) with
+the exact target path. A declaration never waives coverage: the value must be
+at that path in the selected branch, and provenance must show it comes from
+that source field. Do not declare a target the field only sometimes equals.

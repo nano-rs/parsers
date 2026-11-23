@@ -27,6 +27,7 @@ import yaml
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import field_coverage_check as fcc  # noqa: E402  (shared no-loss check)
+import residual_spill  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PARSER = ROOT / 'parsers-ocsf/hashicorp_vault/parser.yaml'
@@ -132,7 +133,7 @@ def main():
                     source['syslog_header'] = header
                 cfg = yaml.safe_load((PARSER.parent / 'field-coverage.yaml').read_text())
                 rules = cfg.get('transforms', [])
-                fcc.check(source, out, line, rules, candidates=cfg['consumed_candidates'])
+                fcc.check(source, out, line, rules, mappings=residual_spill.mappings_of(cfg))
         except AssertionError as error:
             failures.append(f'line {index}: {error}')
     if failures:

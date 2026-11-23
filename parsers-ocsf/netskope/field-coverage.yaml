@@ -1,61 +1,29 @@
 source: json
 transforms:
-- source: record_type
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: type
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: alert
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: action
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: severity
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: dlp_rule_severity
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: risk_level
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
 - source: domain
   kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
+  target: dst_endpoint.hostname
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
+- source: domain
+  kind: lowercase
+  target: http_request.url.hostname
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
 - source: hostname
   kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: dsthost
+  target: evidences.src_endpoint.hostname
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
+- source: hostname
   kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: object_type
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
+  target: src_endpoint.hostname
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
 - source: sha256
   kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: md5
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
+  target: observables.value
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
 - source: protocol
   kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
+  target: connection_info.protocol_name
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
 - source: action
   kind: enum
   target: action_id
@@ -78,14 +46,8 @@ transforms:
     dropped: 2
     log: 3
     observed: 3
-  reason: Named vendor outcome/protocol/severity normalized by the existing mapping;
-    consume only when the expected ID is emitted.
-- source: severity
-  kind: enum
-  target: severity
-  values:
-    high: High
-  reason: Parser normalizes the caption case; verify the emitted caption.
+  reason: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when
+    the expected ID is emitted.
 - source: severity
   kind: enum
   target: severity_id
@@ -101,61 +63,80 @@ transforms:
     error: 4
     critical: 5
     fatal: 6
-  reason: Named vendor outcome/protocol/severity normalized by the existing mapping;
-    consume only when the expected ID is emitted.
+  reason: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when
+    the expected ID is emitted.
 - source: timestamp
   kind: scale
   factor: 1000
   target: time
-  reason: Existing unit conversion by 1000 verified against time; unused clock fallbacks
-    remain residual.
-consumed_candidates:
-- _id
-- action
-- activity
-- alert
-- alert_id
-- alert_name
-- alert_type
-- app
-- appcategory
-- audit_log_event
-- cci
-- client_bytes
-- detection_engine
-- dlp_incident_id
-- dlp_profile
-- dlp_rule
-- dlp_rule_severity
-- domain
-- dst_country
-- dsthost
-- dstip
-- dstport
-- file_path
-- hostname
-- http_status_code
-- malware_name
-- md5
-- object
-- object_type
-- protocol
-- record_type
-- referer
-- risk_level
-- server_bytes
-- severity
-- sha256
-- src_country
-- srcip
-- srcport
-- timestamp
-- transaction_id
-- type
-- url
-- user
-- useragent
-- userip
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+  reason: Existing unit conversion by 1000 verified against time; unused clock fallbacks remain residual.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  _id:
+  - metadata.original_event_uid
+  activity:
+  - api.operation
+  alert_id:
+  - finding_info.uid
+  alert_name:
+  - finding_info.title
+  alert_type:
+  - finding_info.types
+  app:
+  - api.service.name
+  - app_name
+  appcategory:
+  - http_request.url.categories
+  audit_log_event:
+  - api.operation
+  client_bytes:
+  - traffic.bytes_out
+  detection_engine:
+  - finding_info.analytic.name
+  domain:
+  - dst_endpoint.hostname
+  - http_request.url.hostname
+  dst_country:
+  - evidences.dst_endpoint.location.country
+  dstip:
+  - dst_endpoint.ip
+  - evidences.dst_endpoint.ip
+  - observables.value
+  dstport:
+  - dst_endpoint.port
+  http_status_code:
+  - http_response.code
+  malware_name:
+  - malware.name
+  object:
+  - evidences.file.name
+  - observables.value
+  - resources.name
+  object_type:
+  - resources.type
+  protocol:
+  - connection_info.protocol_name
+  referer:
+  - http_request.referrer
+  server_bytes:
+  - traffic.bytes_in
+  src_country:
+  - evidences.src_endpoint.location.country
+  srcip:
+  - evidences.src_endpoint.ip
+  - observables.value
+  - src_endpoint.ip
+  srcport:
+  - src_endpoint.port
+  url:
+  - evidences.url.url_string
+  - http_request.url.url_string
+  - observables.value
+  user:
+  - actor.user.name
+  - evidences.user.name
+  - observables.value
+  useragent:
+  - http_request.user_agent

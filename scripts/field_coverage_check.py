@@ -32,9 +32,10 @@ import re
 import subprocess
 import tempfile
 import yaml
-from residual_spill import ROOT, check_rule, update
+from residual_spill import ROOT, check_rule, mappings_of, norm_path, update
+import provenance
+from provenance import MISSING, VECTOR_ENV, at, leaf_index, same, transform_want
 
-MISSING = object()
 # source_normalize step kinds and their required parameters (and types).
 NORMALIZE_KINDS = {
     'unwrap_single': {'path': str},
@@ -69,16 +70,6 @@ def values(value):
             yield from values(item)
 
 
-def same(a, b):
-    if type(a) in (int, float) and type(b) in (int, float):
-        return a == b
-    if type(a) is type(b):
-        return a == b
-    # VRL to_string conversions preserve scalar numeric/boolean values.
-    scalar = lambda v: json.dumps(v, separators=(',', ':')) if not isinstance(v, str) else v
-    return a is not None and b is not None and not isinstance(a, (dict, list)) and not isinstance(b, (dict, list)) and scalar(a) == scalar(b)
-
-
 def snake(key):
     # Mirror VRL snakecase boundaries, including Unicode letters, while keeping
     # punctuation such as @ and / which are legitimate source key characters.
@@ -98,64 +89,72 @@ def snake(key):
     return ''.join(out).strip('_')
 
 
-def represented(value, mapped):
-    if any(same(value, item) for item in mapped): return True
-    return isinstance(value, list) and bool(value) and all(
-        not isinstance(item, (dict, list)) and any(same(item, output) for output in mapped)
-        for item in value)
-
-
 def mapped_view(output, raw):
     """The event as coverage evidence: never raw_data, unmapped, or a message
     that is just the raw body (spill.vrl's __mapped)."""
     return {k: v for k, v in output.items() if k not in ('unmapped', 'raw_data') and not (k == 'message' and v == raw)}
 
 
-def transformed(rule, value, output, mapped, raw=MISSING):
+def local_to_utc(ms, setting):
+    """A clock read as UTC (ms) moved to real UTC by a log source timezone
+    setting, as local_clock.vrl does: a fixed +HH:MM offset by arithmetic; an
+    IANA zone with fold=0 (an ambiguous time's first occurrence, a gap time
+    moved forward); anything else (absent, "local", unknown) unchanged."""
+    import datetime as dt
+    import zoneinfo
+    setting = (setting or '').strip() if isinstance(setting, str) else ''
+    m = re.fullmatch(r'([+-])(\d{2}):?(\d{2})', setting)
+    if m:
+        h, mi = int(m.group(2)), int(m.group(3))
+        if h > 14 or mi > 59:
+            return ms
+        return ms - (1 if m.group(1) == '+' else -1) * (h * 3600 + mi * 60) * 1000
+    if not setting or setting.lower() == 'local':
+        return ms
     try:
-        kind = rule['kind']
-        if kind == 'lowercase':
-            if not isinstance(value, str): return False
-            want = value.lower()
-        elif kind == 'epoch_ms':
-            clock = dt.datetime.fromisoformat(value.replace('Z', '+00:00')) if rule.get('format', '%+') == '%+' else dt.datetime.strptime(value, rule['format'])
-            want = int(clock.timestamp() * 1000)
-        elif kind == 'scale':
-            want = int(float(value) * rule['factor'])
-        elif kind == 'hex':
-            if not isinstance(value, str) or not value.lower().startswith('0x'): return False
-            want = int(value, 16)
-        elif kind == 'enum':
-            want = rule['values'].get(str(value).lower(), MISSING)
-        else:
-            raise AssertionError(f'unknown transform {kind}')
-    except (ValueError, TypeError, AttributeError, OverflowError):
+        zone = zoneinfo.ZoneInfo(setting)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError):
+        return ms
+    naive = dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc).replace(tzinfo=None)
+    return int(naive.replace(tzinfo=zone, fold=0).timestamp() * 1000)
+
+
+def transformed(rule, value, index, setting=None):
+    """A rule consumes its source only when the converted value is AT its
+    target. An epoch_ms clock may have been moved to real UTC by the log
+    source's timezone setting (the parser read it without an offset)."""
+    want = transform_want(rule, value)
+    if want is MISSING:
         return False
-    if 'target' in rule:
-        # The target is looked up in the mapped event only, so a rule can never
-        # be satisfied by unmapped, raw_data or a message equal to the raw body.
-        actual = mapped_view(output, raw)
-        for part in rule['target'].split('.'):
-            if not isinstance(actual, dict) or part not in actual: return False
-            actual = actual[part]
-        return want is not MISSING and same(want, actual)
-    return any(same(want, item) for item in mapped)
+    target = norm_path(rule['target'])
+    if at(index, target, want):
+        return True
+    return rule['kind'] == 'epoch_ms' and setting is not None and at(index, target, local_to_utc(want, setting))
 
 
-def check(source, output, raw, rules, consumed=(), candidates=None):
+def check(source, output, raw, rules, consumed=(), mappings=None, setting=None):
+    """Every source field is consumed by an explicit mapping (its value at one of
+    its declared target paths), a transforms rule (its converted value at the
+    rule's target) or a reference check, or it is in unmapped unaltered. A value
+    that merely appears elsewhere in the event never counts."""
     assert '__coverage_source' not in output
     residual = output.get('unmapped', {})
     assert isinstance(residual, dict), 'unmapped must be an object'
     assert 'unmapped' not in output or residual, 'empty unmapped'
-    mapped_event = mapped_view(output, raw)
-    mapped = list(values(mapped_event))
-    fields = list(flatten(source))
+    index = leaf_index(mapped_view(output, raw))
+    mappings = mappings or {}
+    # Escaped keys: a literal dotted key ("a~1b") and the nested path ("a.b")
+    # are different fields, mapped and spilled independently.
+    fields = list(provenance.esc_flatten(source))
     used = set()
     for key, value in fields:
-        if key in consumed or ((candidates is None or key in candidates) and represented(value, mapped)) or any(r['source'] == key and transformed(r, value, output, mapped, raw) for r in rules):
+        if key in consumed or any(at(index, target, value) for target in mappings.get(key, ())) or any(r['source'] == key and transformed(r, value, index, setting) for r in rules):
             continue
         if value == raw: continue
-        base = '.'.join(snake(part) for part in key.split('.'))
+        base = '.'.join(snake(provenance.unesc(part)) for part in key.split('.'))
+        # A name nano owns in unmapped is spilled as source_<name> (no forged marker).
+        if base in RESERVED or base.startswith('nano.'):
+            base = 'source_' + base
         matched = False
         for slot, actual in residual.items():
             if slot in used or not (slot == base or re.fullmatch(re.escape(base)+r'_\d+', slot)): continue
@@ -270,7 +269,7 @@ def vrl_parse_kv(items):
             tmp = Path(tmp)
             (tmp/'kv.vrl').write_text(KV_PROGRAM)
             (tmp/'kv.json').write_text(''.join(json.dumps({'s': s, 'k': k, 'f': f})+'\n' for s, k, f in todo))
-            run = subprocess.run(['vector', 'vrl', '--program', str(tmp/'kv.vrl'), '--input', str(tmp/'kv.json'), '--print-object'], text=True, capture_output=True, timeout=180)
+            run = subprocess.run(['vector', 'vrl', '--program', str(tmp/'kv.vrl'), '--input', str(tmp/'kv.json'), '--print-object'], text=True, capture_output=True, timeout=180, env=VECTOR_ENV)
         assert run.returncode == 0, run.stderr
         outputs = [json.loads(line, strict=False) for line in run.stdout.splitlines() if line.startswith('{')]
         assert len(outputs) == len(todo), f'Vector returned {len(outputs)} KV parses for {len(todo)} inputs'
@@ -502,7 +501,13 @@ def run_parser(path, supplied=None, output_dir=None):
     assert config_path.exists(), f'{path.parent.name}: missing field-coverage.yaml'
     config = yaml.safe_load(config_path.read_text())
     update(path, check=True)
+    vrl = yaml.safe_load(path.read_text())['parser_vrl']
+    naive = naive_timestamps(vrl)
+    assert not naive, f'{path.parent.name}: parse_timestamp without timezone: "UTC" reads a clock in the host timezone: {naive[:3]}'
+    local = unconverted_clocks(vrl)
+    assert not local, f'{path.parent.name}: an offset-less clock read as UTC without the local-clock contract (add `# NAN local clock: <var>`, or `# utc-by-spec: <reason>` when the format is UTC by specification): {local[:3]}'
     rules, steps = validate_config(config)
+    mappings = mappings_of(config)
     doc = yaml.safe_load(path.read_text())
     samples = samples_for(path, doc, supplied)
     assert samples, f'{path}: no samples'
@@ -550,7 +555,7 @@ def run_parser(path, supplied=None, output_dir=None):
         tmp = Path(tmp)
         (tmp/'parser.vrl').write_text(program)
         (tmp/'input.json').write_text(''.join(json.dumps(event)+'\n' for _, event in samples))
-        run = subprocess.run(['vector', 'vrl', '--program', str(tmp/'parser.vrl'), '--input', str(tmp/'input.json'), '--print-object'], text=True, capture_output=True, timeout=180)
+        run = subprocess.run(['vector', 'vrl', '--program', str(tmp/'parser.vrl'), '--input', str(tmp/'input.json'), '--print-object'], text=True, capture_output=True, timeout=180, env=VECTOR_ENV)
         assert run.returncode == 0, run.stderr
         outputs = []
         for line in run.stdout.splitlines():
@@ -559,8 +564,10 @@ def run_parser(path, supplied=None, output_dir=None):
         assert len(outputs) == len(samples), f'Vector returned {len(outputs)} events for {len(samples)} samples: {run.stdout[:500]}'
         count = 0
         spill_keys = set()
+        outputs_sources = []
         for (name, event), output in zip(samples, outputs):
             source = output.pop('__coverage_source')
+            outputs_sources.append((name, event, output, source))
             if config['source'] in ('json', 'mixed'):
                 try: original = json.loads(event['message'])
                 except json.JSONDecodeError: original = {}
@@ -571,7 +578,9 @@ def run_parser(path, supplied=None, output_dir=None):
                 consumed = []
                 if config.get('reference') == 'windows_sysmon':
                     consumed = reference_consumed(source, output)
-                count += check(source, output, event['message'], rules, consumed, config['consumed_candidates'])
+                nano = event.get('nano')
+                setting = nano.get('source_timezone') if isinstance(nano, dict) else None
+                count += check(source, output, event['message'], rules, consumed, mappings, setting)
             except AssertionError as error:
                 raise AssertionError(f'{path.parent.name}/{name}: {error}') from error
             # raw_data, when emitted, is the untouched original (never masked,
@@ -597,7 +606,237 @@ def run_parser(path, supplied=None, output_dir=None):
                 source_dir.mkdir(exist_ok=True)
                 (source_dir/(name+'.json')).write_text(json.dumps(source, indent=2)+'\n')
         assert count > 0, f'{path.parent.name}: no parsed source fields were assessed'
+        verify_provenance(path, doc['parser_vrl'], samples, outputs_sources, mappings, rules)
         print(f'PASS {path.parent.name}: {len(samples)} samples, {count} source fields; spilled: {", ".join(sorted(spill_keys))}')
+
+
+TIMESTAMP_CALL = re.compile(r'parse_timestamp!?\(')
+
+
+def strip_comments(vrl):
+    """VRL with every # comment removed (a '#' inside a string is kept)."""
+    out, i, n = [], 0, len(vrl)
+    while i < n:
+        c = vrl[i]
+        if c == '"':
+            j = i + 1
+            while j < n and vrl[j] != '"':
+                j += 2 if vrl[j] == '\\' else 1
+            out.append(vrl[i:j + 1]); i = j + 1
+        elif c == "'" and i and vrl[i - 1] == 'r':
+            j = vrl.find("'", i + 1)
+            j = n if j < 0 else j
+            out.append(vrl[i:j + 1]); i = j + 1
+        elif c == '#':
+            j = vrl.find('\n', i)
+            i = n if j < 0 else j
+        else:
+            out.append(c); i += 1
+    return ''.join(out)
+
+
+def split_args(args):
+    """Top-level comma-separated arguments of a call (strings and nesting kept)."""
+    parts, depth, cur, i = [], 0, [], 0
+    while i < len(args):
+        c = args[i]
+        if c == '"':
+            j = i + 1
+            while j < len(args) and args[j] != '"':
+                j += 2 if args[j] == '\\' else 1
+            cur.append(args[i:j + 1]); i = j + 1; continue
+        if c == "'" and i and args[i - 1] == 'r':
+            j = args.find("'", i + 1); j = len(args) if j < 0 else j
+            cur.append(args[i:j + 1]); i = j + 1; continue
+        if c in '([{':
+            depth += 1
+        elif c in ')]}':
+            depth -= 1
+        elif c == ',' and depth == 0:
+            parts.append(''.join(cur)); cur = []; i += 1; continue
+        cur.append(c); i += 1
+    parts.append(''.join(cur))
+    return parts
+
+
+def call_args(text, start):
+    """The argument text of the call whose "(" ends at start, and the index
+    after its closing ")": balanced parentheses, quoted and raw strings skipped,
+    across lines."""
+    i, depth = start, 1
+    while i < len(text) and depth:
+        c = text[i]
+        if c == '"':
+            i += 1
+            while i < len(text) and text[i] != '"':
+                i += 2 if text[i] == '\\' else 1
+        elif c == "'" and text[i - 1] == 'r':
+            i += 1
+            while i < len(text) and text[i] != "'":
+                i += 1
+        elif c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+        i += 1
+    return text[start:i - 1], i
+
+
+def named_args(parts):
+    return {p.split(':', 1)[0].strip(): p.split(':', 1)[1].strip() for p in parts if re.match(r'\s*\w+\s*:', p)}
+
+
+def naive_timestamps(vrl):
+    """parse_timestamp(...) calls (comments ignored) without a named timezone:
+    argument. Without one VRL reads an offset-less clock in the HOST timezone,
+    so the same line gets a different time on every Vector host. The argument
+    may be a literal or a variable (a source's own timezone field)."""
+    text = strip_comments(vrl)
+    bad = []
+    for m in TIMESTAMP_CALL.finditer(text):
+        args, i = call_args(text, m.end())
+        parts = split_args(args)
+        fmt = parts[1].strip() if len(parts) > 1 else ''
+        named = named_args(parts[2:])
+        # "local" is the Vector host's zone: the host-dependence the rule exists to stop.
+        if named.get('timezone', '').strip('"').lower() == 'local':
+            bad.append(text[m.start():i][:80])
+            continue
+        # A FORMAT (the second argument) that carries an offset needs no timezone.
+        if 'timezone' not in named and not re.fullmatch(r'"[^"]*(?:%\+|%:?z)[^"]*"', fmt):
+            bad.append(text[m.start():i][:80])
+    return bad
+
+
+# Names nano owns in unmapped: parser markers and the nano.* namespace.
+RESERVED = {'nano', 'nano_time_assumed_tz', 'nano_time_source', 'nano_operational'}
+
+GENERATED = [(r'# NAN source timezone\.', r'# END NAN source timezone'), (r'# NAN-2421 residual spill\.', r'# END NAN-2421 residual spill')]
+
+
+# A format that carries its own zone: an offset (%z, %:z, %::z, %#z), RFC 3339
+# (%+), epoch seconds (%s), or a literal Z closing it.
+ZONED_FORMAT = re.compile(r'"(?:[^"]*(?:%\+|%:{0,2}z|%#z|%s)[^"]*|[^"]*(?<!%)Z)"')
+UTC_BY_SPEC = re.compile(r'#\s*utc-by-spec:\s*\S')
+NO_STRINGS = re.compile(r'"(?:\\.|[^"\\])*"|r\'[^\']*\'')
+
+
+def unconverted_clocks(vrl):
+    """Offset-less clocks that skip the local-clock contract.
+
+    A parse_timestamp(...) with a fixed timezone literal ("UTC", "Etc/UTC",
+    "+00:00", ...) whose format carries no zone reads a LOCAL clock in that
+    zone, ignoring the log source's timezone setting. Unless the line (or the
+    one before) carries `# utc-by-spec: <reason>`, the call must assign its
+    result to a variable, and on the same branch before that variable is used,
+    reassigned (other than by a retry parse) or its branch left, the parser must
+    set `__lc_pending = true` and place `# NAN local clock: <var>`. Generated
+    blocks are ignored. A variable timezone (the source's own field, the
+    prelude's __src_tz) is the source's zone and passes.
+    """
+    keep, skip = [], False
+    for line in vrl.split('\n'):
+        s = line.strip()
+        if any(re.match(a, s) for a, _ in GENERATED):
+            skip = True
+        if not skip:
+            keep.append(line)
+        if any(re.match(b, s) for _, b in GENERATED):
+            skip = False
+    raw = '\n'.join(keep)
+    # The expanded local-clock bodies are generated too: keep only the markers.
+    raw = re.sub(r'(# NAN local clock: [^\n]*\n).*?# END NAN local clock\n', r'\1', raw, flags=re.S)
+    lines = raw.split('\n')
+    code_lines = [strip_comments(l) for l in lines]
+    code = '\n'.join(code_lines)
+    starts = [0]
+    for l in code_lines:
+        starts.append(starts[-1] + len(l) + 1)
+    line_of = lambda off: max(k for k, st in enumerate(starts) if st <= off)
+    bad = []
+    for m in TIMESTAMP_CALL.finditer(code):
+        args, end = call_args(code, m.end())
+        parts = split_args(args)
+        named = named_args(parts[2:])
+        tz = named.get('timezone', '')
+        if not tz.startswith('"'):
+            continue  # no timezone (naive_timestamps) or a variable one
+        fmt = parts[1].strip() if len(parts) > 1 else ''
+        if ZONED_FORMAT.fullmatch(fmt):
+            continue
+        li = line_of(m.start())
+        if UTC_BY_SPEC.search(lines[li]) or (li and UTC_BY_SPEC.search(lines[li - 1])):
+            continue
+        call = ' '.join(code[m.start():end].split())[:90]
+        prefix = code[starts[li]:m.start()]
+        var = re.search(r'(?:^|[{;]|\bthen\b)\s*(\w+)\s*(?:,\s*\w+)?\s*=\s*$', prefix)
+        if not var:
+            bad.append(call + ' (result not assigned to a variable)')
+            continue
+        v = re.escape(var.group(1))
+        retry = re.compile(r'\b' + v + r'\s*(?:,\s*\w+)?\s*=\s*parse_timestamp\b')
+        # Walk forward: brace depth relative to the call; the base is the
+        # shallower of the call and the end of its line (a one-line retry block).
+        end_line = line_of(end - 1)
+        rest = [code[end:starts[end_line + 1] - 1]] + code_lines[end_line + 1:]
+        depth, base, pending, why = 0, None, False, 'no `# NAN local clock: ' + var.group(1) + '` marker follows'
+        for k, chunk in enumerate(rest):
+            j = end_line + k
+            if k and re.match(r'\s*# NAN local clock: ' + v + r'\b', lines[j]):
+                why = None if pending else 'marker without `__lc_pending = true` before it'
+                break
+            flat = NO_STRINGS.sub('""', chunk)
+            if re.search(r'__lc_pending\s*=\s*true', flat):
+                pending = True
+            if re.search(r'\b' + v + r'\b', flat) and not retry.search(flat):
+                why = f'{var.group(1)} is used before its local-clock marker'
+                break
+            if re.search(r'(?<![\w.])' + v + r'\s*(?:,\s*\w+)?\s*=(?!=)', flat) and not retry.search(flat):
+                why = f'{var.group(1)} is reassigned before its local-clock marker'
+                break
+            left = False
+            for tok in re.findall(r'[{}]|\belse\b', flat):
+                if tok == '{':
+                    depth += 1
+                elif tok == '}':
+                    depth -= 1
+                elif base is not None and depth < base:
+                    left = True
+            if k == 0:
+                base = min(0, depth)
+            if left:
+                why = 'the branch ends before its local-clock marker'
+                break
+        if why:
+            bad.append(f'{call} ({why})')
+    return bad
+
+
+PROBES = ('residual_probe', 'text_residual_probe')
+
+
+def verify_provenance(path, program, samples, outputs_sources, mappings, rules):
+    """Every declared mapping and every transforms rule must be demonstrated: in
+    some sample, perturbing the source value moves the value at the declared
+    target with it. A declaration that only ever matches by coincidence (or
+    that no sample exercises) fails."""
+    real = [(n, e, o, s) for n, e, o, s in outputs_sources if n not in PROBES and not n.startswith('normalize_probe_')]
+    samples = [(n, e) for n, e, _, _ in real]
+    sources = [s for _, _, _, s in real]
+    outputs = [o for _, _, o, _ in real]
+    items = [(key, None) for key in mappings] + [(rule['source'], rule) for rule in rules]
+    declared = {(key, None): targets for key, targets in mappings.items()}
+    declared.update({(rule['source'], id(rule)): [norm_path(rule['target'])] for rule in rules})
+    found = provenance.probe(program, samples, sources, outputs, items, per_key=40, declared=declared, scope=path.parent.name)
+    missing = []
+    for key, targets in mappings.items():
+        for target in targets:
+            if target not in found.get((key, None), {}):
+                missing.append(f'{key} -> {target}')
+    for rule in rules:
+        if norm_path(rule['target']) not in found.get((rule['source'], id(rule)), {}):
+            missing.append(f'{rule["source"]} ({rule["kind"]}) -> {rule["target"]}')
+    assert not missing, f'{path.parent.name}: declared mapping(s) without provenance in any sample (perturbing the source does not move the target; PROVENANCE_SEED={provenance.BASE_SEED}): ' + ', '.join(missing[:12]) + (' ...' if len(missing) > 12 else '')
 
 
 def main():

@@ -8,8 +8,8 @@
 # `if` in a large program makes Vector's VRL type checker clone and merge the
 # whole type state, which doubled compile (reload) time for the parsers with
 # the most rules. Placeholders: __FORMAT__, __FACTOR__, __VALUES__, and
-# __MATCH__ (the emitted target equals __expected, or __expected is a
-# represented value when the rule names no target).
+# __MATCH__ (__expected is at the rule's target path in __repr; every rule
+# names its target, so no value found elsewhere ever counts).
 # A rule consumes its source only when the source is valid for the kind AND
 # the converted value actually appears in the emitted branch. An absent source
 # is never visited, which matches the unrolled form: no kind consumes a null
@@ -24,9 +24,21 @@ if is_string(__value) {
 }
 # kind: epoch_ms
 __value = value
-__clock, __clock_err = parse_timestamp(string(__value) ?? "", __FORMAT__)
+__clock, __clock_err = parse_timestamp(string(__value) ?? "", __FORMAT__, timezone: "UTC")
 if __clock_err == null {
     __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+    #local_clock{
+    # A clock the local-clock block moved to real UTC (the log source's
+    # timezone, a year rollover) is matched by its converted value. Emitted
+    # only for a parser with a local-clock block (compile cost, NAN-5298).
+    if __lc_shifted != "" && !(__MATCH__) {
+        __lc_at = find(__lc_shifted, "\n" + to_string(__expected) + "\t")
+        if is_integer(__lc_at) {
+            __lc_rest = slice!(__lc_shifted, int!(__lc_at) + strlen(to_string(__expected)) + 2)
+            __expected = to_int(slice!(__lc_rest, 0, int!(find(__lc_rest, "\n")))) ?? __expected
+        }
+    }
+    #}local_clock
     if __MATCH__ { __consumed = __consumed + ("," + encode_json(key)) }
 }
 # kind: scale

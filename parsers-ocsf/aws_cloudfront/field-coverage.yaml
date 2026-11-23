@@ -1,10 +1,35 @@
 source: mixed
 transforms:
-- source: timestamp
-  kind: epoch_ms
-  target: time
-  format: '%+'
-  reason: Standard log date + time captured as one UTC instant and converted to the emitted millisecond clock.
+- source: cs-method
+  kind: enum
+  target: http_request.http_method
+  values:
+    connect: CONNECT
+    delete: DELETE
+    get: GET
+    head: HEAD
+    options: OPTIONS
+    post: POST
+    put: PUT
+    trace: TRACE
+    patch: PATCH
+  reason: The OCSF http_method enum; a method outside it (M-SEARCH, PROPFIND) is not emitted and stays
+    in unmapped as sent.
+- source: cs_method
+  kind: enum
+  target: http_request.http_method
+  values:
+    connect: CONNECT
+    delete: DELETE
+    get: GET
+    head: HEAD
+    options: OPTIONS
+    post: POST
+    put: PUT
+    trace: TRACE
+    patch: PATCH
+  reason: The OCSF http_method enum; a method outside it (M-SEARCH, PROPFIND) is not emitted and stays
+    in unmapped as sent.
 - source: timestamp
   kind: scale
   factor: 1000
@@ -30,55 +55,91 @@ transforms:
   factor: 1000
   target: http_response.latency
   reason: Seconds converted to the emitted millisecond response latency (v2 JSON key).
-consumed_candidates:
-- asn
-- c-country
-- c-ip
-- c-port
-- c_country
-- c_ip
-- c_port
-- cs(Host)
-- cs(Referer)
-- cs(User-Agent)
-- cs-bytes
-- cs-method
-- cs-protocol
-- cs-protocol-version
-- cs-uri-query
-- cs-uri-stem
-- cs_bytes
-- cs_host
-- cs_method
-- cs_protocol
-- cs_protocol_version
-- cs_referer
-- cs_uri_query
-- cs_uri_stem
-- cs_user_agent
-- s-ip
-- s_ip
-- sc-bytes
-- sc-content-len
-- sc-content-type
-- sc-status
-- sc_bytes
-- sc_content_len
-- sc_content_type
-- sc_status
-- ssl-cipher
-- ssl-protocol
-- ssl_cipher
-- ssl_protocol
-- timestamp(ms)
-- x-edge-request-id
-- x-edge-result-type
-- x-forwarded-for
-- x-host-header
-- x_edge_request_id
-- x_edge_result_type
-- x_forwarded_for
-- x_host_header
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  asn:
+  - src_endpoint.autonomous_system.number
+  c-country:
+  - src_endpoint.location.country
+  c-ip:
+  - src_endpoint.ip
+  c-port:
+  - src_endpoint.port
+  c_country:
+  - src_endpoint.location.country
+  c_ip:
+  - src_endpoint.ip
+  c_port:
+  - src_endpoint.port
+  cs(Host):
+  - dst_endpoint.hostname
+  cs(User-Agent):
+  - http_request.user_agent
+  cs-bytes:
+  - traffic.bytes_out
+  cs-protocol:
+  - http_request.url.scheme
+  cs-protocol-version:
+  - http_request.version
+  cs-uri-stem:
+  - http_request.url.path
+  cs_bytes:
+  - traffic.bytes_out
+  cs_host:
+  - dst_endpoint.hostname
+  cs_protocol:
+  - http_request.url.scheme
+  cs_protocol_version:
+  - http_request.version
+  cs_referer:
+  - http_request.referrer
+  cs_uri_query:
+  - http_request.url.query_string
+  cs_uri_stem:
+  - http_request.url.path
+  cs_user_agent:
+  - http_request.user_agent
+  s_ip:
+  - dst_endpoint.ip
+  sc-bytes:
+  - traffic.bytes_in
+  sc-content-len:
+  - http_response.length
+  sc-content-type:
+  - http_response.content_type
+  sc-status:
+  - http_response.code
+  sc_bytes:
+  - traffic.bytes_in
+  sc_content_len:
+  - http_response.length
+  sc_content_type:
+  - http_response.content_type
+  sc_status:
+  - http_response.code
+  ssl-cipher:
+  - tls.cipher
+  ssl-protocol:
+  - tls.version
+  ssl_cipher:
+  - tls.cipher
+  ssl_protocol:
+  - tls.version
+  timestamp(ms):
+  - time
+  x-edge-request-id:
+  - http_request.uid
+  - metadata.uid
+  x-edge-result-type:
+  - status_detail
+  x-host-header:
+  - http_request.url.hostname
+  x_edge_request_id:
+  - http_request.uid
+  - metadata.uid
+  x_edge_result_type:
+  - status_detail
+  x_host_header:
+  - http_request.url.hostname

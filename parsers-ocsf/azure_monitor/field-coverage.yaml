@@ -30,7 +30,8 @@ transforms:
     '3': 3
     '2': 4
     '1': 5
-  reason: Windows-style numeric record level normalized to OCSF severity; consume only when the expected ID is emitted.
+  reason: Windows-style numeric record level normalized to OCSF severity; consume only when the expected
+    ID is emitted.
 - source: properties.Severity
   kind: enum
   target: severity_id
@@ -39,7 +40,8 @@ transforms:
     low: 2
     medium: 3
     high: 4
-  reason: Defender for Cloud alert severity drives the finding severity; consume only when the expected ID is emitted.
+  reason: Defender for Cloud alert severity drives the finding severity; consume only when the expected
+    ID is emitted.
 - source: properties.riskLevelDuringSignIn
   kind: enum
   target: risk_level
@@ -64,75 +66,132 @@ transforms:
   reason: Activity Log result normalized to the OCSF status caption; verify the emitted caption.
 - source: callerIpAddress
   kind: lowercase
-  reason: Parser lowercases IPs (nano lowercases at ingest); consume only when the normalized value is emitted.
+  target: src_endpoint.ip
+  reason: Parser lowercases IPs (nano lowercases at ingest); consume only when the normalized value is
+    emitted.
 - source: properties.ipAddress
   kind: lowercase
-  reason: Parser lowercases IPs (nano lowercases at ingest); consume only when the normalized value is emitted.
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
-consumed_candidates:
-- time
-- resourceId
-- operationName
-- category
-- tenantId
-- resultType
-- resultSignature
-- resultDescription
-- callerIpAddress
-- correlationId
-- level
-- Level
-- identity.claims.http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn
-- identity.claims.http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name
-- identity.claims.http://schemas.microsoft.com/identity/claims/objectidentifier
-- identity.claims.http://schemas.microsoft.com/identity/claims/tenantid
-- identity.claims.name
-- identity.claims.appid
-- identity.claims.ipaddr
-- identity.authorization.evidence.principalType
-- properties.eventCategory
-- properties.statusCode
-- properties.statusMessage
-- properties.operationId
-- properties.eventName
-- properties.alertDisplayName
-- properties.alertId
-- properties.id
-- properties.correlationId
-- properties.createdDateTime
-- properties.userPrincipalName
-- properties.userDisplayName
-- properties.userId
-- properties.servicePrincipalName
-- properties.servicePrincipalId
-- properties.resourceDisplayName
-- properties.appDisplayName
-- properties.resourceId
-- properties.ipAddress
-- properties.location.countryOrRegion
-- properties.location.city
-- properties.location.state
-- properties.autonomousSystemNumber
-- properties.status.errorCode
-- properties.status.failureReason
-- properties.status.additionalDetails
-- properties.isInteractive
-- properties.deviceDetail.displayName
-- properties.deviceDetail.deviceId
-- properties.deviceDetail.operatingSystem
-- properties.userAgent
-- properties.activityDisplayName
-- properties.activityDateTime
-- properties.category
-- properties.result
-- properties.resultReason
-- properties.loggedByService
-- properties.initiatedBy.user.id
-- properties.initiatedBy.user.userPrincipalName
-- properties.initiatedBy.user.displayName
-- properties.initiatedBy.user.ipAddress
-- properties.initiatedBy.app.displayName
-- properties.initiatedBy.app.servicePrincipalId
-- properties.initiatedBy.app.appId
+  target: device.ip
+  reason: Parser lowercases IPs (nano lowercases at ingest); consume only when the normalized value is
+    emitted.
+- source: properties.ipAddress
+  kind: lowercase
+  target: src_endpoint.ip
+  reason: Parser lowercases IPs (nano lowercases at ingest); consume only when the normalized value is
+    emitted.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  resourceId:
+  - resources.uid
+  operationName:
+  - api.operation
+  - message
+  category:
+  - metadata.event_code
+  - metadata.log_name
+  tenantId:
+  - cloud.account.uid
+  - cloud.org.uid
+  resultType:
+  - status
+  - status_detail
+  resultSignature:
+  - status_code
+  resultDescription:
+  - finding_info.desc
+  callerIpAddress:
+  - src_endpoint.ip
+  correlationId:
+  - metadata.correlation_uid
+  identity.claims.http://schemas~1xmlsoap~1org/ws/2005/05/identity/claims/upn:
+  - actor.user.email_addr
+  - actor.user.name
+  identity.claims.http://schemas~1microsoft~1com/identity/claims/objectidentifier:
+  - actor.user.name
+  - actor.user.uid
+  identity.claims.http://schemas~1microsoft~1com/identity/claims/tenantid:
+  - cloud.org.uid
+  identity.claims.name:
+  - actor.user.display_name
+  identity.claims.appid:
+  - actor.app_uid
+  identity.claims.ipaddr:
+  - src_endpoint.ip
+  properties.eventCategory:
+  - metadata.event_code
+  properties.statusCode:
+  - status_code
+  properties.statusMessage:
+  - status_detail
+  properties.eventName:
+  - finding_info.title
+  - message
+  properties.id:
+  - metadata.original_event_uid
+  - session.uid
+  properties.userPrincipalName:
+  - user.email_addr
+  - user.name
+  properties.userDisplayName:
+  - user.display_name
+  properties.userId:
+  - user.uid
+  properties.servicePrincipalName:
+  - user.name
+  properties.servicePrincipalId:
+  - user.uid
+  properties.resourceDisplayName:
+  - service.name
+  properties.appDisplayName:
+  - service.name
+  properties.resourceId:
+  - service.uid
+  properties.ipAddress:
+  - device.ip
+  - src_endpoint.ip
+  properties.location.countryOrRegion:
+  - src_endpoint.location.country
+  properties.location.city:
+  - src_endpoint.location.city
+  properties.location.state:
+  - src_endpoint.location.region
+  properties.autonomousSystemNumber:
+  - src_endpoint.autonomous_system.number
+  properties.status.errorCode:
+  - status_code
+  properties.status.failureReason:
+  - status_detail
+  properties.status.additionalDetails:
+  - status_detail
+  properties.deviceDetail.displayName:
+  - device.hostname
+  properties.deviceDetail.deviceId:
+  - device.uid
+  properties.deviceDetail.operatingSystem:
+  - device.os.name
+  properties.userAgent:
+  - http_request.user_agent
+  properties.activityDisplayName:
+  - api.operation
+  - message
+  properties.category:
+  - metadata.event_code
+  properties.resultReason:
+  - status_detail
+  properties.loggedByService:
+  - api.service.name
+  - metadata.log_provider
+  properties.initiatedBy.user.id:
+  - actor.user.uid
+  properties.initiatedBy.user.userPrincipalName:
+  - actor.user.email_addr
+  - actor.user.name
+  properties.initiatedBy.user.ipAddress:
+  - src_endpoint.ip
+  properties.initiatedBy.app.displayName:
+  - actor.app_name
+  - actor.user.name
+  properties.initiatedBy.app.servicePrincipalId:
+  - actor.user.uid

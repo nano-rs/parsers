@@ -7,8 +7,9 @@ transforms:
   reason: Existing timestamp conversion verified against the emitted millisecond clock.
 - source: level
   kind: lowercase
-  reason: Case normalization already performed by the parser; observed at metadata.log_level,
-    and checked against the emitted branch.
+  target: metadata.log_level
+  reason: Case normalization already performed by the parser; observed at metadata.log_level, and checked
+    against the emitted branch.
 - source: timestamp
   kind: epoch_ms
   target: time
@@ -16,14 +17,14 @@ transforms:
   reason: Existing timestamp conversion verified against the emitted millisecond clock.
 - source: protocol
   kind: lowercase
+  target: connection_info.protocol_name
   reason: Case normalization already performed by the parser; observed at connection_info.protocol_name,
     and checked against the emitted branch.
 - source: time
   kind: scale
   factor: 1000
   target: time
-  reason: Existing unit conversion by 1000 verified against time; unused clock fallbacks
-    remain residual.
+  reason: Existing unit conversion by 1000 verified against time; unused clock fallbacks remain residual.
 - source: datetime
   kind: epoch_ms
   target: time
@@ -33,64 +34,33 @@ transforms:
   kind: scale
   factor: 1
   target: actor.process.pid
-  reason: Integer identity (NAN-5073), checked at the exact emitted path, so a coincidentally
-    equal value elsewhere in the event (severity_id, activity_id, another port) cannot
-    consume the key; when the branch does not emit it, it stays in unmapped.
-- source: process_id
-  kind: scale
-  factor: 1
-  target: actor.process.pid
-  reason: Integer identity (NAN-5073), checked at the exact emitted path, so a coincidentally
-    equal value elsewhere in the event (severity_id, activity_id, another port) cannot
-    consume the key; when the branch does not emit it, it stays in unmapped.
+  reason: Integer identity (NAN-5073), checked at the exact emitted path, so a coincidentally equal value
+    elsewhere in the event (severity_id, activity_id, another port) cannot consume the key; when the branch
+    does not emit it, it stays in unmapped.
 - source: src_port
   kind: scale
   factor: 1
   target: src_endpoint.port
-  reason: Integer identity (NAN-5073), checked at the exact emitted path, so a coincidentally
-    equal value elsewhere in the event (severity_id, activity_id, another port) cannot
-    consume the key; when the branch does not emit it, it stays in unmapped.
-- source: source_port
-  kind: scale
-  factor: 1
-  target: src_endpoint.port
-  reason: Integer identity (NAN-5073), checked at the exact emitted path, so a coincidentally
-    equal value elsewhere in the event (severity_id, activity_id, another port) cannot
-    consume the key; when the branch does not emit it, it stays in unmapped.
+  reason: Integer identity (NAN-5073), checked at the exact emitted path, so a coincidentally equal value
+    elsewhere in the event (severity_id, activity_id, another port) cannot consume the key; when the branch
+    does not emit it, it stays in unmapped.
 - source: dest_port
   kind: scale
   factor: 1
   target: dst_endpoint.port
-  reason: Integer identity (NAN-5073), checked at the exact emitted path, so a coincidentally
-    equal value elsewhere in the event (severity_id, activity_id, another port) cannot
-    consume the key; when the branch does not emit it, it stays in unmapped.
-- source: dst_port
-  kind: scale
-  factor: 1
-  target: dst_endpoint.port
-  reason: Integer identity (NAN-5073), checked at the exact emitted path, so a coincidentally
-    equal value elsewhere in the event (severity_id, activity_id, another port) cannot
-    consume the key; when the branch does not emit it, it stays in unmapped.
-- source: destination_port
-  kind: scale
-  factor: 1
-  target: dst_endpoint.port
-  reason: Integer identity (NAN-5073), checked at the exact emitted path, so a coincidentally
-    equal value elsewhere in the event (severity_id, activity_id, another port) cannot
-    consume the key; when the branch does not emit it, it stays in unmapped.
-consumed_candidates:
-- cmdline
-- command_line
-- domain
-- event_code
-- image
-- message
-- msg
-- process_name
-- protocol
-- referer
-- referrer
-- user_agent
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+  reason: Integer identity (NAN-5073), checked at the exact emitted path, so a coincidentally equal value
+    elsewhere in the event (severity_id, activity_id, another port) cannot consume the key; when the branch
+    does not emit it, it stays in unmapped.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  message:
+  - status_detail
+  process_name:
+  - actor.app_name
+  - actor.process.name
+  referer:
+  - http_request.referrer
+  user_agent:
+  - http_request.user_agent

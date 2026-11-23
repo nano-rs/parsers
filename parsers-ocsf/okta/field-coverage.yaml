@@ -1,13 +1,5 @@
 source: json
 transforms:
-- source: outcome.result
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: severity
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
 - source: published
   kind: epoch_ms
   target: time
@@ -37,67 +29,46 @@ transforms:
     error: 4
     critical: 5
     fatal: 6
-  reason: Named vendor outcome/protocol/severity normalized by the existing mapping;
-    consume only when the expected ID is emitted.
-- source: debugContext.debugData.factorResult
-  kind: enum
-  target: status
-  values:
-    success: Success
-  reason: Parser normalizes the caption case; verify the emitted caption.
-consumed_candidates:
-- actor
-- actor.alternateId
-- actor.displayName
-- actor.id
-- actor.type
-- authenticationContext
-- authenticationContext.authenticationProvider
-- authenticationContext.credentialProvider
-- authenticationContext.credentialType
-- authenticationContext.externalSessionId
-- authenticationContext.interface
-- client
-- client.device
-- client.geographicalContext
-- client.geographicalContext.city
-- client.geographicalContext.country
-- client.geographicalContext.state
-- client.ipAddress
-- client.userAgent
-- client.userAgent.browser
-- client.userAgent.os
-- client.userAgent.rawUserAgent
-- client.zone
-- debugContext.debugData
-- debugContext.debugData.behaviors
-- debugContext.debugData.factor
-- debugContext.debugData.factorResult
-- debugContext.debugData.policyType
-- debugContext.debugData.requestUri
-- debugContext.debugData.risk
-- debugContext.debugData.rule
-- debugContext.debugData.threatSuspected
-- displayMessage
-- eventType
-- legacyEventType
-- outcome
-- outcome.reason
-- outcome.result
-- published
-- request.ipChain
-- securityContext
-- securityContext.asNumber
-- securityContext.asOrg
-- securityContext.domain
-- securityContext.isProxy
-- securityContext.isp
-- severity
-- target
-- transaction
-- transaction.id
-- transaction.type
-- uuid
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+  reason: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when
+    the expected ID is emitted.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  actor.alternateId:
+  - actor.user.email_addr
+  - actor.user.name
+  - user.email_addr
+  - user.name
+  actor.id:
+  - actor.user.uid
+  - user.uid
+  actor.type:
+  - actor.user.type
+  - user.type
+  authenticationContext.credentialType:
+  - auth_protocol
+  authenticationContext.externalSessionId:
+  - session.uid
+  client.ipAddress:
+  - src_endpoint.ip
+  client.userAgent.rawUserAgent:
+  - http_request.user_agent
+  displayMessage:
+  - message
+  eventType:
+  - api.operation
+  - metadata.event_code
+  outcome.reason:
+  - status_detail
+  securityContext.asNumber:
+  - src_endpoint.autonomous_system.number
+  securityContext.asOrg:
+  - src_endpoint.autonomous_system.name
+  securityContext.isp:
+  - src_endpoint.isp
+  transaction.id:
+  - metadata.correlation_uid
+  uuid:
+  - metadata.original_event_uid
+  - metadata.uid

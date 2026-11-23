@@ -15,7 +15,8 @@ transforms:
     oidc: 4
     saml: 5
     github: 6
-  reason: The SSO connector type normalized to the OCSF auth protocol; consume only when the expected ID is emitted.
+  reason: The SSO connector type normalized to the OCSF auth protocol; consume only when the expected
+    ID is emitted.
 - source: verb
   kind: enum
   target: activity_id
@@ -53,7 +54,8 @@ transforms:
     '16': 5
     '17': 2
     '18': 1
-  reason: The scp direction or Teleport SFTPAction number drives the File System Activity; consume only when that activity is emitted.
+  reason: The scp direction or Teleport SFTPAction number drives the File System Activity; consume only
+    when that activity is emitted.
 - source: success
   kind: enum
   target: status_id
@@ -61,51 +63,100 @@ transforms:
     'true': 1
     'false': 2
   reason: The success flag is the OCSF status; consume only when the expected ID is emitted.
-consumed_candidates:
-- addr.local
-- addr.remote
-- argv
-- attributes.email
-- attributes.groups
-- cert_type
-- cluster_name
-- code
-- command
-- connector
-- db_service
-- db_user
-- error
-- event
-- exitCode
-- exitError
-- id
-- identity.user
-- kubernetes_cluster
-- login
-- message
-- name
-- path
-- pid
-- ppid
-- program
-- proto
-- request_path
-- resource_kind
-- resource_name
-- resource_namespace
-- response_code
-- return_code
-- roles
-- server_addr
-- server_hostname
-- server_id
-- sid
-- state
-- target_path
-- uid
-- updated_by
-- user
-- app_name
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  addr~1local:
+  - dst_endpoint.ip
+  addr~1remote:
+  - src_endpoint.ip
+  attributes.email:
+  - user.email_addr
+  attributes.groups:
+  - user.groups.name
+  cert_type:
+  - api.request.flags
+  cluster_name:
+  - metadata.log_provider
+  - service.name
+  code:
+  - metadata.event_code
+  command:
+  - process.cmd_line
+  connector:
+  - user.domain
+  db_service:
+  - service.name
+  db_user:
+  - user.name
+  error:
+  - status_detail
+  event:
+  - api.operation
+  - message
+  exitCode:
+  - exit_code
+  exitError:
+  - status_detail
+  id:
+  - resources.uid
+  identity.user:
+  - actor.user.name
+  kubernetes_cluster:
+  - device.name
+  login:
+  - actor.user.account.name
+  - process.user.name
+  - user.name
+  message:
+  - message
+  name:
+  - entity.name
+  - user.name
+  path:
+  - file.path
+  - process.file.path
+  pid:
+  - process.pid
+  ppid:
+  - process.parent_process.pid
+  program:
+  - process.name
+  proto:
+  - api.service.name
+  request_path:
+  - http_request.url.path
+  resource_kind:
+  - resources.type
+  resource_name:
+  - resources.name
+  resource_namespace:
+  - resources.namespace
+  response_code:
+  - http_response.code
+  return_code:
+  - exit_code
+  roles:
+  - privileges
+  server_hostname:
+  - device.hostname
+  - dst_endpoint.hostname
+  server_id:
+  - device.uid
+  - dst_endpoint.uid
+  sid:
+  - actor.session.uid
+  - metadata.correlation_uid
+  - process.session.uid
+  - session.uid
+  state:
+  - status_code
+  uid:
+  - api.request.uid
+  - metadata.uid
+  updated_by:
+  - actor.user.name
+  user:
+  - actor.user.name
+  - user.name

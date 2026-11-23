@@ -4,10 +4,6 @@ transforms:
   kind: epoch_ms
   target: time
   reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-- source: receiveTimestamp
-  kind: epoch_ms
-  target: time
-  reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
 - source: severity
   kind: enum
   target: severity_id
@@ -23,38 +19,44 @@ transforms:
     error: 4
     critical: 5
     fatal: 6
-  reason: Named vendor outcome/protocol/severity normalized by the existing mapping;
-    consume only when the expected ID is emitted.
-consumed_candidates:
-- insertId
-- logName
-- protoPayload
-- protoPayload.authenticationInfo
-- protoPayload.authenticationInfo.oauthInfo.oauthClientId
-- protoPayload.authenticationInfo.principalEmail
-- protoPayload.authenticationInfo.principalSubject
-- protoPayload.authorizationInfo
-- protoPayload.methodName
-- protoPayload.request
-- protoPayload.requestMetadata
-- protoPayload.requestMetadata.callerIp
-- protoPayload.requestMetadata.callerSuppliedUserAgent
-- protoPayload.resourceName
-- protoPayload.response
-- protoPayload.serviceData
-- protoPayload.serviceData.policyDelta.bindingDeltas
-- protoPayload.serviceName
-- protoPayload.status
-- protoPayload.status.code
-- protoPayload.status.message
-- receiveTimestamp
-- resource
-- resource.labels
-- resource.labels.project_id
-- resource.labels.zone
-- resource.type
-- severity
-- timestamp
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+  reason: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when
+    the expected ID is emitted.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  insertId:
+  - api.request.uid
+  - metadata.uid
+  logName:
+  - metadata.log_name
+  protoPayload.authenticationInfo.principalEmail:
+  - actor.user.email_addr
+  - actor.user.name
+  - actor.user.uid
+  protoPayload.methodName:
+  - api.operation
+  protoPayload.requestMetadata.callerIp:
+  - src_endpoint.hostname
+  - src_endpoint.ip
+  protoPayload.requestMetadata.callerSuppliedUserAgent:
+  - http_request.user_agent
+  protoPayload.resourceName:
+  - resources.name
+  - resources.uid
+  protoPayload.status.code:
+  - status_code
+  protoPayload.status.message:
+  - api.response.message
+  - status_detail
+  resource.labels.project_id:
+  - cloud.account.name
+  - cloud.account.uid
+  - cloud.project_uid
+  - resources.namespace
+  resource.labels.zone:
+  - cloud.region
+  - cloud.zone
+  - resources.zone
+  resource.type:
+  - resources.type

@@ -1,22 +1,42 @@
 source: text
+probe:
+  mode: before
+  anchor: </EventData>
+  require: </EventData>
+  text: <Data Name="ResidualProbe">nan2421-text-unknown</Data><Data Name="Password">nan2421-secret</Data>
+  source: event_data.ResidualProbe
 transforms:
 - source: event_data.SubjectUserName
   kind: lowercase
+  target: actor.user.name
+  reason: Parser lowercases this Windows identity field when emitted.
+- source: event_data.SubjectUserName
+  kind: lowercase
+  target: user.name
   reason: Parser lowercases this Windows identity field when emitted.
 - source: event_data.SubjectDomainName
   kind: lowercase
+  target: actor.user.domain
+  reason: Parser lowercases this Windows identity field when emitted.
+- source: event_data.SubjectDomainName
+  kind: lowercase
+  target: user.domain
   reason: Parser lowercases this Windows identity field when emitted.
 - source: event_data.TargetUserName
   kind: lowercase
+  target: group.name
+  reason: Parser lowercases this Windows identity field when emitted.
+- source: event_data.TargetUserName
+  kind: lowercase
+  target: user.name
   reason: Parser lowercases this Windows identity field when emitted.
 - source: event_data.TargetDomainName
   kind: lowercase
+  target: group.domain
   reason: Parser lowercases this Windows identity field when emitted.
-- source: event_data.UserName
+- source: event_data.TargetDomainName
   kind: lowercase
-  reason: Parser lowercases this Windows identity field when emitted.
-- source: event_data.DomainName
-  kind: lowercase
+  target: user.domain
   reason: Parser lowercases this Windows identity field when emitted.
 - source: system.TimeCreated.@SystemTime
   kind: epoch_ms
@@ -24,96 +44,111 @@ transforms:
   reason: XML system clock converted to event milliseconds.
 - source: system.Computer
   kind: lowercase
-  reason: Case normalization already performed by the parser; observed at device.hostname,
-    and checked against the emitted branch.
+  target: device.hostname
+  reason: Case normalization already performed by the parser; observed at device.hostname, and checked
+    against the emitted branch.
+- source: system.Computer
+  kind: lowercase
+  target: dst_endpoint.hostname
+  reason: Case normalization already performed by the parser; observed at device.hostname, and checked
+    against the emitted branch.
 - source: event_data.WorkstationName
   kind: lowercase
-  reason: Case normalization already performed by the parser; observed at src_endpoint.hostname,
-    and checked against the emitted branch.
+  target: src_endpoint.hostname
+  reason: Case normalization already performed by the parser; observed at src_endpoint.hostname, and checked
+    against the emitted branch.
 - source: event_data.ProcessId
   kind: hex
   target: actor.process.pid
-  reason: Parsed hexadecimal process ID or access mask is represented as an integer
-    at this destination.
+  reason: Parsed hexadecimal process ID or access mask is represented as an integer at this destination.
 - source: event_data.NewProcessId
   kind: hex
   target: process.pid
-  reason: Parsed hexadecimal process ID or access mask is represented as an integer
-    at this destination.
+  reason: Parsed hexadecimal process ID or access mask is represented as an integer at this destination.
 - source: event_data.ProcessId
   kind: hex
   target: process.pid
-  reason: Parsed hexadecimal process ID or access mask is represented as an integer
-    at this destination.
+  reason: Parsed hexadecimal process ID or access mask is represented as an integer at this destination.
 - source: event_data.MemberName
   kind: lowercase
-  reason: Case normalization already performed by the parser; observed at user.name,
-    and checked against the emitted branch.
-probe:
-  mode: before
-  anchor: </EventData>
-  require: </EventData>
-  text: <Data Name="ResidualProbe">nan2421-text-unknown</Data><Data Name="Password">nan2421-secret</Data>
-  source: event_data.ResidualProbe
-consumed_candidates:
-- event_data.AccessMask
-- event_data.AccountName
-- event_data.AuthenticationPackage
-- event_data.AuthenticationPackageName
-- event_data.ClientAddress
-- event_data.ClientPort
-- event_data.CommandLine
-- event_data.DomainName
-- event_data.FailureReason
-- event_data.ImagePath
-- event_data.IpAddress
-- event_data.IpPort
-- event_data.LogonType
-- event_data.MemberName
-- event_data.MemberSid
-- event_data.NewProcessId
-- event_data.NewProcessName
-- event_data.NewValue
-- event_data.ObjectName
-- event_data.ObjectValueName
-- event_data.OperationType
-- event_data.ParentProcessName
-- event_data.Path
-- event_data.PrivilegeList
-- event_data.ProcessId
-- event_data.ProcessName
-- event_data.RelativeTargetName
-- event_data.ScriptBlockId
-- event_data.ScriptBlockText
-- event_data.ServiceAccount
-- event_data.ServiceFileName
-- event_data.ServiceName
-- event_data.ShareLocalPath
-- event_data.ShareName
-- event_data.Status
-- event_data.SubStatus
-- event_data.SubjectDomainName
-- event_data.SubjectLogonId
-- event_data.SubjectUserName
-- event_data.SubjectUserSid
-- event_data.TargetDomainName
-- event_data.TargetLogonId
-- event_data.TargetSid
-- event_data.TargetUserName
-- event_data.TargetUserSid
-- event_data.TaskName
-- event_data.UserName
-- event_data.UserSid
-- event_data.WorkstationName
-- system.Channel
-- system.Computer
-- system.EventID
-- system.EventRecordID
-- system.Level
-- system.Provider
-- system.Provider.@Name
-- system.TimeCreated
-- system.TimeCreated.@SystemTime
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+  target: user.name
+  reason: Case normalization already performed by the parser; observed at user.name, and checked against
+    the emitted branch.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  event_data.AccountName:
+  - win_service.service_start_name
+  event_data.AuthenticationPackageName:
+  - auth_protocol
+  event_data.CommandLine:
+  - process.cmd_line
+  event_data.FailureReason:
+  - status_detail
+  event_data.ImagePath:
+  - win_service.cmd_line
+  event_data.IpAddress:
+  - src_endpoint.ip
+  event_data.MemberSid:
+  - user.uid
+  event_data.NewProcessName:
+  - process.file.path
+  event_data.NewValue:
+  - reg_value.data.string
+  event_data.ObjectName:
+  - file.path
+  event_data.ObjectValueName:
+  - reg_value.name
+  event_data.ParentProcessName:
+  - actor.process.file.path
+  event_data.Path:
+  - script.file.path
+  event_data.ProcessName:
+  - actor.process.name
+  - process.file.path
+  event_data.ScriptBlockId:
+  - script.uid
+  event_data.ScriptBlockText:
+  - message
+  - script.script_content.value
+  event_data.ServiceAccount:
+  - win_service.service_start_name
+  event_data.ServiceFileName:
+  - win_service.cmd_line
+  event_data.ServiceName:
+  - win_service.name
+  event_data.ShareLocalPath:
+  - file.name
+  - file.path
+  event_data.Status:
+  - status_code
+  event_data.SubjectLogonId:
+  - session.uid
+  event_data.SubjectUserName:
+  - actor.user.name
+  - user.name
+  event_data.SubjectUserSid:
+  - actor.user.uid
+  - user.uid
+  event_data.TargetLogonId:
+  - session.uid
+  event_data.TargetSid:
+  - group.uid
+  - user.uid
+  event_data.TargetUserName:
+  - user.name
+  event_data.TargetUserSid:
+  - user.uid
+  event_data.TaskName:
+  - job.file.path
+  system.Channel:
+  - log_name
+  - metadata.log_name
+  system.EventID:
+  - metadata.event_code
+  system.EventRecordID:
+  - metadata.original_event_uid
+  system.Provider.@Name:
+  - log_provider
+  - metadata.log_provider

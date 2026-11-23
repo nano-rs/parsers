@@ -2,54 +2,72 @@ source: json
 transforms:
 - source: TimeGenerated
   kind: epoch_ms
+  target: finding_info.created_time
+  reason: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created
+    or modified).
+- source: TimeGenerated
+  kind: epoch_ms
+  target: time
   reason: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created
     or modified).
 - source: StartTimeUtc
   kind: epoch_ms
+  target: finding_info.first_seen_time
   reason: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created
     or modified).
 - source: EndTimeUtc
   kind: epoch_ms
+  target: finding_info.last_seen_time
   reason: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created
     or modified).
 - source: StartTime
   kind: epoch_ms
+  target: finding_info.first_seen_time
   reason: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created
     or modified).
 - source: EndTime
   kind: epoch_ms
-  reason: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created
-    or modified).
-- source: ProcessingEndTime
-  kind: epoch_ms
+  target: finding_info.last_seen_time
   reason: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created
     or modified).
 - source: Properties.TimeGenerated
   kind: epoch_ms
+  target: time
   reason: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created
     or modified).
 - source: properties.timeGeneratedUtc
   kind: epoch_ms
+  target: finding_info.created_time
+  reason: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created
+    or modified).
+- source: properties.timeGeneratedUtc
+  kind: epoch_ms
+  target: time
   reason: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created
     or modified).
 - source: properties.startTimeUtc
   kind: epoch_ms
+  target: finding_info.first_seen_time
   reason: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created
     or modified).
 - source: properties.endTimeUtc
   kind: epoch_ms
-  reason: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created
-    or modified).
-- source: properties.processingEndTimeUtc
-  kind: epoch_ms
+  target: finding_info.last_seen_time
   reason: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created
     or modified).
 - source: properties.status.statusChangeDate
   kind: epoch_ms
+  target: finding_info.modified_time
+  reason: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created
+    or modified).
+- source: properties.status.statusChangeDate
+  kind: epoch_ms
+  target: time
   reason: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created
     or modified).
 - source: properties.status.firstEvaluationDate
   kind: epoch_ms
+  target: finding_info.created_time
   reason: ISO 8601 clock converted to an emitted millisecond time (event time, first or last seen, created
     or modified).
 - source: Severity
@@ -60,6 +78,7 @@ transforms:
     medium: 3
     high: 4
     critical: 5
+  target: severity_id
   reason: Defender severity normalized to the OCSF severity_id; consume only when that ID is emitted.
 - source: AlertSeverity
   kind: enum
@@ -69,6 +88,7 @@ transforms:
     medium: 3
     high: 4
     critical: 5
+  target: severity_id
   reason: Defender severity normalized to the OCSF severity_id; consume only when that ID is emitted.
 - source: properties.severity
   kind: enum
@@ -78,6 +98,7 @@ transforms:
     medium: 3
     high: 4
     critical: 5
+  target: severity_id
   reason: Defender severity normalized to the OCSF severity_id; consume only when that ID is emitted.
 - source: properties.metadata.severity
   kind: enum
@@ -87,6 +108,7 @@ transforms:
     medium: 3
     high: 4
     critical: 5
+  target: severity_id
   reason: Defender severity normalized to the OCSF severity_id; consume only when that ID is emitted.
 - source: Properties.Status.Severity
   kind: enum
@@ -96,90 +118,128 @@ transforms:
     medium: 3
     high: 4
     critical: 5
+  target: severity_id
   reason: Defender severity normalized to the OCSF severity_id; consume only when that ID is emitted.
-consumed_candidates:
-- AlertDisplayName
-- AlertLink
-- AlertName
-- AlertSeverity
-- AlertType
-- AlertUri
-- AzureResourceId
-- CompromisedEntity
-- ConfidenceLevel
-- Description
-- DisplayName
-- EndTime
-- EndTimeUtc
-- Id
-- Intent
-- IsIncident
-- Name
-- ProcessingEndTime
-- ProductComponentName
-- ProductName
-- Properties.Category
-- Properties.Description
-- Properties.DisplayName
-- Properties.Impact
-- Properties.Remediation
-- Properties.ResourceDetails.Id
-- Properties.Status.Code
-- Properties.Status.Severity
-- Properties.TimeGenerated
-- RemediationSteps
-- ResourceId
-- Severity
-- StartTime
-- StartTimeUtc
-- Status
-- SystemAlertId
-- Tactics
-- Techniques
-- TenantId
-- TimeGenerated
-- Type
-- VendorName
-- id
-- name
-- properties.alertDisplayName
-- properties.alertType
-- properties.alertUri
-- properties.assessmentDetailsLink
-- properties.compromisedEntity
-- properties.description
-- properties.displayName
-- properties.endTimeUtc
-- properties.intent
-- properties.isIncident
-- properties.links.azurePortal
-- properties.metadata.categories
-- properties.metadata.description
-- properties.metadata.displayName
-- properties.metadata.policyDefinitionId
-- properties.metadata.remediationDescription
-- properties.metadata.severity
-- properties.processingEndTimeUtc
-- properties.productComponentName
-- properties.productName
-- properties.remediationSteps
-- properties.resourceDetails.Id
-- properties.resourceDetails.ResourceName
-- properties.resourceDetails.ResourceType
-- properties.resourceDetails.id
-- properties.severity
-- properties.startTimeUtc
-- properties.state
-- properties.status
-- properties.status.code
-- properties.status.description
-- properties.status.firstEvaluationDate
-- properties.status.statusChangeDate
-- properties.systemAlertId
-- properties.techniques
-- properties.timeGeneratedUtc
-- properties.vendorName
-- tenantId
-- type
-consumed_reason: Only source keys read by this parser are eligible for exact-value consumption; the selected
-  branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  AlertDisplayName:
+  - finding_info.analytic.name
+  - finding_info.title
+  - message
+  AlertName:
+  - finding_info.analytic.name
+  - finding_info.title
+  - message
+  AlertType:
+  - finding_info.analytic.uid
+  - finding_info.types
+  AlertUri:
+  - finding_info.src_url
+  AzureResourceId:
+  - resources.uid
+  CompromisedEntity:
+  - resources.name
+  Description:
+  - finding_info.desc
+  Id:
+  - finding_info.uid
+  Name:
+  - compliance.control
+  ProductComponentName:
+  - finding_info.product.name
+  ProductName:
+  - metadata.product.name
+  Properties.Description:
+  - finding_info.desc
+  Properties.DisplayName:
+  - finding_info.title
+  - message
+  Properties.Remediation:
+  - remediation.desc
+  Properties.ResourceDetails.Id:
+  - resources.uid
+  Properties.Status.Code:
+  - compliance.status_code
+  RemediationSteps:
+  - remediation.desc
+  ResourceId:
+  - resources.uid
+  SystemAlertId:
+  - finding_info.uid
+  - metadata.original_event_uid
+  - metadata.uid
+  Tactics:
+  - finding_info.attacks.tactic.name
+  Techniques:
+  - finding_info.attacks.technique.uid
+  TenantId:
+  - cloud.org.uid
+  VendorName:
+  - metadata.product.vendor_name
+  id:
+  - finding_info.uid
+  name:
+  - compliance.control
+  properties.alertDisplayName:
+  - finding_info.analytic.name
+  - finding_info.title
+  - message
+  properties.alertType:
+  - finding_info.analytic.uid
+  - finding_info.types
+  properties.alertUri:
+  - finding_info.src_url
+  properties.assessmentDetailsLink:
+  - finding_info.src_url
+  properties.compromisedEntity:
+  - resources.name
+  properties.description:
+  - finding_info.desc
+  - finding_info.title
+  - message
+  properties.displayName:
+  - finding_info.analytic.name
+  - finding_info.title
+  - message
+  properties.intent:
+  - finding_info.attacks.tactic.name
+  properties.links.azurePortal:
+  - finding_info.src_url
+  properties.metadata.categories:
+  - compliance.category
+  properties.metadata.description:
+  - finding_info.desc
+  properties.metadata.policyDefinitionId:
+  - finding_info.analytic.uid
+  properties.metadata.remediationDescription:
+  - remediation.desc
+  properties.productComponentName:
+  - finding_info.product.name
+  properties.productName:
+  - metadata.product.name
+  properties.resourceDetails.Id:
+  - resources.uid
+  properties.resourceDetails.ResourceName:
+  - resources.name
+  properties.resourceDetails.ResourceType:
+  - resources.type
+  properties.resourceDetails.id:
+  - resources.uid
+  properties.state:
+  - compliance.status_code
+  properties.status.code:
+  - compliance.status_code
+  properties.status.description:
+  - compliance.status_detail
+  properties.systemAlertId:
+  - finding_info.uid
+  - metadata.original_event_uid
+  - metadata.uid
+  properties.techniques:
+  - finding_info.attacks.technique.uid
+  properties.vendorName:
+  - metadata.product.vendor_name
+  tenantId:
+  - cloud.org.uid

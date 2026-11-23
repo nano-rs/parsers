@@ -1,21 +1,5 @@
 source: json
 transforms:
-- source: ResultStatus
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: Direction
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: Action
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: ItemType
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
 - source: CreationTime
   kind: epoch_ms
   target: time
@@ -35,65 +19,63 @@ transforms:
   kind: epoch_ms
   target: time
   format: '%Y-%m-%dT%H:%M:%S'
-  reason: M365 also accepts zone-less ISO clocks using the parser runtime timezone;
-    compare the emitted milliseconds.
-consumed_candidates:
-- Action
-- ActorIpAddress
-- AzureActiveDirectoryEventType
-- ChannelName
-- ChatName
-- ClientAppId
-- ClientIP
-- ClientIPAddress
-- ClientInfoString
-- ClientProcessName
-- CommunicationType
-- ConnectorId
-- CreationTime
-- Direction
-- Directionality
-- EventSource
-- ExchangeMetaData
-- ExtendedProperties
-- ExternalAccess
-- Folders
-- FromIP
-- Id
-- IncidentId
-- ItemType
-- LogonError
-- MailboxGuid
-- MailboxOwnerUPN
-- MessageId
-- MessageTraceId
-- MessageType
-- ModifiedProperties
-- ObjectId
-- Operation
-- OrganizationId
-- PolicyDetails
-- RecipientAddress
-- RecordType
-- ResultStatus
-- SCL
-- SenderAddress
-- SensitiveInfoDetections
-- SessionId
-- SiteUrl
-- Size
-- SourceFileExtension
-- SourceFileName
-- SourceRelativeUrl
-- Subject
-- Target
-- TeamName
-- ToIP
-- UserAgent
-- UserId
-- UserKey
-- UserType
-- Workload
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+  reason: M365 also accepts zone-less ISO clocks using the parser runtime timezone; compare the emitted
+    milliseconds.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  ClientIP:
+  - src_endpoint.ip
+  FromIP:
+  - src_endpoint.ip
+  Id:
+  - metadata.original_event_uid
+  - metadata.uid
+  LogonError:
+  - status_detail
+  MessageId:
+  - email.message_uid
+  MessageTraceId:
+  - message_trace_uid
+  ObjectId:
+  - file.path
+  - resources.name
+  - resources.uid
+  Operation:
+  - api.operation
+  - message
+  - metadata.event_code
+  OrganizationId:
+  - cloud.account.uid
+  - metadata.tenant_uid
+  RecipientAddress:
+  - email.to
+  SenderAddress:
+  - email.from
+  SessionId:
+  - session.uid
+  Size:
+  - email.size
+  SourceFileExtension:
+  - file.ext
+  SourceFileName:
+  - file.name
+  Subject:
+  - email.subject
+  ToIP:
+  - dst_endpoint.ip
+  UserAgent:
+  - http_request.user_agent
+  UserId:
+  - actor.user.email_addr
+  - actor.user.name
+  - user.email_addr
+  - user.name
+  UserKey:
+  - actor.user.uid
+  - user.uid
+  Workload:
+  - api.service.name
+  - cloud.account.name
+  - resources.type

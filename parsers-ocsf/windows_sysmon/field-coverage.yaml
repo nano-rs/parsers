@@ -1,53 +1,36 @@
 source: json
+reference: windows_sysmon
+reference_reason: Reuse v1.2 branch consumed-key lists; the independent Sysmon mappings checker verifies
+  transformed destinations, including hashes, users, enums and hexadecimal masks.
 transforms:
 - source: computer
   kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: event_data.Signed
+  target: device.hostname
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
+- source: computer
   kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: event_data.GrantedAccess
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: event_data.Protocol
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
+  target: src_endpoint.hostname
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
 - source: event_data.SourceIp
   kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
+  target: src_endpoint.ip
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
 - source: event_data.SourceHostname
   kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
+  target: src_endpoint.hostname
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
 - source: event_data.DestinationIp
   kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
+  target: dst_endpoint.ip
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
 - source: event_data.DestinationHostname
   kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
+  target: dst_endpoint.hostname
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
 - source: event_data.QueryName
   kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: event_data.Initiated
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: channel
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
-- source: provider_name
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
+  target: query.hostname
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
 - source: timestamp
   kind: epoch_ms
   target: time
@@ -62,12 +45,8 @@ transforms:
   reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
 - source: event_data.CreationUtcTime
   kind: epoch_ms
-  target: time
+  target: file.created_time
   reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
-- source: host
-  kind: lowercase
-  reason: Case normalization already performed by the parser; observed at device.hostname,
-    and checked against the emitted branch.
 - source: event_data.Protocol
   kind: enum
   target: connection_info.protocol_num
@@ -77,72 +56,102 @@ transforms:
     icmp: 1
     icmpv6: 58
     ipv6-icmp: 58
-  reason: Named vendor outcome/protocol/severity normalized by the existing mapping;
-    consume only when the expected ID is emitted.
+  reason: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when
+    the expected ID is emitted.
 - source: event_data.GrantedAccess
   kind: hex
   target: actual_permissions
-  reason: Parsed hexadecimal process ID or access mask is represented as an integer
-    at this destination.
-reference: windows_sysmon
-reference_reason: Reuse v1.2 branch consumed-key lists; the independent Sysmon mappings
-  checker verifies transformed destinations, including hashes, users, enums and hexadecimal
-  masks.
-consumed_candidates:
-- channel
-- computer
-- event_data
-- event_data.CommandLine
-- event_data.CreationUtcTime
-- event_data.DestinationHostname
-- event_data.DestinationIp
-- event_data.DestinationPort
-- event_data.DestinationPortName
-- event_data.Details
-- event_data.EventType
-- event_data.GrantedAccess
-- event_data.Hashes
-- event_data.Image
-- event_data.ImageLoaded
-- event_data.Initiated
-- event_data.IntegrityLevel
-- event_data.ParentCommandLine
-- event_data.ParentImage
-- event_data.ParentProcessGuid
-- event_data.ParentProcessId
-- event_data.ParentUser
-- event_data.ProcessGuid
-- event_data.ProcessId
-- event_data.Protocol
-- event_data.QueryName
-- event_data.QueryResults
-- event_data.QueryStatus
-- event_data.Signature
-- event_data.SignatureStatus
-- event_data.Signed
-- event_data.SourceHostname
-- event_data.SourceImage
-- event_data.SourceIp
-- event_data.SourcePort
-- event_data.SourcePortName
-- event_data.SourceProcessGUID
-- event_data.SourceProcessId
-- event_data.SourceThreadId
-- event_data.SourceUser
-- event_data.TargetFilename
-- event_data.TargetImage
-- event_data.TargetObject
-- event_data.TargetProcessGUID
-- event_data.TargetProcessId
-- event_data.TargetUser
-- event_data.User
-- event_data.UtcTime
-- event_id
-- host
-- provider_name
-- record_id
-- time_created
-- timestamp
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+  reason: Parsed hexadecimal process ID or access mask is represented as an integer at this destination.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  channel:
+  - metadata.log_name
+  computer:
+  - device.hostname
+  event_data.CommandLine:
+  - actor.process.cmd_line
+  - process.cmd_line
+  event_data.DestinationHostname:
+  - dst_endpoint.hostname
+  event_data.DestinationIp:
+  - dst_endpoint.ip
+  event_data.DestinationPort:
+  - dst_endpoint.port
+  event_data.DestinationPortName:
+  - dst_endpoint.svc_name
+  event_data.Details:
+  - reg_value.data
+  event_data.Image:
+  - actor.process.file.path
+  - process.file.path
+  event_data.ImageLoaded:
+  - module.file.path
+  event_data.IntegrityLevel:
+  - process.integrity
+  event_data.ParentCommandLine:
+  - actor.process.cmd_line
+  - actor.process.parent_process.cmd_line
+  event_data.ParentImage:
+  - actor.process.file.path
+  - actor.process.parent_process.file.path
+  event_data.ParentProcessGuid:
+  - actor.process.parent_process.uid
+  - actor.process.uid
+  event_data.ParentProcessId:
+  - actor.process.parent_process.pid
+  - actor.process.pid
+  event_data.ParentUser:
+  - actor.process.parent_process.user.name
+  - actor.process.user.name
+  event_data.ProcessGuid:
+  - actor.process.uid
+  - process.uid
+  event_data.ProcessId:
+  - actor.process.pid
+  - process.pid
+  event_data.QueryName:
+  - query.hostname
+  event_data.QueryResults:
+  - answers.rdata
+  event_data.Signature:
+  - module.file.signatures.developer_uid
+  event_data.SignatureStatus:
+  - module.file.signatures.state
+  event_data.SourceImage:
+  - actor.process.file.path
+  event_data.SourceIp:
+  - src_endpoint.ip
+  event_data.SourcePort:
+  - src_endpoint.port
+  event_data.SourcePortName:
+  - src_endpoint.svc_name
+  event_data.SourceProcessGUID:
+  - actor.process.uid
+  event_data.SourceProcessId:
+  - actor.process.pid
+  event_data.SourceThreadId:
+  - actor.process.ptid
+  event_data.SourceUser:
+  - actor.process.user.name
+  event_data.TargetFilename:
+  - file.path
+  event_data.TargetImage:
+  - process.file.path
+  event_data.TargetObject:
+  - reg_key.path
+  event_data.TargetProcessGUID:
+  - process.uid
+  event_data.TargetProcessId:
+  - process.pid
+  event_data.TargetUser:
+  - process.user.name
+  event_data.User:
+  - actor.user.name
+  event_id:
+  - metadata.event_code
+  provider_name:
+  - metadata.log_provider
+  record_id:
+  - metadata.original_event_uid

@@ -1,13 +1,13 @@
 source: json
 transforms:
-- source: properties.Action
-  kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
 - source: properties.Protocol
   kind: lowercase
-  reason: Parser lowercases this source value; consume only when the normalized value
-    is emitted.
+  target: app_protocol_name
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
+- source: properties.Protocol
+  kind: lowercase
+  target: connection_info.protocol_name
+  reason: Parser lowercases this source value; consume only when the normalized value is emitted.
 - source: time
   kind: epoch_ms
   target: time
@@ -34,47 +34,44 @@ transforms:
     dropped: 2
     log: 3
     observed: 3
-  reason: Named vendor outcome/protocol/severity normalized by the existing mapping;
-    consume only when the expected ID is emitted.
-- source: properties.ResponseCode
-  kind: enum
-  target: rcode
-  values:
-    noerror: NoError
-  reason: Parser normalizes the caption case; verify the emitted caption.
-consumed_candidates:
-- category
-- operationName
-- properties
-- properties.Action
-- properties.DestinationIP
-- properties.DestinationPort
-- properties.Error
-- properties.FQDN
-- properties.Fqdn
-- properties.Policy
-- properties.Protocol
-- properties.QueryClass
-- properties.QueryId
-- properties.QueryName
-- properties.QueryType
-- properties.Reason
-- properties.RequestSize
-- properties.ResponseCode
-- properties.ResponseFlags
-- properties.ResponseSize
-- properties.Rule
-- properties.RuleCollection
-- properties.RuleCollectionGroup
-- properties.SourceIP
-- properties.SourcePort
-- properties.TargetUrl
-- properties.ThreatDescription
-- properties.ThreatIntel
-- properties.WebCategory
-- properties.msg
-- resourceId
-- time
-consumed_reason: Only source keys read by this parser are eligible for exact-value
-  consumption; the selected branch must emit the value. Unknown keys always spill,
-  even when their value equals an OCSF default.
+  reason: Named vendor outcome/protocol/severity normalized by the existing mapping; consume only when
+    the expected ID is emitted.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  category:
+  - firewall_rule.type
+  - metadata.log_source
+  operationName:
+  - metadata.event_code
+  properties.DestinationIP:
+  - dst_endpoint.ip
+  properties.DestinationPort:
+  - dst_endpoint.port
+  properties.Fqdn:
+  - dst_endpoint.hostname
+  properties.Policy:
+  - firewall_rule.version
+  properties.QueryClass:
+  - query.class
+  properties.QueryId:
+  - transaction_id
+  properties.QueryName:
+  - query.hostname
+  properties.QueryType:
+  - query.type
+  properties.RequestSize:
+  - traffic.bytes_out
+  properties.ResponseSize:
+  - traffic.bytes_in
+  properties.Rule:
+  - firewall_rule.name
+  - firewall_rule.uid
+  properties.RuleCollection:
+  - firewall_rule.category
+  - firewall_rule.name
+  properties.SourceIP:
+  - src_endpoint.ip
+  properties.SourcePort:
+  - src_endpoint.port
