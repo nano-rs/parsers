@@ -95,13 +95,44 @@ def mapped_view(output, raw):
     return {k: v for k, v in output.items() if k not in ('unmapped', 'raw_data') and not (k == 'message' and v == raw)}
 
 
-def transformed(rule, value, index):
-    """A rule consumes its source only when the converted value is AT its target."""
+def local_to_utc(ms, setting):
+    """A clock read as UTC (ms) moved to real UTC by a log source timezone
+    setting, as local_clock.vrl does: a fixed +HH:MM offset by arithmetic; an
+    IANA zone with fold=0 (an ambiguous time's first occurrence, a gap time
+    moved forward); anything else (absent, "local", unknown) unchanged."""
+    import datetime as dt
+    import zoneinfo
+    setting = (setting or '').strip() if isinstance(setting, str) else ''
+    m = re.fullmatch(r'([+-])(\d{2}):?(\d{2})', setting)
+    if m:
+        h, mi = int(m.group(2)), int(m.group(3))
+        if h > 14 or mi > 59:
+            return ms
+        return ms - (1 if m.group(1) == '+' else -1) * (h * 3600 + mi * 60) * 1000
+    if not setting or setting.lower() == 'local':
+        return ms
+    try:
+        zone = zoneinfo.ZoneInfo(setting)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError):
+        return ms
+    naive = dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc).replace(tzinfo=None)
+    return int(naive.replace(tzinfo=zone, fold=0).timestamp() * 1000)
+
+
+def transformed(rule, value, index, setting=None):
+    """A rule consumes its source only when the converted value is AT its
+    target. An epoch_ms clock may have been moved to real UTC by the log
+    source's timezone setting (the parser read it without an offset)."""
     want = transform_want(rule, value)
-    return want is not MISSING and at(index, norm_path(rule['target']), want)
+    if want is MISSING:
+        return False
+    target = norm_path(rule['target'])
+    if at(index, target, want):
+        return True
+    return rule['kind'] == 'epoch_ms' and setting is not None and at(index, target, local_to_utc(want, setting))
 
 
-def check(source, output, raw, rules, consumed=(), mappings=None):
+def check(source, output, raw, rules, consumed=(), mappings=None, setting=None):
     """Every source field is consumed by an explicit mapping (its value at one of
     its declared target paths), a transforms rule (its converted value at the
     rule's target) or a reference check, or it is in unmapped unaltered. A value
@@ -117,7 +148,7 @@ def check(source, output, raw, rules, consumed=(), mappings=None):
     fields = list(provenance.esc_flatten(source))
     used = set()
     for key, value in fields:
-        if key in consumed or any(at(index, target, value) for target in mappings.get(key, ())) or any(r['source'] == key and transformed(r, value, index) for r in rules):
+        if key in consumed or any(at(index, target, value) for target in mappings.get(key, ())) or any(r['source'] == key and transformed(r, value, index, setting) for r in rules):
             continue
         if value == raw: continue
         base = '.'.join(snake(provenance.unesc(part)) for part in key.split('.'))
@@ -544,7 +575,9 @@ def run_parser(path, supplied=None, output_dir=None):
                 consumed = []
                 if config.get('reference') == 'windows_sysmon':
                     consumed = reference_consumed(source, output)
-                count += check(source, output, event['message'], rules, consumed, mappings)
+                nano = event.get('nano')
+                setting = nano.get('source_timezone') if isinstance(nano, dict) else None
+                count += check(source, output, event['message'], rules, consumed, mappings, setting)
             except AssertionError as error:
                 raise AssertionError(f'{path.parent.name}/{name}: {error}') from error
             # raw_data, when emitted, is the untouched original (never masked,
