@@ -1,0 +1,61 @@
+source: json
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+transforms:
+- source: recordedAt
+  kind: epoch_ms
+  target: time
+  reason: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+- source: createdAt
+  kind: epoch_ms
+  target: metadata.logged_time
+  reason: Successful ISO timestamp conversion of the log write time in milliseconds.
+- source: result.status
+  kind: enum
+  target: status
+  values:
+    success: Success
+    succeeded: Success
+    failed: Failure
+    failure: Failure
+  reason: PingOne result.status normalized to the OCSF status caption; consume only when the emitted caption
+    matches (a named-failure override keeps it residual).
+mappings:
+  action.description:
+  - message
+  action.type:
+  - api.operation
+  - metadata.event_code
+  actors.client.environment.id:
+  - metadata.tenant_uid
+  actors.client.id:
+  - actor.app_uid
+  - service.uid
+  actors.client.name:
+  - actor.app_name
+  - service.name
+  actors.user.environment.id:
+  - metadata.tenant_uid
+  actors.user.id:
+  - actor.user.uid
+  - user.uid
+  actors.user.name:
+  - actor.user.email_addr
+  - actor.user.name
+  - user.email_addr
+  - user.name
+  correlationId:
+  - metadata.correlation_uid
+  id:
+  - metadata.uid
+  internalCorrelation.sessionId:
+  - session.uid
+  result.description:
+  - status_detail
+  source.ipAddress:
+  - src_endpoint.ip
+  source.userAgent:
+  - http_request.user_agent
+  tags:
+  - metadata.labels

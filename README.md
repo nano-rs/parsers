@@ -60,6 +60,7 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Juniper Junos](parsers-ocsf/juniper_junos) | `juniper_junos` | Juniper | BSD syslog / RFC 5424 structured data | UI_LOGIN / UI_AUTH / UI_LOGOUT, login failures, UI_COMMIT and CLI commands, SNMP link traps. General device logs; SRX flow logs use `juniper_srx` |
 | [SonicWall](parsers-ocsf/sonicwall) | `sonicwall` | SonicWall | key=value syslog | Connections, IPS detection, content filtering, user auth |
 | [Zscaler ZIA](parsers-ocsf/zscaler_zia) | `zscaler_zia` | Zscaler | JSON envelope | Web, firewall, DNS, tunnel, DLP, audit log types |
+| [Zscaler ZPA](parsers-ocsf/zscaler_zpa) | `zscaler_zpa` | Zscaler | JSON (LSS) | Private Access user activity (Network Activity, policy denies), user status and App Connector status (Authentication) |
 | [Broadcom ProxySG](parsers-ocsf/broadcom_proxy) | `broadcom_proxy` | Broadcom | ELFF space-delimited | Web proxy access logs with URL reconstruction |
 | [Cloudflare](parsers-ocsf/cloudflare) | `cloudflare` | Cloudflare | JSON (Logpush) | HTTP requests, firewall events, DNS logs with WAF/bot scoring |
 | [Cloudflare Zero Trust](parsers-ocsf/cloudflare_zero_trust) | `cloudflare_zero_trust` | Cloudflare | JSON (Logpush) | Gateway DNS, Gateway HTTP, Gateway Network, Access requests |
@@ -115,6 +116,9 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Duo Security](parsers-ocsf/duo) | `duo` | Cisco | JSON | Authentication, admin actions, MFA with device/geo context |
 | [Cisco ISE](parsers-ocsf/cisco_ise) | `cisco_ise` | Cisco | Syslog key=value | RADIUS and TACACS+ authentication passed/failed, RADIUS and TACACS+ accounting, TACACS+ command accounting, posture |
 | [Auth0](parsers-ocsf/auth0) | `auth0` | Okta | JSON | 20+ event types: login, signup, MFA, token exchange, management API |
+| [PingOne](parsers-ocsf/pingone) | `pingone` | Ping Identity | JSON | Platform audit activities: access allowed / denied, password and OTP checks, sessions, user, password, role and MFA device changes, groups, configuration API activity |
+| [JumpCloud](parsers-ocsf/jumpcloud) | `jumpcloud` | JumpCloud | JSON | Directory Insights: console, SSO, RADIUS, LDAP and system logins, user / admin lifecycle, lockout, password and TOTP events, groups, admin API activity |
+| [OneLogin](parsers-ocsf/onelogin) | `onelogin` | OneLogin | JSON | Events API: 82 event_type_ids mapped (logins, failures, MFA, logouts, user lifecycle, password, role and privilege changes); other ids kept as Base Event |
 | [1Password](parsers-ocsf/onepassword) | `onepassword` | 1Password | JSON | Sign-in attempts, item usage, vault access events |
 | [CyberArk PAM](parsers-ocsf/cyberark) | `cyberark` | CyberArk | CEF syslog | Vault audit, PSM sessions, privileged access events |
 | [PingFederate](parsers-ocsf/pingfederate) | `pingfederate` | Ping Identity | Pipe-delimited audit.log (documented 15-field pattern) / CEF | Security audit log: SSO, SLO, OAuth, AUTHN_ATTEMPT and session events as Authentication with protocol, partner connection and tracking id |
