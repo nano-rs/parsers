@@ -1,0 +1,19 @@
+# The wrapper's keys (from the mixed-input block) join the parsed line's source
+# fields. A key the line also has, with another value, is kept under
+# `wrapper` (or `wrapper_N` when that name is taken): nothing is dropped.
+__mx_side = {}
+for_each(__mx_wrapper) -> |__mx_wk, __mx_wv| {
+    __mx_have = get(__source_kv, [__mx_wk]) ?? null
+    if __mx_have == null {
+        __source_kv = set!(__source_kv, [__mx_wk], __mx_wv)
+    } else if __mx_have != __mx_wv {
+        __mx_side = set!(__mx_side, [__mx_wk], __mx_wv)
+    }
+}
+if length(__mx_side) > 0 {
+    __mx_slot = "wrapper"
+    for_each(["wrapper", "wrapper_1", "wrapper_2", "wrapper_3"]) -> |_i, __mx_name| {
+        if __mx_slot == "wrapper" && (get(__source_kv, [__mx_slot]) ?? null) != null { __mx_slot = string!(__mx_name) }
+    }
+    __source_kv = set!(__source_kv, [__mx_slot], __mx_side)
+}

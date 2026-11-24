@@ -16,7 +16,9 @@
 #   __mx_raw      the body (raw_data);
 #   __mx_record   the JSON record, or {};
 #   __mx_text     the text line, or "";
-#   __mx_wrapper  a wrapper's other keys (source fields: map or spill them), or {}.
+#   __mx_wrapper  a wrapper's other keys, or {}: after parsing the line, place
+#                 `# NAN mixed input merge` to add them to __source_kv (a key
+#                 the line also has is kept beside it, never overwritten).
 # A record taken from %nano_hec_event is removed from there, so nano does not
 # file its keys a second time.
 __mx_raw = __mx_body
@@ -27,7 +29,13 @@ __mx_json, __mx_json_err = parse_json(__mx_raw)
 if __mx_json_err == null && is_object(__mx_json) {
     __mx_obj = object!(__mx_json)
     __mx_inner = __mx_obj.message
-    if is_string(__mx_inner) && match(string!(__mx_inner), __mx_line) {
+    # A record of this source (any of __mx_keys) is the record, whatever its
+    # message holds; only an object that is not one wraps a line.
+    __mx_native = false
+    for_each(__mx_keys) -> |_i, __mx_k| {
+        if (get(__mx_obj, [string!(__mx_k)]) ?? null) != null { __mx_native = true }
+    }
+    if !__mx_native && is_string(__mx_inner) && match(string!(__mx_inner), __mx_line) {
         __mx_text = string!(__mx_inner)
         __mx_wrapper = __mx_obj
         __mx_wrapper = remove!(__mx_wrapper, ["message"])
