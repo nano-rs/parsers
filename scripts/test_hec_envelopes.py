@@ -12,9 +12,11 @@ Cases live beside each parser in parsers-ocsf/<parser>/hec-envelopes.yaml:
 The delivery follows nano (nanosiem config/vector/02-hec-source.toml
 hec_normalize, and nanosiem-core src/parsers/vector_config/hec_payload.rs
 HEC_JSON_PAYLOAD_VRL for a JSON-input parser; the classifier is the port in
-test_input_contract.py). An object event with a `message` and sibling keys is
-also kept whole in event metadata (%nano_hec_event), which this test sets the
-same way:
+test_input_contract.py). Vector's splunk_hec source spreads an object event over
+the event root, so the sender's other keys sit beside `.message` when the parser
+runs (this test puts them there too). An object event with a `message` and
+sibling keys is also kept whole in event metadata (%nano_hec_event), which this
+test sets the same way:
 
 - no `message`: `.message` is the event's JSON, no stash;
 - a `message` and no siblings: `.message` is it (an object JSON-encoded);
@@ -62,13 +64,13 @@ def vrl_string(text):
     return json.dumps(text, ensure_ascii=False)
 
 
-def run_case(vrl, message, stash):
+def run_case(vrl, message, stash, root):
     prefix = f'%nano_hec_event = parse_json!({vrl_string(json.dumps(stash, ensure_ascii=False))})\n' if stash is not None else ''
     program = prefix + vrl + '\n.__stash_left = %nano_hec_event != null\n'
     with tempfile.TemporaryDirectory(prefix='hec-envelope-') as tmp:
         tmp = Path(tmp)
         (tmp / 'p.vrl').write_text(program)
-        (tmp / 'in.json').write_text(json.dumps({'message': message}) + '\n')
+        (tmp / 'in.json').write_text(json.dumps({**root, 'message': message}) + '\n')
         out = subprocess.run(['vector', 'vrl', '--program', str(tmp / 'p.vrl'), '--input', str(tmp / 'in.json'), '--print-object'],
                              text=True, capture_output=True, timeout=300, env=VECTOR_ENV)
     assert out.returncode == 0, out.stderr
@@ -94,7 +96,8 @@ def main():
             parsers.add(parser)
             name, event = f'{parser}: {case["name"]}', case['event']
             message, stash = delivered(vrl, event)
-            out, stash_left = run_case(vrl, message, stash)
+            root = {k: v for k, v in event.items() if k != 'message'}
+            out, stash_left = run_case(vrl, message, stash, root)
             unmapped = out.get('unmapped') or {}
             for bad in ('parse_fallback', 'parse_error'):
                 if bad in unmapped:
