@@ -348,8 +348,8 @@ field. The event can then get the wrong time or lose fields. This hits JSON logs
 that have their own `timestamp` or `message` field, and sources that write both
 JSON and text lines: Traefik, AWS CloudWatch Logs, Google Cloud Logging (Pub/Sub
 push), Atlassian, Salesforce Event Monitoring, Zoom (webhooks), Keycloak,
-PostgreSQL and Kubernetes container logs. Each of those parsers' `samples/README.md` says so. A
-fix is planned in nano (.36).
+PostgreSQL and Kubernetes container logs. Each of those parsers says so in its
+`samples/README.md` or its description. A fix is planned in nano (.36).
 
 ## Structure
 
