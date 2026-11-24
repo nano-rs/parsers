@@ -76,6 +76,12 @@ parser_vrl: |
       if __src_probe_err == null { __src_tz = __src_tz_in; __src_tz_label = __src_tz_in }
   }
   # END NAN source timezone
+  # nano's input contract (nanosiem hec_payload.rs): JSON, stated. The
+  # subscription envelope and flat events are JSON objects and must arrive
+  # whole; an S3 export line (`<RFC 3339> <message>`) arrives as text, or, from
+  # an HEC / OTel sender, as an object whose `message` is that line (its other
+  # keys are the sender's), read as the line below.
+  # nano:input=json
   # AWS CloudWatch Logs (generic) -> OCSF 1.9.0 Base Event (0), cloud profile
   raw_log = to_string(.message) ?? ""
   __raw_body = raw_log
@@ -121,6 +127,17 @@ parser_vrl: |
       if length(x) > 0 {
           ev = x
           __source_kv = x
+          form = "export"
+      }
+  }
+  if form == "" && jerr == null && is_object(j) {
+      # A wrapper (HEC / OTel) around an export line: the line is its `message`.
+      inner = string(object!(j).message) ?? ""
+      xw = parse_regex(inner, r'^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})) (?P<message>.*)$') ?? {}
+      if length(xw) > 0 {
+          ev = xw
+          # The wrapper's own keys stay source fields (mapped or spilled).
+          __source_kv = merge(remove!(object!(j), ["message"]), xw)
           form = "export"
       }
   }

@@ -15,7 +15,9 @@ description: >
   (`load_balancer.name`), the backend and server land on dst_endpoint
   (`svc_name` / `name`), the termination state is `status_code`, and the
   timers drive `duration` (Ta for HTTP, Tt for TCP). accept_date carries no
-  UTC offset; it is read as UTC and kept verbatim in metadata.original_time.
+  UTC offset: it is the sender's local time, converted with the log source's
+  timezone setting, and kept verbatim in metadata.original_time. A line without
+  one (Connect from, startup notices) is dated by its syslog header.
   Unrecognized lines become Base Event (class_uid 0) with the raw line kept
   and `unmapped.parse_fallback` set. The whole OCSF object is emitted on the
   root.
@@ -487,7 +489,7 @@ parser_vrl: |
           "severity": severity,
           "status_id": 0,
           "status": "Unknown",
-          "time": 0,
+          "time": time_ms,
           "raw_data": raw_log,
           "message": body,
           "metadata": {
@@ -792,3 +794,8 @@ samples:
     expect:
       class_uid: 0
       "unmapped.parse_fallback": "unparsable input"
+  # a startup notice (Base Event): dated by its syslog header, not time 0
+  - raw: "Feb  6 12:14:14 localhost haproxy[14389]: Proxy http-in started."
+    expect:
+      "class_uid": 0
+      "unmapped.nano_time_assumed_tz": "UTC"

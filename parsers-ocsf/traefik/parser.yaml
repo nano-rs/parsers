@@ -66,6 +66,13 @@ parser_vrl: |
       if __src_probe_err == null { __src_tz = __src_tz_in; __src_tz_label = __src_tz_in }
   }
   # END NAN source timezone
+  # nano's input contract (nanosiem hec_payload.rs): JSON, stated. Traefik writes
+  # JSON (access and v3 application logs, whose own `message` must arrive with
+  # its level and time) and text lines (CLF access, v2 logfmt, v3 console). As
+  # a JSON-input parser it gets an HEC / OTel object event whole; an object
+  # whose `message` is itself a Traefik text line is a wrapper around that line
+  # (its other keys are the sender's), read as the line below.
+  # nano:input=json
   # Traefik -> OCSF 1.9.0 HTTP Activity (4002) / Base Event (0)
   raw_log = to_string(.message) ?? ""
   __raw_body = raw_log
@@ -73,8 +80,23 @@ parser_vrl: |
 
   kind = ""
   a = {}
+  line = raw_log
+  wrapper = {}
+  as_text = true
   j, jerr = parse_json(raw_log)
   if jerr == null && is_object(j) {
+      as_text = false
+      jo = object!(j)
+      inner = string(jo.message) ?? ""
+      if match(inner, r'^\S+ \S+ \S+ \[[^\x5D]+\] "') || match(inner, r'^time="[^"]*" level=\w+ ') || match(inner, r'^\d{4}-\d{2}-\d{2}T\S+ (?:TRC|DBG|INF|WRN|ERR|FTL|PNC) ') {
+          # A wrapper (HEC / OTel): the line is in `message`, the rest is the sender's.
+          line = inner
+          wrapper = jo
+          wrapper = remove!(wrapper, ["message"])
+          as_text = true
+      }
+  }
+  if !as_text {
       a = object!(j)
       __source_kv = a
       if exists(a.RequestMethod) || exists(a.DownstreamStatus) || exists(a.ClientAddr) {
@@ -85,7 +107,7 @@ parser_vrl: |
       # Any other JSON object is not a Traefik log: it takes the fallback branch,
       # so a misrouted source shows up in parser health instead of passing silently.
   } else {
-      c = parse_regex(raw_log, r'^(?P<client_host>\S+) \S+ (?P<client_username>\S+) \[(?P<start_local>[^\x5D]+)\] "(?P<request_method>\S+) (?P<request_path>\S+) (?P<request_protocol>[^"]*)" (?P<downstream_status>\d{3}|-) (?P<downstream_content_size>\d+|-)(?: (?:"(?P<request_referer>[^"]*)"|-) (?:"(?P<request_user_agent>[^"]*)"|-)(?: (?P<request_count>\d+|-) (?:"(?P<router_name>[^"]*)"|-) (?:"(?P<service_url>[^"]*)"|-) (?P<duration>\d+)ms)?)?\s*$') ?? {}
+      c = parse_regex(line, r'^(?P<client_host>\S+) \S+ (?P<client_username>\S+) \[(?P<start_local>[^\x5D]+)\] "(?P<request_method>\S+) (?P<request_path>\S+) (?P<request_protocol>[^"]*)" (?P<downstream_status>\d{3}|-) (?P<downstream_content_size>\d+|-)(?: (?:"(?P<request_referer>[^"]*)"|-) (?:"(?P<request_user_agent>[^"]*)"|-)(?: (?P<request_count>\d+|-) (?:"(?P<router_name>[^"]*)"|-) (?:"(?P<service_url>[^"]*)"|-) (?P<duration>\d+)ms)?)?\s*$') ?? {}
       if length(c) > 0 {
           kind = "access_clf"
           # Optional groups that did not participate come back null; they are not source fields.
@@ -93,8 +115,8 @@ parser_vrl: |
           __source_kv = a
       } else {
           # v2 `common` application log: logfmt with time / level / msg.
-          if match(raw_log, r'^time="[^"]*" level=\w+ ') {
-              kv = parse_key_value(raw_log, key_value_delimiter: "=", field_delimiter: " ") ?? {}
+          if match(line, r'^time="[^"]*" level=\w+ ') {
+              kv = parse_key_value(line, key_value_delimiter: "=", field_delimiter: " ") ?? {}
               if exists(kv.level) {
                   kind = "app"
                   a = kv
@@ -103,7 +125,7 @@ parser_vrl: |
           }
           if kind == "" {
               # v3 console application log: `<RFC3339> <LVL> [<caller> >] <message> key=value...`
-              v3 = parse_regex(raw_log, r'^(?P<time>\d{4}-\d{2}-\d{2}T\S+) (?P<level>TRC|DBG|INF|WRN|ERR|FTL|PNC) (?:(?P<caller>\S+:\d+) > )?(?P<message>.*)$') ?? {}
+              v3 = parse_regex(line, r'^(?P<time>\d{4}-\d{2}-\d{2}T\S+) (?P<level>TRC|DBG|INF|WRN|ERR|FTL|PNC) (?:(?P<caller>\S+:\d+) > )?(?P<message>.*)$') ?? {}
               if length(v3) > 0 {
                   kind = "app"
                   a = compact(v3, string: false)
@@ -112,6 +134,9 @@ parser_vrl: |
           }
       }
   }
+
+  # A wrapper's own keys stay source fields (mapped or spilled), never lost.
+  if length(wrapper) > 0 { __source_kv = merge(wrapper, __source_kv) }
 
   # ---- severity from the Traefik level ----------------------------------
   level = downcase(string(a.level) ?? "")

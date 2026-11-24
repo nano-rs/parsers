@@ -1,0 +1,22 @@
+# What this parser gets when its log arrives as an HEC (or OTel-style) object
+# event; scripts/test_hec_envelopes.py builds the delivery the way nano does and
+# checks each case.
+cases:
+- name: aws_cloudwatch_logs S3 export line wrapped by an HEC sender
+  event:
+    message: '2026-11-21T10:00:01.120Z START RequestId: 8f2b6c1e-0000-4000-8000-000000000001 Version: $LATEST'
+    s3_bucket: my-export-bucket
+  expect:
+    class_uid: 0
+    time: 1795255201120
+- name: aws_cloudwatch_logs flat CloudWatch event as an HEC object
+  event:
+    logGroup: /aws/lambda/checkout
+    logStream: 2026/11/21/[$LATEST]abc
+    eventId: '37979581049392134838464893426378950498512234962512691200'
+    timestamp: 1795255201120
+    message: 'START RequestId: 8f2b6c1e-0000-4000-8000-000000000001 Version: $LATEST'
+  expect:
+    class_uid: 0
+    time: 1795255201120
+    metadata.log_name: /aws/lambda/checkout
