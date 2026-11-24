@@ -22,6 +22,14 @@ description: >
   endpoint.url_validation challenges and unparseable input become a Base
   Event with the raw body kept.
   Timestamps without an offset use the log source's timezone setting (UTC if unset).
+  Over Splunk HEC, send each log as an HEC string event (or post it to
+  nano's /ingest endpoint), not as an HEC object event: for an object event
+  nano today removes some fields (such as timestamp) and may hand the parser
+  only the event's message, so the time or fields can be lost. A fix is
+  planned in nano.
+  For Zoom this hits every webhook: a webhook has its own top-level event field,
+  which nano reads as the HEC event and removes, so the webhook is not parsed.
+  Sent as a string event or to /ingest, it parses (see the last sample).
 match_values:
   - zoom
 category: cloud
@@ -842,3 +850,10 @@ samples:
     expect:
       "time": 1717754400000
       "unmapped.nano_time_assumed_tz": "UTC"
+  # A webhook as /ingest and an HEC string event deliver it (the record text as message): it parses.
+  # The same webhook as an HEC object event does not until the nano fix (see the description).
+  - raw: "{\"event\":\"user.signed_in\",\"event_ts\":1787083200000,\"payload\":{\"account_id\":\"AAAAAABBBB\",\"object\":{\"id\":\"z8yAAAAA8bbbQ\",\"first_name\":\"Jill\",\"last_name\":\"Chill\",\"email\":\"jchill@example.com\",\"date_time\":\"2026-08-18T20:00:00Z\",\"client_type\":\"browser\",\"version\":\"6.1.0\",\"login_type\":0}}}"
+    expect:
+      "class_uid": 3002
+      "activity_id": 1
+      "time": 1787083200000
