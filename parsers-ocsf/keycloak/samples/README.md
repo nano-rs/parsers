@@ -59,3 +59,18 @@ ranges, users with example.com addresses.
   `ndc`, Quarkus exceptions and pre-existing `representation_json` keys. Shapes
   per Keycloak's CredentialRepresentation, CertificateRepresentation and
   JBossLoggingEventListenerProvider.
+
+## Sending these logs over Splunk HEC
+
+Send each log to nano as an HEC **string** event (`"event": "<the log, as text>"`),
+or post it to nano's `/ingest` endpoint. Both work today.
+
+Do not send these logs as HEC **object** events (`"event": { ... }`). For an
+object event, nano currently removes some fields (such as `timestamp` and
+`host`) before this parser runs, and it may hand the parser only the event's
+`message` field. The event can then get the wrong time or lose fields. A fix is
+planned in nano (.36).
+
+For Keycloak, JSON log records (ECS or Quarkus) carry the event line in
+message beside their time and level; for an object event only that line
+arrives, so the time and level are lost.
