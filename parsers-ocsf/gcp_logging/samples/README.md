@@ -26,3 +26,16 @@ https://cloud.google.com/logging/docs/reference/v2/rest/v2/LogEntry
 | `pubsub_push_collision_secret_kept.json` | review regression: an unmerged Pub/Sub body carrying a credential spills as-is (base64 `message.data`), never overwritten | constructed |
 | `pubsub_push_collision_textpayload_secret.json` | review regression: a colliding Pub/Sub entry is not mapped from its unmerged body ; it falls back with the base64 body spilled as-is | constructed |
 | `pubsub_push_object_data_secret.json`, `pubsub_push_array_data_secret.json` | review regression: an already-decoded object `data` and an array `data` spill as-is | constructed |
+
+## Sending these logs over Splunk HEC
+
+Send each log to nano as an HEC **string** event (`"event": "<the log, as text>"`),
+or post it to nano's `/ingest` endpoint. Both work today.
+
+Do not send these logs as HEC **object** events (`"event": { ... }`). For an
+object event, nano currently removes some fields (such as `timestamp` and
+`host`) before this parser runs, and it may hand the parser only the event's
+`message` field. The event can then get the wrong time or lose fields. A fix is
+planned in nano (.36).
+
+For Cloud Logging, a Pub/Sub push envelope sent as an HEC object event reaches the parser as its inner `message` only, so the log entry is not decoded.

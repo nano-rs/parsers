@@ -336,6 +336,21 @@ and after a large rewrite. CI runs the check on every PR (job "Parser load budge
   spec's home for an event with no class; forcing an application log line into a
   security class poisons every class-scoped hunt.
 
+### Sending logs over Splunk HEC
+
+Send each log to nano as an HEC **string** event (`"event": "<the log, as text>"`),
+or post it to nano's `/ingest` endpoint. Both work for every parser.
+
+HEC **object** events (`"event": { ... }`) are a problem for some parsers today.
+For an object event, nano removes some fields (such as `timestamp` and `host`)
+before the parser runs, and it may hand the parser only the event's `message`
+field. The event can then get the wrong time or lose fields. This hits JSON logs
+that have their own `timestamp` or `message` field, and sources that write both
+JSON and text lines: Traefik, AWS CloudWatch Logs, Google Cloud Logging (Pub/Sub
+push), Atlassian, Salesforce Event Monitoring, Keycloak, PostgreSQL and
+Kubernetes container logs. Each of those parsers' `samples/README.md` says so. A
+fix is planned in nano (.36).
+
 ## Structure
 
 Each parser lives in its own directory under `parsers-ocsf/` with a `parser.yaml` file containing:

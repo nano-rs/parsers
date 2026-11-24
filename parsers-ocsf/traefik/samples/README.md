@@ -31,3 +31,16 @@ sizes and durations are as published.
 | `malformed.json` | garbage (Base Event fallback) | synthetic |
 | `json_ipv6_default_port_service_url.json` | review regression: bracketed IPv6 ClientAddr and default-port IPv6 ServiceURL (`http://[v6]/`) | constructed from the field list |
 | `json_bracketed_ipv6_service_addr_no_port.json` | review regression: bracketed IPv6 ServiceAddr without a port | constructed |
+
+## Sending these logs over Splunk HEC
+
+Send each log to nano as an HEC **string** event (`"event": "<the log, as text>"`),
+or post it to nano's `/ingest` endpoint. Both work today.
+
+Do not send these logs as HEC **object** events (`"event": { ... }`). For an
+object event, nano currently removes some fields (such as `timestamp` and
+`host`) before this parser runs, and it may hand the parser only the event's
+`message` field. The event can then get the wrong time or lose fields. A fix is
+planned in nano (.36).
+
+For Traefik this matters most for v3 JSON application logs, which have their own `message` field: as an HEC object event only that text arrives.

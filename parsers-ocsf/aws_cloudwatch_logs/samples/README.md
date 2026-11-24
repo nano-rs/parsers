@@ -30,3 +30,16 @@ Account IDs use 123456789012 / 210987654321 and IPs documentation ranges.
 | `forwarder_unmovable_number_array_secret_kept.json`, `forwarder_truncated_null_array_secret_kept.json`, `export_line_truncated_number_array_secret_kept.json` | review regression: a JSON array opening with a number or `null` that cannot be moved (input `message_json`, or truncated) is kept as-is in `message` | constructed |
 | `forwarder_bracketed_timestamp_text.json` | review regression: a Python/Log4j `[2026-11-21 10:00:00,123] INFO` line stays text (not a JSON array) | constructed |
 | `forwarder_unmovable_null_array_kept.json` | a valid JSON array that cannot be moved (input `message_json`) is kept as-is in `message` | constructed |
+
+## Sending these logs over Splunk HEC
+
+Send each log to nano as an HEC **string** event (`"event": "<the log, as text>"`),
+or post it to nano's `/ingest` endpoint. Both work today.
+
+Do not send these logs as HEC **object** events (`"event": { ... }`). For an
+object event, nano currently removes some fields (such as `timestamp` and
+`host`) before this parser runs, and it may hand the parser only the event's
+`message` field. The event can then get the wrong time or lose fields. A fix is
+planned in nano (.36).
+
+For CloudWatch Logs, flat events (with `timestamp`) and S3 export lines wrapped in an object are the shapes affected.
