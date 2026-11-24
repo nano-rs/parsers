@@ -45,14 +45,21 @@ parser_vrl: |
   __time_inline = false
   __lc_pending = false
   __lc_shifted = ""
-  __src_off = parse_regex(__src_tz_in, r'^(?P<sign>[+-])(?P<h>\d{2}):?(?P<m>\d{2})$') ?? {}
-  if !is_empty(__src_off) {
-      __src_h = to_int(__src_off.h) ?? 99
-      __src_m = to_int(__src_off.m) ?? 99
+  # No parse_* decoder here: nano infers a parser's input contract from the first
+  # decoder in its program (parse_json first = a JSON-input parser, handed the
+  # whole HEC / OTLP object). This prelude opens every parser, so a decoder in it
+  # would turn every JSON-input parser into a text one. match + slice instead.
+  if match(__src_tz_in, r'^[+-]\d{2}:?\d{2}$') {
+      __src_sign = slice(__src_tz_in, 0, 1) ?? "+"
+      __src_digits = replace(slice(__src_tz_in, 1) ?? "", ":", "")
+      __src_hh = slice(__src_digits, 0, 2) ?? "99"
+      __src_mm = slice(__src_digits, 2, 4) ?? "99"
+      __src_h = to_int(__src_hh) ?? 99
+      __src_m = to_int(__src_mm) ?? 99
       if __src_h <= 14 && __src_m <= 59 {
           __src_shift_ms = (__src_h * 3600 + __src_m * 60) * 1000
-          if __src_off.sign == "-" { __src_shift_ms = 0 - __src_shift_ms }
-          if __src_shift_ms != 0 { __src_tz_label = string!(__src_off.sign) + string!(__src_off.h) + ":" + string!(__src_off.m) }
+          if __src_sign == "-" { __src_shift_ms = 0 - __src_shift_ms }
+          if __src_shift_ms != 0 { __src_tz_label = __src_sign + __src_hh + ":" + __src_mm }
       }
   } else if __src_tz_in != "" && downcase(__src_tz_in) != "local" {
       # "local" (the Vector host's zone) would make the time depend on the host.
