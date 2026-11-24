@@ -163,3 +163,34 @@ When adding a mapped field, declare its mapping (or transformation rule) with
 the exact target path. A declaration never waives coverage: the value must be
 at that path in the selected branch, and provenance must show it comes from
 that source field. Do not declare a target the field only sometimes equals.
+
+## Mixed input (`# NAN mixed input`)
+
+A source that writes both JSON records and text lines (Traefik, CloudWatch Logs
+exports, Salesforce Event Monitoring, Keycloak) reaches its parser in more than
+one shape: a text line; a JSON record; an HEC or OTel object whose `message` is
+a text line (a wrapper, whose other keys are the sender's); or, over HEC, only
+an event's own `message` while the whole event waits in event metadata
+(`%nano_hec_event`). Rather than handling each shape by hand, such a parser
+sets two variables and places the marker:
+
+```
+# nano:input=json
+__mx_line = r'^(?:<the text line shapes of this source>)'
+__mx_keys = ["<a key that marks a JSON record of this source>", ...]
+# NAN mixed input
+if !is_empty(__mx_record) { ...JSON path on __mx_record... }
+else if __mx_text != "" { ...text path on __mx_text... }
+__source_kv = merge(__mx_wrapper, __source_kv)   # the sender's keys stay source fields
+```
+
+`scripts/residual_spill.py` expands the marker from `mixed_input.vrl`. It sets
+`__mx_raw` (the body for raw_data), `__mx_record` (the record, or `{}`),
+`__mx_text` (the line, or `""`) and `__mx_wrapper`. A record found in
+`%nano_hec_event` is taken from there and removed, so nano does not file its
+keys twice. The block contains `parse_json`, and nano infers a parser's input
+contract from its first decoder, so a parser using it must state its contract
+(`# nano:input=json` or `text`); the expansion fails otherwise.
+`scripts/test_mixed_input.py` runs the block for every delivery shape, and
+`parsers-ocsf/<parser>/hec-envelopes.yaml` cases (`scripts/test_hec_envelopes.py`)
+check each parser end to end.
