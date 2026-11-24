@@ -123,7 +123,9 @@ V1, V2 = 'nano:input=', 'nano:input-v2='
 
 
 def declarations(vrl):
-    """(v1, v2, bad): the first `# nano:input=` and `# nano:input-v2=` values."""
+    """(v1, v2, bad): the first `# nano:input=` and `# nano:input-v2=` values,
+    and every problem nano's classifier warns about (an unknown value, a
+    second declaration with a different value, a v1 `json_or_text` anywhere)."""
     v1 = v2 = None
     bad = []
     for line in vrl.splitlines():
@@ -135,11 +137,18 @@ def declarations(vrl):
             if c.startswith(key):
                 value = c[len(key):].strip()
                 if value not in CONTRACTS:
-                    bad.append(f'# {key}{value}')
-                elif key == V2:
-                    v2 = v2 or value
-                else:
-                    v1 = v1 or value
+                    bad.append(f'unknown input contract `# {key}{value}`')
+                    break
+                if key == V1 and value == 'json_or_text':
+                    bad.append('`# nano:input=json_or_text` is undeclared on nano before v2.0.36; keep `# nano:input=json|text` and add `# nano:input-v2=json_or_text`')
+                first = v2 if key == V2 else v1
+                if first is None:
+                    if key == V2:
+                        v2 = value
+                    else:
+                        v1 = value
+                elif first != value:
+                    bad.append(f'two `# {key}` declarations (`{first}` and `{value}`); the first one applies')
                 break
     return v1, v2, bad
 
@@ -172,9 +181,7 @@ def pairing_problems(vrl):
     what older nano does. It needs a v1 line, and a bare v1 json_or_text
     (which older nano reads as undeclared, and may infer as JSON) is refused."""
     v1, v2, bad = declarations(vrl)
-    problems = [f'unknown input contract `{b}`' for b in bad]
-    if v1 == 'json_or_text':
-        problems.append('`# nano:input=json_or_text` is undeclared on nano before v2.0.36; keep `# nano:input=json|text` and add `# nano:input-v2=json_or_text`')
+    problems = list(bad)
     if v2 and not v1:
         problems.append(f'`# nano:input-v2={v2}` without a `# nano:input=json|text` line: older nano would infer its contract')
     return problems
@@ -244,7 +251,12 @@ def main():
     for vrl, want in (('# nano:input=text\n# nano:input-v2=json_or_text\n. = .', 0),
                       ('# nano:input-v2=json_or_text\n. = .', 1),
                       ('# nano:input=json_or_text\n. = .', 1),
-                      ('# nano:input-v2=jsonish\n# nano:input=text\n. = .', 1)):
+                      ('# nano:input-v2=jsonish\n# nano:input=text\n. = .', 1),
+                      # Conflicting duplicates, as nano's classifier warns.
+                      ('# nano:input=text\n# nano:input=json\n. = .', 1),
+                      ('# nano:input=text\n# nano:input=json_or_text\n. = .', 2),
+                      ('# nano:input=text\n# nano:input-v2=json\n# nano:input-v2=text\n. = .', 1),
+                      ('# nano:input=text\n# nano:input=text\n. = .', 0)):
         if len(pairing_problems(vrl)) != want:
             failures.append(f'pairing check: {vrl!r} gave {pairing_problems(vrl)}')
     if input_contract('# nano:input=text\n# nano:input-v2=json_or_text\n. = .')[0] != 'json_or_text' or \
