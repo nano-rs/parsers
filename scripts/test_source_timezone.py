@@ -310,6 +310,12 @@ def main():
                 failures.append(f'{parser}/{name}: .nano leaked into the event or the source')
             if src != nsrc:
                 failures.append(f'{parser}/{name}: the timezone setting changed the parsed source')
+            # A clock read with the setting is a clock the event carries: a parser
+            # that marks the assumed zone but emits no time (time 0) dropped it.
+            for o_ in (out, nout):
+                if (o_.get('unmapped') or {}).get('nano_time_assumed_tz') is not None and not o_.get('time'):
+                    failures.append(f'{parser}/{name}: marks nano_time_assumed_tz but emits time {o_.get("time")!r}')
+                    break
         if parser not in LOCAL:
             continue
         pick = next(((n, e, o) for (n, e), (o, _) in zip(samples, base) if (o.get('unmapped') or {}).get('nano_time_assumed_tz') == 'UTC' and o.get('time')), None)

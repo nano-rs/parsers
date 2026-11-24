@@ -1,0 +1,129 @@
+source: mixed
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+transforms:
+- source: StartUTC
+  kind: epoch_ms
+  target: time
+  reason: Request start clock (RFC 3339) converted to event milliseconds.
+- source: time
+  kind: epoch_ms
+  target: time
+  reason: Log record clock (RFC 3339) converted to event milliseconds.
+- source: start_local
+  kind: epoch_ms
+  target: time
+  format: '%d/%b/%Y:%H:%M:%S %z'
+  reason: CLF timestamp with explicit offset converted to event milliseconds.
+- source: Duration
+  kind: scale
+  factor: 1.0e-06
+  target: duration
+  reason: Traefik reports Duration in nanoseconds; OCSF duration is milliseconds.
+- source: level
+  kind: enum
+  target: severity_id
+  values:
+    trace: 1
+    trc: 1
+    debug: 1
+    dbg: 1
+    info: 1
+    inf: 1
+    warn: 3
+    warning: 3
+    wrn: 3
+    error: 4
+    err: 4
+    fatal: 6
+    ftl: 6
+    panic: 6
+    pnc: 6
+  reason: Traefik log level normalized to OCSF severity_id; consumed only when that ID is emitted.
+mappings:
+  client_host:
+  - src_endpoint.ip
+  client_username:
+  - actor.user.name
+  downstream_content_size:
+  - http_response.length
+  - traffic.bytes_in
+  downstream_status:
+  - http_response.code
+  - load_balancer.code
+  duration:
+  - duration
+  request_method:
+  - http_request.http_method
+  request_path:
+  - http_request.url.path
+  request_protocol:
+  - http_request.version
+  request_referer:
+  - http_request.referrer
+  request_user_agent:
+  - http_request.user_agent
+  router_name:
+  - load_balancer.name
+  start_local:
+  - metadata.original_time
+  ClientAddr:
+  - src_endpoint.ip
+  DownstreamContentSize:
+  - http_response.length
+  - traffic.bytes_in
+  DownstreamStatus:
+  - http_response.code
+  - load_balancer.code
+  RequestHost:
+  - http_request.url.hostname
+  - tls.sni
+  RequestMethod:
+  - http_request.http_method
+  RequestPath:
+  - http_request.url.path
+  RequestPort:
+  - http_request.url.port
+  RequestProtocol:
+  - http_request.version
+  RouterName:
+  - load_balancer.name
+  ServiceAddr:
+  - dst_endpoint.ip
+  - load_balancer.dst_endpoint.ip
+  level:
+  - metadata.log_level
+  msg:
+  - message
+  error:
+  - status_detail
+  message:
+  - message
+  BackendName:
+  - dst_endpoint.svc_name
+  - load_balancer.dst_endpoint.svc_name
+  ClientHost:
+  - src_endpoint.ip
+  ClientPort:
+  - src_endpoint.port
+  FrontendName:
+  - load_balancer.name
+  RequestContentSize:
+  - http_request.length
+  - traffic.bytes_out
+  downstream_Content-Type:
+  - http_response.content_type
+  request_User-Agent:
+  - http_request.user_agent
+  ServiceName:
+  - dst_endpoint.svc_name
+  - load_balancer.dst_endpoint.svc_name
+  RequestScheme:
+  - http_request.url.scheme
+  TLSCipher:
+  - tls.cipher
+  TLSVersion:
+  - tls.version
+  trace_id:
+  - trace.uid
