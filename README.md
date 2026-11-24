@@ -363,10 +363,13 @@ From nano v2.0.36, what `.message` holds for each contract:
 |---|---|---|---|---|
 | `json` | the record | the text (1) | the whole record | the body |
 | `json_or_text` | the record | the text (1) | the whole record | the body |
-| `text` | the record | the text | the record's line (its string `message`, else, with no `message`, its string `line`), or the whole record when it has none | the body |
+| `text` | the record | the text | the record's line (its string `message`, else, with no `message`, its string `line`), or the whole record when it has none (2) | the body |
 
 (1) As before: when the text is not a JSON object and the event carried HEC
 indexed `fields`, the parser gets one JSON object of the fields and `message`.
+(2) The line needs a Vector build that marks object events
+(`%splunk_hec.event_kind`, nano-rs/vector NAN-5891); without it a `text`
+parser gets the whole record.
 
 A `text` parser's unread record keys, and HEC indexed `fields`, land under
 `unmapped` (never replacing a key the parser set).
