@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# The classifier below is a PORT of nano's: nanosiem-core
+# src/parsers/vector_config/hec_payload.rs (`vrl_reads_json_object`,
+# FIRST_DECODER / LINE_DECODER, HEC_JSON_PAYLOAD_VRL). Keep it equal to that file
+# until nanosiem NAN-5883 (an explicit input contract, checked by nano itself)
+# replaces this copy.
 """A parser's input contract survives the generated blocks; HEC / OTel delivery works.
 
 nano decides what a parser receives for an HEC (or OTel-style) object event from
@@ -17,7 +22,10 @@ every HEC / OTLP event got unmapped.parse_error. This test keeps:
 
 1. the classification of every parser equal with and without the prelude and
    local-clock blocks;
-2. the generated templates free of any structural decoder ahead of the parser;
+2. the generated templates free of any structural decoder ahead of the parser
+   (prelude, local clock) and of any LINE decoder anywhere (spill, transforms:
+   one there flips every JSON-input parser to text);
+   every parser's contract equal to scripts/json-input-parsers.txt;
 3. Generic JSON, fed exactly what nano delivers for a Splunk HEC object event
    and an OTel-style event (message plus attributes / resource), parsing
    without a parse_error and keeping the sibling fields.
@@ -101,11 +109,24 @@ def main():
             failures.append(f'{path.parent.name}: the generated blocks turn a {"JSON" if own else "text"}-input parser into a {"JSON" if full else "text"}-input one (nano hands it the wrong HEC / OTLP payload)')
 
     templates = ROOT / 'scripts' / 'residual'
+    code_of = lambda name: '\n'.join(l for l in (templates / name).read_text().splitlines() if not l.strip().startswith('#'))
     for name in ('source_tz.vrl', 'local_clock.vrl'):
-        code = '\n'.join(l for l in (templates / name).read_text().splitlines() if not l.strip().startswith('#'))
-        hit = FIRST_DECODER.search(code)
+        hit = FIRST_DECODER.search(code_of(name))
         if hit:
             failures.append(f'scripts/residual/{name}: {hit.group(0)} ahead of the parser decides its input contract; use match / slice')
+    for name in ('spill.vrl', 'transforms.vrl'):
+        hit = LINE_DECODER.search(code_of(name))
+        if hit:
+            failures.append(f'scripts/residual/{name}: {hit.group(0)} anywhere in a program makes nano treat the parser as text; it would flip every JSON-input parser')
+
+    pinned = {l.strip() for l in (ROOT / 'scripts' / 'json-input-parsers.txt').read_text().splitlines() if l.strip() and not l.startswith('#')}
+    for path in parsers:
+        name = path.parent.name
+        is_json = reads_json_object(yaml.safe_load(path.read_text())['parser_vrl'])
+        if is_json != (name in pinned):
+            failures.append(f'{name}: nano reads it as a {"JSON" if is_json else "text"}-input parser, scripts/json-input-parsers.txt says {"JSON" if name in pinned else "text"}')
+    for name in sorted(pinned - {p.parent.name for p in parsers}):
+        failures.append(f'scripts/json-input-parsers.txt: {name} is not a parser')
 
     vrl = yaml.safe_load((ROOT / 'parsers-ocsf/json_generic/parser.yaml').read_text())['parser_vrl']
     if not reads_json_object(vrl):
@@ -135,7 +156,8 @@ def main():
         print('FAIL', f)
     if failures:
         sys.exit(1)
-    print(f'PASS input contract: {len(parsers)} parsers keep their HEC / OTLP input contract with the generated blocks; '
+    print(f'PASS input contract: {len(parsers)} parsers keep their HEC / OTLP input contract with the generated blocks '
+          f'({len(pinned)} JSON-input, as pinned); '
           f'json_generic parses {len(shapes)} delivered envelope shapes')
 
 
