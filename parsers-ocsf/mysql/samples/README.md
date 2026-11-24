@@ -22,3 +22,19 @@ documentation values (192.0.2.0/24, 198.51.100.0/24).
 | `slowlog_admin_command_mariadb.json` | MariaDB slow log entry for `# administrator command: Quit;` with `# Schema:`, `Last_errno`, `Killed`, `Rows_affected`, `Bytes_sent` headers (https://mariadb.com/kb/en/slow-query-log-extended-statistics/): every header kept |
 | `empty_message.json` | Empty `message`: raw_data stays the empty string |
 | `junk.json` | Malformed input; must fall back without aborting |
+
+## Sending these logs over Splunk HEC
+
+Send each log to nano as an HEC **string** event (`"event": "<the log, as text>"`),
+or post it to nano's `/ingest` endpoint. Both work today.
+
+Do not send these logs as HEC **object** events (`"event": { ... }`). For an
+object event, nano currently removes some fields (such as `timestamp` and
+`host`) before this parser runs, and it may hand the parser only the event's
+`message` field. The event can then get the wrong time or lose fields. A fix is
+planned in nano (.36).
+
+For MySQL this hits Enterprise Audit JSON records: each has its own `event` and
+`timestamp` fields, which nano removes from an object event, so the record is
+not parsed. Percona audit records and the error, general and slow logs are not
+affected.

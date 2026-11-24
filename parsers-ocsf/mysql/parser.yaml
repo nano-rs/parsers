@@ -74,8 +74,10 @@ parser_vrl: |
   # general and slow logs are lines; inferred from the first decoder (the audit
   # JSON try) it would be JSON-input, and an HEC event carrying a log line plus
   # sibling fields would reach this parser as the whole event JSON instead of
-  # its line. An audit JSON record still arrives as JSON (hec_normalize encodes
-  # an event without a message).
+  # its line. Over HEC, send audit JSON as a string event (or via /ingest): as an
+  # HEC object event, a Percona audit record (no `message`) arrives as JSON, but
+  # a MySQL Enterprise Audit record does not. nano reads its own `event` field as
+  # the HEC event and removes it, and strips `timestamp` (NAN-5891, nano .36).
   # nano:input=text
   # MySQL / MariaDB error, general, slow and audit logs -> OCSF 1.9.0. Emits the
   # COMPLETE record on root and never aborts on bad input.
