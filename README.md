@@ -340,20 +340,52 @@ and after a large rewrite. CI runs the check on every PR (job "Parser load budge
   spec's home for an event with no class; forcing an application log line into a
   security class poisons every class-scoped hunt.
 
+### Declaring the input contract
+
+Every parser says what it reads with one comment line in its `parser_vrl`
+(nano NAN-5883):
+
+- `# nano:input=json`: a JSON object record;
+- `# nano:input=text`: a text line;
+- `# nano:input=json_or_text`: a JSON record or a text line (the parser tries
+  `parse_json` first and falls back to its line format).
+
+From nano v2.0.36, what `.message` holds for each contract:
+
+| Contract | HTTP `/ingest` | HEC string event | HEC object event | OTLP log |
+|---|---|---|---|---|
+| `json` | the record | the string | the whole record, unmodified | the body |
+| `json_or_text` | the record | the string | the whole record, unmodified | the body |
+| `text` | the record | the string | the record's line (its string `message`, else, with no `message`, its string `line`), or the whole record when it has none | the body |
+
+A `text` parser's unread record keys, and HEC indexed `fields`, land under
+`unmapped` (never replacing a key the parser set). A `json_or_text` parser
+must tell a record of its source from a forwarder's wrapper
+(`{"message": "<line>", ...}`) itself, as it must for `/ingest`.
+
+Undeclared, nano infers the contract from the parser's first structural
+decoder and logs a warning. `scripts/test_input_contract.py` checks every
+parser's contract against `scripts/json-input-parsers.txt` (and against nano's
+own classifier when `NANO_INPUT_CONTRACT` points at it; see
+`scripts/input-contract.lock`). nano before v2.0.36 knows only `json` and
+`text`: there, `json_or_text` reads as undeclared.
+
 ### Sending logs over Splunk HEC
 
-Send each log to nano as an HEC **string** event (`"event": "<the log, as text>"`),
-or post it to nano's `/ingest` endpoint. Both work for every parser.
+Send each log to nano as an HEC string event (`"event": "<the log, as text>"`),
+an HEC object event (`"event": { ... }`), or post it to nano's `/ingest`
+endpoint. From nano v2.0.36 all three keep every field of the record
+(nanosiem NAN-5891).
 
-HEC **object** events (`"event": { ... }`) are a problem for some parsers today.
-For an object event, nano removes some fields (such as `timestamp` and `host`)
-before the parser runs, and it may hand the parser only the event's `message`
-field. The event can then get the wrong time or lose fields. This hits JSON logs
-that have their own `timestamp`, `message` or `event` field, and sources that
-write both JSON and text lines: Traefik, AWS CloudWatch Logs, Google Cloud Logging (Pub/Sub
+On nano before v2.0.36, HEC **object** events are a problem for some parsers:
+nano removes some fields (such as `timestamp` and `host`) before the parser
+runs, and it may hand the parser only the event's `message` field. The event
+can then get the wrong time or lose fields. This hits JSON logs that have their
+own `timestamp`, `message` or `event` field, and sources that write both JSON
+and text lines: Traefik, AWS CloudWatch Logs, Google Cloud Logging (Pub/Sub
 push), Atlassian, Salesforce Event Monitoring, Zoom (webhooks), Keycloak,
-MySQL (Enterprise Audit), PostgreSQL and Kubernetes container logs. Each of those parsers says so in its
-`samples/README.md` or its description. A fix is planned in nano (.36).
+MySQL (Enterprise Audit), PostgreSQL and Kubernetes container logs. On those
+versions, send these sources as HEC string events or to `/ingest`.
 
 ## Structure
 

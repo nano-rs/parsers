@@ -188,10 +188,25 @@ jobs:
       - name: Test the log source timezone setting
         run: python3 scripts/test_source_timezone.py
 
-      # nano hands a JSON-input parser (first decoder parse_json) the whole HEC /
-      # OTLP object, a text parser the message line. The generated blocks must
-      # never change which one a parser is, and Generic JSON must parse what an
-      # HEC object event and an OTel-style event deliver.
+      # NAN-5883: nano's own input-contract classifier, when a build is pinned
+      # in scripts/input-contract.lock (exit 3 = none published yet: the test
+      # then checks the Python port alone).
+      - name: Fetch nano's input-contract classifier
+        env:
+          OCSF_VALIDATOR_TOKEN: ${{ secrets.OCSF_VALIDATOR_TOKEN }}
+        run: |
+          set -uo pipefail
+          classifier="$(bash scripts/fetch-input-contract.sh "$RUNNER_TEMP/contract")"; status=$?
+          if [ "$status" -eq 0 ]; then
+            echo "NANO_INPUT_CONTRACT=$classifier" >> "$GITHUB_ENV"
+          elif [ "$status" -ne 3 ]; then
+            exit "$status"
+          fi
+
+      # nano hands a `json` / `json_or_text` parser the whole HEC / OTLP record,
+      # a `text` parser the record's line. The generated blocks must never
+      # change which one a parser is, and Generic JSON must parse what an HEC
+      # object event and an OTel-style event deliver.
       - name: Test the HEC / OTLP input contract
         run: python3 scripts/test_input_contract.py
 
