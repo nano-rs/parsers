@@ -6,20 +6,23 @@
 # fails on any difference, so the port cannot drift from nano.
 """A parser's input contract survives the generated blocks; HEC / OTel delivery works.
 
-A parser declares what it reads with one comment line in its VRL (nanosiem
-NAN-5883, v2.0.36+): `# nano:input=json`, `# nano:input=text` or
-`# nano:input=json_or_text`. Undeclared, nano infers it: when the FIRST
-structural decoder of the parser's own code is `parse_json` and no line decoder
-appears, it is `json`; otherwise `text`. From v2.0.36 nano skips comments and the
-generated blocks (prelude, local clock, residual spill, mixed input) when it
-infers; older nano versions skip only comments, and know only `json` / `text`
-declarations (`json_or_text` reads as undeclared there).
+A parser declares what it reads with comment lines in its VRL (nanosiem
+NAN-5883). This content channel serves EVERY install, so declarations come in
+a backward-compatible pair:
+- `# nano:input=json|text` (v1): every nano version reads it, exactly as today;
+- `# nano:input-v2=json|text|json_or_text` (v2): read from nano v2.0.36, where
+  it wins over v1; older versions ignore it.
+A v2 line always comes with a v1 line, and a bare v1 `json_or_text` is refused
+(older nano reads it as undeclared and may infer JSON). Undeclared, nano infers
+the contract from the first structural decoder; from v2.0.36 it skips the
+generated blocks (prelude, local clock, residual spill, mixed input), older
+versions count them.
 
 What each contract receives over HEC (nanosiem NAN-5891, v2.0.36+):
-- `json` / `json_or_text`: the sender's whole record, unmodified (an object
-  event's JSON; a string event's text), as HTTP /ingest does;
-- `text`: the record's line (its string `message`, else, with no `message` at
-  all, its string `line`), or the whole record when it has none; the record's
+- string events and `/services/collector/raw`: the text, as before;
+- object events: `json` / `json_or_text` get the sender's whole record; `text`
+  gets the record's line (its string `message`, else, with no `message` at all,
+  its string `line`), or the whole record when it has none, and the record's
   other keys are filed under `unmapped`.
 
 The generated blocks (the source-timezone prelude at the top of every parser,
@@ -32,8 +35,8 @@ JSON-input parser got unmapped.parse_error. This test keeps:
    local-clock blocks under the pre-v2.0.36 rule;
 2. the generated templates free of any structural decoder ahead of the parser
    (prelude, local clock) and of any LINE decoder anywhere (spill, transforms);
-   every parser's contract (record-reading: json or json_or_text) equal to
-   scripts/json-input-parsers.txt;
+   every parser's pre-v2.0.36 contract equal to scripts/json-input-parsers.txt,
+   and every v2 declaration paired with a v1 line;
 3. the port equal to nano's classifier binary, when it is available;
 4. Generic JSON, fed exactly what nano delivers for a Splunk HEC object event
    and an OTel-style event (message plus attributes / resource), parsing
@@ -116,20 +119,36 @@ def own_code(vrl):
 
 
 CONTRACTS = ('json', 'text', 'json_or_text')
+V1, V2 = 'nano:input=', 'nano:input-v2='
 
 
-def input_contract(vrl):
-    """Port of nano `input_contract`: (contract, declared, inferred)."""
-    declared = None
+def declarations(vrl):
+    """(v1, v2, bad): the first `# nano:input=` and `# nano:input-v2=` values."""
+    v1 = v2 = None
+    bad = []
     for line in vrl.splitlines():
         c = _comment(line)
         if c is None:
             continue
         c = c.lower()
-        if c.startswith('nano:input='):
-            value = c[len('nano:input='):].strip()
-            if value in CONTRACTS and declared is None:
-                declared = value
+        for key in (V2, V1):
+            if c.startswith(key):
+                value = c[len(key):].strip()
+                if value not in CONTRACTS:
+                    bad.append(f'# {key}{value}')
+                elif key == V2:
+                    v2 = v2 or value
+                else:
+                    v1 = v1 or value
+                break
+    return v1, v2, bad
+
+
+def input_contract(vrl):
+    """Port of nano (v2.0.36+) `input_contract`: (contract, declared, inferred).
+    `# nano:input-v2=` wins over `# nano:input=`; else inference."""
+    v1, v2, _ = declarations(vrl)
+    declared = v2 or v1
     code = own_code(vrl)
     first = FIRST_DECODER.search(code)
     inferred = 'json' if first and first.group(1) == 'json' and not LINE_DECODER.search(code) else 'text'
@@ -144,8 +163,21 @@ def reads_json_first(vrl):
 
 
 def reads_json_object(vrl):
-    """Whether nano (v2.0.36+) hands the parser the whole HEC record."""
+    """Whether nano (v2.0.36+) hands the parser the whole HEC object record."""
     return input_contract(vrl)[0] in ('json', 'json_or_text')
+
+
+def pairing_problems(vrl):
+    """The content channel serves every install: a v2 contract never changes
+    what older nano does. It needs a v1 line, and a bare v1 json_or_text
+    (which older nano reads as undeclared, and may infer as JSON) is refused."""
+    v1, v2, bad = declarations(vrl)
+    problems = [f'unknown input contract `{b}`' for b in bad]
+    if v1 == 'json_or_text':
+        problems.append('`# nano:input=json_or_text` is undeclared on nano before v2.0.36; keep `# nano:input=json|text` and add `# nano:input-v2=json_or_text`')
+    if v2 and not v1:
+        problems.append(f'`# nano:input-v2={v2}` without a `# nano:input=json|text` line: older nano would infer its contract')
+    return problems
 
 
 def nano_classifier():
@@ -178,7 +210,7 @@ def without_generated(vrl):
 
 def hec_delivery(vrl, event):
     """The `.message` nano (v2.0.36+) hands the parser for an HEC object event
-    (the `bytes`-decoded record, hec_normalize, the `<parser>_hec_payload` step)."""
+    (hec_normalize and the `<parser>_hec_payload` step)."""
     if reads_json_object(vrl):
         return json.dumps(event)
     if isinstance(event.get('message'), str):
@@ -208,12 +240,25 @@ def main():
         if hit:
             failures.append(f'scripts/residual/{name}: {hit.group(0)} anywhere in a program makes nano treat the parser as text; it would flip every JSON-input parser')
 
+    # The pairing rules themselves.
+    for vrl, want in (('# nano:input=text\n# nano:input-v2=json_or_text\n. = .', 0),
+                      ('# nano:input-v2=json_or_text\n. = .', 1),
+                      ('# nano:input=json_or_text\n. = .', 1),
+                      ('# nano:input-v2=jsonish\n# nano:input=text\n. = .', 1)):
+        if len(pairing_problems(vrl)) != want:
+            failures.append(f'pairing check: {vrl!r} gave {pairing_problems(vrl)}')
+    if input_contract('# nano:input=text\n# nano:input-v2=json_or_text\n. = .')[0] != 'json_or_text' or \
+            legacy_reads_json_object('# nano:input=text\n# nano:input-v2=json_or_text\np = parse_json!(.message)'):
+        failures.append('v2 must win on v2.0.36+ and be invisible to the pre-v2.0.36 rule')
+
     pinned = {l.strip() for l in (ROOT / 'scripts' / 'json-input-parsers.txt').read_text().splitlines() if l.strip() and not l.startswith('#')}
     for path in parsers:
         name = path.parent.name
-        is_json = reads_json_object(yaml.safe_load(path.read_text())['parser_vrl'])
+        vrl = yaml.safe_load(path.read_text())['parser_vrl']
+        is_json = legacy_reads_json_object(vrl)
         if is_json != (name in pinned):
-            failures.append(f'{name}: nano reads it as a {"JSON" if is_json else "text"}-input parser, scripts/json-input-parsers.txt says {"JSON" if name in pinned else "text"}')
+            failures.append(f'{name}: nano before v2.0.36 reads it as a {"JSON" if is_json else "text"}-input parser, scripts/json-input-parsers.txt says {"JSON" if name in pinned else "text"}')
+        failures.extend(f'{name}: {p}' for p in pairing_problems(vrl))
     for name in sorted(pinned - {p.parent.name for p in parsers}):
         failures.append(f'scripts/json-input-parsers.txt: {name} is not a parser')
 
@@ -222,7 +267,7 @@ def main():
     # the record, until it declares json_or_text.
     for path in parsers:
         if reads_json_first(yaml.safe_load(path.read_text())['parser_vrl']):
-            print(f'NOTE {path.parent.name}: input contract `text` but parse_json first; declare `# nano:input=json_or_text`')
+            print(f'NOTE {path.parent.name}: input contract `text` but parse_json first; on nano v2.0.36+ add `# nano:input-v2=json_or_text` once it tells a forwarder wrapper from its records')
 
     binary = nano_classifier()
     programs = [(p.parent.name, yaml.safe_load(p.read_text())['parser_vrl']) for p in parsers]
@@ -231,7 +276,10 @@ def main():
         for name, vrl in programs:
             port = input_contract(vrl)
             got = nano.get(name) or {}
+            v1, v2, _ = declarations(vrl)
+            legacy = 'json' if legacy_reads_json_object(vrl) else 'text'
             if (got.get('contract'), got.get('declared'), got.get('inferred')) != port or \
+                    (got.get('declared_v1'), got.get('declared_v2'), got.get('legacy')) != (v1, v2, legacy) or \
                     bool(got.get('reads_json_first')) != reads_json_first(vrl):
                 failures.append(f'{name}: nano classifies it {got}, the Python port {port}')
             for w in got.get('warnings') or []:

@@ -342,40 +342,49 @@ and after a large rewrite. CI runs the check on every PR (job "Parser load budge
 
 ### Declaring the input contract
 
-Every parser says what it reads with one comment line in its `parser_vrl`
-(nano NAN-5883):
+Every parser says what it reads with comment lines in its `parser_vrl` (nano
+NAN-5883). This repository serves every nano install, old and new, so the
+declaration is a backward-compatible pair:
 
-- `# nano:input=json`: a JSON object record;
-- `# nano:input=text`: a text line;
-- `# nano:input=json_or_text`: a JSON record or a text line (the parser tries
-  `parse_json` first and falls back to its line format).
+- `# nano:input=json` or `# nano:input=text` (v1): every nano version reads
+  it, exactly as today.
+- `# nano:input-v2=json`, `text` or `json_or_text` (v2): read from nano
+  v2.0.36, where it wins over the v1 line. Older versions ignore it.
+
+A v2 line always comes with a v1 line, and never write a bare
+`# nano:input=json_or_text`: nano before v2.0.36 reads it as undeclared and
+may infer JSON. `json_or_text` means the parser reads JSON records and text
+lines; declare it only once the parser tells a record of its source from a
+forwarder's wrapper (`{"message": "<line>", ...}`) itself.
 
 From nano v2.0.36, what `.message` holds for each contract:
 
-| Contract | HTTP `/ingest` | HEC string event | HEC object event | OTLP log |
+| Contract | HTTP `/ingest` | HEC string event or `/raw` | HEC object event | OTLP log |
 |---|---|---|---|---|
-| `json` | the record | the string | the whole record, unmodified | the body |
-| `json_or_text` | the record | the string | the whole record, unmodified | the body |
-| `text` | the record | the string | the record's line (its string `message`, else, with no `message`, its string `line`), or the whole record when it has none | the body |
+| `json` | the record | the text (1) | the whole record | the body |
+| `json_or_text` | the record | the text (1) | the whole record | the body |
+| `text` | the record | the text | the record's line (its string `message`, else, with no `message`, its string `line`), or the whole record when it has none | the body |
+
+(1) As before: when the text is not a JSON object and the event carried HEC
+indexed `fields`, the parser gets one JSON object of the fields and `message`.
 
 A `text` parser's unread record keys, and HEC indexed `fields`, land under
-`unmapped` (never replacing a key the parser set). A `json_or_text` parser
-must tell a record of its source from a forwarder's wrapper
-(`{"message": "<line>", ...}`) itself, as it must for `/ingest`.
+`unmapped` (never replacing a key the parser set).
 
 Undeclared, nano infers the contract from the parser's first structural
 decoder and logs a warning. `scripts/test_input_contract.py` checks every
-parser's contract against `scripts/json-input-parsers.txt` (and against nano's
-own classifier when `NANO_INPUT_CONTRACT` points at it; see
-`scripts/input-contract.lock`). nano before v2.0.36 knows only `json` and
-`text`: there, `json_or_text` reads as undeclared.
+parser's contract against `scripts/json-input-parsers.txt` (the v1 contract
+every install reads), refuses unpaired v2 lines, and compares its port with
+nano's own classifier when `NANO_INPUT_CONTRACT` points at it (see
+`scripts/input-contract.lock`).
 
 ### Sending logs over Splunk HEC
 
 Send each log to nano as an HEC string event (`"event": "<the log, as text>"`),
 an HEC object event (`"event": { ... }`), or post it to nano's `/ingest`
-endpoint. From nano v2.0.36 all three keep every field of the record
-(nanosiem NAN-5891).
+endpoint. From nano v2.0.36 an object event keeps every field of the record
+(nanosiem NAN-5891); string events and `/services/collector/raw` are handled
+exactly as before.
 
 On nano before v2.0.36, HEC **object** events are a problem for some parsers:
 nano removes some fields (such as `timestamp` and `host`) before the parser
