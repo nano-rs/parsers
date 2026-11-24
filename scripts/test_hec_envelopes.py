@@ -79,11 +79,19 @@ def run_case(vrl, message, stash, root):
 
 
 def at(obj, path):
-    for part in path.split('.'):
-        if not isinstance(obj, dict) or part not in obj:
-            return '<missing>'
-        obj = obj[part]
-    return obj
+    """A dotted path; a key may itself hold dots (unmapped keys are flattened)."""
+    parts = path.split('.')
+    if not parts or parts == ['']:
+        return obj
+    if not isinstance(obj, dict):
+        return '<missing>'
+    for k in range(len(parts), 0, -1):
+        key = '.'.join(parts[:k])
+        if key in obj:
+            found = at(obj[key], '.'.join(parts[k:])) if k < len(parts) else obj[key]
+            if found != '<missing>':
+                return found
+    return '<missing>'
 
 
 def main():
