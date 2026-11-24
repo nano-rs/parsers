@@ -160,7 +160,7 @@ def check(source, output, raw, rules, consumed=(), mappings=None, setting=None):
             # NAN-5894: a literal dotted key whose name another key also gets
             # keeps its dots escaped ("a~1b"), as nano's ingest step names it.
             escaped = '.'.join('~1'.join(provenance.esc(snake(provenance.unesc(piece))) for piece in part.split('~1')) for part in key.split('.'))
-            bases.append('source_' + escaped if escaped.startswith('nano~1') else escaped)
+            bases.append('source_' + escaped if escaped.startswith(('nano~1', 'nano.')) else escaped)
         matched = False
         for slot, actual in residual.items():
             if slot in used or not any(slot == b or re.fullmatch(re.escape(b)+r'_\d+', slot) for b in bases): continue

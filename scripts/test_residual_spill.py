@@ -64,6 +64,8 @@ class DeclTests(unittest.TestCase):
             ({'a.b': 1, 'a': {'b': 2}, 'A': {'b': 3}}, {'a.b': 3, 'a.b_2': 2, 'a~1b': 1}),
             ({'a.b': 1, 'a': {'b': 2}, 'a.b_2': 9}, {'a.b': 2, 'a~1b': 1, 'a.b_2': 9}),
             ({'nano.x': 1, 'nano': {'x': 2}}, {'source_nano.x': 2, 'source_nano~1x': 1}),
+            ({'nano': {'a.b': 1, 'a': {'b': 2}}}, {'source_nano.a.b': 2, 'source_nano.a~1b': 1}),
+            ({'nano.a': {'b': 1}, 'nano': {'a.b': 2}}, {'source_nano.a~1b': 2, 'source_nano~1a.b': 1}),
             # No literal dot: only snake-casing clashes, so the suffix stays.
             ({'userName': 1, 'user_name': 2}, {'user_name': 1, 'user_name_2': 2}),
             # Two flat keys that escape alike: escaping cannot tell them apart.
