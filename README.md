@@ -345,8 +345,8 @@ HEC **object** events (`"event": { ... }`) are a problem for some parsers today.
 For an object event, nano removes some fields (such as `timestamp` and `host`)
 before the parser runs, and it may hand the parser only the event's `message`
 field. The event can then get the wrong time or lose fields. This hits JSON logs
-that have their own `timestamp` or `message` field, and sources that write both
-JSON and text lines: Traefik, AWS CloudWatch Logs, Google Cloud Logging (Pub/Sub
+that have their own `timestamp`, `message` or `event` field, and sources that
+write both JSON and text lines: Traefik, AWS CloudWatch Logs, Google Cloud Logging (Pub/Sub
 push), Atlassian, Salesforce Event Monitoring, Zoom (webhooks), Keycloak,
 PostgreSQL and Kubernetes container logs. Each of those parsers says so in its
 `samples/README.md` or its description. A fix is planned in nano (.36).
