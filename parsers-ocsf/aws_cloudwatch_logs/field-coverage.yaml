@@ -1,0 +1,53 @@
+source: mixed
+source_normalize:
+- kind: unwrap_single
+  path: logEvents
+  reason: A subscription envelope carrying one logEvent is captured as that event, the same shape `unnest(.logEvents)`
+    leaves, so the event is not spilled twice.
+- kind: parse_json_object
+  paths:
+  - logEvents.message
+  - message
+  target: message_json
+  arrays: true
+  reason: A JSON log message is moved under message_json so its fields spill one by one, as-is (its raw
+    text stays in raw_data); never overwrites an existing message_json.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+transforms:
+- source: timestamp
+  kind: epoch_ms
+  target: time
+  reason: Exported lines carry an RFC 3339 event clock, converted to event milliseconds.
+mappings:
+  logEvents.id:
+  - metadata.uid
+  logEvents.timestamp:
+  - time
+  logGroup:
+  - metadata.log_name
+  message_json.level:
+  - metadata.log_level
+  message_json.message:
+  - message
+  owner:
+  - cloud.account.uid
+  message:
+  - message
+  timestamp:
+  - time
+  logEvents.@aws~1account:
+  - cloud.account.uid
+  logEvents.@aws~1region:
+  - cloud.region
+  logEvents.message:
+  - message
+  message_json.msg:
+  - message
+  eventId:
+  - metadata.uid
+  ingestionTime:
+  - metadata.logged_time
+  id:
+  - metadata.uid

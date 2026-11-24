@@ -104,6 +104,8 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Microsoft 365](parsers-ocsf/microsoft_365) | `microsoft_365` | Microsoft | JSON | Exchange, SharePoint, Azure AD, DLP, Teams audit events |
 | [Google Workspace Audit](parsers-ocsf/google_workspace) | `gws_login` | Google | JSON | Admin SDK Reports: login, admin console, OAuth token, Drive activity |
 | [Wiz](parsers-ocsf/wiz) | `wiz` | Wiz | JSON (API + webhooks) | Issues and Detections / Threats as Detection Finding, vulnerability findings as Vulnerability Finding, cloud configuration findings as Compliance Finding. OCSF only |
+| [AWS CloudWatch Logs (generic)](parsers-ocsf/aws_cloudwatch_logs) | `aws_cloudwatch_logs` | Amazon | JSON (subscription / Firehose envelope, per-event) / export lines | Any log group: each inner message becomes a Base Event with log group, account and event id; JSON messages pass through. Multi-event envelopes must be split upstream. OCSF only |
+| [Google Cloud Logging (generic)](parsers-ocsf/gcp_logging) | `gcp_logging` | Google | JSON LogEntry (Pub/Sub, push wrapper, sink) | Any log: textPayload / jsonPayload as Base Event, httpRequest as HTTP Activity, project / location on cloud; audit logs belong on gcp_audit. OCSF only |
 
 ### Security & IAM
 
@@ -151,6 +153,9 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Apache HTTP Server](parsers-ocsf/apache) | `apache_access` | Apache | Combined/common log | Client IP, method, status, bytes, user agent, referrer |
 | [Nginx](parsers-ocsf/nginx) | `nginx` | Nginx | Combined / JSON / error | Access and error logs with upstream and proxy support |
 | [Microsoft IIS](parsers-ocsf/iis) | `iis` | Microsoft | W3C extended log | Default and extended field sets, `#Fields`-driven JSON wrapper, NXLog / App Service named keys |
+| [HAProxy](parsers-ocsf/haproxy) | `haproxy` | HAProxy Technologies | Default / tcplog / httplog / httpslog / error | HTTP mode as HTTP Activity, TCP mode and connection errors as Network Activity; timers, termination state, frontend/backend/server. OCSF only |
+| [Traefik](parsers-ocsf/traefik) | `traefik` | Traefik Labs | CLF / genericCLF / JSON access, JSON / logfmt app log | Access logs as HTTP Activity with router, service, TLS and trace; application log as Base Event. OCSF only |
+| [Caddy](parsers-ocsf/caddy) | `caddy` | Caddy | JSON (zap) | Access and request error logs as HTTP Activity with decoded TLS; server logs as Base Event. OCSF only |
 | [Squid Proxy](parsers-ocsf/squid_proxy) | `squid_proxy` | Squid Project | Access log | Cache hit/miss, URL extraction, HTTP metadata |
 | [MongoDB](parsers-ocsf/mongodb) | `mongodb` | MongoDB | JSON (4.4+ structured log, auditLog) | Authentication success and failure, connections, slow queries, start and shutdown, audit authCheck denials, collection and user changes |
 | [Elasticsearch / OpenSearch](parsers-ocsf/elasticsearch) | `elasticsearch` | Elastic / OpenSearch | JSON (server, audit, slow log) | Security audit (authentication, access granted / denied, run-as, IP filter, user changes), OpenSearch audit categories, search and indexing slow logs, node start / stop and errors |
@@ -330,6 +335,21 @@ and after a large rewrite. CI runs the check on every PR (job "Parser load budge
 - When nothing fits, **Base Event (`class_uid` 0) is the right answer.** It is the
   spec's home for an event with no class; forcing an application log line into a
   security class poisons every class-scoped hunt.
+
+### Sending logs over Splunk HEC
+
+Send each log to nano as an HEC **string** event (`"event": "<the log, as text>"`),
+or post it to nano's `/ingest` endpoint. Both work for every parser.
+
+HEC **object** events (`"event": { ... }`) are a problem for some parsers today.
+For an object event, nano removes some fields (such as `timestamp` and `host`)
+before the parser runs, and it may hand the parser only the event's `message`
+field. The event can then get the wrong time or lose fields. This hits JSON logs
+that have their own `timestamp`, `message` or `event` field, and sources that
+write both JSON and text lines: Traefik, AWS CloudWatch Logs, Google Cloud Logging (Pub/Sub
+push), Atlassian, Salesforce Event Monitoring, Zoom (webhooks), Keycloak,
+MySQL (Enterprise Audit), PostgreSQL and Kubernetes container logs. Each of those parsers says so in its
+`samples/README.md` or its description. A fix is planned in nano (.36).
 
 ## Structure
 
