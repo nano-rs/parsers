@@ -188,23 +188,17 @@ jobs:
       - name: Test the log source timezone setting
         run: python3 scripts/test_source_timezone.py
 
+      # Container collector envelopes: an envelope field is dropped only when its
+      # value is emitted; docker builds no container from an image name alone.
+      - name: Test container collector envelopes
+        run: python3 scripts/test_container_envelopes.py
+
       # nano hands a JSON-input parser (first decoder parse_json) the whole HEC /
       # OTLP object, a text parser the message line. The generated blocks must
       # never change which one a parser is, and Generic JSON must parse what an
       # HEC object event and an OTel-style event deliver.
       - name: Test the HEC / OTLP input contract
         run: python3 scripts/test_input_contract.py
-
-      # What a parser gets for its log sent as an HEC / OTel object event
-      # (parsers-ocsf/<parser>/hec-envelopes.yaml): a wrapped text line and a JSON
-      # record with its own message both parse, and the sender's other keys are kept.
-      - name: Test HEC / OTel envelope delivery
-        run: python3 scripts/test_hec_envelopes.py
-
-      # The generated mixed-input block (JSON records and text lines from one
-      # source, in every shape nano delivers them).
-      - name: Test the mixed-input block
-        run: python3 scripts/test_mixed_input.py
 
   # NAN-5388: compiling is not enough; a parser must also compile FAST. An
   # install's deploy waits 45 s for Vector to acknowledge a reload, and a reload

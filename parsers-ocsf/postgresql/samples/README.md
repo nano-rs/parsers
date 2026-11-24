@@ -22,3 +22,18 @@ and users are documentation values (192.0.2.0/24, 198.51.100.0/24).
 | `csvlog_bare_ipv6_same_db_user.json` | csvlog with a bare IPv6 `connection_from` (no port) and dbname equal to the user: the IP is not split and dbname is kept |
 | `empty_message.json` | Empty `message`: raw_data stays the empty string |
 | `junk.json` | Malformed input; must fall back without aborting |
+
+## Sending these logs over Splunk HEC
+
+Send each log to nano as an HEC **string** event (`"event": "<the log, as text>"`),
+or post it to nano's `/ingest` endpoint. Both work today.
+
+Do not send these logs as HEC **object** events (`"event": { ... }`). For an
+object event, nano currently removes some fields (such as `timestamp` and
+`host`) before this parser runs, and it may hand the parser only the event's
+`message` field. The event can then get the wrong time or lose fields. A fix is
+planned in nano (.36).
+
+For PostgreSQL, a jsonlog record (PostgreSQL 15 and later) has its own
+message field, so as an HEC object event only that text arrives and the
+record is not parsed.

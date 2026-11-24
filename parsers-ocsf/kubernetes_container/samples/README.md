@@ -17,3 +17,17 @@ are documentation values (192.0.2.0/24, example.com).
 | `vector_file_source_envelope.json` | Vector `file` source CRI line: `file` (with its restart index `3.log`), `host`, `stream`, `source_type` kept in unmapped.envelope |
 | `empty_message.json` | Empty `message`: raw_data stays the empty string |
 | `junk.json` | Malformed input; must fall back without aborting |
+
+## Sending these logs over Splunk HEC
+
+Send each log to nano as an HEC **string** event (`"event": "<the log, as text>"`),
+or post it to nano's `/ingest` endpoint. Both work today.
+
+Do not send these logs as HEC **object** events (`"event": { ... }`). For an
+object event, nano currently removes some fields (such as `timestamp` and
+`host`) before this parser runs, and it may hand the parser only the event's
+`message` field. The event can then get the wrong time or lose fields. A fix is
+planned in nano (.36).
+
+For Kubernetes logs, a JSON application line with its own message field
+arrives as that text only.
