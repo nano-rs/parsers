@@ -20,7 +20,7 @@ from test_source_timezone import ROOT, VECTOR_ENV  # noqa: E402
 # Kept equal to LINE_DECODER in nanosiem-core hec_payload.rs (and test_input_contract.py).
 LINE_DECODER = re.compile(r'\bparse_(syslog|groks|grok|cef|key_value|csv|xml|common_log|apache_log|nginx_log|klog|glog|logfmt|linux_authorization|aws_alb_log|aws_vpc_flow_log|aws_cloudwatch_log_subscription_message)\b')
 
-PROGRAM = '''__mx_body = to_string(.message) ?? encode_json(.)
+PROGRAM = '''__mx_body = string(.message) ?? encode_json(.)
 __mx_line = r'^LINE '
 __mx_keys = ["rk", "rk2"]
 {block}
