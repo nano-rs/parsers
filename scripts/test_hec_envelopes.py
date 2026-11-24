@@ -7,6 +7,7 @@ Cases live beside each parser in parsers-ocsf/<parser>/hec-envelopes.yaml:
     - name: <what it covers>
       event: {<the HEC `event` object, as the sender posts it>}
       expect: {<dotted path>: <value>, ...}     # "<missing>" for absent
+      keep: [<a sender key>, ...]                # a wrapper's keys the parser keeps
 
 The delivery follows nano (nanosiem config/vector/02-hec-source.toml
 hec_normalize, and nanosiem-core src/parsers/vector_config/hec_payload.rs
@@ -22,10 +23,10 @@ same way:
   not itself a JSON object, `.message` becomes the whole event's JSON and the
   stash is removed.
 
-Every case fails on unmapped.parse_fallback / parse_error. When a parser takes
-the stash (removes it), the sender's other keys are its to keep: each value must
-appear outside raw_data. When the stash is left, nano's prepare step files them
-under unmapped after the parser.
+Every case fails on unmapped.parse_fallback / parse_error. A `keep` key (a
+wrapper's sender key: the record's own fields are field coverage's to check)
+must appear, by value, outside raw_data, unless the parser left the stash: then
+nano's prepare step files it under unmapped after the parser.
 """
 import json
 import subprocess
@@ -102,16 +103,12 @@ def main():
                 got = at(out, path)
                 if got != want and str(got) != str(want):
                     failures.append(f'{name}: {path} = {got!r}, want {want!r}')
-            # The parser holds the sender's keys when it got the whole event:
-            # delivered as its JSON, or taken from the stash.
-            whole = message != event.get('message') or (stash is not None and not stash_left)
-            if whole:
+            if not (stash is not None and stash_left):
                 text = json.dumps({k: v for k, v in out.items() if k != 'raw_data'}, ensure_ascii=False)
-                for key, value in event.items():
-                    if key == 'message' or key in (case.get('expect') or {}):
-                        continue
+                for key in case.get('keep') or []:
+                    value = event[key]
                     if json.dumps(value, ensure_ascii=False) not in text and str(value) not in text:
-                        failures.append(f'{name}: sibling {key}={value!r} lost (only in raw_data)')
+                        failures.append(f'{name}: sender key {key}={value!r} lost (only in raw_data)')
     for f in failures:
         print('FAIL', f)
     if failures:
