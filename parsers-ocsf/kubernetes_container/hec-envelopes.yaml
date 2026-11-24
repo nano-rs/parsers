@@ -1,0 +1,56 @@
+# What this parser gets when its log arrives as an HEC (or OTel-style) object
+# event; scripts/test_hec_envelopes.py builds the delivery the way nano does and
+# checks each case.
+cases:
+- name: a CRI line wrapped by an HEC sender with the pod log file beside it
+  event:
+    message: 2026-11-20T10:00:00.000Z stderr F ERROR connection refused
+    file: /var/log/pods/prod_api_12345678-1234-1234-1234-1234567890ab/app/0.log
+  expect:
+    severity_id: 4
+- name: a kubernetes_logs body with its kubernetes envelope (OTel / Vector style)
+  event:
+    message: ERROR payment failed
+    kubernetes:
+      pod_namespace: prod
+      pod_name: pay-1
+      container_name: app
+  expect:
+    severity_id: 4
+    raw_data: ERROR payment failed
+    device.container.name: app
+- name: an image without its ID and a pod uid that is not one stay in the envelope
+  event:
+    message: hello
+    kubernetes:
+      pod_namespace: prod
+      pod_name: p1
+      pod_uid: bad-uid
+      container_name: app
+      container_image: acme/app:v1
+  expect:
+    unmapped.envelope.kubernetes.container_image: acme/app:v1
+    unmapped.envelope.kubernetes.pod_uid: bad-uid
+    unmapped.envelope.kubernetes.container_name: <missing>
+- name: an image ID without its name stays in the envelope
+  event:
+    message: hello
+    kubernetes:
+      pod_namespace: prod
+      pod_name: p1
+      container_name: app
+      container_image_id: sha256:onlyid
+  expect:
+    unmapped.envelope.kubernetes.container_image_id: sha256:onlyid
+- name: 'no container: the namespace and pod stay in the envelope'
+  event:
+    message: hello
+    kubernetes:
+      pod_namespace: prod
+      pod_name: p1
+      pod_node_name: node-1
+  expect:
+    device.hostname: node-1
+    unmapped.envelope.kubernetes.pod_namespace: prod
+    unmapped.envelope.kubernetes.pod_name: p1
+    unmapped.envelope.kubernetes.pod_node_name: <missing>
