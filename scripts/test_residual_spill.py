@@ -50,6 +50,42 @@ class DeclTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(out.get('unmapped', {}), expected)
 
+    def test_path_clash_names_under_vector(self):
+        # NAN-5894: a literal dotted key that clashes with a nested path keeps
+        # its dots escaped (a~1b), the name nano's ingest step gives it when no
+        # parser runs. Only a name still taken after that gets a _N suffix.
+        cases = [
+            ({'a.b': 1, 'a': {'b': 2}}, {'a.b': 2, 'a~1b': 1}),
+            ({'a': {'b': 2}, 'a.b': 1, 'a.c': 3}, {'a.b': 2, 'a~1b': 1, 'a.c': 3}),
+            ({'x': {'a.b': 1}, 'x.a': {'b': 2}}, {'x.a~1b': 1, 'x~1a.b': 2}),
+            ({'A.b': 1, 'a': {'b': 2}}, {'a.b': 2, 'a~1b': 1}),
+            ({'Foo.BarBaz': 1, 'foo': {'bar_baz': 2}}, {'foo.bar_baz': 2, 'foo~1bar_baz': 1}),
+            ({'a.b': {'c.d': 1}, 'a': {'b': {'c': {'d': 2}}}}, {'a.b.c.d': 2, 'a~1b.c~1d': 1}),
+            ({'a.b': 1, 'a': {'b': 2}, 'A': {'b': 3}}, {'a.b': 3, 'a.b_2': 2, 'a~1b': 1}),
+            ({'a.b': 1, 'a': {'b': 2}, 'a.b_2': 9}, {'a.b': 2, 'a~1b': 1, 'a.b_2': 9}),
+            ({'nano.x': 1, 'nano': {'x': 2}}, {'source_nano.x': 2, 'source_nano~1x': 1}),
+            # No literal dot: only snake-casing clashes, so the suffix stays.
+            ({'userName': 1, 'user_name': 2}, {'user_name': 1, 'user_name_2': 2}),
+            # Two flat keys that escape alike: escaping cannot tell them apart.
+            ({'userName.x': 1, 'user_name.x': 2}, {'user_name.x': 1, 'user_name.x_2': 2}),
+            ({'A.b': 1, 'a.b': 2, 'a': {'b': 3}}, {'a.b': 1, 'a.b_2': 3, 'a.b_3': 2}),
+            # No clash: dotted keys keep their plain names.
+            ({'plain': 1, 'd.x': 2}, {'plain': 1, 'd.x': 2}),
+        ]
+        program = residual_spill.prelude() + '\n__source_kv = object!(.source)\n__raw_body = "raw input"\n. = .output\n' + generated({'mappings': {}})
+        with tempfile.TemporaryDirectory(prefix='clash-') as tmp:
+            tmp = Path(tmp)
+            (tmp/'p.vrl').write_text(program)
+            (tmp/'in.json').write_text(''.join(json.dumps({'source': s, 'output': {}}) + '\n' for s, _ in cases))
+            run = subprocess.run(['vector', 'vrl', '--program', str(tmp/'p.vrl'), '--input', str(tmp/'in.json'), '--print-object'],
+                                 text=True, capture_output=True, timeout=120)
+        self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+        outputs = [json.loads(l) for l in run.stdout.splitlines() if l.startswith('{')]
+        self.assertEqual(len(outputs), len(cases))
+        for (source, expected), out in zip(cases, outputs):
+            with self.subTest(source=source):
+                self.assertEqual(out.get('unmapped', {}), expected)
+
     def test_decl_is_one_literal(self):
         self.assertTrue(decl_literal({'a': ['b']}).startswith('"\\n'))
 

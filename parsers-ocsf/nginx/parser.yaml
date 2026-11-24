@@ -511,10 +511,45 @@ parser_vrl: |
           value
       }
   } else {
-      # Slow path, in source key order: a name already taken gets the next free
-      # _2, _3, ... suffix.
+      # Slow path: two spilled keys get the same name. A literal dotted key and a
+      # nested path read alike ({"a.b": 1, "a": {"b": 2}} is "a.b" twice), and so
+      # do keys that only snake-case alike ("userName", "user_name").
+      # NAN-5894: a literal dotted key whose name is shared keeps its dots
+      # escaped, RFC 6901 style ("a~1b", a "~" in it as "~0"), and the key
+      # without a literal dot keeps "a.b". That is the name nano's ingest step
+      # gives the flat key when no parser runs, so the name never depends on
+      # whether a parser read the event, and it cannot clash with a vendor key
+      # that is really named "b_2". A key is escaped only when its escaped name
+      # is unique too (two flat keys that only snake-case alike escape to the
+      # same name, so escaping would not tell them apart). Only a name still
+      # taken after that gets the next free _2, _3, ... suffix, in key order:
+      # keys that differ only in case or snake-casing, or a vendor key already
+      # spelled "a~1b" (nothing is ever dropped).
+      __spilled = filter(__flat) -> |key, value| {
+          value != __raw_body && !contains(__consumed, "," + encode_json(key))
+      }
+      __plain = map_values(keys(__spilled)) -> |key| {
+          key = replace(replace(string!(key), "~1", "."), "~0", "~")
+          join!(map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }, ".")
+      }
+      __shared = filter(tally(__plain)) -> |_name, count| { count > 1 }
+      __shared = "\n" + join!(map_values(keys(__shared)) -> |name| { encode_json(name) }, "\n") + "\n"
+      # The escaped name of each literal dotted key ("" for any other key).
+      __escaped_names = map_values(keys(__spilled)) -> |key| {
+          key = string!(key)
+          if contains(key, "~1") {
+              join!(map_values(split(key, ".")) -> |segment| {
+                  join!(map_values(split(string!(segment), "~1")) -> |piece| {
+                      replace(snakecase(replace(string!(piece), "~0", "~")), "~", "~0")
+                  }, "~1")
+              }, ".")
+          } else { "" }
+      }
+      __escaped_shared = filter(tally(__escaped_names)) -> |_name, count| { count > 1 }
+      __escaped_shared = "\n" + join!(map_values(keys(__escaped_shared)) -> |name| { encode_json(name) }, "\n") + "\n"
       for_each(__flat) -> |key, value| {
           __token = "," + encode_json(key)
+          __escaped_key = key
           key = replace(replace(key, "~1", "."), "~0", "~")
           if is_array(value) || is_object(value) {
               value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
@@ -524,6 +559,14 @@ parser_vrl: |
           if !contains(__consumed, __token) && value != __raw_body {
               __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
               __base = join!(__parts, ".")
+              if contains(__escaped_key, "~1") && contains(__shared, "\n" + encode_json(__base) + "\n") {
+                  __escaped_name = join!(map_values(split(__escaped_key, ".")) -> |segment| {
+                      join!(map_values(split(string!(segment), "~1")) -> |piece| {
+                          replace(snakecase(replace(string!(piece), "~0", "~")), "~", "~0")
+                      }, "~1")
+                  }, ".")
+                  if !contains(__escaped_shared, "\n" + encode_json(__escaped_name) + "\n") { __base = __escaped_name }
+              }
               __key = __base
               __suffix = 2
               if includes(keys(__residual), __key) {
@@ -547,10 +590,11 @@ parser_vrl: |
   }
   # Names nano owns in unmapped (the parser markers and the reserved nano.*
   # namespace) are never taken by a source field: a vendor key with such a name
-  # is kept, renamed source_<name>, so a log cannot forge a marker.
-  if match(encode_json(keys(__residual)), r'"nano(?:"|\.|_time_assumed_tz"|_time_source"|_operational")') {
+  # is kept, renamed source_<name>, so a log cannot forge a marker. An escaped
+  # flat key ("nano~1x", NAN-5894) is renamed the same way as "nano.x".
+  if match(encode_json(keys(__residual)), r'"nano(?:"|\.|~1|_time_assumed_tz"|_time_source"|_operational")') {
       for_each(object!(__residual)) -> |key, value| {
-          if includes(["nano", "nano_time_assumed_tz", "nano_time_source", "nano_operational"], key) || starts_with(key, "nano.") {
+          if includes(["nano", "nano_time_assumed_tz", "nano_time_source", "nano_operational"], key) || starts_with(key, "nano.") || starts_with(key, "nano~1") {
               # source_<name>, or the next free _2, _3, ... when a vendor key
               # already holds that name: nothing is lost.
               __rk = "source_" + key
