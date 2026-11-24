@@ -172,10 +172,11 @@ one shape: a text line; a JSON record; an HEC or OTel object whose `message` is
 a text line (a wrapper, whose other keys are the sender's); or, over HEC, only
 an event's own `message` while the whole event waits in event metadata
 (`%nano_hec_event`). Rather than handling each shape by hand, such a parser
-sets two variables and places the marker:
+sets three variables and places the marker:
 
 ```
 # nano:input=json
+__mx_body = to_string(.message) ?? ""     # the delivered body, by the parser's own rule
 __mx_line = r'^(?:<the text line shapes of this source>)'
 __mx_keys = ["<a key that marks a JSON record of this source>", ...]
 # NAN mixed input
