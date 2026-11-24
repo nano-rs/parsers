@@ -188,8 +188,10 @@ parser_vrl: |
       lo = null
       if is_integer(geo.longitude) || is_float(geo.longitude) { lo = to_float(geo.longitude) ?? null }
       if lo != null { loc.long = lo }
-      # location needs a country or region beside any coordinates.
-      if cc != "" || rn != "" { src_ep.location = loc }
+      # location needs a country or region beside any coordinates, and an
+      # endpoint needs an address to name it: without one the geo fields stay in
+      # unmapped (OCSF network_endpoint requires an identifying field).
+      if (cc != "" || rn != "") && exists(src_ep.ip) { src_ep.location = loc }
 
       # ---- class routing ----
       class_uid = 0
@@ -305,8 +307,10 @@ parser_vrl: |
           gn = string(res.name) ?? ""
           if gn != "" { g.name = gn }
           if r_id != "" { g.uid = r_id }
+          # OCSF group needs a name or uid; a type alone does not name one (it
+          # stays in unmapped). The group itself is required by the class.
           gt = string(res.type) ?? ""
-          if gt != "" { g.type = gt }
+          if gt != "" && length(g) > 0 { g.type = gt }
           if length(g) == 0 { g = { "name": "unknown" } }
           ocsf.group = g
           if length(actor_user) > 0 { ocsf.actor = { "user": actor_user } }
@@ -703,3 +707,20 @@ samples:
     expect:
       "src_endpoint.location.lat": "-27.658"
       "src_endpoint.location.country": "AU"
+  # geo without a valid address: no location-only src_endpoint (geo stays in unmapped)
+  - raw: "{\"@version\": \"1\", \"version\": \"2\", \"client_ip\": \"not-an-ip\", \"event_type\": \"user_login_attempt\", \"id\": \"63c264c6c1bd55c1b7e901a5\", \"initiated_by\": {\"email\": \"jane.doe@example.com\", \"id\": \"5c86b7149fdce00001d38014\", \"type\": \"user\"}, \"mfa\": false, \"organization\": \"000000000000000000000000\", \"service\": \"directory\", \"success\": true, \"timestamp\": \"2023-01-14T08:20:06.495Z\", \"username\": \"jane.doe\", \"geoip\": {\"country_code\": \"US\", \"region_name\": \"Colorado\"}}"
+    expect:
+      "src_endpoint": "<missing>"
+      "unmapped.client_ip": "not-an-ip"
+  # a group resource with a type only: the group is named unknown, the type stays in unmapped
+  - raw: "{\"id\": \"5c8fcfe0e7eb500001c71105\", \"event_type\": \"group_create\", \"timestamp\": \"2026-10-04T19:20:00Z\", \"organization\": \"000000000000000000000000\", \"resource\": {\"type\": \"user_group\"}, \"initiated_by\": {\"type\": \"admin\", \"id\": \"5c86b6cf9fdce00001d3800c\", \"email\": \"admin@example.com\"}, \"client_ip\": \"198.51.100.14\", \"success\": true, \"service\": \"directory\", \"@version\": \"1\"}"
+    expect:
+      "class_uid": 3006
+      "group.name": "unknown"
+      "group.type": "<missing>"
+  # API Activity requires src_endpoint: without an address it is named unknown, with no location
+  - raw: "{\"id\": \"5c8fcfe0e7eb500001c71106\", \"event_type\": \"passwordmanager_enable\", \"timestamp\": \"2026-10-04T19:25:00Z\", \"organization\": \"000000000000000000000000\", \"changes\": [{\"field\": \"enabled\", \"from\": \"false\", \"to\": \"true\"}], \"initiated_by\": {\"id\": \"60d4d8f72c6b9226e875781a\", \"type\": \"admin\", \"email\": \"admin@example.com\", \"source\": \"system\"}, \"client_ip\": \"not-an-ip\", \"success\": false, \"error_message\": \"This user can't be updated because it's the last folder admin\", \"service\": \"password_manager\", \"@version\": \"1\", \"geoip\": {\"country_code\": \"US\"}}"
+    expect:
+      "class_uid": 6003
+      "src_endpoint.hostname": "unknown"
+      "src_endpoint.location": "<missing>"

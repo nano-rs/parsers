@@ -195,9 +195,10 @@ parser_vrl: |
           if clong != null { loc.long = clong }
           ccc = string(p.ClientCountryCode) ?? ""
           if ccc != "" { loc.country = ccc }
-          # location needs a country (or city/region) beside the coordinates.
-          if ccc != "" { src.location = loc }
-          if length(src) == 0 { src = { "hostname": "unknown" } }
+          # location needs a country (or city/region) beside the coordinates, and
+          # the endpoint an address or hostname to name it: without one the
+          # client's geo fields stay in unmapped.
+          if ccc != "" && (exists(src.ip) || exists(src.hostname)) { src.location = loc }
 
           dst = {}
           sip = string(p.ServerIP) ?? ""
@@ -212,7 +213,8 @@ parser_vrl: |
           }
           sport = to_int(p.ServerPort) ?? 0
           if sport == 0 { sport = to_int(p.ServicePort) ?? 0 }
-          if sport > 0 { dst.port = sport }
+          # port_t is 0-65535; any other value stays in unmapped.
+          if sport > 0 && sport <= 65535 { dst.port = sport }
           app = string(p.Application) ?? ""
           if app != "" { dst.svc_name = app }
 
@@ -240,7 +242,7 @@ parser_vrl: |
           cip = string(p.ConnectorIP) ?? ""
           if cip != "" && (is_ipv4(cip) || is_ipv6(cip)) { proxy.ip = cip }
           cport = to_int(p.ConnectorPort) ?? 0
-          if cport > 0 { proxy.port = cport }
+          if cport > 0 && cport <= 65535 { proxy.port = cport }
 
           ocsf.class_name = "Network Activity"
           ocsf.category_uid = 4
@@ -260,10 +262,12 @@ parser_vrl: |
           # client is named "unknown" (the raw values stay in unmapped).
           if length(src) == 0 { src = { "hostname": "unknown" } }
           ocsf.src_endpoint = src
-          if length(dst) > 0 { ocsf.dst_endpoint = dst }
+          # An endpoint needs something that names it (OCSF network_endpoint): a
+          # port alone is not one, and stays in unmapped.
+          if exists(dst.ip) || exists(dst.hostname) || exists(dst.svc_name) { ocsf.dst_endpoint = dst }
           ocsf.connection_info = conn
           if length(traffic) > 0 { ocsf.traffic = traffic }
-          if length(proxy) > 0 { ocsf.proxy_endpoint = proxy }
+          if exists(proxy.ip) || exists(proxy.name) { ocsf.proxy_endpoint = proxy }
           if app != "" { ocsf.app_name = app }
           pol = string(p.Policy) ?? ""
           if pol != "" { ocsf.policy = { "name": pol } }
@@ -765,3 +769,21 @@ samples:
     expect:
       "src_endpoint.location.lat": "45"
       "src_endpoint.location.long": "-119"
+  # placeholder client IPs and a country: src_endpoint named unknown, no location-only endpoint
+  - raw: "{\"LogTimestamp\": \"Fri May 31 17:35:42 2019\", \"Customer\": \"Example Corp\", \"SessionID\": \"LHJdkjmNDf12nclBsvwA\", \"ConnectionID\": \"SqyZIMkg0JTj7EABsvwA,Q+EjXGdrvbF2lPiBbedm\", \"InternalReason\": \"\", \"ConnectionStatus\": \"active\", \"IPProtocol\": 6, \"DoubleEncryption\": 0, \"Username\": \"john.doe@example.com\", \"ServicePort\": 10011, \"ClientPublicIP\": \"-\", \"ClientPrivateIP\": \"-\", \"ClientLatitude\": 45.0, \"ClientLongitude\": -119.0, \"ClientCountryCode\": \"US\", \"ClientZEN\": \"broker2b.pdx\", \"Policy\": \"ABC Lab Apps\", \"Connector\": \"ZDEMO ABC\", \"ConnectorZEN\": \"broker2b.pdx\", \"ConnectorIP\": \"192.0.2.200\", \"ConnectorPort\": 60266, \"Host\": \"203.0.113.5\", \"Application\": \"ABC Lab Apps\", \"AppGroup\": \"ABC Lab Apps\", \"Server\": \"0\", \"ServerIP\": \"203.0.113.5\", \"ServerPort\": 10011, \"PolicyProcessingTime\": 28, \"CAProcessingTime\": 1330, \"ConnectorZENSetupTime\": 191017, \"ConnectionSetupTime\": 192397, \"ServerSetupTime\": 465, \"AppLearnTime\": 0, \"TimestampConnectionStart\": \"2019-05-30T08:20:42.230Z\", \"TimestampConnectionEnd\": \"\", \"TimestampCATx\": \"2019-05-30T08:20:42.230Z\", \"TimestampCARx\": \"2019-05-30T08:20:42.231Z\", \"TimestampAppLearnStart\": \"\", \"TimestampZENFirstRxClient\": \"2019-05-30T08:20:42.424Z\", \"TimestampZENFirstTxClient\": \"\", \"TimestampZENLastRxClient\": \"2019-05-31T17:34:27.348Z\", \"TimestampZENLastTxClient\": \"\", \"TimestampConnectorZENSetupComplete\": \"2019-05-30T08:20:42.422Z\", \"TimestampZENFirstRxConnector\": \"\", \"TimestampZENFirstTxConnector\": \"2019-05-30T08:20:42.424Z\", \"TimestampZENLastRxConnector\": \"\", \"TimestampZENLastTxConnector\": \"2019-05-31T17:34:27.348Z\", \"ZENTotalBytesRxClient\": 2406926, \"ZENBytesRxClient\": 7115, \"ZENTotalBytesTxClient\": 0, \"ZENBytesTxClient\": 0, \"ZENTotalBytesRxConnector\": 0, \"ZENBytesRxConnector\": 0, \"ZENTotalBytesTxConnector\": 2406926, \"ZENBytesTxConnector\": 7115, \"Idp\": \"Example IDP Config\", \"ClientToClient\": \"0\", \"Hostname\": \"\"}"
+    expect:
+      "src_endpoint.hostname": "unknown"
+      "src_endpoint.location": "<missing>"
+  # no server address, host or application: no port-only dst_endpoint (the port stays in unmapped)
+  - raw: "{\"LogTimestamp\": \"Fri May 31 17:35:42 2019\", \"Customer\": \"Example Corp\", \"SessionID\": \"LHJdkjmNDf12nclBsvwA\", \"ConnectionID\": \"SqyZIMkg0JTj7EABsvwA,Q+EjXGdrvbF2lPiBbedm\", \"InternalReason\": \"\", \"ConnectionStatus\": \"active\", \"IPProtocol\": 6, \"DoubleEncryption\": 0, \"Username\": \"john.doe@example.com\", \"ServicePort\": 10011, \"ClientPublicIP\": \"192.0.2.10\", \"ClientPrivateIP\": \"192.0.2.10\", \"ClientLatitude\": 45.0, \"ClientLongitude\": -119.0, \"ClientCountryCode\": \"US\", \"ClientZEN\": \"broker2b.pdx\", \"Policy\": \"ABC Lab Apps\", \"Connector\": \"ZDEMO ABC\", \"ConnectorZEN\": \"broker2b.pdx\", \"ConnectorIP\": \"192.0.2.200\", \"ConnectorPort\": 60266, \"Host\": \"\", \"Application\": \"\", \"AppGroup\": \"ABC Lab Apps\", \"Server\": \"0\", \"ServerIP\": \"-\", \"ServerPort\": 443, \"PolicyProcessingTime\": 28, \"CAProcessingTime\": 1330, \"ConnectorZENSetupTime\": 191017, \"ConnectionSetupTime\": 192397, \"ServerSetupTime\": 465, \"AppLearnTime\": 0, \"TimestampConnectionStart\": \"2019-05-30T08:20:42.230Z\", \"TimestampConnectionEnd\": \"\", \"TimestampCATx\": \"2019-05-30T08:20:42.230Z\", \"TimestampCARx\": \"2019-05-30T08:20:42.231Z\", \"TimestampAppLearnStart\": \"\", \"TimestampZENFirstRxClient\": \"2019-05-30T08:20:42.424Z\", \"TimestampZENFirstTxClient\": \"\", \"TimestampZENLastRxClient\": \"2019-05-31T17:34:27.348Z\", \"TimestampZENLastTxClient\": \"\", \"TimestampConnectorZENSetupComplete\": \"2019-05-30T08:20:42.422Z\", \"TimestampZENFirstRxConnector\": \"\", \"TimestampZENFirstTxConnector\": \"2019-05-30T08:20:42.424Z\", \"TimestampZENLastRxConnector\": \"\", \"TimestampZENLastTxConnector\": \"2019-05-31T17:34:27.348Z\", \"ZENTotalBytesRxClient\": 2406926, \"ZENBytesRxClient\": 7115, \"ZENTotalBytesTxClient\": 0, \"ZENBytesTxClient\": 0, \"ZENTotalBytesRxConnector\": 0, \"ZENBytesRxConnector\": 0, \"ZENTotalBytesTxConnector\": 2406926, \"ZENBytesTxConnector\": 7115, \"Idp\": \"Example IDP Config\", \"ClientToClient\": \"0\"}"
+    expect:
+      "dst_endpoint": "<missing>"
+  # no connector name or address: no port-only proxy_endpoint
+  - raw: "{\"LogTimestamp\": \"Fri May 31 17:35:42 2019\", \"Customer\": \"Example Corp\", \"SessionID\": \"LHJdkjmNDf12nclBsvwA\", \"ConnectionID\": \"SqyZIMkg0JTj7EABsvwA,Q+EjXGdrvbF2lPiBbedm\", \"InternalReason\": \"\", \"ConnectionStatus\": \"active\", \"IPProtocol\": 6, \"DoubleEncryption\": 0, \"Username\": \"john.doe@example.com\", \"ServicePort\": 10011, \"ClientPublicIP\": \"192.0.2.10\", \"ClientPrivateIP\": \"192.0.2.10\", \"ClientLatitude\": 45.0, \"ClientLongitude\": -119.0, \"ClientCountryCode\": \"US\", \"ClientZEN\": \"broker2b.pdx\", \"Policy\": \"ABC Lab Apps\", \"Connector\": \"\", \"ConnectorZEN\": \"broker2b.pdx\", \"ConnectorIP\": \"-\", \"ConnectorPort\": 443, \"Host\": \"203.0.113.5\", \"Application\": \"ABC Lab Apps\", \"AppGroup\": \"ABC Lab Apps\", \"Server\": \"0\", \"ServerIP\": \"203.0.113.5\", \"ServerPort\": 10011, \"PolicyProcessingTime\": 28, \"CAProcessingTime\": 1330, \"ConnectorZENSetupTime\": 191017, \"ConnectionSetupTime\": 192397, \"ServerSetupTime\": 465, \"AppLearnTime\": 0, \"TimestampConnectionStart\": \"2019-05-30T08:20:42.230Z\", \"TimestampConnectionEnd\": \"\", \"TimestampCATx\": \"2019-05-30T08:20:42.230Z\", \"TimestampCARx\": \"2019-05-30T08:20:42.231Z\", \"TimestampAppLearnStart\": \"\", \"TimestampZENFirstRxClient\": \"2019-05-30T08:20:42.424Z\", \"TimestampZENFirstTxClient\": \"\", \"TimestampZENLastRxClient\": \"2019-05-31T17:34:27.348Z\", \"TimestampZENLastTxClient\": \"\", \"TimestampConnectorZENSetupComplete\": \"2019-05-30T08:20:42.422Z\", \"TimestampZENFirstRxConnector\": \"\", \"TimestampZENFirstTxConnector\": \"2019-05-30T08:20:42.424Z\", \"TimestampZENLastRxConnector\": \"\", \"TimestampZENLastTxConnector\": \"2019-05-31T17:34:27.348Z\", \"ZENTotalBytesRxClient\": 2406926, \"ZENBytesRxClient\": 7115, \"ZENTotalBytesTxClient\": 0, \"ZENBytesTxClient\": 0, \"ZENTotalBytesRxConnector\": 0, \"ZENBytesRxConnector\": 0, \"ZENTotalBytesTxConnector\": 2406926, \"ZENBytesTxConnector\": 7115, \"Idp\": \"Example IDP Config\", \"ClientToClient\": \"0\"}"
+    expect:
+      "proxy_endpoint": "<missing>"
+  # ports outside 0-65535 are not port_t: they stay in unmapped
+  - raw: "{\"LogTimestamp\": \"Fri May 31 17:35:42 2019\", \"Customer\": \"Example Corp\", \"SessionID\": \"LHJdkjmNDf12nclBsvwA\", \"ConnectionID\": \"SqyZIMkg0JTj7EABsvwA,Q+EjXGdrvbF2lPiBbedm\", \"InternalReason\": \"\", \"ConnectionStatus\": \"active\", \"IPProtocol\": 6, \"DoubleEncryption\": 0, \"Username\": \"john.doe@example.com\", \"ServicePort\": 10011, \"ClientPublicIP\": \"192.0.2.10\", \"ClientPrivateIP\": \"192.0.2.10\", \"ClientLatitude\": 45.0, \"ClientLongitude\": -119.0, \"ClientCountryCode\": \"US\", \"ClientZEN\": \"broker2b.pdx\", \"Policy\": \"ABC Lab Apps\", \"Connector\": \"ZDEMO ABC\", \"ConnectorZEN\": \"broker2b.pdx\", \"ConnectorIP\": \"192.0.2.200\", \"ConnectorPort\": 70000, \"Host\": \"203.0.113.5\", \"Application\": \"ABC Lab Apps\", \"AppGroup\": \"ABC Lab Apps\", \"Server\": \"0\", \"ServerIP\": \"203.0.113.5\", \"ServerPort\": 70000, \"PolicyProcessingTime\": 28, \"CAProcessingTime\": 1330, \"ConnectorZENSetupTime\": 191017, \"ConnectionSetupTime\": 192397, \"ServerSetupTime\": 465, \"AppLearnTime\": 0, \"TimestampConnectionStart\": \"2019-05-30T08:20:42.230Z\", \"TimestampConnectionEnd\": \"\", \"TimestampCATx\": \"2019-05-30T08:20:42.230Z\", \"TimestampCARx\": \"2019-05-30T08:20:42.231Z\", \"TimestampAppLearnStart\": \"\", \"TimestampZENFirstRxClient\": \"2019-05-30T08:20:42.424Z\", \"TimestampZENFirstTxClient\": \"\", \"TimestampZENLastRxClient\": \"2019-05-31T17:34:27.348Z\", \"TimestampZENLastTxClient\": \"\", \"TimestampConnectorZENSetupComplete\": \"2019-05-30T08:20:42.422Z\", \"TimestampZENFirstRxConnector\": \"\", \"TimestampZENFirstTxConnector\": \"2019-05-30T08:20:42.424Z\", \"TimestampZENLastRxConnector\": \"\", \"TimestampZENLastTxConnector\": \"2019-05-31T17:34:27.348Z\", \"ZENTotalBytesRxClient\": 2406926, \"ZENBytesRxClient\": 7115, \"ZENTotalBytesTxClient\": 0, \"ZENBytesTxClient\": 0, \"ZENTotalBytesRxConnector\": 0, \"ZENBytesRxConnector\": 0, \"ZENTotalBytesTxConnector\": 2406926, \"ZENBytesTxConnector\": 7115, \"Idp\": \"Example IDP Config\", \"ClientToClient\": \"0\"}"
+    expect:
+      "dst_endpoint.port": "<missing>"
+      "proxy_endpoint.port": "<missing>"
