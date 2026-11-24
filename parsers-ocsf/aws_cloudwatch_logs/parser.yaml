@@ -82,6 +82,7 @@ parser_vrl: |
   # the mixed-input block below sorts every delivered shape.
   # nano:input=json
   # AWS CloudWatch Logs (generic) -> OCSF 1.9.0 Base Event (0), cloud profile
+  __mx_body = to_string(.message) ?? ""
   __mx_line = r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}) '
   __mx_keys = ["logEvents", "logGroup", "logGroupName", "logStream", "logStreamName", "ingestionTime", "eventId"]
   # NAN mixed input
@@ -96,6 +97,8 @@ parser_vrl: |
   #     forwarder added beside the record) while the whole event waits in event
   #     metadata, %nano_hec_event.
   # The parser sets, before the marker:
+  #   __mx_body  the delivered body as a string (its own rule for a non-string
+  #              .message: a source that decoded the record may hand it over);
   #   __mx_line  a regex matching this source's text lines (and nothing else);
   #   __mx_keys  keys of which any one marks an object as a record of this source.
   # This block sets:
@@ -105,14 +108,7 @@ parser_vrl: |
   #   __mx_wrapper  a wrapper's other keys (source fields: map or spill them), or {}.
   # A record taken from %nano_hec_event is removed from there, so nano does not
   # file its keys a second time.
-  __mx_raw = ""
-  if is_string(.message) {
-      __mx_raw = string!(.message)
-  } else if exists(.message) && .message != null {
-      __mx_raw = encode_json(.message)
-  } else {
-      __mx_raw = encode_json(.)
-  }
+  __mx_raw = __mx_body
   __mx_record = {}
   __mx_text = ""
   __mx_wrapper = {}
