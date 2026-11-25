@@ -12,3 +12,5 @@ covered by the inline `samples:` in parser.yaml.
 | `firewall_event_graphql_waf_block_sqli.json` | managed WAF block, query string kept in url_string |
 | `firewall_event_graphql_managed_challenge_api.json` | rate-limit managed challenge (Denied / Challenge) |
 | `firewall_event_graphql_bic_block.json` | Browser Integrity Check block without a rule id (no firewall_rule) |
+| `logpush_firewall_challenge.json` | Logpush `challenge`: Denied / Challenge (23; was 19, which is Alert in 1.9) |
+| `logpush_firewall_log_query_with_question_mark.json` | Logpush `log`: Observed / Logged (was Allowed); a `?` inside the query is kept |
