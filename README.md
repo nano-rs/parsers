@@ -393,6 +393,15 @@ every install reads), refuses unpaired v2 lines, and compares its port with
 nano's own classifier when `NANO_INPUT_CONTRACT` points at it (see
 `scripts/input-contract.lock`).
 
+Every JSON-input parser declares `# nano:input=json` (NAN-5902), and the test
+fails on one that does not. It also runs each declared parser through nano's
+own HEC delivery VRL (copied in `scripts/nano-hec/` by
+`scripts/nano_hec_sync.py`) with and without its declaration: every lane but
+HEC object events must give the same output, and an HEC object event must
+parse as the same record posted to `/ingest` does. To give one parser the
+v2.0.35 HEC delivery back, delete its `# nano:input=json` line and add it,
+with the reason, to `UNDECLARED_ON_PURPOSE` in that test.
+
 ### Sending logs over Splunk HEC
 
 Send each log to nano as an HEC string event (`"event": "<the log, as text>"`),

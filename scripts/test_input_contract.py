@@ -44,19 +44,29 @@ JSON-input parser got unmapped.parse_error. This test keeps:
    record keys on the root, the record text in `.message`), an OTel-style event,
    a string event and an /ingest body, parsing without a parse_error, keeping
    every record value, and taking time and host from the record, not the
-   envelope.
+   envelope;
+5. every JSON-input parser declaring its contract (NAN-5902), and every
+   declared JSON parser, run through nano's own HEC delivery VRL
+   (scripts/nano-hec) with and without its declaration, giving the same output
+   on every lane but HEC object events (HEC string JSON / text, /raw, /ingest
+   JSON / text, OTLP), and reading an HEC object event as it reads the same
+   record posted to /ingest. `--report=<file>` writes the HEC object
+   before / after difference per parser.
 """
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_source_timezone import ROOT, run  # noqa: E402
+from provenance import VECTOR_ENV  # noqa: E402
 
 # Kept equal to FIRST_DECODER / LINE_DECODER in nanosiem-core hec_payload.rs.
 FIRST_DECODER = re.compile(r'\bparse_(json|syslog|regex_all|regex|groks|grok|cef|key_value|csv|xml|common_log|apache_log|nginx_log|klog|glog|logfmt|linux_authorization|aws_[a-z_]+|tokens|ruby_hash|cbor|influxdb)\b')
@@ -273,6 +283,322 @@ def leaves(value):
         yield value
 
 
+# ---------------------------------------------------------------------------
+# Every declared JSON parser, before and after its declaration, through nano's
+# own HEC delivery VRL (scripts/nano-hec, copied from nanosiem by
+# scripts/nano_hec_sync.py).
+#
+# "Before" is the parser with its `# nano:input=` lines removed, fed what nano
+# v2.0.36+ gives an undeclared JSON-input parser (hec_normalize, then
+# HEC_LEGACY_JSON_PAYLOAD_VRL: the v2.0.35 delivery). "After" is the parser as
+# shipped, fed what a declared one gets (hec_normalize, then
+# HEC_JSON_PAYLOAD_VRL: the lossless record view). Lanes:
+#
+#   hec_object       an HEC object event (`"event": {...}`), each JSON sample
+#                    as the record, sent beside an envelope with its own host
+#                    and time: the ONLY lane the declaration may change;
+#   hec_string_json  an HEC string event carrying the JSON text;
+#   hec_string_text  an HEC string event carrying a plain text line;
+#   hec_raw          `/services/collector/raw` (no event-kind marker);
+#   ingest_json / ingest_text   HTTP /ingest bodies;
+#   otlp             an OTLP log (body plus attributes / resource), which nano
+#                    routes without looking at the contract.
+#
+# Any output difference outside hec_object FAILS. On hec_object, the parser
+# must not start failing or change class, raw_data must be the record as sent,
+# and no value the undeclared parser kept may be lost.
+# ---------------------------------------------------------------------------
+NANO_HEC = Path(__file__).resolve().parent / 'nano-hec'
+DECLARATION_LINE = re.compile(r'^\s*#\s*nano:input(-v2)?=.*$', re.M | re.I)
+# The splunk_hec source (bytes codec) writes the envelope BESIDE `.message`.
+HEC_SOURCE_ENVELOPE = {'timestamp': HEC_ENVELOPE['time'], 'host': HEC_ENVELOPE['host'],
+                       'splunk_source': 'hec-envelope-source', 'splunk_index': HEC_ENVELOPE['index'],
+                       'splunk_channel': 'c-1'}
+PIPELINE_TIME = '2026-11-25T20:00:01Z'
+# Keys `_ocsf_prepare` never files from the HEC stash (HEC_SIBLING_SKIP_KEYS_OCSF).
+SIBLING_SKIP = {'message', 'parse_error', 'parse_fallback', 'parse_failure', 'claimed_source_type'}
+TEXT_LINE = 'plain text line nan5902 user=alice src=10.0.0.9 action=allow'
+
+
+def nano_hec_program(payload):
+    """hec_normalize, then a `<parser>_hec_payload` step, as ONE program. In
+    nano they are two remaps, so the event metadata the step reads is laundered
+    to an unknown type first (otherwise VRL proves `object(%nano_hec)` cannot
+    fail and refuses the program). The stash `_ocsf_prepare` files under
+    `unmapped` is copied to `.__stash`."""
+    launder = ''.join(f'%{k} = if .__never == true {{ "x" }} else {{ %{k} }}\n'
+                      for k in ('nano_hec', 'nano_hec_record', 'nano_hec_event'))
+    return ('%splunk_hec.event_kind = .__kind\n%nano_credential_id = .__cred\n%nano_credential_name = .__route\n'
+            'del(.__kind)\ndel(.__cred)\ndel(.__route)\n'
+            + (NANO_HEC / 'hec_normalize.vrl').read_text() + '\n' + launder
+            + (NANO_HEC / payload).read_text() + '\n'
+            + f'.routing_timestamp = "{PIPELINE_TIME}"\n.__stash = %nano_hec_event\n')
+
+
+def vector_objects(program, events):
+    with tempfile.TemporaryDirectory(prefix='input-contract-') as tmp:
+        tmp = Path(tmp)
+        (tmp / 'p.vrl').write_text(program)
+        (tmp / 'in.json').write_text(''.join(json.dumps(e) + '\n' for e in events))
+        out = subprocess.run(['vector', 'vrl', '--program', str(tmp / 'p.vrl'), '--input', str(tmp / 'in.json'),
+                              '--print-object'], text=True, capture_output=True, timeout=900, env=VECTOR_ENV)
+    if out.returncode != 0:
+        raise RuntimeError(out.stderr[-2000:])
+    got = [json.loads(l, strict=False) for l in out.stdout.splitlines() if l.startswith('{')]
+    if len(got) != len(events):
+        raise RuntimeError(f'{len(events)} events in, {len(got)} out (an event aborted?)\n{out.stderr[-2000:]}')
+    return got
+
+
+def samples_of(parser_dir):
+    """Each raw log line a parser ships as a sample (inline `samples:` and the
+    sidecar `samples/` files, which validate-ocsf.sh unwraps the same way)."""
+    doc = yaml.safe_load((parser_dir / 'parser.yaml').read_text())
+    raws = []
+    for s in doc.get('samples') or []:
+        raw = s.get('raw') if isinstance(s, dict) else s
+        if raw is not None:
+            raws.append(raw if isinstance(raw, str) else json.dumps(raw))
+    for f in sorted((parser_dir / 'samples').glob('*')) if (parser_dir / 'samples').is_dir() else []:
+        text = f.read_text().strip()
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict) and 'message' in parsed:
+            if isinstance(parsed['message'], str):
+                raws.append(parsed['message'])
+        else:
+            raws.append(text)
+    return raws
+
+
+def json_record(raw):
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def lane_inputs(name, raws):
+    """(lane, sample index, delivered via HEC?, event) for one parser."""
+    hec = lambda kind, message: {**HEC_SOURCE_ENVELOPE, 'splunk_sourcetype': name, '__kind': kind,
+                                 '__cred': 'cred-nan5902', '__route': name, 'message': message}
+    out = []
+    for i, raw in enumerate(raws):
+        record = json_record(raw)
+        if record is not None:
+            # The sender's record text: a sample is one line; a pretty-printed
+            # one is sent compact, as a forwarder serializes it.
+            text = raw.strip() if '\n' not in raw.strip() else json.dumps(record, separators=(',', ':'))
+            out.append(('hec_object', i, True, hec('object', text)))
+            out.append(('hec_string_json', i, True, hec('string', raw)))
+            out.append(('hec_raw', i, True, hec(None, raw)))
+            out.append(('ingest_json', i, False, {'message': raw, 'source_type': name}))
+            out.append(('otlp', i, False, {'message': raw, 'source_type': name, 'severity_text': 'INFO',
+                                            'attributes': {'log.file.name': 'nan5902.log'},
+                                            'resource': {'service.name': 'nan5902'}}))
+        else:
+            out.append(('hec_string_text', i, True, hec('string', raw)))
+            out.append(('hec_raw', i, True, hec(None, raw)))
+            out.append(('ingest_text', i, False, {'message': raw, 'source_type': name}))
+    out.append(('hec_string_text', -1, True, hec('string', TEXT_LINE)))
+    out.append(('ingest_text', -1, False, {'message': TEXT_LINE, 'source_type': name}))
+    return out
+
+
+def file_stash(event, stash):
+    """`_ocsf_prepare`'s HEC sibling merge: stash keys under `unmapped`, never
+    over a key the parser set."""
+    if isinstance(stash, dict) and (isinstance(event.get('unmapped'), dict) or event.get('unmapped') is None):
+        unmapped = dict(event.get('unmapped') or {})
+        for k, v in stash.items():
+            if k not in SIBLING_SKIP and unmapped.get(k) is None:
+                unmapped[k] = v
+        if unmapped:
+            event['unmapped'] = unmapped
+    return event
+
+
+def flat(value, prefix=''):
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            out.update(flat(v, f'{prefix}{k}.'))
+        return out if out or not prefix else {prefix[:-1]: {}}
+    return {prefix[:-1]: value}
+
+
+UUID4 = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
+VRL_POSITION = re.compile(r' at \(\d+:\d+\)')
+
+
+def normalize_clock(value, lo, hi):
+    """Values that differ from run to run compare equal: the wall clock (a
+    parser's `now()` fallback), a random uuid_v4() id, and the program offset
+    VRL writes into an error message (the declaration lines shift it)."""
+    if isinstance(value, dict):
+        return {k: normalize_clock(v, lo, hi) for k, v in value.items()}
+    if isinstance(value, list):
+        return [normalize_clock(v, lo, hi) for v in value]
+    if isinstance(value, int) and not isinstance(value, bool) and lo <= value <= hi:
+        return '<now>'
+    if isinstance(value, str):
+        if UUID4.match(value):
+            return '<uuid4>'
+        return VRL_POSITION.sub(' at (<pos>)', value)
+    return value
+
+
+def delivered(variant_payload, events):
+    """nano's HEC delivery for every HEC event: (root, stash)."""
+    hec = [e for e in events if e is not None]
+    roots = vector_objects(nano_hec_program(variant_payload), hec) if hec else []
+    it = iter(roots)
+    out = []
+    for e in events:
+        if e is None:
+            out.append(None)
+            continue
+        root = next(it)
+        stash = root.pop('__stash', None)
+        root.pop('__never', None)
+        out.append((root, stash))
+    return out
+
+
+def before_after(name, vrl):
+    """Run one parser over every lane, undeclared (before, twice: what differs
+    between the two runs is the parser's own clock or randomness) and declared
+    (after)."""
+    raws = samples_of(ROOT / 'parsers-ocsf' / name)
+    if not any(json_record(r) is not None for r in raws):
+        # No JSON sample (opentelemetry_logs ships its log bodies): send the
+        # first line as an HEC object record, as a forwarder wraps it.
+        raws.append(json.dumps({'message': raws[0] if raws else TEXT_LINE, 'timestamp': '2026-11-24T01:02:03Z',
+                                'host': 'Rec-Host-5902', 'service': 'nan5902'}, separators=(',', ':')))
+    inputs = lane_inputs(name, raws)
+    hec_events = [e if via_hec else None for _, _, via_hec, e in inputs]
+    undeclared = DECLARATION_LINE.sub('', vrl)
+    sides = {}
+    for side, payload, program in (('before', 'hec_legacy_json_payload.vrl', undeclared),
+                                   ('again', 'hec_legacy_json_payload.vrl', undeclared),
+                                   ('after', 'hec_json_payload.vrl', vrl)):
+        roots = delivered(payload, hec_events)
+        parser_in = [d[0] if via_hec else e for (_, _, via_hec, e), d in zip(inputs, roots)]
+        stashes = [d[1] if via_hec else None for (_, _, via_hec, _), d in zip(inputs, roots)]
+        lo = int(time.time() * 1000) - 1000
+        outs = vector_objects(program, parser_in)
+        hi = int(time.time() * 1000) + 1000
+        sides[side] = [normalize_clock(file_stash(o, st), lo, hi) for o, st in zip(outs, stashes)]
+        sides[side + '_in'] = parser_in
+    return raws, inputs, sides
+
+
+def differing(a, b, skip=()):
+    fa, fb = flat(a), flat(b)
+    return sorted(k for k in set(fa) | set(fb) if fa.get(k) != fb.get(k) and k not in skip)
+
+
+# JSON-input parsers kept undeclared on purpose (name: why). Each still gets
+# the v2.0.35 HEC delivery on nano v2.0.36+.
+UNDECLARED_ON_PURPOSE = {}
+
+# Declared parsers whose own code reads more of the event than `.message`, so
+# an HEC event (envelope keys on the root) need not parse as an /ingest body.
+ROOT_READERS = {
+    # An OTLP log parser: it reads the OTLP root (timestamp, attributes,
+    # resource, trace ids). Over HEC the root `timestamp` is the envelope's.
+    'opentelemetry_logs',
+}
+
+
+def check_as_ingest(failures, where, hec, ingest, skip, compacted):
+    """A declared parser reads an HEC object record as it reads the same
+    record posted to /ingest."""
+    if compacted:
+        skip = skip | {'raw_data', 'metadata.uid'}  # a pretty-printed sample is sent compact
+    diff = differing(hec, ingest, skip)
+    if diff:
+        failures.append(f'{where}: declared, the HEC object event does not parse as its /ingest body does: {diff[:8]}')
+
+
+def compare_parser(name, vrl):
+    """(failures, report row) for one declared parser.
+
+    - Every lane but hec_object: the output equals the undeclared parser's.
+    - hec_object: the declared parser gets the record text and its output
+      equals its /ingest output for the same sample (what the declaration
+      promises: an HEC object event is read as /ingest reads it), raw_data is
+      the record as sent, and the envelope host never reaches the event.
+      The before / after difference is reported, not judged."""
+    failures = []
+    raws, inputs, sides = before_after(name, vrl)
+    unstable = [set(differing(b, g)) for b, g in zip(sides['before'], sides['again'])]
+    ingest = {i: k for k, (lane, i, _, _) in enumerate(inputs) if lane == 'ingest_json'}
+    row = {'parser': name, 'samples': len(raws), 'hec_object': 0, 'changed': 0, 'fields': {}, 'classes': [], 'lanes': {}}
+    for k, (lane, i, _, event) in enumerate(inputs):
+        before, after, after_in = sides['before'][k], sides['after'][k], sides['after_in'][k]
+        row['lanes'][lane] = row['lanes'].get(lane, 0) + 1
+        where = f'{name} {lane} sample {i}'
+        if lane != 'hec_object':
+            diff = differing(before, after, unstable[k])
+            if diff:
+                failures.append(f'{where}: the declaration changed the output outside the HEC object lane: {diff[:8]}')
+            continue
+        row['hec_object'] += 1
+        record_text = event['message']
+        record = json_record(record_text) or {}
+        if len(record) == 1 and isinstance(record.get('message'), dict):
+            # `{"message": {...}}` alone is a wrapper: nano unwraps it for
+            # every parser (hec_normalize), so the declaration changes nothing.
+            row['wrappers'] = row.get('wrappers', 0) + 1
+            diff = differing(before, after, unstable[k])
+            if diff:
+                failures.append(f'{where}: a wrapper record parses differently once declared: {diff[:8]}')
+            continue
+        if after_in.get('message') != record_text:
+            failures.append(f'{where}: nano did not hand the declared parser the record text')
+        if 'raw_data' in after and after['raw_data'] != record_text:
+            failures.append(f'{where}: raw_data is not the record as sent: {str(after["raw_data"])[:80]!r}')
+        if HEC_ENVELOPE['host'] in json.dumps(after):
+            failures.append(f'{where}: the HEC envelope host reached the declared event')
+        if name not in ROOT_READERS:  # a root reader's HEC root is not an /ingest root
+            check_as_ingest(failures, where, after, sides['after'][ingest[i]], unstable[k] | unstable[ingest[i]],
+                            record_text != raws[i])
+        changed = differing(before, after, unstable[k])
+        if changed:
+            row['changed'] += 1
+        if before.get('class_uid') != after.get('class_uid'):
+            row['classes'].append(f'{before.get("class_uid")}->{after.get("class_uid")}')
+        for key in changed:
+            key = 'unmapped.*' if key.startswith('unmapped.') else key
+            row['fields'][key] = row['fields'].get(key, 0) + 1
+    return failures, row
+
+
+def declared_delivery_checks(failures, report_path=None):
+    """Every parser that declares a JSON contract, before vs after, on every lane."""
+    from concurrent.futures import ThreadPoolExecutor
+    programs = []
+    for path in sorted((ROOT / 'parsers-ocsf').glob('*/parser.yaml')):
+        vrl = yaml.safe_load(path.read_text())['parser_vrl']
+        contract, declared, _ = input_contract(vrl)
+        if declared and contract in ('json', 'json_or_text'):
+            programs.append((path.parent.name, vrl))
+    workers = max(1, min(int(os.environ.get('INPUT_CONTRACT_JOBS', '6')), len(programs)))
+    rows = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for name, (fails, row) in zip([n for n, _ in programs], pool.map(lambda p: compare_parser(*p), programs)):
+            failures.extend(fails)
+            rows.append(row)
+    if report_path:
+        Path(report_path).write_text(json.dumps(rows, indent=1, sort_keys=True))
+    lanes = sum(sum(r['lanes'].values()) for r in rows)
+    return f'; {len(programs)} declared JSON parsers identical before / after on every non-HEC-object lane ({lanes} runs each side)'
+
+
 def main():
     failures = []
     parsers = sorted((ROOT / 'parsers-ocsf').glob('*/parser.yaml'))
@@ -430,13 +756,36 @@ def main():
         if not is_json and 'parse_error' not in unmapped:
             failures.append(f'json_generic {name}: a non-JSON line must report unmapped.parse_error')
 
+    # NAN-5902: every JSON-input parser states its contract, so nano v2.0.36+
+    # hands it an HEC object event's whole record (undeclared, it gets the
+    # v2.0.35 delivery: the record's own host / timestamp replaced by the
+    # envelope's). A parser kept undeclared on purpose is listed, with why.
+    for name in sorted(pinned):
+        path = ROOT / 'parsers-ocsf' / name / 'parser.yaml'
+        if not path.exists() or name in UNDECLARED_ON_PURPOSE:
+            continue
+        if not input_contract(yaml.safe_load(path.read_text())['parser_vrl'])[1]:
+            failures.append(f'{name}: a JSON-input parser must declare `# nano:input=json` (undeclared, nano v2.0.36+ '
+                            'gives it the v2.0.35 HEC delivery and an HEC object event loses its own host / timestamp)')
+
+    # The nano HEC VRL copy, against a nanosiem checkout when one is named.
+    nanosiem = os.environ.get('NANOSIEM_GIT', '')
+    if nanosiem:
+        sync = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / 'nano_hec_sync.py'), '--check',
+                               nanosiem, os.environ.get('NANOSIEM_REF', 'origin/main')], capture_output=True, text=True)
+        if sync.returncode != 0:
+            failures.append((sync.stderr or sync.stdout).strip())
+
+    report = next((a.split('=', 1)[1] for a in sys.argv[1:] if a.startswith('--report=')), None)
+    lanes = declared_delivery_checks(failures, report)
+
     for f in failures:
         print('FAIL', f)
     if failures:
         sys.exit(1)
     print(f'PASS input contract: {len(parsers)} parsers keep their HEC / OTLP input contract with the generated blocks '
           f'({len(pinned)} JSON-input, as pinned); '
-          f'json_generic declares json and parses {len(shapes) + lossless} HEC object shapes losslessly plus 4 text / JSON lanes{checked}')
+          f'json_generic declares json and parses {len(shapes) + lossless} HEC object shapes losslessly plus 4 text / JSON lanes{lanes}{checked}')
 
 
 if __name__ == '__main__':
