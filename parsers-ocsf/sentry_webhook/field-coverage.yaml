@@ -1,4 +1,7 @@
 source: json
+preserve_unmapped:
+  nano_time_source: Derived marker that the record carried no usable clock and time is when nano received
+    it; kept even when a source value happens to equal "received".
 mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
   only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
   else spills to unmapped.
@@ -38,6 +41,16 @@ transforms:
   format: '%+'
   target: time
   reason: A new issue's first sighting is the event time.
+- source: data.error.datetime
+  kind: epoch_ms
+  format: '%+'
+  target: time
+  reason: An error event's own clock (RFC 3339) when it has no numeric timestamp.
+- source: data.metric_alert.date_closed
+  kind: epoch_ms
+  format: '%+'
+  target: time
+  reason: A resolved metric alert's close clock is the event time.
 mappings:
   payload.data.issue.culprit:
   - finding_info.desc
@@ -62,6 +75,21 @@ mappings:
   - actor.user.uid
   actor.name:
   - actor.user.name
+  data.error.event_id:
+  - finding_info.uid
+  data.error.level:
+  - metadata.log_level
+  data.error.project:
+  - resources.uid
+  data.error.release:
+  - resources.name
+  data.error.title:
+  - finding_info.title
+  - message
+  data.error.web_url:
+  - finding_info.src_url
+  installation.uuid:
+  - resources.uid
   data.event.event_id:
   - finding_info.uid
   data.event.level:
@@ -77,8 +105,6 @@ mappings:
   - finding_info.src_url
   data.triggered_rule:
   - finding_info.analytic.name
-  installation.uuid:
-  - resources.uid
   installation.app.slug:
   - resources.name
   data.issue.culprit:

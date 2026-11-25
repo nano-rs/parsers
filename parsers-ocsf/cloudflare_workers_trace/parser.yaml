@@ -19,12 +19,13 @@ description: |
   names no caller, so the script stands in as actor.app_name and src_endpoint.svc_name.
   EventTimestampMs is epoch milliseconds, or RFC 3339 with timestamp_format rfc3339.
   Unparseable input becomes a Base Event with the raw line kept.
-  Ingestion: HTTP ingest (/ingest) from a Logpush HTTP destination, NDJSON.
+  Ingestion: HTTP ingest (/ingest) from a Logpush HTTP destination, one JSON record per line.
   Setup: Workers Logpush needs the Workers Paid plan. Turn on logpush for each Worker
   (set logpush = true in its wrangler file). Then create an account Logpush job for the
-  Workers trace events dataset with an HTTP destination: your nano HTTP ingest URL with
-  header_Authorization=Bearer%20<your cloudflare_workers_trace ingest token> added to
-  the URL, and pick the fields you want.
+  Workers trace events dataset with an HTTP destination. The destination is your nano
+  HTTP ingest URL with the token added as a query parameter, for example
+  https://<your nano host>/ingest?header_Authorization=Bearer%20<your
+  cloudflare_workers_trace ingest token>. Then pick the fields you want.
 match_values:
   - cloudflare_workers_trace
 category: cloud
@@ -350,7 +351,7 @@ parser_vrl: |
   }
   # Declared source -> target mappings (field-coverage.yaml `mappings`).
   __decl = "\n\"DispatchNamespace\"\t[\"resources.namespace\"]\n\"Event.RayID\"\t[\"api.request.uid\",\"metadata.correlation_uid\"]\n\"Event.Request.Method\"\t[\"http_request.http_method\"]\n\"Event.Request.URL\"\t[\"http_request.url.url_string\"]\n\"Event.Response.Status\"\t[\"api.response.code\",\"http_response.code\"]\n\"EventTimestampMs\"\t[\"time\"]\n\"EventType\"\t[\"api.operation\",\"metadata.event_code\"]\n\"Outcome\"\t[\"status_detail\"]\n\"ScriptName\"\t[\"actor.app_name\",\"api.service.name\",\"resources.name\",\"src_endpoint.svc_name\"]\n\"ScriptTags\"\t[\"resources.labels\"]\n\"ScriptVersion.ID\"\t[\"api.version\",\"resources.version\"]\n\"WallTimeMs\"\t[\"duration\"]\n"
-  __preserve = []
+  __preserve = ["nano_time_source"]
   # END parser-specific transformations
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
   # target paths + "\n" per mapped source key (a raw newline never occurs in
@@ -588,16 +589,16 @@ samples:
   # fetch_exception.json
   - raw: "{\"DispatchNamespace\":\"\",\"Entrypoint\":\"\",\"Event\":{\"RayID\":\"8d2f1a3b4c5d6e80\",\"Request\":{\"URL\":\"https://us.example.com/api/search\",\"Method\":\"GET\"},\"Response\":{\"Status\":500}},\"EventTimestampMs\":1792077801000,\"EventType\":\"fetch\",\"Exceptions\":[{\"Name\":\"TypeError\",\"Message\":\"Cannot read properties of undefined (reading 'tenant')\",\"TimestampMs\":1792077801040}],\"Logs\":[{\"Level\":\"error\",\"Message\":[\"upstream search failed\"],\"TimestampMs\":1792077801030}],\"Outcome\":\"exception\",\"ScriptName\":\"edge-router\",\"ScriptTags\":[],\"ScriptVersion\":{\"ID\":\"7b6a5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d\",\"Message\":\"r52\",\"Tag\":\"r52\"},\"CPUTimeMs\":12,\"WallTimeMs\":230}"
   # fetch_ok_customer_worker.json
-  - raw: "{\"DispatchNamespace\":\"\",\"Entrypoint\":\"\",\"Event\":{\"RayID\":\"8d2f1a3b4c5d6e7f\",\"Request\":{\"URL\":\"https://b12e5ee2.ingest.example.com/v1/logs\",\"Method\":\"POST\"},\"Response\":{\"Status\":202}},\"EventTimestampMs\":1792077800123,\"EventType\":\"fetch\",\"Exceptions\":[],\"Logs\":[],\"Outcome\":\"ok\",\"ScriptName\":\"customer-worker-b12e5ee2-fcb9-4335-a7f9-2c45ba26254a\",\"ScriptTags\":[\"tenant:b12e5ee2-fcb9-4335-a7f9-2c45ba26254a\"],\"ScriptVersion\":{\"ID\":\"4a1b2c3d-5e6f-4a7b-8c9d-0e1f2a3b4c5d\",\"Message\":\"\",\"Tag\":\"\"},\"CPUTimeMs\":3,\"WallTimeMs\":41}"
+  - raw: "{\"DispatchNamespace\":\"\",\"Entrypoint\":\"\",\"Event\":{\"RayID\":\"8d2f1a3b4c5d6e7f\",\"Request\":{\"URL\":\"https://tenant1.ingest.example.com/v1/logs\",\"Method\":\"POST\"},\"Response\":{\"Status\":202}},\"EventTimestampMs\":1792077800123,\"EventType\":\"fetch\",\"Exceptions\":[],\"Logs\":[],\"Outcome\":\"ok\",\"ScriptName\":\"customer-worker-11111111-0000-4000-8000-000000000001\",\"ScriptTags\":[\"tenant:11111111-0000-4000-8000-000000000001\"],\"ScriptVersion\":{\"ID\":\"4a1b2c3d-5e6f-4a7b-8c9d-0e1f2a3b4c5d\",\"Message\":\"\",\"Tag\":\"\"},\"CPUTimeMs\":3,\"WallTimeMs\":41}"
   # fetch_ok_query_string_kept.json
   - raw: "{\"DispatchNamespace\":\"\",\"Entrypoint\":\"\",\"Event\":{\"RayID\":\"8d2f1a3b4c5d6e81\",\"Request\":{\"URL\":\"https://us.example.com/api/search?q=error&page=2\",\"Method\":\"GET\"},\"Response\":{\"Status\":200}},\"EventTimestampMs\":1792077802000,\"EventType\":\"fetch\",\"Exceptions\":[],\"Logs\":[{\"Level\":\"log\",\"Message\":[\"search ok\"],\"TimestampMs\":1792077802010}],\"Outcome\":\"ok\",\"ScriptName\":\"edge-router\",\"ScriptTags\":[],\"ScriptVersion\":{\"ID\":\"7b6a5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d\",\"Message\":\"r52\",\"Tag\":\"r52\"},\"CPUTimeMs\":4,\"WallTimeMs\":88}"
   # malformed.json
   - raw: "{\"EventType\":\"fetch\",\"Outcome\":"
   # queue_ok_dispatch_namespace.json
-  - raw: "{\"DispatchNamespace\":\"customer-workers\",\"Entrypoint\":\"QueueConsumer\",\"Event\":{\"Queue\":\"ingest-queue\",\"BatchSize\":100},\"EventTimestampMs\":1792077950000,\"EventType\":\"queue\",\"Exceptions\":[],\"Logs\":[],\"Outcome\":\"ok\",\"ScriptName\":\"ingest-worker-817609c4-694a-4599-ace4-2652abe3b237\",\"ScriptTags\":[],\"ScriptVersion\":{\"ID\":\"2d3e4f5a-6b7c-4d8e-9f0a-1b2c3d4e5f6a\"},\"CPUTimeMs\":7,\"WallTimeMs\":95}"
+  - raw: "{\"DispatchNamespace\":\"customer-workers\",\"Entrypoint\":\"QueueConsumer\",\"Event\":{\"Queue\":\"ingest-queue\",\"BatchSize\":100},\"EventTimestampMs\":1792077950000,\"EventType\":\"queue\",\"Exceptions\":[],\"Logs\":[],\"Outcome\":\"ok\",\"ScriptName\":\"ingest-worker-22222222-0000-4000-8000-000000000002\",\"ScriptTags\":[],\"ScriptVersion\":{\"ID\":\"2d3e4f5a-6b7c-4d8e-9f0a-1b2c3d4e5f6a\"},\"CPUTimeMs\":7,\"WallTimeMs\":95}"
   # scheduled_exceeded_cpu.json
   - raw: "{\"DispatchNamespace\":\"\",\"Entrypoint\":\"\",\"Event\":{\"Cron\":\"*/5 * * * *\",\"ScheduledTime\":1792077900000},\"EventTimestampMs\":1792077900050,\"EventType\":\"scheduled\",\"Exceptions\":[],\"Logs\":[],\"Outcome\":\"exceededCpu\",\"ScriptName\":\"feed-projector\",\"ScriptTags\":[],\"ScriptVersion\":{\"ID\":\"1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f\"},\"CPUTimeMs\":50,\"WallTimeMs\":51}"
   # shipped_fields_exception.json
   - raw: "{\"EventTimestampMs\":1792078030000,\"EventType\":\"queue\",\"Outcome\":\"exception\",\"ScriptName\":\"audit-delivery\",\"ScriptVersion\":{\"ID\":\"3c4d5e6f-7081-4b92-8c3d-4e5f6a7b8c9d\"},\"ScriptTags\":[],\"DispatchNamespace\":\"\",\"Entrypoint\":\"\",\"CPUTimeMs\":9,\"WallTimeMs\":140,\"Exceptions\":[{\"Name\":\"Error\",\"Message\":\"upstream 503\",\"TimestampMs\":1792078030100}]}"
   # shipped_fields_rfc3339_ok.json
-  - raw: "{\"EventTimestampMs\":\"2026-10-15T14:46:40Z\",\"EventType\":\"fetch\",\"Outcome\":\"ok\",\"ScriptName\":\"ingest-worker-b12e5ee2-fcb9-4335-a7f9-2c45ba26254a\",\"ScriptVersion\":{\"ID\":\"2b3c4d5e-6f70-4a81-9b2c-3d4e5f6a7b8c\"},\"ScriptTags\":[\"tenant\"],\"DispatchNamespace\":\"\",\"Entrypoint\":\"\",\"CPUTimeMs\":3,\"WallTimeMs\":18,\"Exceptions\":[]}"
+  - raw: "{\"EventTimestampMs\":\"2026-10-15T14:46:40Z\",\"EventType\":\"fetch\",\"Outcome\":\"ok\",\"ScriptName\":\"ingest-worker-11111111-0000-4000-8000-000000000001\",\"ScriptVersion\":{\"ID\":\"2b3c4d5e-6f70-4a81-9b2c-3d4e5f6a7b8c\"},\"ScriptTags\":[\"tenant\"],\"DispatchNamespace\":\"\",\"Entrypoint\":\"\",\"CPUTimeMs\":3,\"WallTimeMs\":18,\"Exceptions\":[]}"

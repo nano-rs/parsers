@@ -11,13 +11,15 @@ description: |
   of acme project with 1 added", "Created service token ..."), so the text is the
   message and api.operation, and its first word sets the activity (Created -> Create,
   Modified -> Update, Deleted / Removed / Revoked -> Delete, Viewed -> Read, else Other).
-  The workplace user is the actor (slug, username, name, e-mail), the config and
+  api.operation stays short: the verb and the kind of object the text names first
+  ("modified secrets", "created service token"). The workplace user is the actor (slug,
+  username, name, email), the config and
   project are resources, the record id is metadata.uid and created_at is time. Secret
   names in diff / diffs (never values) spill to unmapped as sent. The record has no
   caller address (src_endpoint {"hostname": "unknown"}). Unparseable input becomes a
   Base Event.
   Ingestion: HTTP ingest (/ingest), one activity record per line (not the API page).
-  Setup: Doppler doesn't send its activity log anywhere by itself. Run a small
+  Setup: this parser reads records from Doppler's activity log API. Run a small
   scheduled job (every few minutes) that reads https://api.doppler.com/v3/logs with a
   read-only Doppler token, keeps only records it hasn't sent yet, and posts each record
   as one line to your nano HTTP ingest with your doppler_activity ingest token as a
@@ -125,15 +127,36 @@ parser_vrl: |
       text = string(d.text) ?? ""
 
       # The record names its action only in English text ("Modified secrets in
-      # prd of acme project ...", "Created service token ..."); its first word
-      # is the verb. Anything else stays Other with the text as the message.
-      verb = downcase(string(split(text, " ")[0]) ?? "")
+      # prd of acme project ...", "Created service token ..."); its first word,
+      # trimmed of whitespace and punctuation, is the verb. An unknown verb is
+      # Other, with the text as the message.
+      words = split(strip_whitespace(text), " ")
+      verb = ""
+      if length(words) > 0 { verb = downcase(replace(string(words[0]) ?? "", r'[^A-Za-z]', "")) }
       activity_id = 99
       activity_name = "Other"
-      if includes(["created", "added", "generated", "invited", "enabled"], verb) { activity_id = 1; activity_name = "Create" }
-      if includes(["viewed", "accessed", "downloaded", "exported", "read"], verb) { activity_id = 2; activity_name = "Read" }
-      if includes(["modified", "updated", "renamed", "changed", "rotated", "moved", "restored"], verb) { activity_id = 3; activity_name = "Update" }
-      if includes(["deleted", "removed", "revoked", "disabled"], verb) { activity_id = 4; activity_name = "Delete" }
+      if includes(["created", "added", "generated", "invited", "cloned", "forked", "copied", "imported", "uploaded", "granted", "assigned"], verb) { activity_id = 1; activity_name = "Create" }
+      if includes(["viewed", "accessed", "downloaded", "exported", "read", "revealed", "fetched"], verb) { activity_id = 2; activity_name = "Read" }
+      if includes(["modified", "updated", "renamed", "changed", "rotated", "moved", "restored", "locked", "unlocked", "synced", "set", "edited", "configured", "connected", "disconnected", "paused", "resumed", "rolled", "archived", "unarchived", "approved", "denied", "accepted", "enabled", "disabled", "deactivated", "suspended"], verb) { activity_id = 3; activity_name = "Update" }
+      if includes(["deleted", "removed", "revoked"], verb) { activity_id = 4; activity_name = "Delete" }
+
+      # api.operation stays low-cardinality: the verb and the kind of object
+      # the text names first (never project, config or token names, which
+      # are in the message and the resources).
+      lt = downcase(text)
+      noun = ""
+      best = -1
+      for_each(["service token", "service account", "api token", "personal token", "secrets", "secret", "config", "environment", "project", "workplace", "member", "invite", "webhook", "integration", "sync", "group", "role"]) -> |_i, n| {
+          # find answers -1 or null (Vector version) when n is absent
+          at = find(lt, n)
+          if is_integer(at) && int!(at) >= 0 && (best < 0 || int!(at) < best) {
+              best = int!(at)
+              noun = n
+          }
+      }
+      op = verb
+      if op == "" { op = "activity" }
+      if noun != "" { op = op + " " + noun }
 
       time_ms = 0
       c_t, c_err = parse_timestamp(string(d.created_at) ?? "", "%+", timezone: "UTC")
@@ -184,7 +207,7 @@ parser_vrl: |
           "time": time_ms,
           "message": msg,
           "raw_data": raw_log,
-          "api": { "operation": msg, "service": { "name": "Doppler" } },
+          "api": { "operation": op, "service": { "name": "Doppler" } },
           "actor": { "user": au },
           "src_endpoint": { "hostname": "unknown" },
           "metadata": {
@@ -292,8 +315,8 @@ parser_vrl: |
       }
   }
   # Declared source -> target mappings (field-coverage.yaml `mappings`).
-  __decl = "\n\"enclave_config\"\t[\"resources.name\"]\n\"enclave_project\"\t[\"resources.name\",\"resources.namespace\"]\n\"id\"\t[\"metadata.uid\"]\n\"text\"\t[\"api.operation\",\"message\"]\n\"user.slug\"\t[\"actor.user.uid\"]\n\"user.username\"\t[\"actor.user.name\"]\n"
-  __preserve = []
+  __decl = "\n\"enclave_config\"\t[\"resources.name\"]\n\"enclave_project\"\t[\"resources.name\",\"resources.namespace\"]\n\"id\"\t[\"metadata.uid\"]\n\"text\"\t[\"message\"]\n\"user.email\"\t[\"actor.user.email_addr\"]\n\"user.name\"\t[\"actor.user.full_name\"]\n\"user.slug\"\t[\"actor.user.uid\"]\n\"user.username\"\t[\"actor.user.name\"]\n"
+  __preserve = ["nano_time_source"]
   # END parser-specific transformations
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
   # target paths + "\n" per mapped source key (a raw newline never occurs in
@@ -533,8 +556,10 @@ samples:
   # malformed.json
   - raw: "doppler poll: HTTP 502"
   # secrets_added_updated.json
-  - raw: "{\"id\":\"0f1e2d3c4b5a69780000000000000002\",\"text\":\"Modified secrets in prd of example-project project with 1 added and 1 updated\",\"html\":\"<p>Modified secrets in <b>prd</b> of <b>example-project</b> project with 1 added and 1 updated</p>\",\"created_at\":\"2026-11-25T14:02:10.551Z\",\"enclave_project\":\"example-project\",\"enclave_config\":\"prd\",\"enclave_environment\":\"prd\",\"user\":{\"kind\":\"user\",\"slug\":\"usr_redacted0001\",\"email\":\"[redacted]@example.com\",\"name\":\"[redacted]\",\"username\":\"[redacted]\",\"profile_image_url\":\"https://example.invalid/avatar.png\"},\"diff\":{\"added\":[\"LOG_SHIPPER_TOKEN\"],\"removed\":[],\"updated\":[\"STRIPE_SECRET_KEY\"]},\"diffs\":[{\"added\":[\"LOG_SHIPPER_TOKEN\"],\"removed\":[],\"updated\":[\"STRIPE_SECRET_KEY\"]}]}"
+  - raw: "{\"id\":\"0f1e2d3c4b5a69780000000000000002\",\"text\":\"Modified secrets in prd of example-project project with 1 added and 1 updated\",\"html\":\"<p>Modified secrets in <b>prd</b> of <b>example-project</b> project with 1 added and 1 updated</p>\",\"created_at\":\"2026-11-25T14:02:10.551Z\",\"enclave_project\":\"example-project\",\"enclave_config\":\"prd\",\"enclave_environment\":\"prd\",\"user\":{\"kind\":\"user\",\"slug\":\"usr_example0001\",\"email\":\"alice@example.com\",\"name\":\"Alice Example\",\"username\":\"alice\",\"profile_image_url\":\"https://example.invalid/avatar.png\"},\"diff\":{\"added\":[\"LOG_SHIPPER_TOKEN\"],\"removed\":[],\"updated\":[\"STRIPE_SECRET_KEY\"]},\"diffs\":[{\"added\":[\"LOG_SHIPPER_TOKEN\"],\"removed\":[],\"updated\":[\"STRIPE_SECRET_KEY\"]}]}"
   # secrets_removed.json
   - raw: "{\"id\":\"0f1e2d3c4b5a69780000000000000001\",\"text\":\"Modified secrets in dev_gke of example-project project with 1 removed\",\"html\":\"<p>Modified secrets in <b>dev_gke</b> of <b>example-project</b> project with 1 removed</p>\",\"created_at\":\"2026-11-25T13:16:44.172Z\",\"enclave_project\":\"example-project\",\"enclave_config\":\"dev_gke\",\"enclave_environment\":\"dev\",\"user\":{\"kind\":\"user\",\"slug\":\"usr_redacted0001\",\"email\":\"[redacted]@example.com\",\"name\":\"[redacted]\",\"username\":\"[redacted]\",\"profile_image_url\":\"https://example.invalid/avatar.png\"},\"diff\":{\"added\":[],\"removed\":[\"OLD_FEATURE_FLAG\"],\"updated\":[]},\"diffs\":[{\"added\":[],\"removed\":[\"OLD_FEATURE_FLAG\"],\"updated\":[]}]}"
   # service_token_created.json
   - raw: "{\"id\":\"0f1e2d3c4b5a69780000000000000003\",\"text\":\"Created service token log-relay in dev_gke of example-project project\",\"html\":\"<p>Created service token <b>log-relay</b> in <b>dev_gke</b> of <b>example-project</b> project</p>\",\"created_at\":\"2026-11-25T14:20:00.000Z\",\"enclave_project\":\"example-project\",\"enclave_config\":\"dev_gke\",\"enclave_environment\":\"dev\",\"user\":{\"kind\":\"user\",\"slug\":\"usr_redacted0002\",\"email\":\"[redacted]@example.com\",\"name\":\"[redacted]\",\"username\":\"[redacted]\",\"profile_image_url\":\"https://example.invalid/avatar.png\"},\"diff\":{\"added\":[],\"removed\":[],\"updated\":[]},\"diffs\":[]}"
+  # unverified_text_leading_space_punctuation.json
+  - raw: "{\"id\":\"0f1e2d3c4b5a69780000000000000005\",\"text\":\"  Locked config prd: requested by alice\",\"html\":\"<p>Locked config <b>prd</b>: requested by alice</p>\",\"created_at\":\"2026-11-25T14:40:00.000Z\",\"enclave_project\":\"example-project\",\"enclave_config\":\"prd\",\"enclave_environment\":\"prd\",\"user\":{\"kind\":\"user\",\"slug\":\"usr_example0001\",\"email\":\"alice@example.com\",\"name\":\"Alice Example\",\"username\":\"alice\",\"profile_image_url\":\"https://example.invalid/avatar.png\"},\"diff\":{\"added\":[],\"removed\":[],\"updated\":[]},\"diffs\":[]}"

@@ -1,13 +1,18 @@
 source: json
-mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
-  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
-  else spills to unmapped.
+preserve_unmapped:
+  nano_time_source: Derived marker that the record carried no usable clock and time is when nano received
+    it; kept even when a source value happens to equal "received".
 transforms:
 - source: workflow_run.updated_at
   kind: epoch_ms
   format: '%+'
   target: time
   reason: The run's last-update clock (the completion time on a completed run) is the event time.
+- source: workflow_job.completed_at
+  kind: epoch_ms
+  format: '%+'
+  target: time
+  reason: A finished job's completion clock is the event time.
 - source: alert.updated_at
   kind: epoch_ms
   format: '%+'
@@ -33,14 +38,54 @@ transforms:
   factor: 1000
   target: time
   reason: push payloads carry repository.pushed_at as epoch seconds; it is the push time.
+- source: payload.workflow_run.updated_at
+  kind: epoch_ms
+  format: '%+'
+  target: time
+  reason: The run's last-update clock (the completion time on a completed run) is the event time.
+- source: payload.workflow_job.completed_at
+  kind: epoch_ms
+  format: '%+'
+  target: time
+  reason: A finished job's completion clock is the event time.
+- source: payload.alert.updated_at
+  kind: epoch_ms
+  format: '%+'
+  target: time
+  reason: The alert's last-update clock is the event time.
+- source: payload.alert.created_at
+  kind: epoch_ms
+  format: '%+'
+  target: time
+  reason: An alert without updated_at takes its creation clock as the event time.
+- source: payload.alert.created_at
+  kind: epoch_ms
+  format: '%+'
+  target: finding_info.created_time
+  reason: The alert's creation clock.
+- source: payload.key.created_at
+  kind: epoch_ms
+  format: '%+'
+  target: resources.created_time
+  reason: The deploy key's creation clock.
+- source: payload.repository.pushed_at
+  kind: scale
+  factor: 1000
+  target: time
+  reason: push payloads carry repository.pushed_at as epoch seconds; it is the push time.
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
 mappings:
   organization.id:
   - group.uid
   organization.login:
   - group.name
   repository.full_name:
+  - group.name
   - resources.name
   repository.id:
+  - group.uid
   - resources.uid
   rule.id:
   - resources.uid
@@ -67,6 +112,11 @@ mappings:
   - finding_info.uid
   ref:
   - resources.name
+  alert.security_advisory.ghsa_id:
+  - finding_info.types
+  alert.security_advisory.summary:
+  - finding_info.title
+  - message
   key.added_by:
   - resources.owner.name
   key.id:
@@ -75,26 +125,143 @@ mappings:
   - resources.name
   github_delivery:
   - metadata.uid
+  github_event:
+  - api.operation
+  - message
+  - metadata.event_code
+  payload.organization.id:
+  - group.uid
+  payload.organization.login:
+  - group.name
+  payload.repository.full_name:
+  - group.name
+  - resources.name
+  payload.repository.id:
+  - group.uid
+  - resources.uid
+  payload.rule.id:
+  - resources.uid
+  payload.rule.name:
+  - resources.name
+  payload.sender.id:
+  - actor.user.uid
+  payload.sender.login:
+  - actor.user.name
+  payload.alert.html_url:
+  - finding_info.src_url
+  payload.alert.most_recent_instance.location.path:
+  - resources.name
+  payload.alert.rule.description:
+  - finding_info.title
+  - message
+  payload.alert.rule.id:
+  - finding_info.types
+  payload.alert.state:
+  - status_detail
+  payload.alert.tool.name:
+  - finding_info.analytic.name
+  payload.alert.url:
+  - finding_info.uid
+  payload.ref:
+  - resources.name
+  payload.alert.security_advisory.ghsa_id:
+  - finding_info.types
+  payload.alert.security_advisory.summary:
+  - finding_info.title
+  - message
+  payload.key.added_by:
+  - resources.owner.name
+  payload.key.id:
+  - resources.uid
+  payload.key.title:
+  - resources.name
+  payload.changes.permission.to:
+  - privileges
+  payload.member.id:
+  - user.uid
+  payload.member.login:
+  - user.name
+  payload.blocked_user.id:
+  - user.uid
+  payload.blocked_user.login:
+  - user.name
   payload.membership.role:
   - privileges
   payload.membership.user.id:
   - user.uid
   payload.membership.user.login:
   - user.name
-  payload.organization.id:
+  payload.user.id:
+  - user.uid
+  payload.user.login:
+  - user.name
+  payload.repository_ruleset.id:
+  - resources.uid
+  payload.repository_ruleset.name:
+  - resources.name
+  payload.alert.push_protection_bypassed_by.id:
+  - evidences.actor.user.uid
+  payload.alert.push_protection_bypassed_by.login:
+  - evidences.actor.user.name
+  payload.alert.secret_type:
+  - finding_info.types
+  payload.alert.secret_type_display_name:
+  - finding_info.title
+  - message
+  payload.team.id:
   - group.uid
-  payload.organization.login:
+  payload.team.permission:
+  - privileges
+  payload.team.slug:
   - group.name
-  payload.sender.id:
+  payload.workflow_job.conclusion:
+  - status_detail
+  payload.workflow_job.head_sha:
+  - app.version
+  payload.workflow_job.id:
+  - metadata.correlation_uid
+  payload.workflow_job.name:
+  - app.name
+  payload.workflow_run.conclusion:
+  - status_detail
+  payload.workflow_run.head_sha:
+  - app.version
+  payload.workflow_run.id:
+  - metadata.correlation_uid
+  payload.workflow_run.name:
+  - app.name
+  payload.workflow_run.path:
+  - app.path
+  payload.workflow_run.triggering_actor.id:
   - actor.user.uid
-  payload.sender.login:
+  payload.workflow_run.triggering_actor.login:
   - actor.user.name
+  payload.workflow_run.workflow_id:
+  - app.uid
+  changes.permission.to:
+  - privileges
+  member.id:
+  - user.uid
+  member.login:
+  - user.name
+  blocked_user.id:
+  - user.uid
+  blocked_user.login:
+  - user.name
   membership.role:
   - privileges
   membership.user.id:
   - user.uid
   membership.user.login:
   - user.name
+  user.id:
+  - user.uid
+  user.login:
+  - user.name
+  repository_ruleset.id:
+  - resources.uid
+  repository_ruleset.name:
+  - resources.name
   alert.push_protection_bypassed_by.id:
   - evidences.actor.user.uid
   alert.push_protection_bypassed_by.login:
@@ -110,6 +277,14 @@ mappings:
   - privileges
   team.slug:
   - group.name
+  workflow_job.conclusion:
+  - status_detail
+  workflow_job.head_sha:
+  - app.version
+  workflow_job.id:
+  - metadata.correlation_uid
+  workflow_job.name:
+  - app.name
   workflow_run.conclusion:
   - status_detail
   workflow_run.head_sha:

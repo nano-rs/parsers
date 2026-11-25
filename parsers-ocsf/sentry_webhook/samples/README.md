@@ -4,7 +4,7 @@ One delivery per file: Sentry's JSON body exactly as signed (the resource is
 not in the body; the parser reads it from `data.*`).
 `envelope_issue_created.json` is the same delivery in a relay envelope
 `{sentry_resource, sentry_timestamp, payload}`, which is also accepted. Shapes
-follow https://docs.sentry.io/organization/integrations/integration-platform/webhooks/.
+follow https://docs.sentry.io/integrations/integration-platform/webhooks/.
 
 | File | Branch |
 |------|--------|
@@ -15,3 +15,5 @@ follow https://docs.sentry.io/organization/integrations/integration-platform/web
 | `installation_deleted.json` | installation.deleted: API Activity, Delete by a user, time received |
 | `envelope_issue_created.json` | relay envelope form |
 | `malformed.json` | truncated JSON: Base Event fallback |
+| `metric_alert_resolved.json` | metric_alert.resolved: Close, time = date_closed |
+| `error_created_datetime_only.json` | error.created: Detection Finding, time from datetime (no numeric timestamp) |

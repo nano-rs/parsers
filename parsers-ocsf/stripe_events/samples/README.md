@@ -12,3 +12,4 @@ Stripe Event objects exactly as a webhook endpoint receives them
 | `radar_early_fraud_warning_created.json` | Detection Finding, fraud_type |
 | `charge_dispute_created.json` | Detection Finding, dispute reason fraudulent |
 | `malformed.json` | not JSON: Base Event fallback |
+| `charge_succeeded_with_invoice.json` | charge with its invoice as a resource |

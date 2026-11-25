@@ -4,7 +4,7 @@ Records of `logs` from `GET https://api.doppler.com/v3/logs`, one per file
 (https://docs.doppler.com/reference/activity_logs-list). The record shape comes
 from a read-only call to the API; the `text` of `secrets_added_updated.json`
 follows a real record, the other texts follow the same pattern but are assumed.
-Names and e-mails are example or redacted values.
+Names and emails are example or redacted values.
 
 | File | Branch |
 |------|--------|
@@ -13,3 +13,4 @@ Names and e-mails are example or redacted values.
 | `service_token_created.json` | "Created service token ...": Create |
 | `api_page_not_a_record.json` | a whole API page sent as one line: Base Event fallback (send each record) |
 | `malformed.json` | not JSON: Base Event fallback |
+| `unverified_text_leading_space_punctuation.json` | leading spaces and a colon around the verb ("  Locked config prd: ..."), an assumed text; a user with a real email, name and username |
