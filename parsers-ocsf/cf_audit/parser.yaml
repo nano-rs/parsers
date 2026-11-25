@@ -2,22 +2,27 @@ name: cf_audit_ocsf
 display_name: Cloudflare Account Audit Logs (OCSF)
 version: "1.0.0"
 ocsf_version: "1.9.0"
-description: >
+description: |
   Preserves unconsumed parsed fields, unaltered, in dotted snake_case unmapped keys.
   Parses Cloudflare account audit log records (v1 GET
-  /accounts/{account_id}/audit_logs: id, action, actor, interface, metadata,
-  newValue, oldValue, owner, resource, when) into OCSF 1.9.0:
+  /accounts/{account_id}/audit_logs: id, action, actor, interface, metadata, newValue,
+  oldValue, owner, resource, when) into OCSF 1.9.0:
     action.type login / logout                             -> Authentication 3002
     every other action (API tokens, DNS records, rulesets,
     members, zones, Workers, Logpush ...)                  -> API Activity 6003
-  The actor (id, e-mail, IP) is actor.user / user and src_endpoint; for a
-  login the account signing in is the user. action.result is the status, the
-  record id is metadata.uid, `when` is time, and metadata.event_code is
+  The actor (id, e-mail, IP) is actor.user / user and src_endpoint; for a login the
+  account signing in is the user. action.result is the status, the record id is
+  metadata.uid, `when` is time, and metadata.event_code is
   "<resource.type>.<action.type>". The target (resource id and type, named by
-  metadata.name or metadata.token_name when sent) and the owning account
-  become resources. newValue / oldValue, interface and metadata spill to
-  unmapped as sent. Unparseable input becomes a Base Event with the raw line
-  kept.
+  metadata.name or metadata.token_name when sent, in metadata.zone_name) and the owning
+  account are resources. newValue / oldValue, interface and metadata spill to unmapped
+  as sent. Unparseable input becomes a Base Event with the raw line kept.
+  Ingestion: HTTP ingest (/ingest), one audit record per line (not the API page).
+  Setup: Cloudflare doesn't push this audit log by itself. Create a read-only
+  Cloudflare API token with Account, Audit Logs, Read. Run a small scheduled job (every
+  few minutes) that reads GET /accounts/<your account id>/audit_logs with that token,
+  using `since` to pick up where it left off, and posts each record as one line to your
+  nano HTTP ingest with your cf_audit ingest token as a Bearer token.
 match_values:
   - cf_audit
 category: cloud
@@ -112,7 +117,7 @@ parser_vrl: |
               "log_provider": "Cloudflare",
               "product": { "name": "Cloudflare", "vendor_name": "Cloudflare" }
           },
-          "unmapped": { "parse_error": reason }
+          "unmapped": { "parse_error": reason, "nano_time_source": "received" }
       }
       # NAN-5264: explicit fallback marker; nano parser health counts it.
       . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
@@ -126,7 +131,12 @@ parser_vrl: |
       time_ms = 0
       w_t, w_err = parse_timestamp(string(a.when) ?? "", "%+", timezone: "UTC")
       if w_err == null { time_ms = to_unix_timestamp(w_t, unit: "milliseconds") }
-      if time_ms == 0 { time_ms = to_unix_timestamp(now(), unit: "milliseconds") }
+      # no clock in the record: the time nano received it, and say so
+      time_received = false
+      if time_ms == 0 {
+          time_ms = to_unix_timestamp(now(), unit: "milliseconds")
+          time_received = true
+      }
 
       # ---- actor ----
       au = {}
@@ -232,6 +242,7 @@ parser_vrl: |
       ocsf.message = msg
       ocsf.raw_data = raw_log
       ocsf.metadata = md
+      if time_received { ocsf = set!(ocsf, ["unmapped", "nano_time_source"], "received") }
       . = ocsf
   }
 
@@ -570,3 +581,21 @@ parser_vrl: |
   if !is_empty(__residual) { .unmapped = __residual }
   .
   # END NAN-2421 residual spill
+
+samples:
+  # The sidecar samples/*.json, inline for nano's OCSF deploy gate (it re-runs
+  # the parser on each raw line and validates the emitted event).
+  # api_token_created.json
+  - raw: "{\"id\":\"5c2a9f1e-0000-4000-8000-000000000001\",\"action\":{\"type\":\"create\",\"result\":true,\"info\":\"api_token\"},\"actor\":{\"id\":\"0f0e0d0c0b0a09080706050403020100\",\"email\":\"[redacted]@example.com\",\"type\":\"user\",\"ip\":\"203.0.113.10\"},\"interface\":\"UI\",\"metadata\":{\"token_name\":\"log-relay-poll\",\"token_tag\":\"a1b2c3d4e5f60718293a4b5c6d7e8f90\"},\"newValue\":\"\",\"oldValue\":\"\",\"owner\":{\"id\":\"a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5\"},\"resource\":{\"id\":\"a1b2c3d4e5f60718293a4b5c6d7e8f90\",\"type\":\"api_token\"},\"when\":\"2026-11-25T14:50:02.123Z\"}"
+  # dns_record_deleted.json
+  - raw: "{\"id\":\"6d3b0a2f-0000-4000-8000-000000000002\",\"action\":{\"type\":\"delete\",\"result\":true},\"actor\":{\"id\":\"cf_token_redacted0000000000000000\",\"email\":\"\",\"type\":\"user\",\"ip\":\"198.51.100.46\"},\"interface\":\"API\",\"metadata\":{\"zone_name\":\"example.com\",\"name\":\"demo-old.example.com\",\"type\":\"A\",\"content\":\"198.51.100.20\",\"ttl\":300,\"proxied\":false},\"newValue\":\"\",\"oldValue\":\"\",\"owner\":{\"id\":\"a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5\"},\"resource\":{\"id\":\"0123456789abcdef0123456789abcd01\",\"type\":\"DNS_record\"},\"when\":\"2026-11-25T14:52:40.004Z\"}"
+  # login_failed.json
+  - raw: "{\"id\":\"8f5d2c41-0000-4000-8000-000000000004\",\"action\":{\"type\":\"login\",\"result\":false},\"actor\":{\"id\":\"0f0e0d0c0b0a09080706050403020100\",\"email\":\"[redacted]@example.com\",\"type\":\"user\",\"ip\":\"192.0.2.77\"},\"interface\":\"UI\",\"metadata\":{\"reason\":\"invalid_2fa\"},\"newValue\":\"\",\"oldValue\":\"\",\"owner\":{\"id\":\"a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5\"},\"resource\":{\"id\":\"0f0e0d0c0b0a09080706050403020100\",\"type\":\"account\"},\"when\":\"2026-11-25T15:01:00.000Z\"}"
+  # login_success_ipv6.json
+  - raw: "{\"id\":\"ab7f4e63-0000-4000-8000-000000000006\",\"action\":{\"type\":\"login\",\"result\":true},\"actor\":{\"id\":\"0e0d0c0b0a0908070605040302010000\",\"email\":\"soc-analyst@example.com\",\"type\":\"user\",\"ip\":\"2001:db8::10\"},\"interface\":\"UI\",\"metadata\":{},\"newValue\":\"\",\"oldValue\":\"\",\"owner\":{\"id\":\"a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5\"},\"resource\":{\"id\":\"0e0d0c0b0a0908070605040302010000\",\"type\":\"account\"},\"when\":\"2026-11-25T15:05:00.000Z\"}"
+  # malformed.json
+  - raw: "{\"id\":\"x\",\"action\":"
+  # member_added.json
+  - raw: "{\"id\":\"9a6e3d52-0000-4000-8000-000000000005\",\"action\":{\"type\":\"add\",\"result\":true,\"info\":\"account_member\"},\"actor\":{\"id\":\"0f0e0d0c0b0a09080706050403020100\",\"email\":\"[redacted]@example.com\",\"type\":\"user\",\"ip\":\"203.0.113.10\"},\"interface\":\"UI\",\"metadata\":{},\"newValue\":\"\",\"oldValue\":\"\",\"owner\":{\"id\":\"a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5\"},\"resource\":{\"id\":\"1a2b3c4d5e6f708192a3b4c5d6e7f809\",\"type\":\"account_member\"},\"when\":\"2026-11-25T15:03:30.000Z\"}"
+  # waf_rule_updated.json
+  - raw: "{\"id\":\"7e4c1b30-0000-4000-8000-000000000003\",\"action\":{\"type\":\"update\",\"result\":true,\"info\":\"ruleset\"},\"actor\":{\"id\":\"0f0e0d0c0b0a09080706050403020100\",\"email\":\"[redacted]@example.com\",\"type\":\"user\",\"ip\":\"203.0.113.10\"},\"interface\":\"UI\",\"metadata\":{\"zone_name\":\"example.com\",\"ruleset_phase\":\"http_request_firewall_custom\",\"rule_ref\":\"block_bad_asn\"},\"newValue\":\"{\\\"enabled\\\":false}\",\"oldValue\":\"{\\\"enabled\\\":true}\",\"owner\":{\"id\":\"a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5\"},\"resource\":{\"id\":\"fedcba9876543210fedcba9876543210\",\"type\":\"ruleset\"},\"when\":\"2026-11-25T14:55:13.551Z\"}"

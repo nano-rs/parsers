@@ -2,24 +2,34 @@ name: sentry_webhook_ocsf
 display_name: Sentry Webhooks (OCSF)
 version: "1.0.0"
 ocsf_version: "1.9.0"
-description: >
+description: |
   Preserves unconsumed parsed fields, unaltered, in dotted snake_case unmapped keys.
-  Parses Sentry integration-platform webhooks into OCSF 1.9.0. Sentry sends the
-  resource in the Sentry-Hook-Resource header and the send time in
-  Sentry-Hook-Timestamp, so the record is the relay envelope {sentry_resource,
-  sentry_timestamp, payload}; a bare payload is keyed by its data shape.
+  Parses Sentry integration platform webhooks into OCSF 1.9.0. The record is
+  Sentry's JSON body exactly as signed. Sentry sends the resource only in the
+  Sentry-Hook-Resource header, so it is read from the body (data.issue, data.event,
+  data.metric_alert, data.error, data.installation); a relay envelope {sentry_resource,
+  sentry_timestamp, payload} is also accepted.
     issue (created, resolved, assigned, ignored, archived, unresolved),
     event_alert (an issue alert rule fired), metric_alert
     (critical, warning, resolved), error                   -> Detection Finding 2004
     installation (created, deleted) and anything else      -> API Activity 6003
-  The issue / event / metric alert id is finding_info.uid, its title the
-  finding title, and the issue alert rule (or metric alert rule) the analytic.
-  The Sentry level sets severity (fatal High, error Medium, warning Low) and
-  metadata.log_level. time is the event's own clock (event.timestamp, the
-  metric alert's date_detected), else sentry_timestamp. An uninstalled
-  integration is API Activity by the acting user, with no caller address
-  ({"hostname": "unknown"}). Unparseable input becomes a Base Event with the
-  raw line kept.
+  The issue / event / metric alert id is finding_info.uid, its title the finding
+  title, and the alert rule the analytic. The Sentry level sets severity (fatal High,
+  error Medium, warning Low) and metadata.log_level. time is the event's own clock
+  (event.timestamp, a metric alert's date_detected, a new issue's firstSeen); a status
+  change or an install carries none, so it gets the time nano received it
+  (unmapped.nano_time_source = "received"). An install or uninstall is API Activity by
+  the acting user, with no caller address ({"hostname": "unknown"}). Unparseable input
+  becomes a Base Event with the raw line kept.
+  Ingestion: HTTP ingest (/ingest), one JSON body per line.
+  Setup: Sentry can't add nano's ingest token to a webhook, so put a small
+  forwarder in between (for example a Cloudflare Worker). In Sentry, open Settings,
+  then Developer Settings, then Custom Integrations, and create an internal
+  integration. Set the webhook URL to the forwarder, turn on the issue and error
+  webhooks, and allow it in alert rules for issue and metric alerts. The forwarder
+  checks the Sentry-Hook-Signature header with the integration's client secret, then
+  posts the body, unchanged, to your nano HTTP ingest with your sentry_webhook ingest
+  token as a Bearer token.
 match_values:
   - sentry_webhook
 category: application
@@ -114,25 +124,43 @@ parser_vrl: |
               "log_provider": "Sentry",
               "product": { "name": "Sentry", "vendor_name": "Sentry" }
           },
-          "unmapped": { "parse_error": reason }
+          "unmapped": { "parse_error": reason, "nano_time_source": "received" }
       }
       # NAN-5264: explicit fallback marker; nano parser health counts it.
       . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
   } else {
       env = object!(parsed)
-      pl = object(env.payload) ?? env
+      # The usual record is Sentry's signed body as delivered (the resource
+      # travels in the unsigned Sentry-Hook-Resource header, which a relay that
+      # forwards only signed bytes drops). A relay envelope
+      # {sentry_resource, sentry_timestamp, payload} is also accepted.
+      is_envelope = exists(env.sentry_resource) && is_object(env.payload)
+      pl = env
+      if is_envelope { pl = object!(env.payload) }
       data = object(pl.data) ?? {}
-      resource = string(env.sentry_resource) ?? ""
+      resource = ""
+      if is_envelope { resource = string(env.sentry_resource) ?? "" }
       if resource == "" {
-          if exists(data.issue) { resource = "issue" }
-          if exists(data.event) { resource = "event_alert" }
-          if exists(data.metric_alert) { resource = "metric_alert" }
-          if exists(data.error) { resource = "error" }
-          if exists(data.installation) { resource = "installation" }
+          if exists(data.issue) {
+              resource = "issue"
+          } else if exists(data.event) {
+              resource = "event_alert"
+          } else if exists(data.metric_alert) {
+              resource = "metric_alert"
+          } else if exists(data.error) {
+              resource = "error"
+          } else if exists(data.installation) || exists(pl.installation.app) {
+              resource = "installation"
+          } else if exists(data.comment) {
+              resource = "comment"
+          }
       }
       action = string(pl.action) ?? ""
       event_code = resource
-      if action != "" { event_code = resource + "." + action }
+      if action != "" {
+          event_code = action
+          if resource != "" { event_code = resource + "." + action }
+      }
 
       # ---- time: the event's own clock, else the hook send time ----
       time_ms = 0
@@ -144,11 +172,22 @@ parser_vrl: |
           ma_t, ma_err = parse_timestamp(string(data.metric_alert.date_detected) ?? "", "%+", timezone: "UTC")
           if ma_err == null { time_ms = to_unix_timestamp(ma_t, unit: "milliseconds") }
       }
-      if time_ms == 0 {
+      # a new issue happened at its first sighting; a later status change
+      # (resolved, assigned, ...) carries no clock of its own
+      if time_ms == 0 && resource == "issue" && action == "created" {
+          fs_t, fs_err = parse_timestamp(string(data.issue.firstSeen) ?? "", "%+", timezone: "UTC")
+          if fs_err == null { time_ms = to_unix_timestamp(fs_t, unit: "milliseconds") }
+      }
+      if time_ms == 0 && is_envelope {
           hook_s = to_int(env.sentry_timestamp) ?? 0
           if hook_s > 0 { time_ms = hook_s * 1000 }
       }
-      if time_ms == 0 { time_ms = to_unix_timestamp(now(), unit: "milliseconds") }
+      # no clock in the record: the time nano received it, and say so
+      time_received = false
+      if time_ms == 0 {
+          time_ms = to_unix_timestamp(now(), unit: "milliseconds")
+          time_received = true
+      }
 
       md = {
           "version": "1.9.0",
@@ -316,6 +355,7 @@ parser_vrl: |
       ocsf.message = msg
       ocsf.raw_data = raw_log
       ocsf.metadata = md
+      if time_received { ocsf = set!(ocsf, ["unmapped", "nano_time_source"], "received") }
       . = ocsf
   }
 
@@ -394,16 +434,17 @@ parser_vrl: |
   }
   __flat = flatten(__escaped)
   # BEGIN parser-specific transformations
-  # payload.data.event.timestamp: The event's own clock (epoch seconds, fractional) is the event time.
-  # payload.data.metric_alert.date_detected: The metric alert's detection clock is the event time.
-  # sentry_timestamp: Sentry-Hook-Timestamp (epoch seconds) is the event time when the payload carries no clock.
+  # data.event.timestamp: The event's own clock (epoch seconds, fractional) is the event time.
+  # data.metric_alert.date_detected: The metric alert's detection clock is the event time.
   # payload.data.issue.firstSeen: The issue's first-seen clock.
+  # data.issue.firstSeen: The issue's first-seen clock.
   # payload.data.issue.lastSeen: The issue's last-seen clock.
+  # data.issue.lastSeen: The issue's last-seen clock.
+  # data.issue.firstSeen: A new issue's first sighting is the event time.
   for_each(__flat) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
-        payload\.data\.event\.timestamp
-      | sentry_timestamp
+        data\.event\.timestamp
       )\z') {
           __value = value
           __number, __number_err = to_float(__value)
@@ -414,7 +455,8 @@ parser_vrl: |
       }
       if match(key, r'(?x)
       \A(?:
-        payload\.data\.metric_alert\.date_detected
+        data\.metric_alert\.date_detected
+      | data\.issue\.firstSeen
       )\z') {
           __value = value
           __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
@@ -426,6 +468,7 @@ parser_vrl: |
       if match(key, r'(?x)
       \A(?:
         payload\.data\.issue\.firstSeen
+      | data\.issue\.firstSeen
       )\z') {
           __value = value
           __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
@@ -437,6 +480,7 @@ parser_vrl: |
       if match(key, r'(?x)
       \A(?:
         payload\.data\.issue\.lastSeen
+      | data\.issue\.lastSeen
       )\z') {
           __value = value
           __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
@@ -447,7 +491,7 @@ parser_vrl: |
       }
   }
   # Declared source -> target mappings (field-coverage.yaml `mappings`).
-  __decl = "\n\"payload.actor.id\"\t[\"actor.user.uid\"]\n\"payload.actor.name\"\t[\"actor.user.name\"]\n\"payload.data.event.event_id\"\t[\"finding_info.uid\"]\n\"payload.data.event.level\"\t[\"metadata.log_level\"]\n\"payload.data.event.project\"\t[\"resources.uid\"]\n\"payload.data.event.release\"\t[\"resources.name\"]\n\"payload.data.event.title\"\t[\"finding_info.title\",\"message\"]\n\"payload.data.event.web_url\"\t[\"finding_info.src_url\"]\n\"payload.data.triggered_rule\"\t[\"finding_info.analytic.name\"]\n\"payload.installation.uuid\"\t[\"resources.uid\"]\n\"payload.installation.app.slug\"\t[\"resources.name\"]\n\"payload.data.issue.culprit\"\t[\"finding_info.desc\"]\n\"payload.data.issue.id\"\t[\"finding_info.uid\"]\n\"payload.data.issue.level\"\t[\"metadata.log_level\"]\n\"payload.data.issue.project.id\"\t[\"resources.uid\"]\n\"payload.data.issue.project.slug\"\t[\"resources.name\"]\n\"payload.data.issue.shortId\"\t[\"finding_info.uid_alt\"]\n\"payload.data.issue.status\"\t[\"status_detail\"]\n\"payload.data.issue.title\"\t[\"finding_info.title\",\"message\"]\n\"payload.data.issue.web_url\"\t[\"finding_info.src_url\"]\n\"payload.data.description_text\"\t[\"finding_info.desc\"]\n\"payload.data.description_title\"\t[\"finding_info.title\",\"message\"]\n\"payload.data.metric_alert.alert_rule.id\"\t[\"finding_info.analytic.uid\"]\n\"payload.data.metric_alert.alert_rule.name\"\t[\"finding_info.analytic.name\"]\n\"payload.data.metric_alert.id\"\t[\"finding_info.uid\"]\n\"payload.data.metric_alert.projects\"\t[\"resources.name\"]\n\"payload.data.web_url\"\t[\"finding_info.src_url\"]\n"
+  __decl = "\n\"payload.data.issue.culprit\"\t[\"finding_info.desc\"]\n\"payload.data.issue.id\"\t[\"finding_info.uid\"]\n\"payload.data.issue.level\"\t[\"metadata.log_level\"]\n\"payload.data.issue.project.id\"\t[\"resources.uid\"]\n\"payload.data.issue.project.slug\"\t[\"resources.name\"]\n\"payload.data.issue.shortId\"\t[\"finding_info.uid_alt\"]\n\"payload.data.issue.status\"\t[\"status_detail\"]\n\"payload.data.issue.title\"\t[\"finding_info.title\",\"message\"]\n\"payload.data.issue.web_url\"\t[\"finding_info.src_url\"]\n\"actor.id\"\t[\"actor.user.uid\"]\n\"actor.name\"\t[\"actor.user.name\"]\n\"data.event.event_id\"\t[\"finding_info.uid\"]\n\"data.event.level\"\t[\"metadata.log_level\"]\n\"data.event.project\"\t[\"resources.uid\"]\n\"data.event.release\"\t[\"resources.name\"]\n\"data.event.title\"\t[\"finding_info.title\",\"message\"]\n\"data.event.web_url\"\t[\"finding_info.src_url\"]\n\"data.triggered_rule\"\t[\"finding_info.analytic.name\"]\n\"installation.uuid\"\t[\"resources.uid\"]\n\"installation.app.slug\"\t[\"resources.name\"]\n\"data.issue.culprit\"\t[\"finding_info.desc\"]\n\"data.issue.id\"\t[\"finding_info.uid\"]\n\"data.issue.level\"\t[\"metadata.log_level\"]\n\"data.issue.project.id\"\t[\"resources.uid\"]\n\"data.issue.project.slug\"\t[\"resources.name\"]\n\"data.issue.shortId\"\t[\"finding_info.uid_alt\"]\n\"data.issue.status\"\t[\"status_detail\"]\n\"data.issue.title\"\t[\"finding_info.title\",\"message\"]\n\"data.issue.web_url\"\t[\"finding_info.src_url\"]\n\"data.description_text\"\t[\"finding_info.desc\"]\n\"data.description_title\"\t[\"finding_info.title\",\"message\"]\n\"data.metric_alert.alert_rule.id\"\t[\"finding_info.analytic.uid\"]\n\"data.metric_alert.alert_rule.name\"\t[\"finding_info.analytic.name\"]\n\"data.metric_alert.id\"\t[\"finding_info.uid\"]\n\"data.metric_alert.projects\"\t[\"resources.name\"]\n\"data.web_url\"\t[\"finding_info.src_url\"]\n"
   __preserve = []
   # END parser-specific transformations
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
@@ -679,3 +723,21 @@ parser_vrl: |
   if !is_empty(__residual) { .unmapped = __residual }
   .
   # END NAN-2421 residual spill
+
+samples:
+  # The sidecar samples/*.json, inline for nano's OCSF deploy gate (it re-runs
+  # the parser on each raw line and validates the emitted event).
+  # envelope_issue_created.json
+  - raw: "{\"sentry_resource\":\"issue\",\"sentry_timestamp\":\"1764080000\",\"payload\":{\"action\":\"created\",\"installation\":{\"uuid\":\"a1b2c3d4-0000-4000-8000-000000000001\"},\"data\":{\"issue\":{\"id\":\"6100000001\",\"shortId\":\"EXAMPLE-API-4F2\",\"title\":\"TypeError: Cannot read properties of undefined (reading 'tenantId')\",\"culprit\":\"services/provisioning.ts in triggerProvisioning\",\"level\":\"error\",\"status\":\"unresolved\",\"platform\":\"node\",\"project\":{\"id\":\"4500000001\",\"name\":\"example-api\",\"slug\":\"example-api\",\"platform\":\"node\"},\"firstSeen\":\"2026-11-25T14:13:20.000000Z\",\"lastSeen\":\"2026-11-25T14:13:20.000000Z\",\"count\":\"1\",\"userCount\":0,\"web_url\":\"https://example-org.sentry.io/issues/6100000001/\"}},\"actor\":{\"type\":\"application\",\"id\":\"sentry\",\"name\":\"Sentry\"}}}"
+  # event_alert_triggered.json
+  - raw: "{\"action\":\"triggered\",\"installation\":{\"uuid\":\"a1b2c3d4-0000-4000-8000-000000000001\"},\"data\":{\"event\":{\"event_id\":\"0f1e2d3c4b5a69788796a5b4c3d2e1f0\",\"project\":4500000001,\"release\":\"example-api@2.0.35\",\"environment\":\"production\",\"level\":\"error\",\"message\":\"\",\"title\":\"Error: refused: upstream proxy configuration is not recognized\",\"timestamp\":1764080419.512,\"tags\":[[\"environment\",\"production\"],[\"level\",\"error\"],[\"release\",\"example-api@2.0.35\"],[\"server_name\",\"api-6d8f9c7b5-x2k4p\"]],\"web_url\":\"https://example-org.sentry.io/issues/6100000002/events/0f1e2d3c4b5a69788796a5b4c3d2e1f0/\"},\"triggered_rule\":\"api error spike\"},\"actor\":{\"type\":\"application\",\"id\":\"sentry\",\"name\":\"Sentry\"}}"
+  # installation_deleted.json
+  - raw: "{\"action\":\"deleted\",\"installation\":{\"uuid\":\"a1b2c3d4-0000-4000-8000-000000000001\",\"app\":{\"uuid\":\"b2c3d4e5-0000-4000-8000-000000000002\",\"slug\":\"log-relay\"},\"organization\":{\"slug\":\"example-org\"},\"status\":\"installed\"},\"data\":{\"installation\":{\"uuid\":\"a1b2c3d4-0000-4000-8000-000000000001\",\"status\":\"installed\",\"organization\":{\"slug\":\"example-org\"}}},\"actor\":{\"type\":\"user\",\"id\":\"2100000001\",\"name\":\"org-admin-1\"}}"
+  # issue_created.json
+  - raw: "{\"action\":\"created\",\"installation\":{\"uuid\":\"a1b2c3d4-0000-4000-8000-000000000001\"},\"data\":{\"issue\":{\"id\":\"6100000001\",\"shortId\":\"EXAMPLE-API-4F2\",\"title\":\"TypeError: Cannot read properties of undefined (reading 'tenantId')\",\"culprit\":\"services/provisioning.ts in triggerProvisioning\",\"level\":\"error\",\"status\":\"unresolved\",\"platform\":\"node\",\"project\":{\"id\":\"4500000001\",\"name\":\"example-api\",\"slug\":\"example-api\",\"platform\":\"node\"},\"firstSeen\":\"2026-11-25T14:13:20.000000Z\",\"lastSeen\":\"2026-11-25T14:13:20.000000Z\",\"count\":\"1\",\"userCount\":0,\"web_url\":\"https://example-org.sentry.io/issues/6100000001/\"}},\"actor\":{\"type\":\"application\",\"id\":\"sentry\",\"name\":\"Sentry\"}}"
+  # issue_resolved.json
+  - raw: "{\"action\":\"resolved\",\"installation\":{\"uuid\":\"a1b2c3d4-0000-4000-8000-000000000001\"},\"data\":{\"issue\":{\"id\":\"6100000001\",\"shortId\":\"EXAMPLE-API-4F2\",\"title\":\"TypeError: Cannot read properties of undefined (reading 'tenantId')\",\"culprit\":\"services/provisioning.ts in triggerProvisioning\",\"level\":\"error\",\"status\":\"resolved\",\"platform\":\"node\",\"project\":{\"id\":\"4500000001\",\"name\":\"example-api\",\"slug\":\"example-api\",\"platform\":\"node\"},\"firstSeen\":\"2026-11-25T14:13:20.000000Z\",\"lastSeen\":\"2026-11-25T14:40:02.000000Z\",\"count\":\"7\",\"userCount\":0,\"web_url\":\"https://example-org.sentry.io/issues/6100000001/\"}},\"actor\":{\"type\":\"user\",\"id\":\"2100000001\",\"name\":\"org-admin-1\"}}"
+  # malformed.json
+  - raw: "{\"sentry_resource\":\"issue\",\"payload\":"
+  # metric_alert_critical.json
+  - raw: "{\"action\":\"critical\",\"installation\":{\"uuid\":\"a1b2c3d4-0000-4000-8000-000000000001\"},\"data\":{\"metric_alert\":{\"id\":\"7100000001\",\"identifier\":\"14\",\"organization_id\":\"4400000001\",\"projects\":[\"example-api\"],\"date_started\":\"2026-11-25T14:50:00.000000Z\",\"date_detected\":\"2026-11-25T14:50:00.000000Z\",\"date_closed\":null,\"alert_rule\":{\"id\":\"880001\",\"name\":\"api 5xx rate\",\"aggregate\":\"percentage(sessions_crashed, sessions) AS _crash_rate_alert_aggregate\",\"threshold_type\":0,\"time_window\":5}},\"description_text\":\"5xx rate 12.5% over the last 5 minutes\",\"description_title\":\"Critical: api 5xx rate\",\"web_url\":\"https://example-org.sentry.io/alerts/rules/details/880001/\"},\"actor\":{\"type\":\"application\",\"id\":\"sentry\",\"name\":\"Sentry\"}}"

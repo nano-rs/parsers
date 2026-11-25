@@ -2,29 +2,35 @@ name: github_webhook_ocsf
 display_name: GitHub Webhooks (OCSF)
 version: "1.0.0"
 ocsf_version: "1.9.0"
-description: >
+description: |
   Preserves unconsumed parsed fields, unaltered, in dotted snake_case unmapped keys.
-  Parses GitHub organization / repository webhook deliveries into OCSF 1.9.0.
-  For organizations without GitHub Enterprise Cloud (no audit log API or
-  streaming) the org webhook is the security record. A webhook body does not
-  name its event type (GitHub sends it in the X-GitHub-Event header), so the
-  record is the relay envelope {github_event, github_delivery, github_hook_id,
-  github_hook_installation_target_type, payload}; a bare payload is accepted
-  and keyed by its shape. Routing by event:
+  Parses GitHub organization and repository webhook deliveries into OCSF 1.9.0. This is
+  the security record for organizations without GitHub Enterprise Cloud (no audit log
+  API or streaming). The record is GitHub's JSON body exactly as signed. GitHub sends
+  the event name only in the X-GitHub-Event header, so the event is read from the
+  body's own keys (membership, team, member, key, rule, alert, workflow_run, pusher,
+  ...); a relay envelope {github_event, github_delivery, ..., payload} is also accepted.
     organization, member, membership, team, org_block      -> Group Management 3006
     secret_scanning_alert, code_scanning_alert,
-    dependabot_alert, repository_vulnerability_alert       -> Detection Finding 2004
+    dependabot_alert                                       -> Detection Finding 2004
     workflow_run, workflow_job                             -> Application Lifecycle 6002
-    everything else (repository, deploy_key, push,
-    branch_protection_rule, repository_ruleset, public,
-    personal_access_token_request, meta, installation ...) -> API Activity 6003
-  `sender` is the actor; the delivery GUID is metadata.uid (redeliveries keep
-  it, so they dedupe); metadata.event_code is "<event>.<action>". A webhook
-  body carries no delivery clock: time is the event's own clock where GitHub
-  sends one (workflow run / job, alert, push), otherwise the time nano received
-  it (unmapped.nano_time_source = "received"). API Activity has no caller
-  address in a webhook, so src_endpoint is {"hostname": "unknown"}.
-  Unparseable input becomes a Base Event with the raw line kept.
+    everything else (repository, public, deploy_key, push,
+    branch_protection_rule, repository_ruleset, meta, ...) -> API Activity 6003
+  `sender` is the actor and metadata.event_code is "<event>.<action>". A webhook body
+  has no delivery clock: time is the event's own clock where GitHub sends one
+  (workflow run / job, alert, push), otherwise the time nano received it
+  (unmapped.nano_time_source = "received"). A webhook names no caller address, so API
+  Activity has src_endpoint {"hostname": "unknown"}. Unparseable input becomes a Base
+  Event with the raw line kept.
+  Ingestion: HTTP ingest (/ingest), one JSON body per line.
+  Setup: GitHub can't add nano's ingest token to a webhook, so put a small
+  forwarder in between (for example a Cloudflare Worker). In GitHub, open your
+  organization, then Settings, then Webhooks, then Add webhook. Set the payload URL to
+  the forwarder, the content type to application/json, and a secret. Choose the events
+  you want: members, teams, repositories, deploy keys, branch protection rules,
+  workflow runs, and secret and code scanning alerts. The forwarder checks the
+  X-Hub-Signature-256 header with that secret, then posts the body, unchanged, to your
+  nano HTTP ingest with your github_webhook ingest token as a Bearer token.
 match_values:
   - github_webhook
 category: security
@@ -121,25 +127,73 @@ parser_vrl: |
               "log_provider": "GitHub",
               "product": { "name": "GitHub", "vendor_name": "GitHub" }
           },
-          "unmapped": { "parse_error": reason }
+          "unmapped": { "parse_error": reason, "nano_time_source": "received" }
       }
       # NAN-5264: explicit fallback marker; nano parser health counts it.
       . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
   } else {
       env = object!(parsed)
-      pl = object(env.payload) ?? env
-      gh_event = string(env.github_event) ?? ""
+      # The usual record is GitHub's signed body as delivered (the event name
+      # travels in the unsigned X-GitHub-Event header, which a relay that
+      # forwards only signed bytes drops). A relay envelope
+      # {github_event, github_delivery, ..., payload} is also accepted.
+      is_envelope = exists(env.github_event) && is_object(env.payload)
+      pl = env
+      if is_envelope { pl = object!(env.payload) }
+      gh_event = ""
+      if is_envelope { gh_event = string(env.github_event) ?? "" }
       action = string(pl.action) ?? ""
-      # A bare payload names no event; key it by its shape.
+      # A bare body names no event: the payload's own keys do (first match wins).
       if gh_event == "" {
-          if exists(pl.workflow_run) { gh_event = "workflow_run" }
-          if exists(pl.workflow_job) { gh_event = "workflow_job" }
-          if exists(pl.alert) { gh_event = "alert" }
-          if exists(pl.membership) { gh_event = "organization" }
-          if exists(pl.pusher) { gh_event = "push" }
+          if exists(pl.workflow_run) {
+              gh_event = "workflow_run"
+          } else if exists(pl.workflow_job) {
+              gh_event = "workflow_job"
+          } else if exists(pl.alert) && exists(pl.location) {
+              gh_event = "secret_scanning_alert_location"
+          } else if exists(pl.alert.secret_type) {
+              gh_event = "secret_scanning_alert"
+          } else if exists(pl.alert.rule) && exists(pl.alert.tool) {
+              gh_event = "code_scanning_alert"
+          } else if exists(pl.alert.security_advisory) || exists(pl.alert.dependency) {
+              gh_event = "dependabot_alert"
+          } else if exists(pl.membership) && exists(pl.team) {
+              gh_event = "membership"
+          } else if exists(pl.membership) || exists(pl.invitation) {
+              gh_event = "organization"
+          } else if exists(pl.blocked_user) {
+              gh_event = "org_block"
+          } else if exists(pl.team) {
+              gh_event = "team"
+          } else if exists(pl.member) && exists(pl.repository) {
+              gh_event = "member"
+          } else if exists(pl.key) && exists(pl.repository) {
+              gh_event = "deploy_key"
+          } else if exists(pl.rule) && exists(pl.repository) {
+              gh_event = "branch_protection_rule"
+          } else if exists(pl.repository_ruleset) {
+              gh_event = "repository_ruleset"
+          } else if exists(pl.personal_access_token_request) {
+              gh_event = "personal_access_token_request"
+          } else if exists(pl.pusher) {
+              gh_event = "push"
+          } else if exists(pl.zen) && exists(pl.hook) {
+              gh_event = "ping"
+          } else if exists(pl.hook) && action != "" {
+              gh_event = "meta"
+          } else if exists(pl.repository) && action != "" {
+              gh_event = "repository"
+          } else if exists(pl.repository) {
+              gh_event = "public"
+          } else if exists(pl.organization) && action != "" {
+              gh_event = "organization"
+          }
       }
       event_code = gh_event
-      if action != "" { event_code = gh_event + "." + action }
+      if action != "" {
+          event_code = action
+          if gh_event != "" { event_code = gh_event + "." + action }
+      }
 
       # ---- actor: the account that triggered the delivery ----
       sender = object(pl.sender) ?? {}
@@ -546,18 +600,18 @@ parser_vrl: |
   }
   __flat = flatten(__escaped)
   # BEGIN parser-specific transformations
-  # payload.workflow_run.updated_at: The run's last-update clock (the completion time on a completed run) is the event time.
-  # payload.alert.updated_at: The alert's last-update clock is the event time.
-  # payload.alert.created_at: An alert without updated_at takes its creation clock as the event time.
-  # payload.alert.created_at: The alert's creation clock.
-  # payload.key.created_at: The deploy key's creation clock.
-  # payload.repository.pushed_at: push payloads carry repository.pushed_at as epoch seconds; it is the push time.
+  # workflow_run.updated_at: The run's last-update clock (the completion time on a completed run) is the event time.
+  # alert.updated_at: The alert's last-update clock is the event time.
+  # alert.created_at: An alert without updated_at takes its creation clock as the event time.
+  # alert.created_at: The alert's creation clock.
+  # key.created_at: The deploy key's creation clock.
+  # repository.pushed_at: push payloads carry repository.pushed_at as epoch seconds; it is the push time.
   for_each(__flat) -> |key, value| {
       if match(key, r'(?x)
       \A(?:
-        payload\.workflow_run\.updated_at
-      | payload\.alert\.updated_at
-      | payload\.alert\.created_at
+        workflow_run\.updated_at
+      | alert\.updated_at
+      | alert\.created_at
       )\z') {
           __value = value
           __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
@@ -568,7 +622,7 @@ parser_vrl: |
       }
       if match(key, r'(?x)
       \A(?:
-        payload\.alert\.created_at
+        alert\.created_at
       )\z') {
           __value = value
           __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
@@ -579,7 +633,7 @@ parser_vrl: |
       }
       if match(key, r'(?x)
       \A(?:
-        payload\.key\.created_at
+        key\.created_at
       )\z') {
           __value = value
           __clock, __clock_err = parse_timestamp(string(__value) ?? "", "%+", timezone: "UTC")
@@ -590,7 +644,7 @@ parser_vrl: |
       }
       if match(key, r'(?x)
       \A(?:
-        payload\.repository\.pushed_at
+        repository\.pushed_at
       )\z') {
           __value = value
           __number, __number_err = to_float(__value)
@@ -601,7 +655,7 @@ parser_vrl: |
       }
   }
   # Declared source -> target mappings (field-coverage.yaml `mappings`).
-  __decl = "\n\"github_delivery\"\t[\"metadata.uid\"]\n\"github_event\"\t[\"api.operation\",\"message\",\"metadata.event_code\"]\n\"payload.organization.id\"\t[\"group.uid\"]\n\"payload.organization.login\"\t[\"group.name\"]\n\"payload.repository.full_name\"\t[\"resources.name\"]\n\"payload.repository.id\"\t[\"resources.uid\"]\n\"payload.rule.id\"\t[\"resources.uid\"]\n\"payload.rule.name\"\t[\"resources.name\"]\n\"payload.sender.id\"\t[\"actor.user.uid\"]\n\"payload.sender.login\"\t[\"actor.user.name\"]\n\"payload.alert.html_url\"\t[\"finding_info.src_url\"]\n\"payload.alert.most_recent_instance.location.path\"\t[\"resources.name\"]\n\"payload.alert.rule.description\"\t[\"finding_info.title\",\"message\"]\n\"payload.alert.rule.id\"\t[\"finding_info.types\"]\n\"payload.alert.state\"\t[\"status_detail\"]\n\"payload.alert.tool.name\"\t[\"finding_info.analytic.name\"]\n\"payload.alert.url\"\t[\"finding_info.uid\"]\n\"payload.ref\"\t[\"resources.name\"]\n\"payload.key.added_by\"\t[\"resources.owner.name\"]\n\"payload.key.id\"\t[\"resources.uid\"]\n\"payload.key.title\"\t[\"resources.name\"]\n\"payload.membership.role\"\t[\"privileges\"]\n\"payload.membership.user.id\"\t[\"user.uid\"]\n\"payload.membership.user.login\"\t[\"user.name\"]\n\"payload.alert.push_protection_bypassed_by.id\"\t[\"evidences.actor.user.uid\"]\n\"payload.alert.push_protection_bypassed_by.login\"\t[\"evidences.actor.user.name\"]\n\"payload.alert.secret_type\"\t[\"finding_info.types\"]\n\"payload.alert.secret_type_display_name\"\t[\"finding_info.title\",\"message\"]\n\"payload.team.id\"\t[\"group.uid\"]\n\"payload.team.permission\"\t[\"privileges\"]\n\"payload.team.slug\"\t[\"group.name\"]\n\"payload.workflow_run.conclusion\"\t[\"status_detail\"]\n\"payload.workflow_run.head_sha\"\t[\"app.version\"]\n\"payload.workflow_run.id\"\t[\"metadata.correlation_uid\"]\n\"payload.workflow_run.name\"\t[\"app.name\"]\n\"payload.workflow_run.path\"\t[\"app.path\"]\n\"payload.workflow_run.triggering_actor.id\"\t[\"actor.user.uid\"]\n\"payload.workflow_run.triggering_actor.login\"\t[\"actor.user.name\"]\n\"payload.workflow_run.workflow_id\"\t[\"app.uid\"]\n"
+  __decl = "\n\"organization.id\"\t[\"group.uid\"]\n\"organization.login\"\t[\"group.name\"]\n\"repository.full_name\"\t[\"resources.name\"]\n\"repository.id\"\t[\"resources.uid\"]\n\"rule.id\"\t[\"resources.uid\"]\n\"rule.name\"\t[\"resources.name\"]\n\"sender.id\"\t[\"actor.user.uid\"]\n\"sender.login\"\t[\"actor.user.name\"]\n\"alert.html_url\"\t[\"finding_info.src_url\"]\n\"alert.most_recent_instance.location.path\"\t[\"resources.name\"]\n\"alert.rule.description\"\t[\"finding_info.title\",\"message\"]\n\"alert.rule.id\"\t[\"finding_info.types\"]\n\"alert.state\"\t[\"status_detail\"]\n\"alert.tool.name\"\t[\"finding_info.analytic.name\"]\n\"alert.url\"\t[\"finding_info.uid\"]\n\"ref\"\t[\"resources.name\"]\n\"key.added_by\"\t[\"resources.owner.name\"]\n\"key.id\"\t[\"resources.uid\"]\n\"key.title\"\t[\"resources.name\"]\n\"github_delivery\"\t[\"metadata.uid\"]\n\"payload.membership.role\"\t[\"privileges\"]\n\"payload.membership.user.id\"\t[\"user.uid\"]\n\"payload.membership.user.login\"\t[\"user.name\"]\n\"payload.organization.id\"\t[\"group.uid\"]\n\"payload.organization.login\"\t[\"group.name\"]\n\"payload.sender.id\"\t[\"actor.user.uid\"]\n\"payload.sender.login\"\t[\"actor.user.name\"]\n\"membership.role\"\t[\"privileges\"]\n\"membership.user.id\"\t[\"user.uid\"]\n\"membership.user.login\"\t[\"user.name\"]\n\"alert.push_protection_bypassed_by.id\"\t[\"evidences.actor.user.uid\"]\n\"alert.push_protection_bypassed_by.login\"\t[\"evidences.actor.user.name\"]\n\"alert.secret_type\"\t[\"finding_info.types\"]\n\"alert.secret_type_display_name\"\t[\"finding_info.title\",\"message\"]\n\"team.id\"\t[\"group.uid\"]\n\"team.permission\"\t[\"privileges\"]\n\"team.slug\"\t[\"group.name\"]\n\"workflow_run.conclusion\"\t[\"status_detail\"]\n\"workflow_run.head_sha\"\t[\"app.version\"]\n\"workflow_run.id\"\t[\"metadata.correlation_uid\"]\n\"workflow_run.name\"\t[\"app.name\"]\n\"workflow_run.path\"\t[\"app.path\"]\n\"workflow_run.triggering_actor.id\"\t[\"actor.user.uid\"]\n\"workflow_run.triggering_actor.login\"\t[\"actor.user.name\"]\n\"workflow_run.workflow_id\"\t[\"app.uid\"]\n"
   __preserve = []
   # END parser-specific transformations
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
@@ -833,3 +887,29 @@ parser_vrl: |
   if !is_empty(__residual) { .unmapped = __residual }
   .
   # END NAN-2421 residual spill
+
+samples:
+  # The sidecar samples/*.json, inline for nano's OCSF deploy gate (it re-runs
+  # the parser on each raw line and validates the emitted event).
+  # branch_protection_rule_deleted.json
+  - raw: "{\"action\":\"deleted\",\"rule\":{\"id\":30000001,\"repository_id\":700000002,\"name\":\"main\",\"created_at\":\"2026-03-02T10:11:12Z\",\"updated_at\":\"2026-11-25T13:05:40Z\",\"pull_request_reviews_enforcement_level\":\"non_admins\",\"required_approving_review_count\":1,\"dismiss_stale_reviews_on_push\":true,\"require_code_owner_review\":false,\"allow_force_pushes_enforcement_level\":\"off\",\"allow_deletions_enforcement_level\":\"off\",\"admin_enforced\":false,\"required_status_checks_enforcement_level\":\"non_admins\",\"required_status_checks\":[\"ci\"],\"linear_history_requirement_enforcement_level\":\"off\",\"signature_requirement_enforcement_level\":\"off\"},\"repository\":{\"id\":700000002,\"name\":\"api-service\",\"full_name\":\"example-org/api-service\",\"private\":true,\"owner\":{\"login\":\"example-org\",\"id\":180000001,\"type\":\"Organization\"}},\"organization\":{\"login\":\"example-org\",\"id\":180000001},\"sender\":{\"login\":\"org-admin-1\",\"id\":100000002,\"type\":\"User\"}}"
+  # code_scanning_alert_created.json
+  - raw: "{\"action\":\"created\",\"alert\":{\"number\":42,\"created_at\":\"2026-11-25T13:25:10Z\",\"updated_at\":\"2026-11-25T13:25:10Z\",\"url\":\"https://api.github.com/repos/example-org/web-app/code-scanning/alerts/42\",\"html_url\":\"https://github.com/example-org/web-app/security/code-scanning/42\",\"state\":\"open\",\"dismissed_by\":null,\"dismissed_at\":null,\"dismissed_reason\":null,\"rule\":{\"id\":\"js/sql-injection\",\"name\":\"js/sql-injection\",\"severity\":\"error\",\"security_severity_level\":\"high\",\"description\":\"Database query built from user-controlled sources\",\"tags\":[\"security\",\"external/cwe/cwe-089\"]},\"tool\":{\"name\":\"CodeQL\",\"version\":\"2.19.3\"},\"most_recent_instance\":{\"ref\":\"refs/heads/main\",\"analysis_key\":\".github/workflows/codeql.yml:analyze\",\"state\":\"open\",\"commit_sha\":\"c2faacd7d0000000000000000000000000000001\",\"location\":{\"path\":\"apps/api/src/routes/search.ts\",\"start_line\":88,\"end_line\":88}}},\"ref\":\"refs/heads/main\",\"commit_oid\":\"c2faacd7d0000000000000000000000000000001\",\"repository\":{\"id\":700000001,\"name\":\"web-app\",\"full_name\":\"example-org/web-app\",\"private\":true},\"organization\":{\"login\":\"example-org\",\"id\":180000001},\"sender\":{\"login\":\"github-advanced-security[bot]\",\"id\":62310815,\"type\":\"Bot\"}}"
+  # deploy_key_created.json
+  - raw: "{\"action\":\"created\",\"key\":{\"id\":120000001,\"key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[REDACTED]\",\"url\":\"https://api.github.com/repos/example-org/web-app/keys/120000001\",\"title\":\"ci-deploy-2026-11\",\"verified\":true,\"created_at\":\"2026-11-25T13:02:11Z\",\"read_only\":false,\"added_by\":\"org-admin-1\",\"last_used\":null,\"enabled\":true},\"repository\":{\"id\":700000001,\"name\":\"web-app\",\"full_name\":\"example-org/web-app\",\"private\":true,\"owner\":{\"login\":\"example-org\",\"id\":180000001,\"type\":\"Organization\"}},\"organization\":{\"login\":\"example-org\",\"id\":180000001},\"sender\":{\"login\":\"org-admin-1\",\"id\":100000002,\"type\":\"User\"}}"
+  # envelope_organization_member_added.json
+  - raw: "{\"github_event\":\"organization\",\"github_delivery\":\"7b0e6c40-ca1f-11f0-8a1e-000000000001\",\"github_hook_id\":\"512000001\",\"github_hook_installation_target_type\":\"organization\",\"payload\":{\"action\":\"member_added\",\"membership\":{\"url\":\"https://api.github.com/orgs/example-org/memberships/new-contractor\",\"state\":\"pending\",\"role\":\"member\",\"organization_url\":\"https://api.github.com/orgs/example-org\",\"user\":{\"login\":\"new-contractor\",\"id\":100000001,\"node_id\":\"U_kgDOAAAAAQ\",\"type\":\"User\",\"site_admin\":false}},\"organization\":{\"login\":\"example-org\",\"id\":180000001,\"node_id\":\"O_kgDOAAAAAg\",\"url\":\"https://api.github.com/orgs/example-org\"},\"sender\":{\"login\":\"org-admin-1\",\"id\":100000002,\"node_id\":\"U_kgDOAAAAAw\",\"type\":\"User\",\"site_admin\":false}}}"
+  # malformed.json
+  - raw: "{\"github_event\":\"ping\",\"github_delivery\":"
+  # organization_member_added.json
+  - raw: "{\"action\":\"member_added\",\"membership\":{\"url\":\"https://api.github.com/orgs/example-org/memberships/new-contractor\",\"state\":\"pending\",\"role\":\"member\",\"organization_url\":\"https://api.github.com/orgs/example-org\",\"user\":{\"login\":\"new-contractor\",\"id\":100000001,\"node_id\":\"U_kgDOAAAAAQ\",\"type\":\"User\",\"site_admin\":false}},\"organization\":{\"login\":\"example-org\",\"id\":180000001,\"node_id\":\"O_kgDOAAAAAg\",\"url\":\"https://api.github.com/orgs/example-org\"},\"sender\":{\"login\":\"org-admin-1\",\"id\":100000002,\"node_id\":\"U_kgDOAAAAAw\",\"type\":\"User\",\"site_admin\":false}}"
+  # push_forced_main.json
+  - raw: "{\"ref\":\"refs/heads/main\",\"before\":\"c2faacd7d0000000000000000000000000000001\",\"after\":\"d3fbbde8e0000000000000000000000000000002\",\"created\":false,\"deleted\":false,\"forced\":true,\"base_ref\":null,\"compare\":\"https://github.com/example-org/web-app/compare/c2faacd7d000...d3fbbde8e000\",\"commits\":[],\"head_commit\":{\"id\":\"d3fbbde8e0000000000000000000000000000002\",\"message\":\"wip\",\"timestamp\":\"2026-11-25T08:29:58-05:00\",\"author\":{\"name\":\"dev-user-3\",\"username\":\"dev-user-3\"}},\"pusher\":{\"name\":\"dev-user-3\"},\"repository\":{\"id\":700000001,\"name\":\"web-app\",\"full_name\":\"example-org/web-app\",\"private\":true,\"pushed_at\":1795616999},\"organization\":{\"login\":\"example-org\",\"id\":180000001},\"sender\":{\"login\":\"dev-user-3\",\"id\":100000003,\"type\":\"User\"}}"
+  # repository_publicized.json
+  - raw: "{\"action\":\"publicized\",\"repository\":{\"id\":700000003,\"name\":\"ops-scripts\",\"full_name\":\"example-org/ops-scripts\",\"private\":false,\"visibility\":\"public\",\"html_url\":\"https://github.com/example-org/ops-scripts\",\"created_at\":\"2025-02-11T09:00:00Z\",\"updated_at\":\"2026-11-25T13:20:44Z\",\"pushed_at\":\"2026-11-20T18:02:11Z\",\"default_branch\":\"main\",\"owner\":{\"login\":\"example-org\",\"id\":180000001,\"type\":\"Organization\"}},\"organization\":{\"login\":\"example-org\",\"id\":180000001},\"sender\":{\"login\":\"dev-user-3\",\"id\":100000003,\"type\":\"User\",\"site_admin\":false}}"
+  # secret_scanning_alert_created.json
+  - raw: "{\"action\":\"created\",\"alert\":{\"number\":17,\"created_at\":\"2026-11-25T13:09:01Z\",\"url\":\"https://api.github.com/repos/example-org/web-app/secret-scanning/alerts/17\",\"html_url\":\"https://github.com/example-org/web-app/security/secret-scanning/17\",\"state\":\"open\",\"secret_type\":\"stripe_api_key\",\"secret_type_display_name\":\"Stripe API Key\",\"validity\":\"active\",\"publicly_leaked\":false,\"push_protection_bypassed\":true,\"push_protection_bypassed_by\":{\"login\":\"dev-user-3\",\"id\":100000003,\"type\":\"User\"},\"push_protection_bypassed_at\":\"2026-11-25T13:08:55Z\"},\"repository\":{\"id\":700000001,\"name\":\"web-app\",\"full_name\":\"example-org/web-app\",\"private\":true},\"organization\":{\"login\":\"example-org\",\"id\":180000001},\"sender\":{\"login\":\"github\",\"id\":9919,\"type\":\"Organization\"}}"
+  # team_added_to_repository.json
+  - raw: "{\"action\":\"added_to_repository\",\"team\":{\"id\":5000001,\"node_id\":\"T_kwDOAAAAAQ\",\"name\":\"contractors\",\"slug\":\"contractors\",\"privacy\":\"closed\",\"permission\":\"pull\",\"parent\":null},\"repository\":{\"id\":700000001,\"name\":\"web-app\",\"full_name\":\"example-org/web-app\",\"private\":true,\"permissions\":{\"admin\":true,\"maintain\":true,\"push\":true,\"triage\":true,\"pull\":true}},\"organization\":{\"login\":\"example-org\",\"id\":180000001},\"sender\":{\"login\":\"org-admin-1\",\"id\":100000002,\"type\":\"User\",\"site_admin\":false}}"
+  # workflow_run_completed_failure.json
+  - raw: "{\"action\":\"completed\",\"workflow_run\":{\"id\":19000000001,\"name\":\"deploy-gke\",\"head_branch\":\"main\",\"head_sha\":\"c2faacd7d0000000000000000000000000000000\",\"event\":\"workflow_dispatch\",\"status\":\"completed\",\"conclusion\":\"failure\",\"workflow_id\":90000001,\"run_attempt\":1,\"run_started_at\":\"2026-11-25T13:10:00Z\",\"created_at\":\"2026-11-25T13:09:58Z\",\"updated_at\":\"2026-11-25T13:14:31Z\",\"actor\":{\"login\":\"dev-user-3\",\"id\":100000003,\"type\":\"User\"},\"triggering_actor\":{\"login\":\"dev-user-3\",\"id\":100000003,\"type\":\"User\"},\"path\":\".github/workflows/deploy-gke.yml\",\"html_url\":\"https://github.com/example-org/web-app/actions/runs/19000000001\"},\"workflow\":{\"id\":90000001,\"name\":\"deploy-gke\",\"path\":\".github/workflows/deploy-gke.yml\"},\"repository\":{\"id\":700000001,\"full_name\":\"example-org/web-app\",\"private\":true},\"organization\":{\"login\":\"example-org\",\"id\":180000001},\"sender\":{\"login\":\"dev-user-3\",\"id\":100000003,\"type\":\"User\"}}"

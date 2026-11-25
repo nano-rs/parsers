@@ -1,29 +1,32 @@
-name: ops_cf_workers_ocsf
-display_name: nano Cloudflare Workers Trace Events (OCSF)
+name: cloudflare_workers_trace_ocsf
+display_name: Cloudflare Workers Trace Events (OCSF)
 version: "1.0.0"
 ocsf_version: "1.9.0"
-description: >
+description: |
   Preserves unconsumed parsed fields, unaltered, in dotted snake_case unmapped keys.
-  Parses Cloudflare Logpush `workers_trace_events` (one record per Worker
-  invocation: EventTimestampMs, EventType, Outcome, ScriptName, ScriptVersion,
-  ScriptTags, DispatchNamespace, Entrypoint, CPUTimeMs, WallTimeMs, Exceptions,
-  and Event / Logs when the job ships them) into OCSF 1.9.0 API Activity
-  (6003). Ported from nano-main tools/ops-tenant/parsers/ops_cf_workers. 6003
-  rather than HTTP Activity because most invocations are not HTTP (scheduled,
-  queue, alarm, rpc, tail): api.operation is EventType (+ Entrypoint),
-  api.service.name the script, api.version ScriptVersion.ID; Outcome sets the
-  status (ok Success, anything else Failure with Outcome as status_detail) and
-  WallTimeMs the duration. A fetch invocation with Event adds http_request
-  (method, the full URL with its query string), http_response.code and RayID
-  as api.request.uid / metadata.correlation_uid. The first exception becomes
-  the message and raises severity to High. The script (namespace, tags as
-  labels) and the tenant uuid found in its name, dispatch namespace or tags
-  are resources. A trace event names no caller, so the invoked script stands
-  in as actor.app_name and src_endpoint.svc_name. EventTimestampMs is epoch
-  milliseconds, or RFC 3339 for a job with timestamp_format rfc3339.
+  Parses Cloudflare Logpush `workers_trace_events` (one record per Worker invocation:
+  EventTimestampMs, EventType, Outcome, ScriptName, ScriptVersion, ScriptTags,
+  DispatchNamespace, Entrypoint, CPUTimeMs, WallTimeMs, Exceptions, and Event / Logs
+  when the job includes them) into OCSF 1.9.0 API Activity (6003). API Activity rather
+  than HTTP Activity because most invocations are not HTTP (scheduled, queue, alarm,
+  rpc, tail): api.operation is EventType (+ Entrypoint), api.service.name the script,
+  api.version ScriptVersion.ID. Outcome sets the status (ok Success, anything else
+  Failure with Outcome as status_detail) and WallTimeMs the duration. A fetch
+  invocation with Event adds http_request (method and the full URL with its query
+  string), http_response.code and RayID as api.request.uid /
+  metadata.correlation_uid. The first exception becomes the message and raises severity
+  to High. The script (dispatch namespace, tags as labels) is a resource. A trace event
+  names no caller, so the script stands in as actor.app_name and src_endpoint.svc_name.
+  EventTimestampMs is epoch milliseconds, or RFC 3339 with timestamp_format rfc3339.
   Unparseable input becomes a Base Event with the raw line kept.
+  Ingestion: HTTP ingest (/ingest) from a Logpush HTTP destination, NDJSON.
+  Setup: Workers Logpush needs the Workers Paid plan. Turn on logpush for each Worker
+  (set logpush = true in its wrangler file). Then create an account Logpush job for the
+  Workers trace events dataset with an HTTP destination: your nano HTTP ingest URL with
+  header_Authorization=Bearer%20<your cloudflare_workers_trace ingest token> added to
+  the URL, and pick the fields you want.
 match_values:
-  - ops_cf_workers
+  - cloudflare_workers_trace
 category: cloud
 vendor: "Cloudflare"
 product: "Cloudflare Workers"
@@ -110,13 +113,13 @@ parser_vrl: |
           "raw_data": raw_log,
           "metadata": {
               "version": "1.9.0",
-              "uid": sha2("ops_cf_workers|raw|" + raw_log, variant: "SHA-256"),
+              "uid": sha2("cloudflare_workers_trace|raw|" + raw_log, variant: "SHA-256"),
               "log_level": "error",
               "log_name": "workers_trace_events",
               "log_provider": "Cloudflare Logpush",
               "product": { "name": "Cloudflare Workers", "vendor_name": "Cloudflare" }
           },
-          "unmapped": { "parse_error": reason }
+          "unmapped": { "parse_error": reason, "nano_time_source": "received" }
       }
       # NAN-5264: explicit fallback marker; nano parser health counts it.
       . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
@@ -135,7 +138,12 @@ parser_vrl: |
           cf_ts, cf_ts_err = parse_timestamp(string(w.EventTimestampMs) ?? "", "%+", timezone: "UTC")
           if cf_ts_err == null { time_ms = to_unix_timestamp(cf_ts, unit: "milliseconds") }
       }
-      if time_ms == 0 { time_ms = to_unix_timestamp(now(), unit: "milliseconds") }
+      # no clock in the record: the time nano received it, and say so
+      time_received = false
+      if time_ms == 0 {
+          time_ms = to_unix_timestamp(now(), unit: "milliseconds")
+          time_received = true
+      }
 
       method = upcase(string(w.Event.Request.Method) ?? "")
       url_raw = string(w.Event.Request.URL) ?? ""
@@ -171,7 +179,7 @@ parser_vrl: |
 
       md = {
           "version": "1.9.0",
-          "uid": sha2("ops_cf_workers|raw|" + raw_log, variant: "SHA-256"),
+          "uid": sha2("cloudflare_workers_trace|raw|" + raw_log, variant: "SHA-256"),
           "log_name": "workers_trace_events",
           "log_provider": "Cloudflare Logpush",
           "product": { "name": "Cloudflare Workers", "vendor_name": "Cloudflare" }
@@ -219,7 +227,7 @@ parser_vrl: |
           if code > 0 { ocsf.http_response = { "code": code } }
       }
 
-      # the script (namespace, tags) and the tenant it serves
+      # the script that ran (its dispatch namespace and tags)
       res = []
       if w_script != "" {
           sr = { "name": w_script, "type": "worker_script" }
@@ -232,14 +240,6 @@ parser_vrl: |
           if length(tags) > 0 { sr.labels = tags }
           res = push(res, sr)
       }
-      cands = [w_script, w_ns]
-      for_each(array(w.ScriptTags) ?? []) -> |_i, t| { cands = push(cands, to_string(t) ?? "") }
-      tenant = ""
-      for_each(cands) -> |_i, c| {
-          m, m_err = parse_regex(c, r'(?P<u>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')
-          if tenant == "" && m_err == null { tenant = string(m.u) ?? "" }
-      }
-      if tenant != "" { res = push(res, { "uid": tenant, "type": "tenant" }) }
       if length(res) > 0 { ocsf.resources = res }
 
       msg = w_type + " " + w_script + " " + w_outcome
@@ -255,6 +255,7 @@ parser_vrl: |
       ocsf.time = time_ms
       ocsf.message = msg
       ocsf.raw_data = raw_log
+      if time_received { ocsf = set!(ocsf, ["unmapped", "nano_time_source"], "received") }
       . = ocsf
   }
 
@@ -580,3 +581,23 @@ parser_vrl: |
   if !is_empty(__residual) { .unmapped = __residual }
   .
   # END NAN-2421 residual spill
+
+samples:
+  # The sidecar samples/*.json, inline for nano's OCSF deploy gate (it re-runs
+  # the parser on each raw line and validates the emitted event).
+  # fetch_exception.json
+  - raw: "{\"DispatchNamespace\":\"\",\"Entrypoint\":\"\",\"Event\":{\"RayID\":\"8d2f1a3b4c5d6e80\",\"Request\":{\"URL\":\"https://us.example.com/api/search\",\"Method\":\"GET\"},\"Response\":{\"Status\":500}},\"EventTimestampMs\":1792077801000,\"EventType\":\"fetch\",\"Exceptions\":[{\"Name\":\"TypeError\",\"Message\":\"Cannot read properties of undefined (reading 'tenant')\",\"TimestampMs\":1792077801040}],\"Logs\":[{\"Level\":\"error\",\"Message\":[\"upstream search failed\"],\"TimestampMs\":1792077801030}],\"Outcome\":\"exception\",\"ScriptName\":\"edge-router\",\"ScriptTags\":[],\"ScriptVersion\":{\"ID\":\"7b6a5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d\",\"Message\":\"r52\",\"Tag\":\"r52\"},\"CPUTimeMs\":12,\"WallTimeMs\":230}"
+  # fetch_ok_customer_worker.json
+  - raw: "{\"DispatchNamespace\":\"\",\"Entrypoint\":\"\",\"Event\":{\"RayID\":\"8d2f1a3b4c5d6e7f\",\"Request\":{\"URL\":\"https://b12e5ee2.ingest.example.com/v1/logs\",\"Method\":\"POST\"},\"Response\":{\"Status\":202}},\"EventTimestampMs\":1792077800123,\"EventType\":\"fetch\",\"Exceptions\":[],\"Logs\":[],\"Outcome\":\"ok\",\"ScriptName\":\"customer-worker-b12e5ee2-fcb9-4335-a7f9-2c45ba26254a\",\"ScriptTags\":[\"tenant:b12e5ee2-fcb9-4335-a7f9-2c45ba26254a\"],\"ScriptVersion\":{\"ID\":\"4a1b2c3d-5e6f-4a7b-8c9d-0e1f2a3b4c5d\",\"Message\":\"\",\"Tag\":\"\"},\"CPUTimeMs\":3,\"WallTimeMs\":41}"
+  # fetch_ok_query_string_kept.json
+  - raw: "{\"DispatchNamespace\":\"\",\"Entrypoint\":\"\",\"Event\":{\"RayID\":\"8d2f1a3b4c5d6e81\",\"Request\":{\"URL\":\"https://us.example.com/api/search?q=error&page=2\",\"Method\":\"GET\"},\"Response\":{\"Status\":200}},\"EventTimestampMs\":1792077802000,\"EventType\":\"fetch\",\"Exceptions\":[],\"Logs\":[{\"Level\":\"log\",\"Message\":[\"search ok\"],\"TimestampMs\":1792077802010}],\"Outcome\":\"ok\",\"ScriptName\":\"edge-router\",\"ScriptTags\":[],\"ScriptVersion\":{\"ID\":\"7b6a5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d\",\"Message\":\"r52\",\"Tag\":\"r52\"},\"CPUTimeMs\":4,\"WallTimeMs\":88}"
+  # malformed.json
+  - raw: "{\"EventType\":\"fetch\",\"Outcome\":"
+  # queue_ok_dispatch_namespace.json
+  - raw: "{\"DispatchNamespace\":\"customer-workers\",\"Entrypoint\":\"QueueConsumer\",\"Event\":{\"Queue\":\"ingest-queue\",\"BatchSize\":100},\"EventTimestampMs\":1792077950000,\"EventType\":\"queue\",\"Exceptions\":[],\"Logs\":[],\"Outcome\":\"ok\",\"ScriptName\":\"ingest-worker-817609c4-694a-4599-ace4-2652abe3b237\",\"ScriptTags\":[],\"ScriptVersion\":{\"ID\":\"2d3e4f5a-6b7c-4d8e-9f0a-1b2c3d4e5f6a\"},\"CPUTimeMs\":7,\"WallTimeMs\":95}"
+  # scheduled_exceeded_cpu.json
+  - raw: "{\"DispatchNamespace\":\"\",\"Entrypoint\":\"\",\"Event\":{\"Cron\":\"*/5 * * * *\",\"ScheduledTime\":1792077900000},\"EventTimestampMs\":1792077900050,\"EventType\":\"scheduled\",\"Exceptions\":[],\"Logs\":[],\"Outcome\":\"exceededCpu\",\"ScriptName\":\"feed-projector\",\"ScriptTags\":[],\"ScriptVersion\":{\"ID\":\"1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f\"},\"CPUTimeMs\":50,\"WallTimeMs\":51}"
+  # shipped_fields_exception.json
+  - raw: "{\"EventTimestampMs\":1792078030000,\"EventType\":\"queue\",\"Outcome\":\"exception\",\"ScriptName\":\"audit-delivery\",\"ScriptVersion\":{\"ID\":\"3c4d5e6f-7081-4b92-8c3d-4e5f6a7b8c9d\"},\"ScriptTags\":[],\"DispatchNamespace\":\"\",\"Entrypoint\":\"\",\"CPUTimeMs\":9,\"WallTimeMs\":140,\"Exceptions\":[{\"Name\":\"Error\",\"Message\":\"upstream 503\",\"TimestampMs\":1792078030100}]}"
+  # shipped_fields_rfc3339_ok.json
+  - raw: "{\"EventTimestampMs\":\"2026-10-15T14:46:40Z\",\"EventType\":\"fetch\",\"Outcome\":\"ok\",\"ScriptName\":\"ingest-worker-b12e5ee2-fcb9-4335-a7f9-2c45ba26254a\",\"ScriptVersion\":{\"ID\":\"2b3c4d5e-6f70-4a81-9b2c-3d4e5f6a7b8c\"},\"ScriptTags\":[\"tenant\"],\"DispatchNamespace\":\"\",\"Entrypoint\":\"\",\"CPUTimeMs\":3,\"WallTimeMs\":18,\"Exceptions\":[]}"

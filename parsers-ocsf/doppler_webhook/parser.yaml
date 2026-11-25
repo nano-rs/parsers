@@ -2,19 +2,23 @@ name: doppler_webhook_ocsf
 display_name: Doppler Webhooks (OCSF)
 version: "1.0.0"
 ocsf_version: "1.9.0"
-description: >
+description: |
   Preserves unconsumed parsed fields, unaltered, in dotted snake_case unmapped keys.
-  Parses Doppler project webhook bodies ({type, config, project, workplace,
-  diff}) into OCSF 1.9.0 API Activity (6003). The webhook type (for example
-  config.secrets.update) is api.operation and metadata.event_code; its verb
-  sets the activity (create / update / delete). The config, its project and
-  the workplace become resources; the secret NAMES added, removed and updated
-  (Doppler never sends values) are listed in the message and spill to
-  unmapped.diff.* as sent. Doppler names neither the person who made the
-  change nor a caller address (actor.user.name and src_endpoint.hostname are
-  "unknown"; the Doppler activity log has them), and the body has no clock:
-  time is when nano received it (unmapped.nano_time_source = "received").
-  Unparseable input becomes a Base Event with the raw line kept.
+  Parses Doppler project webhook bodies ({type, config, project, workplace, diff})
+  into OCSF 1.9.0 API Activity (6003). The webhook type (for example
+  config.secrets.update) is api.operation and metadata.event_code, and its verb sets the
+  activity (create / update / delete). The config, its project and the workplace are
+  resources. The NAMES of the secrets added, removed and updated (Doppler never sends
+  values) are listed in the message and spill to unmapped.diff.* as sent. Doppler names
+  neither the person who made the change nor a caller address (actor.user.name and
+  src_endpoint.hostname are "unknown"; the Doppler activity log has the person, see
+  doppler_activity), and the body has no clock, so time is when nano received it
+  (unmapped.nano_time_source = "received"). Unparseable input becomes a Base Event.
+  Ingestion: HTTP ingest (/ingest), one webhook body per line.
+  Setup: Doppler can send nano's token itself. In Doppler, open the project, then
+  Webhooks, then Add. Set the URL to your nano HTTP ingest (https://<your nano
+  host>/ingest), choose Bearer authentication and paste your doppler_webhook ingest
+  token, and keep the default payload.
 match_values:
   - doppler_webhook
 category: security
@@ -109,7 +113,7 @@ parser_vrl: |
               "log_provider": "Doppler",
               "product": { "name": "Doppler", "vendor_name": "Doppler" }
           },
-          "unmapped": { "parse_error": reason }
+          "unmapped": { "parse_error": reason, "nano_time_source": "received" }
       }
       # NAN-5264: explicit fallback marker; nano parser health counts it.
       . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
@@ -519,3 +523,17 @@ parser_vrl: |
   if !is_empty(__residual) { .unmapped = __residual }
   .
   # END NAN-2421 residual spill
+
+samples:
+  # The sidecar samples/*.json, inline for nano's OCSF deploy gate (it re-runs
+  # the parser on each raw line and validates the emitted event).
+  # config_secrets_removed.json
+  - raw: "{\"type\":\"config.secrets.update\",\"config\":{\"name\":\"prd\",\"root\":true,\"locked\":true,\"environment\":\"prd\",\"project\":\"example-project\",\"created_at\":\"2025-08-01T10:00:00.000Z\",\"initial_fetch_at\":\"2025-08-01T10:05:00.000Z\",\"last_fetch_at\":\"2026-11-25T14:31:44.000Z\"},\"project\":{\"id\":\"example-project\",\"slug\":\"example-project\",\"name\":\"example-project\",\"description\":\"\",\"created_at\":\"2025-08-01T09:58:00.000Z\"},\"workplace\":{\"id\":\"wkp_redacted000001\",\"name\":\"example-org\"},\"diff\":{\"added\":[],\"removed\":[\"SENTRY_DSN\"],\"updated\":[]}}"
+  # config_secrets_updated.json
+  - raw: "{\"type\":\"config.secrets.update\",\"config\":{\"name\":\"dev_gke\",\"root\":true,\"locked\":false,\"environment\":\"dev\",\"project\":\"example-project\",\"created_at\":\"2025-08-01T10:00:00.000Z\",\"initial_fetch_at\":\"2025-08-01T10:05:00.000Z\",\"last_fetch_at\":\"2026-11-25T14:20:11.000Z\"},\"project\":{\"id\":\"example-project\",\"slug\":\"example-project\",\"name\":\"example-project\",\"description\":\"\",\"created_at\":\"2025-08-01T09:58:00.000Z\"},\"workplace\":{\"id\":\"wkp_redacted000001\",\"name\":\"example-org\"},\"diff\":{\"added\":[\"LOG_SHIPPER_TOKEN\"],\"removed\":[],\"updated\":[\"STRIPE_SECRET_KEY\"]}}"
+  # config_secrets_updated_branch.json
+  - raw: "{\"type\":\"config.secrets.update\",\"config\":{\"name\":\"dev_gke_hotfix\",\"root\":false,\"locked\":false,\"environment\":\"dev\",\"project\":\"example-project\",\"created_at\":\"2026-11-25T14:40:00.000Z\",\"initial_fetch_at\":null,\"last_fetch_at\":null},\"project\":{\"id\":\"example-project\",\"slug\":\"example-project\",\"name\":\"example-project\",\"description\":\"\",\"created_at\":\"2025-08-01T09:58:00.000Z\"},\"workplace\":{\"id\":\"wkp_redacted000001\",\"name\":\"example-org\"},\"diff\":{\"added\":[\"CLOUDFLARE_API_TOKEN\",\"DATABASE_URL\"],\"removed\":[],\"updated\":[]}}"
+  # json_not_doppler.json
+  - raw: "{\"ping\":true}"
+  # malformed.json
+  - raw: "{\"type\":\"config.secrets.update\",\"config\":"

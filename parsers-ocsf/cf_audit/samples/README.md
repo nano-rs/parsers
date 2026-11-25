@@ -2,7 +2,7 @@
 
 Records of the v1 `GET /accounts/{account_id}/audit_logs` API, unchanged
 (https://developers.cloudflare.com/fundamentals/account/account-security/review-audit-logs/).
-E-mails are redacted (`[redacted]@...` is not a valid address, so it lands on
+E-mails are redacted or example values (`[redacted]@...` is not a valid address, so it lands on
 `name` only), IPs are documentation ranges.
 
 | File | Branch |

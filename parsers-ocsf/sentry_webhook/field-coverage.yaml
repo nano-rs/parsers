@@ -1,21 +1,24 @@
 source: json
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
 transforms:
-- source: payload.data.event.timestamp
+- source: data.event.timestamp
   kind: scale
   factor: 1000
   target: time
   reason: The event's own clock (epoch seconds, fractional) is the event time.
-- source: payload.data.metric_alert.date_detected
+- source: data.metric_alert.date_detected
   kind: epoch_ms
   format: '%+'
   target: time
   reason: The metric alert's detection clock is the event time.
-- source: sentry_timestamp
-  kind: scale
-  factor: 1000
-  target: time
-  reason: Sentry-Hook-Timestamp (epoch seconds) is the event time when the payload carries no clock.
 - source: payload.data.issue.firstSeen
+  kind: epoch_ms
+  format: '%+'
+  target: finding_info.first_seen_time
+  reason: The issue's first-seen clock.
+- source: data.issue.firstSeen
   kind: epoch_ms
   format: '%+'
   target: finding_info.first_seen_time
@@ -25,33 +28,17 @@ transforms:
   format: '%+'
   target: finding_info.last_seen_time
   reason: The issue's last-seen clock.
-mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
-  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
-  else spills to unmapped.
+- source: data.issue.lastSeen
+  kind: epoch_ms
+  format: '%+'
+  target: finding_info.last_seen_time
+  reason: The issue's last-seen clock.
+- source: data.issue.firstSeen
+  kind: epoch_ms
+  format: '%+'
+  target: time
+  reason: A new issue's first sighting is the event time.
 mappings:
-  payload.actor.id:
-  - actor.user.uid
-  payload.actor.name:
-  - actor.user.name
-  payload.data.event.event_id:
-  - finding_info.uid
-  payload.data.event.level:
-  - metadata.log_level
-  payload.data.event.project:
-  - resources.uid
-  payload.data.event.release:
-  - resources.name
-  payload.data.event.title:
-  - finding_info.title
-  - message
-  payload.data.event.web_url:
-  - finding_info.src_url
-  payload.data.triggered_rule:
-  - finding_info.analytic.name
-  payload.installation.uuid:
-  - resources.uid
-  payload.installation.app.slug:
-  - resources.name
   payload.data.issue.culprit:
   - finding_info.desc
   payload.data.issue.id:
@@ -71,18 +58,60 @@ mappings:
   - message
   payload.data.issue.web_url:
   - finding_info.src_url
-  payload.data.description_text:
-  - finding_info.desc
-  payload.data.description_title:
+  actor.id:
+  - actor.user.uid
+  actor.name:
+  - actor.user.name
+  data.event.event_id:
+  - finding_info.uid
+  data.event.level:
+  - metadata.log_level
+  data.event.project:
+  - resources.uid
+  data.event.release:
+  - resources.name
+  data.event.title:
   - finding_info.title
   - message
-  payload.data.metric_alert.alert_rule.id:
-  - finding_info.analytic.uid
-  payload.data.metric_alert.alert_rule.name:
+  data.event.web_url:
+  - finding_info.src_url
+  data.triggered_rule:
   - finding_info.analytic.name
-  payload.data.metric_alert.id:
-  - finding_info.uid
-  payload.data.metric_alert.projects:
+  installation.uuid:
+  - resources.uid
+  installation.app.slug:
   - resources.name
-  payload.data.web_url:
+  data.issue.culprit:
+  - finding_info.desc
+  data.issue.id:
+  - finding_info.uid
+  data.issue.level:
+  - metadata.log_level
+  data.issue.project.id:
+  - resources.uid
+  data.issue.project.slug:
+  - resources.name
+  data.issue.shortId:
+  - finding_info.uid_alt
+  data.issue.status:
+  - status_detail
+  data.issue.title:
+  - finding_info.title
+  - message
+  data.issue.web_url:
+  - finding_info.src_url
+  data.description_text:
+  - finding_info.desc
+  data.description_title:
+  - finding_info.title
+  - message
+  data.metric_alert.alert_rule.id:
+  - finding_info.analytic.uid
+  data.metric_alert.alert_rule.name:
+  - finding_info.analytic.name
+  data.metric_alert.id:
+  - finding_info.uid
+  data.metric_alert.projects:
+  - resources.name
+  data.web_url:
   - finding_info.src_url
