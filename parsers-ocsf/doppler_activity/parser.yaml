@@ -9,10 +9,10 @@ description: |
   enclave_config, enclave_environment, diff, diffs) into OCSF 1.9.0 API Activity
   (6003). The record names its action only in English text ("Modified secrets in prd
   of acme project with 1 added", "Created service token ..."), so the text is the
-  message and api.operation, and its first word sets the activity (Created -> Create,
-  Modified -> Update, Deleted / Removed / Revoked -> Delete, Viewed -> Read, else Other).
-  api.operation stays short: the verb and the kind of object the text names first
-  ("modified secrets", "created service token"). The workplace user is the actor (slug,
+  message, and its first word sets the activity (Created -> Create, Modified -> Update,
+  Deleted / Removed / Revoked -> Delete, Viewed -> Read, else Other). api.operation stays
+  short: the verb and the kind of object the rest of the text names first ("modified
+  secrets", "created service token", "invited member"). The workplace user is the actor (slug,
   username, name, email), the config and
   project are resources, the record id is metadata.uid and created_at is time. Secret
   names in diff / diffs (never values) spill to unmapped as sent. The record has no
@@ -143,7 +143,10 @@ parser_vrl: |
       # api.operation stays low-cardinality: the verb and the kind of object
       # the text names first (never project, config or token names, which
       # are in the message and the resources).
-      lt = downcase(text)
+      # scan the text AFTER the verb, so "Invited ... member" is not "invite"
+      lt = downcase(strip_whitespace(text))
+      sp_at = find(lt, " ")
+      if is_integer(sp_at) && int!(sp_at) > 0 { lt = slice(lt, int!(sp_at)) ?? lt } else { lt = "" }
       noun = ""
       best = -1
       for_each(["service token", "service account", "api token", "personal token", "secrets", "secret", "config", "environment", "project", "workplace", "member", "invite", "webhook", "integration", "sync", "group", "role"]) -> |_i, n| {
@@ -177,7 +180,7 @@ parser_vrl: |
       u_full = string(u.name) ?? ""
       if u_full != "" && u_full != u_name { au.full_name = u_full }
       u_email = string(u.email) ?? ""
-      if match(u_email, r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$') { au.email_addr = u_email }
+      if match(u_email, r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$') { au.email_addr = u_email }
       if au == {} { au.name = "unknown" }
 
       res = []
@@ -315,7 +318,7 @@ parser_vrl: |
       }
   }
   # Declared source -> target mappings (field-coverage.yaml `mappings`).
-  __decl = "\n\"enclave_config\"\t[\"resources.name\"]\n\"enclave_project\"\t[\"resources.name\",\"resources.namespace\"]\n\"id\"\t[\"metadata.uid\"]\n\"text\"\t[\"message\"]\n\"user.email\"\t[\"actor.user.email_addr\"]\n\"user.name\"\t[\"actor.user.full_name\"]\n\"user.slug\"\t[\"actor.user.uid\"]\n\"user.username\"\t[\"actor.user.name\"]\n"
+  __decl = "\n\"enclave_config\"\t[\"resources.name\"]\n\"enclave_project\"\t[\"resources.name\",\"resources.namespace\"]\n\"id\"\t[\"metadata.uid\"]\n\"text\"\t[\"message\"]\n\"user.email\"\t[\"actor.user.email_addr\"]\n\"user.name\"\t[\"actor.user.full_name\",\"actor.user.name\"]\n\"user.slug\"\t[\"actor.user.uid\"]\n\"user.username\"\t[\"actor.user.name\"]\n"
   __preserve = ["nano_time_source"]
   # END parser-specific transformations
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of
@@ -561,5 +564,7 @@ samples:
   - raw: "{\"id\":\"0f1e2d3c4b5a69780000000000000001\",\"text\":\"Modified secrets in dev_gke of example-project project with 1 removed\",\"html\":\"<p>Modified secrets in <b>dev_gke</b> of <b>example-project</b> project with 1 removed</p>\",\"created_at\":\"2026-11-25T13:16:44.172Z\",\"enclave_project\":\"example-project\",\"enclave_config\":\"dev_gke\",\"enclave_environment\":\"dev\",\"user\":{\"kind\":\"user\",\"slug\":\"usr_redacted0001\",\"email\":\"[redacted]@example.com\",\"name\":\"[redacted]\",\"username\":\"[redacted]\",\"profile_image_url\":\"https://example.invalid/avatar.png\"},\"diff\":{\"added\":[],\"removed\":[\"OLD_FEATURE_FLAG\"],\"updated\":[]},\"diffs\":[{\"added\":[],\"removed\":[\"OLD_FEATURE_FLAG\"],\"updated\":[]}]}"
   # service_token_created.json
   - raw: "{\"id\":\"0f1e2d3c4b5a69780000000000000003\",\"text\":\"Created service token log-relay in dev_gke of example-project project\",\"html\":\"<p>Created service token <b>log-relay</b> in <b>dev_gke</b> of <b>example-project</b> project</p>\",\"created_at\":\"2026-11-25T14:20:00.000Z\",\"enclave_project\":\"example-project\",\"enclave_config\":\"dev_gke\",\"enclave_environment\":\"dev\",\"user\":{\"kind\":\"user\",\"slug\":\"usr_redacted0002\",\"email\":\"[redacted]@example.com\",\"name\":\"[redacted]\",\"username\":\"[redacted]\",\"profile_image_url\":\"https://example.invalid/avatar.png\"},\"diff\":{\"added\":[],\"removed\":[],\"updated\":[]},\"diffs\":[]}"
+  # unverified_text_invited_member_user_without_username.json
+  - raw: "{\"id\":\"0f1e2d3c4b5a69780000000000000006\",\"text\":\"Invited bob@example.com as member to the workplace\",\"html\":\"<p>Invited <b>bob@example.com</b> as member to the workplace</p>\",\"created_at\":\"2026-11-25T14:50:00.000Z\",\"enclave_project\":null,\"enclave_config\":null,\"enclave_environment\":null,\"user\":{\"kind\":\"user\",\"slug\":\"usr_example0004\",\"email\":\"carol@example.com\",\"name\":\"carol.example\"},\"diff\":{\"added\":[],\"removed\":[],\"updated\":[]},\"diffs\":[]}"
   # unverified_text_leading_space_punctuation.json
   - raw: "{\"id\":\"0f1e2d3c4b5a69780000000000000005\",\"text\":\"  Locked config prd: requested by alice\",\"html\":\"<p>Locked config <b>prd</b>: requested by alice</p>\",\"created_at\":\"2026-11-25T14:40:00.000Z\",\"enclave_project\":\"example-project\",\"enclave_config\":\"prd\",\"enclave_environment\":\"prd\",\"user\":{\"kind\":\"user\",\"slug\":\"usr_example0001\",\"email\":\"alice@example.com\",\"name\":\"Alice Example\",\"username\":\"alice\",\"profile_image_url\":\"https://example.invalid/avatar.png\"},\"diff\":{\"added\":[],\"removed\":[],\"updated\":[]},\"diffs\":[]}"

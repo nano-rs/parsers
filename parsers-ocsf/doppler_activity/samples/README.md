@@ -14,3 +14,4 @@ Names and emails are example or redacted values.
 | `api_page_not_a_record.json` | a whole API page sent as one line: Base Event fallback (send each record) |
 | `malformed.json` | not JSON: Base Event fallback |
 | `unverified_text_leading_space_punctuation.json` | leading spaces and a colon around the verb ("  Locked config prd: ..."), an assumed text; a user with a real email, name and username |
+| `unverified_text_invited_member_user_without_username.json` | "Invited ... as member" (assumed text): Create, api.operation "invited member" (the noun scan skips the verb); a user without username, so name is the user name |

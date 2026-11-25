@@ -28,3 +28,4 @@ keys are example values (the deploy key body is truncated).
 | `issues_deleted_unidentified.json` | a bare `issues` body: unknown.deleted, Other (never "repository.deleted") |
 | `create_branch_unidentified.json` | a bare `create` body: unknown, Other (never "public") |
 | `malformed.json` | truncated JSON: Base Event fallback |
+| `security_and_analysis_disabled.json` | security_and_analysis (no action, has changes): secret scanning turned off, never "public" |
