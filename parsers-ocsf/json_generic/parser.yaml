@@ -65,6 +65,12 @@ parser_vrl: |
       if __src_probe_err == null { __src_tz = __src_tz_in; __src_tz_label = __src_tz_in }
   }
   # END NAN source timezone
+  # nano's input contract (nanosiem hec_payload.rs), stated: JSON. From nano
+  # v2.0.36 an undeclared parser gets the v2.0.35 HEC delivery (the record's own
+  # host / timestamp replaced by the envelope's, an object `message` alone); a
+  # declared one gets an HEC object event's whole record, as /ingest does
+  # (NAN-5902). Older nano already read this parser as JSON: no change there.
+  # nano:input=json
   # Generic JSON -> OCSF 1.9.0 (evidence-routed)
   raw_log = string!(.message)
   __raw_body = raw_log
@@ -987,3 +993,28 @@ samples:
       "unmapped.source_nano_time_assumed_tz": "Mars/Base"
       "unmapped.source_nano_operational": "vendor"
       "unmapped.nano_time_assumed_tz": "<missing>"
+  # NAN-5902: an HEC object event (`"event": {...}`) that carries its own host
+  # and timestamp and an object `message`. With `# nano:input=json` nano
+  # v2.0.36 hands the parser the sender's record text, byte for byte, as
+  # /ingest does: time and device.hostname come from the record (not the HEC
+  # envelope), raw_data is the record, and every value stays searchable.
+  - raw: '{"marker":"hec-obj-1","timestamp":"2026-11-24T01:02:03Z","host":"Rec-Host-01","n":42,"f":1.5,"b":true,"arr":[1,"two",{"three":3}],"deep":{"l1":{"l2":{"l3":"deep-val"}}},"message":{"inner":"msg-obj"}}'
+    expect:
+      class_uid: 0
+      time: 1795482123000
+      "device.hostname": "rec-host-01"
+      raw_data: '{"marker":"hec-obj-1","timestamp":"2026-11-24T01:02:03Z","host":"Rec-Host-01","n":42,"f":1.5,"b":true,"arr":[1,"two",{"three":3}],"deep":{"l1":{"l2":{"l3":"deep-val"}}},"message":{"inner":"msg-obj"}}'
+      "unmapped.marker": "hec-obj-1"
+      "unmapped.host": "Rec-Host-01"
+      "unmapped.n": 42
+      "unmapped.f": 1.5
+      "unmapped.b": true
+      "unmapped.parse_error": "<missing>"
+  # A plain text line (an HEC string event, /services/collector/raw, or an
+  # /ingest text body): not JSON, so the line is kept whole in raw_data and the
+  # parse error is reported, never dropped.
+  - raw: 'plain text line user=alice src=10.0.0.9 action=allow'
+    expect:
+      class_uid: 0
+      raw_data: 'plain text line user=alice src=10.0.0.9 action=allow'
+      "metadata.log_level": "error"

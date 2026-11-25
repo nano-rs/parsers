@@ -398,8 +398,9 @@ nano's own classifier when `NANO_INPUT_CONTRACT` points at it (see
 Send each log to nano as an HEC string event (`"event": "<the log, as text>"`),
 an HEC object event (`"event": { ... }`), or post it to nano's `/ingest`
 endpoint. From nano v2.0.36 an object event keeps every field of the record
-(nanosiem NAN-5891); string events and `/services/collector/raw` are handled
-exactly as before.
+(nanosiem NAN-5891) when the parser declares its input contract (see above); a
+parser that declares none gets the v2.0.35 delivery (NAN-5902). String events
+and `/services/collector/raw` are handled exactly as before.
 
 On nano before v2.0.36, HEC **object** events are a problem for some parsers:
 nano removes some fields (such as `timestamp` and `host`) before the parser
