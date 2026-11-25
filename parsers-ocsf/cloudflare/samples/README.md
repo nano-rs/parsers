@@ -2,8 +2,8 @@
 
 `firewall_event_graphql_*.json`: zone security events polled from the GraphQL
 Analytics API (`firewallEventsAdaptive`, available on the Pro plan) and renamed
-to the Logpush `firewall_events` field names by the NAN-5898 dogfood edge
-relay. The GraphQL spellings of the action (`managed_challenge`) and of the
+to the Logpush `firewall_events` field names by the poller that forwards them
+(Logpush for firewall events needs an Enterprise zone). The GraphQL spellings of the action (`managed_challenge`) and of the
 query (leading `?`) are what this parser must handle. The other branches are
 covered by the inline `samples:` in parser.yaml.
 

@@ -1,7 +1,8 @@
 # GCP Audit Log samples
 
-`relay_*.json` (NAN-5898): Cloud Audit Log LogEntry lines exactly as the kestrel
-GCP relay (sink -> Pub/Sub pull -> Vector -> `/ingest`) delivers them. GKE
+`relay_*.json`: Cloud Audit Log LogEntry lines as a pull relay delivers them
+(Cloud Logging sink -> Pub/Sub pull subscription -> a forwarder such as Vector
+-> nano's `/ingest`, one LogEntry per line). GKE
 Kubernetes API audit arrives here as Cloud Audit Logs (serviceName `k8s.io`),
 not as native `audit.k8s.io` events, so it is this parser's, not
 kubernetes_audit's.
