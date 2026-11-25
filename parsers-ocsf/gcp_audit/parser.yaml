@@ -176,17 +176,24 @@ parser_vrl: |
           # email_addr / domain only for a real address (OCSF email_t): a
           # principalSubject such as "user:alice@example.com" or
           # "principal://.../subject/alice@example.com" stays name / uid only
-          if match(principal, r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$') {
+          # (the domain is dot-separated labels, never a leading or doubled dot)
+          if match(principal, r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$') {
               user.email_addr = principal
               pparts = split(principal, "@")
               if length(pparts) == 2 { user.domain = to_string(pparts[1]) }
           }
-          # a Workload Identity Federation principal (.../workloadIdentityPools/...)
-          # or a serviceAccount: subject is a service identity; a Workforce
-          # Identity Federation principal (.../workforcePools/...) is a person
-          if ends_with(principal, ".gserviceaccount.com") || contains(principal, "/workloadIdentityPools/") || starts_with(principal, "serviceAccount:") {
+          # a Workload Identity Federation principal (.../workloadIdentityPools/...),
+          # a serviceAccount: subject, a Kubernetes service account
+          # (system:serviceaccount:<ns>:<name>, GKE audit) or a deleted service
+          # account is a service identity; other system: principals
+          # (system:kube-controller-manager, ...) are the system itself; a
+          # Workforce Identity Federation principal (.../workforcePools/...) is a person
+          if ends_with(principal, ".gserviceaccount.com") || contains(principal, "/workloadIdentityPools/") || starts_with(principal, "serviceAccount:") || starts_with(principal, "system:serviceaccount:") || starts_with(principal, "deleted:serviceAccount:") {
               user.type_id = 4
               user.type = "Service"
+          } else if starts_with(principal, "system:") {
+              user.type_id = 3
+              user.type = "System"
           } else {
               user.type_id = 1
               user.type = "User"

@@ -16,3 +16,5 @@ kubernetes_audit's.
 | `relay_sts_exchange_token_wif.json` | STS ExchangeToken by a Workload Identity Federation principal (principalSubject as actor) |
 | `principal_subject_with_at_sign_workforce.json` | Workforce principalSubject containing `@`: name / uid only, no email_addr (OCSF email_t), a person (User) |
 | `principal_subject_user_prefix.json` | `user:alice@example.com` principalSubject: name / uid only, no email_addr |
+| `relay_gke_k8s_service_account_secret_update.json` | GKE `system:serviceaccount:<ns>:<name>` caller: Service |
+| `relay_gke_system_principal.json` | GKE `system:kube-controller-manager` caller: System |
