@@ -342,8 +342,55 @@ def wrap(args):
 
 
 
+def inline_events(samples):
+    """(index, event) for each inline sample: the event `vector vrl` runs on.
+
+    An inline `raw` is the raw log line (validate-vrl.sh feeds it as
+    `{"message": raw}`), so it is fed wrapped, even when it is JSON with its
+    own top-level `message` (`wrap` would take that for a wrapper and hand the
+    parser that value, not the line). `envelope: true` says the `raw` IS the
+    event (a JSON object with a `message` key): it tests what a parser does
+    with a non-string `.message` (null, a number, a pre-decoded object), which
+    only this gate can feed. validate-vrl.sh still feeds it as a line.
+    """
+    for index, sample in enumerate(samples):
+        raw = sample.get("raw") if isinstance(sample, dict) else sample
+        if raw is None:
+            continue
+        line = raw if isinstance(raw, str) else json.dumps(raw)
+        if isinstance(sample, dict) and sample.get("envelope") is True:
+            event = json.loads(line)
+            if not isinstance(event, dict) or "message" not in event:
+                raise ValueError(f"inline sample {index}: `envelope: true` needs a JSON object with a `message` key")
+            yield index, event
+        else:
+            yield index, {"message": line}
+
+
+def envelope_problems(samples):
+    """Inline samples whose intent is ambiguous: a `raw` that is exactly
+    `{"message": <non-string>}` reads like an envelope case, but is fed as a
+    line unless it says `envelope: true` (or `envelope: false` to mean the
+    line). Silently feeding such a sample as a line hid every non-string
+    `.message` branch from the gates (parsers#99 review P2-1)."""
+    problems = []
+    for index, sample in enumerate(samples):
+        if not isinstance(sample, dict) or "envelope" in sample:
+            continue
+        raw = sample.get("raw")
+        try:
+            obj = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(obj, dict) and list(obj) == ["message"] and not isinstance(obj["message"], str):
+            problems.append(f"inline sample {index}: raw {str(raw)[:60]!r} is a bare non-string `message`; "
+                            "say `envelope: true` (feed it as the event) or `envelope: false` (feed it as a line)")
+    return problems
+
+
 def extract_inline(args) -> int:
-    """Write a parser's inline `samples:` block out as individual .json files.
+    """Write a parser's inline `samples:` block out as individual .json files,
+    each the event to run (see inline_events), already wrapped for `wrap`.
 
     `validate-vrl.sh` reads inline samples; this gate reads a sidecar
     `samples/` directory. Both are legitimate coverage, so rather than force
@@ -356,21 +403,22 @@ def extract_inline(args) -> int:
     samples = doc.get("samples") or []
     if not samples:
         return 1
+    problems = envelope_problems(samples)
+    if problems:
+        for problem in problems:
+            print(f"FAIL {args.parser}: {problem}", file=sys.stderr)
+        return 2
     out = pathlib.Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     written = 0
-    for index, sample in enumerate(samples):
-        raw = sample.get("raw") if isinstance(sample, dict) else sample
-        if raw is None:
-            continue
-        # An inline `raw` is always the raw log line (validate-vrl.sh feeds it
-        # as `{"message": raw}`). Written already wrapped: `wrap` takes a JSON
-        # object with a `message` key as a wrapper, so a JSON log line with its
-        # own top-level `message` was fed with `.message` = that value, not the
-        # line (an object `message` aborted the parser here).
-        line = raw if isinstance(raw, str) else json.dumps(raw)
-        (out / f"inline_{index:03d}.json").write_text(json.dumps({"message": line}))
-        written += 1
+    try:
+        for index, event in inline_events(samples):
+            (out / f"inline_{index:03d}.json").write_text(json.dumps(event))
+            written += 1
+    except (ValueError, json.JSONDecodeError) as error:
+        # Exit 2, never 1 (which validate-ocsf.sh reads as "no inline samples").
+        print(f"FAIL {args.parser}: {error}", file=sys.stderr)
+        return 2
     return 0 if written else 1
 
 def main():

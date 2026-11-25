@@ -202,10 +202,18 @@ for parser_file in "${PARSERS[@]}"; do
     inline_dir="$WORK/inline"
     rm -rf "$inline_dir"
     mkdir "$inline_dir"
-    if python3 "$CHECKS" extract-inline "$parser_file" "$inline_dir" 2>/dev/null; then
+    # Exit 1 = no inline samples. Anything else (an ambiguous or malformed
+    # `envelope` sample) fails the parser: dropping its inline corpus quietly
+    # would take it out of the gate.
+    inline_rc=0
+    python3 "$CHECKS" extract-inline "$parser_file" "$inline_dir" 2>"$WORK/inline.err" || inline_rc=$?
+    if [ "$inline_rc" -eq 0 ]; then
         while IFS= read -r s; do samples+=("$s"); done < <(
             find "$inline_dir" -name '*.json' | sort
         )
+    elif [ "$inline_rc" -ne 1 ]; then
+        echo "    FAIL inline samples: $(head -3 "$WORK/inline.err")"
+        parser_failed=1
     fi
 
     if [ "${#samples[@]}" -eq 0 ]; then
