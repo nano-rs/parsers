@@ -363,9 +363,13 @@ def extract_inline(args) -> int:
         raw = sample.get("raw") if isinstance(sample, dict) else sample
         if raw is None:
             continue
-        # The gate's `wrap` step expects the sample file to hold the raw log
-        # line, exactly as a sidecar sample does.
-        (out / f"inline_{index:03d}.json").write_text(raw if isinstance(raw, str) else json.dumps(raw))
+        # An inline `raw` is always the raw log line (validate-vrl.sh feeds it
+        # as `{"message": raw}`). Written already wrapped: `wrap` takes a JSON
+        # object with a `message` key as a wrapper, so a JSON log line with its
+        # own top-level `message` was fed with `.message` = that value, not the
+        # line (an object `message` aborted the parser here).
+        line = raw if isinstance(raw, str) else json.dumps(raw)
+        (out / f"inline_{index:03d}.json").write_text(json.dumps({"message": line}))
         written += 1
     return 0 if written else 1
 
