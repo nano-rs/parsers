@@ -13,3 +13,5 @@ kubernetes_audit's.
 | `relay_iamcredentials_generate_access_token.json` | Data Access GenerateAccessToken (Create), callerIp sentinel `gce-internal-ip` as hostname |
 | `relay_secretmanager_access_secret_version.json` | Data Access AccessSecretVersion (Read) |
 | `relay_sts_exchange_token_wif.json` | STS ExchangeToken by a Workload Identity Federation principal (principalSubject as actor) |
+| `principal_subject_with_at_sign_workforce.json` | Workforce principalSubject containing `@`: name / uid only, no email_addr (OCSF email_t), a person (User) |
+| `principal_subject_user_prefix.json` | `user:alice@example.com` principalSubject: name / uid only, no email_addr |

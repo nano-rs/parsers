@@ -173,14 +173,18 @@ parser_vrl: |
       user = { "name": "unknown" }
       if principal != "" {
           user = { "name": principal, "uid": principal }
-          if contains(principal, "@") {
+          # email_addr / domain only for a real address (OCSF email_t): a
+          # principalSubject such as "user:alice@example.com" or
+          # "principal://.../subject/alice@example.com" stays name / uid only
+          if match(principal, r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$') {
               user.email_addr = principal
               pparts = split(principal, "@")
               if length(pparts) == 2 { user.domain = to_string(pparts[1]) }
           }
-          # a federated workload (WIF / STS principal://, principalSet://) is a
-          # service identity like a service account, not a person
-          if ends_with(principal, ".gserviceaccount.com") || starts_with(principal, "principal://") || starts_with(principal, "principalSet://") {
+          # a Workload Identity Federation principal (.../workloadIdentityPools/...)
+          # or a serviceAccount: subject is a service identity; a Workforce
+          # Identity Federation principal (.../workforcePools/...) is a person
+          if ends_with(principal, ".gserviceaccount.com") || contains(principal, "/workloadIdentityPools/") || starts_with(principal, "serviceAccount:") {
               user.type_id = 4
               user.type = "Service"
           } else {

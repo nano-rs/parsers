@@ -338,10 +338,12 @@ parser_vrl: |
           }
           # NAN-2995: OCSF 1.9 network_traffic: bytes_in = destination -> source, bytes_out = source -> destination.
           # src = client: the request is bytes_out, the response is bytes_in. A record
-          # without byte counts (firewall events) gets no traffic, never zeros.
-          if exists(p.ClientRequestBytes) || exists(p.EdgeResponseBytes) {
-              .traffic = { "bytes_in": resp_bytes, "bytes_out": req_bytes }
-          }
+          # without byte counts (firewall events), or with them null, gets no
+          # traffic, never zeros; each side is set only when it was sent.
+          traffic = {}
+          if is_integer(p.EdgeResponseBytes) || is_float(p.EdgeResponseBytes) { traffic.bytes_in = resp_bytes }
+          if is_integer(p.ClientRequestBytes) || is_float(p.ClientRequestBytes) { traffic.bytes_out = req_bytes }
+          if traffic != {} { .traffic = traffic }
           if exists(src_endpoint.ip) || exists(src_endpoint.port) { .src_endpoint = src_endpoint }
           dst_endpoint = {}
           oip = string(p.OriginIP) ?? ""
@@ -365,7 +367,8 @@ parser_vrl: |
           # BotScore is Cloudflare's 1-99 likelihood that the client is human;
           # it is a risk signal, not an entity risk score from the RBA engine.
           bs = -1
-          if exists(p.BotScore) { bs = to_int(p.BotScore) ?? -1 }
+          # to_int(null) is 0, so a null BotScore must count as absent
+          if is_integer(p.BotScore) || is_float(p.BotScore) || is_string(p.BotScore) { bs = to_int(p.BotScore) ?? -1 }
           if bs >= 0 { .risk_score = bs }
           if length(unmapped) > 0 { .unmapped = unmapped }
       }
