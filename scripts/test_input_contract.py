@@ -38,9 +38,13 @@ JSON-input parser got unmapped.parse_error. This test keeps:
    every parser's pre-v2.0.36 contract equal to scripts/json-input-parsers.txt,
    and every v2 declaration paired with a v1 line;
 3. the port equal to nano's classifier binary, when it is available;
-4. Generic JSON, fed exactly what nano delivers for a Splunk HEC object event
-   and an OTel-style event (message plus attributes / resource), parsing
-   without a parse_error and keeping the sibling fields.
+4. Generic JSON declaring its contract (nano v2.0.36+ gives an undeclared
+   parser the v2.0.35 HEC delivery, NAN-5902), and, fed exactly what nano
+   delivers for a Splunk HEC object event (the record view: envelope keys and
+   record keys on the root, the record text in `.message`), an OTel-style event,
+   a string event and an /ingest body, parsing without a parse_error, keeping
+   every record value, and taking time and host from the record, not the
+   envelope.
 """
 import json
 import os
@@ -216,15 +220,57 @@ def without_generated(vrl):
 
 
 def hec_delivery(vrl, event):
-    """The `.message` nano (v2.0.36+) hands the parser for an HEC object event
-    (hec_normalize and the `<parser>_hec_payload` step)."""
+    """The `.message` nano (v2.0.36+) hands a DECLARED parser for an HEC object
+    event (hec_normalize and the `<parser>_hec_payload` step). An undeclared
+    parser gets the v2.0.35 delivery instead (NAN-5902), which this does not
+    model: None."""
+    if not input_contract(vrl)[1]:
+        return None
     if reads_json_object(vrl):
-        return json.dumps(event)
+        return json.dumps(event, separators=(',', ':'))
     if isinstance(event.get('message'), str):
         return event['message']
     if 'message' not in event and isinstance(event.get('line'), str):
         return event['line']
     return json.dumps(event)
+
+
+# Kept equal to `nano_hecv_reserved` in nanosiem-core vector_config/mod.rs
+# (`hec_record_view_vrl!`): record keys never copied onto the root.
+HEC_VIEW_RESERVED = {'source_type', 'namespace', 'auth_status', 'timestamp', 'metadata', 'ingest_time',
+                     '_inserted_at', 'id', 'ext', 'message', 'sourcetype', 'splunk_sourcetype',
+                     'splunk_source', 'splunk_index', 'splunk_channel', 'content_format',
+                     'routing_timestamp', 'claimed_source_type'}
+# The HEC envelope beside the record: its own time and host, never the record's.
+HEC_ENVELOPE = {'time': '2026-11-25T20:00:00Z', 'host': 'hec-envelope-host', 'sourcetype': '_json', 'index': 'main'}
+
+
+def hec_record_view(vrl, event):
+    """The root a declared parser runs on for an HEC object event (nano
+    v2.0.36+, `hec_record_view_vrl!` then `<parser>_hec_payload`): the
+    envelope and routing keys, a copy of each record key the root lacks, and
+    `.message` = what hec_delivery says."""
+    root = {'source_type': 'json_generic', 'auth_status': 'authenticated', 'splunk_channel': 'c-1',
+            'content_format': 'splunk_hec', 'timestamp': HEC_ENVELOPE['time'], 'host': HEC_ENVELOPE['host'],
+            'splunk_sourcetype': HEC_ENVELOPE['sourcetype'], 'splunk_index': HEC_ENVELOPE['index'],
+            'metadata': {'forwarded_via': 'splunk_hec'}}
+    for k, v in event.items():
+        if v is not None and k not in HEC_VIEW_RESERVED and k not in root:
+            root[k] = v
+    root['message'] = hec_delivery(vrl, event)
+    return root
+
+
+def leaves(value):
+    """Every scalar leaf of a JSON value."""
+    if isinstance(value, dict):
+        for v in value.values():
+            yield from leaves(v)
+    elif isinstance(value, list):
+        for v in value:
+            yield from leaves(v)
+    elif value is not None:
+        yield value
 
 
 def main():
@@ -304,6 +350,13 @@ def main():
     vrl = yaml.safe_load((ROOT / 'parsers-ocsf/json_generic/parser.yaml').read_text())['parser_vrl']
     if not reads_json_object(vrl):
         failures.append('json_generic: not classified as a JSON-input parser')
+    # NAN-5902: from nano v2.0.36 an UNDECLARED parser gets the v2.0.35 HEC
+    # delivery: an object event's own host / timestamp replaced by the
+    # envelope's, and an object `message` alone in raw_data. The default
+    # parser must declare its contract to receive the whole record.
+    if input_contract(vrl)[:2] != ('json', True) or declarations(vrl)[0] != 'json':
+        failures.append('json_generic: must declare `# nano:input=json` (undeclared, nano v2.0.36+ gives it the '
+                        'v2.0.35 HEC delivery and an HEC object event loses its own host / timestamp)')
     shapes = {
         # Splunk HEC: {"event": {"message": "...", "k": 1}, "sourcetype": "_json"}
         'hec_object': {'message': 'hec1 contract obj', 'k': 1, 'user': 'alice'},
@@ -313,7 +366,10 @@ def main():
     }
     for name, event in shapes.items():
         message = hec_delivery(vrl, event)
-        (out, _), = run('json_generic', [{'message': message}])
+        if message is None:
+            failures.append(f'json_generic {name}: undeclared, it gets the v2.0.35 HEC delivery')
+            continue
+        (out, _), = run('json_generic', [hec_record_view(vrl, event)])
         unmapped = out.get('unmapped') or {}
         if 'parse_error' in unmapped or (out.get('metadata') or {}).get('log_level') == 'error':
             failures.append(f'json_generic {name}: parse_error {unmapped.get("parse_error")!r} (delivered {message[:60]!r})')
@@ -325,13 +381,62 @@ def main():
         if lost:
             failures.append(f'json_generic {name}: sibling field(s) {lost} not kept outside raw_data')
 
+    # NAN-5902 (the v2.0.36 RC2 fresh-install finding): an HEC object event
+    # with its OWN host and timestamp and an object `message`. Through the
+    # record view the parser must take time and host from the record (never
+    # the envelope's), keep the record byte for byte in raw_data, and keep
+    # every value searchable outside raw_data.
+    record = {'marker': 'hec-obj-5902', 'timestamp': '2026-11-24T01:02:03Z', 'host': 'Rec-Host-5902',
+              'n': 42, 'f': 1.5, 'b': True, 'arr': [1, 'two', {'three': 3}],
+              'deep': {'l1': {'l2': {'l3': 'deep-5902'}}}, 'a.b': 'flat-5902', 'a': {'b': 'nested-5902'},
+              'nul': None, 'message': {'inner': 'msg-obj-5902'}}
+    lossless = 0
+    if hec_delivery(vrl, record) is not None:
+        root = hec_record_view(vrl, record)
+        (out, _), = run('json_generic', [root])
+        unmapped = out.get('unmapped') or {}
+        if 'parse_error' in unmapped:
+            failures.append(f'json_generic hec record: parse_error {unmapped["parse_error"]!r}')
+        if out.get('raw_data') != root['message']:
+            failures.append(f'json_generic hec record: raw_data {out.get("raw_data")!r} is not the record text')
+        if out.get('time') != 1795482123000:
+            failures.append(f'json_generic hec record: time {out.get("time")!r} is not the record timestamp (2026-11-24T01:02:03Z)')
+        if (out.get('device') or {}).get('hostname') != 'rec-host-5902':
+            failures.append(f'json_generic hec record: device.hostname {(out.get("device") or {}).get("hostname")!r} is not the record host')
+        if HEC_ENVELOPE['host'] in json.dumps(out):
+            failures.append('json_generic hec record: the HEC envelope host reached the event')
+        mapped = json.dumps(unmapped)
+        for leaf in leaves(record):
+            if leaf == record['timestamp']:
+                continue  # consumed into `time`, asserted above
+            text = json.dumps(leaf) if not isinstance(leaf, str) else leaf
+            if text not in mapped:
+                failures.append(f'json_generic hec record: value {leaf!r} not kept in unmapped (only in raw_data)')
+        lossless = 1
+
+    # Text and JSON over the other lanes, unchanged by the declaration: an HEC
+    # string event or /raw body and an /ingest body arrive as `.message` = the
+    # text. JSON text parses; a plain line keeps raw_data and reports the error.
+    for name, text, is_json in (('hec string json', '{"marker":"str-json-5902","x":{"y":"z"}}', True),
+                                ('ingest json', '{"marker":"ingest-5902","user":"alice","n":7}', True),
+                                ('hec string text', 'plain text str-5902 k=v user=alice', False),
+                                ('ingest text', 'raw line ingest-5902 src=10.0.0.9 action=allow', False)):
+        (out, _), = run('json_generic', [{'message': text, 'source_type': 'json_generic'}])
+        unmapped = out.get('unmapped') or {}
+        if out.get('raw_data') != text:
+            failures.append(f'json_generic {name}: raw_data {out.get("raw_data")!r} is not the delivered text')
+        if is_json and ('parse_error' in unmapped or unmapped.get('marker') != json.loads(text)['marker']):
+            failures.append(f'json_generic {name}: JSON text not parsed: {unmapped}')
+        if not is_json and 'parse_error' not in unmapped:
+            failures.append(f'json_generic {name}: a non-JSON line must report unmapped.parse_error')
+
     for f in failures:
         print('FAIL', f)
     if failures:
         sys.exit(1)
     print(f'PASS input contract: {len(parsers)} parsers keep their HEC / OTLP input contract with the generated blocks '
           f'({len(pinned)} JSON-input, as pinned); '
-          f'json_generic parses {len(shapes)} delivered envelope shapes{checked}')
+          f'json_generic declares json and parses {len(shapes) + lossless} HEC object shapes losslessly plus 4 text / JSON lanes{checked}')
 
 
 if __name__ == '__main__':

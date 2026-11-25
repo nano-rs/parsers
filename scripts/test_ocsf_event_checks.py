@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
-"""Rule 5 (canonical OCSF 1.9 paths) regression checks."""
+"""Rule 5 (canonical OCSF 1.9 paths) and inline-sample feeding regression checks."""
+import json
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ocsf_event_checks import noncanonical_paths  # noqa: E402
+from ocsf_event_checks import envelope_problems, inline_events, noncanonical_paths  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[1]
+CHECKS = ROOT / "scripts" / "ocsf_event_checks.py"
 
 
 class Rule5Tests(unittest.TestCase):
@@ -53,6 +61,64 @@ class Rule5Tests(unittest.TestCase):
             "enrichments": [{"name": "x", "value": "y", "data": {"producer": {"keys": 1}}}],
         }
         self.assertEqual(noncanonical_paths(event, 4001), [])
+
+
+class InlineSampleFeedTests(unittest.TestCase):
+    """What validate-ocsf.sh runs each inline sample on (parsers#99)."""
+
+    def feed(self, samples):
+        """The events extract-inline writes, read back through `wrap`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "parser.yaml").write_text(yaml.safe_dump({"name": "t", "samples": samples}))
+            rc = subprocess.run([sys.executable, str(CHECKS), "extract-inline", str(tmp / "parser.yaml"), str(tmp / "out")],
+                                capture_output=True, text=True)
+            if rc.returncode != 0:
+                return rc.returncode, rc.stderr
+            events = []
+            for f in sorted((tmp / "out").glob("*.json")):
+                out = subprocess.run([sys.executable, str(CHECKS), "wrap", str(f)], capture_output=True, text=True, check=True)
+                events.append(json.loads(out.stdout))
+            return 0, events
+
+    def test_a_json_line_with_its_own_message_is_fed_as_the_line(self):
+        line = '{"timestamp":"2026-11-24T01:02:03Z","message":{"inner":"x"},"host":"h"}'
+        rc, events = self.feed([{"raw": line}, {"raw": '{"message":"text","k":1}'}, {"raw": "plain text"}])
+        self.assertEqual(rc, 0, events)
+        self.assertEqual(events, [{"message": line}, {"message": '{"message":"text","k":1}'}, {"message": "plain text"}])
+
+    def test_an_envelope_sample_is_fed_as_the_event(self):
+        # The non-string `.message` branches (null, number, pre-decoded object)
+        # are reachable only through this gate; they must stay fed as events.
+        rc, events = self.feed([{"raw": '{"message":null}', "envelope": True},
+                                {"raw": '{"message":{"id":115}}', "envelope": True},
+                                {"raw": '{"message":7}', "envelope": True},
+                                {"raw": '{"message":7}', "envelope": False}])
+        self.assertEqual(rc, 0, events)
+        self.assertEqual(events, [{"message": None}, {"message": {"id": 115}}, {"message": 7}, {"message": '{"message":7}'}])
+
+    def test_an_unmarked_bare_non_string_message_is_refused_not_fed_as_a_line(self):
+        rc, err = self.feed([{"raw": '{"message":null}'}])
+        self.assertEqual(rc, 2, err)
+        self.assertIn("envelope: true", err)
+        self.assertEqual(envelope_problems([{"raw": '{"message":"text"}'}, {"raw": '{"message":1,"k":2}'}]), [])
+
+    def test_a_malformed_envelope_sample_fails_with_exit_2(self):
+        rc, err = self.feed([{"raw": "plain text", "envelope": True}])
+        self.assertEqual(rc, 2, err)
+
+    def test_every_parser_states_its_envelope_samples(self):
+        # The tree: no bare non-string `message` sample is left ambiguous, and
+        # every envelope sample really reaches the parser with that `.message`.
+        envelopes = 0
+        for path in sorted((ROOT / "parsers-ocsf").glob("*/parser.yaml")) + sorted((ROOT / "enrichments").glob("**/parser.yaml")):
+            samples = (yaml.safe_load(path.read_text()) or {}).get("samples") or []
+            self.assertEqual(envelope_problems(samples), [], path)
+            for index, event in inline_events(samples):
+                if isinstance(samples[index], dict) and samples[index].get("envelope") is True:
+                    envelopes += 1
+                    self.assertNotIsInstance(event["message"], str, f"{path} sample {index}")
+        self.assertGreaterEqual(envelopes, 10)
 
 
 if __name__ == "__main__":
