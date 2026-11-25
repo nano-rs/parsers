@@ -39,3 +39,17 @@ object event, nano currently removes some fields (such as `timestamp` and
 planned in nano (.36).
 
 For Cloud Logging, a Pub/Sub push envelope sent as an HEC object event reaches the parser as its inner `message` only, so the log entry is not decoded.
+
+## Pub/Sub pull relay samples
+
+`relay_*.json`: raw LogEntry lines as a pull relay delivers them (Cloud
+Logging sink -> Pub/Sub pull subscription -> a forwarder such as Vector ->
+nano's `/ingest`, one LogEntry per line, no Pub/Sub envelope).
+
+| File | Branch |
+|------|--------|
+| `relay_l7_lb_rule_request.json` | external Application LB request (HTTP Activity) |
+| `relay_gke_api_pino_stdout.json` | GKE container stdout, pino jsonPayload (Base Event) |
+| `relay_k8s_event_warning.json` | Kubernetes event (Base Event, WARNING) |
+| `relay_cloudsql_postgres_connection.json` | Cloud SQL postgres.log textPayload (Base Event) |
+| `relay_cloud_nat_allocation.json` | Cloud NAT flow (Base Event; connection fields spill) |

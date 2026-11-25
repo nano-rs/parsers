@@ -64,6 +64,8 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | [Broadcom ProxySG](parsers-ocsf/broadcom_proxy) | `broadcom_proxy` | Broadcom | ELFF space-delimited | Web proxy access logs with URL reconstruction |
 | [Cloudflare](parsers-ocsf/cloudflare) | `cloudflare` | Cloudflare | JSON (Logpush) | HTTP requests, firewall events, DNS logs with WAF/bot scoring |
 | [Cloudflare Zero Trust](parsers-ocsf/cloudflare_zero_trust) | `cloudflare_zero_trust` | Cloudflare | JSON (Logpush) | Gateway DNS, Gateway HTTP, Gateway Network, Access requests |
+| [Cloudflare Account Audit Logs](parsers-ocsf/cf_audit) | `cf_audit` | Cloudflare | JSON (v1 audit_logs API) | Dashboard / API logins as Authentication; API tokens, DNS records, rulesets, members and every other account change as API Activity with actor, IP and target |
+| [Cloudflare Workers Trace Events](parsers-ocsf/cloudflare_workers_trace) | `cloudflare_workers_trace` | Cloudflare | JSON (Logpush workers_trace_events) | One record per Worker invocation as API Activity: script, version, outcome, CPU / wall time, exceptions, fetch URL and status |
 | [Cisco Umbrella](parsers-ocsf/cisco_umbrella) | `cisco_umbrella` | Cisco | CSV | DNS and proxy logs with domain categorization and identity |
 | [Infoblox DHCP](parsers-ocsf/infoblox_dhcp) | `infoblox_dhcp` | Infoblox | Syslog | DISCOVER, OFFER, REQUEST, ACK, RELEASE, NAK, INFORM |
 | [Windows DNS Server](parsers-ocsf/windows_dns) | `windows_dns` | Microsoft | Debug log text / Analytical ETW JSON (Winlogbeat, NXLog) | Queries, responses and recursion (ETW 256-262, debug PACKET lines) with rcode, flags, opcode and transaction id; audit events as Base Event |
@@ -147,6 +149,11 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 | Parser | Source type | Vendor | Format | Description |
 |--------|-------------|--------|--------|-------------|
 | [GitHub Audit](parsers-ocsf/github_audit) | `github_audit` | GitHub | JSON | Organization and enterprise audit events |
+| [GitHub Webhooks](parsers-ocsf/github_webhook) | `github_webhook` | GitHub | JSON (webhook body as signed; relay envelope also accepted) | Org webhooks for orgs without Enterprise Cloud: membership and teams (Group Management), secret / code scanning and Dependabot alerts (Detection Finding), workflow runs (Application Lifecycle), repositories, deploy keys, branch protection, pushes (API Activity) |
+| [Stripe Events](parsers-ocsf/stripe_events) | `stripe_events` | Stripe | JSON (Event object) | Radar early fraud warnings, disputes and reviews as Detection Finding; subscriptions, checkout, charges and every other object change as API Activity |
+| [Sentry Webhooks](parsers-ocsf/sentry_webhook) | `sentry_webhook` | Sentry | JSON (webhook body as signed; relay envelope also accepted) | Issues, issue alerts and metric alerts as Detection Finding; integration installs / uninstalls as API Activity |
+| [Doppler Webhooks](parsers-ocsf/doppler_webhook) | `doppler_webhook` | Doppler | JSON (project webhook) | Config secret changes (names added, removed, updated; never values) as API Activity on the config, project and workplace |
+| [Doppler Activity Logs](parsers-ocsf/doppler_activity) | `doppler_activity` | Doppler | JSON (GET /v3/logs records) | Workplace activity (secret changes, service tokens, ...) with the user who acted, as API Activity on the config and project |
 | [Slack Audit](parsers-ocsf/slack_audit) | `slack_audit` | Salesforce | JSON | Enterprise Grid audit: login, file, channel, app events |
 | [Slack Access Logs](parsers-ocsf/slack_access) | `slack_access_log` | Salesforce | JSON | Workspace sign-in records from team.accessLogs |
 | [GitLab Audit Events](parsers-ocsf/gitlab_audit) | `gitlab_audit` | GitLab | JSON (streaming, REST API, audit_json.log) | Sign-ins and failures, user lifecycle, 2FA, personal access tokens, group / project membership, project and git activity |
