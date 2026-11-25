@@ -20,7 +20,11 @@ class ResidualTests(unittest.TestCase):
             ({'Unknown': 'unique-unknown'}, {}, {'unknown': 'unique-unknown'}),
             ({'Known': 'mapped'}, {'message': 'mapped'}, {}),
             ({'FooBar': 'first', 'foo_bar': 'second'}, {}, {'foo_bar': 'first', 'foo_bar_2': 'second'}),
-            ({'x.y': 'literal', 'x': {'y': 'nested'}}, {}, {'x.y': 'nested', 'x.y_2': 'literal'}),
+            # NAN-5894: the literal dotted copy keeps its dots escaped (x~1y).
+            ({'x.y': 'literal', 'x': {'y': 'nested'}}, {}, {'x.y': 'nested', 'x~1y': 'literal'}),
+            # ...also under a reserved nano key (renamed source_<name>).
+            ({'nano': {'a.b': 1, 'a': {'b': 2}}}, {}, {'source_nano.a.b': 2, 'source_nano.a~1b': 1}),
+            ({'nano.a': {'b': 1}, 'nano': {'a.b': 2}}, {}, {'source_nano.a~1b': 2, 'source_nano~1a.b': 1}),
             ({'List': [1, 'two', False]}, {}, {'list': [1, 'two', False]}),
             ({'List': [{'Name': 'thing', 'ApiToken': 'private'}]}, {}, {'list': '[{"ApiToken":"private","Name":"thing"}]'}),
             # A parser never masks: credential-named keys spill as-is.

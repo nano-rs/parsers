@@ -93,7 +93,14 @@ value is mapped or spilled under its source path); equality with an unrelated
 mapped attribute is no reason to drop it.
 
 Residual objects flatten into dotted snake_case paths. Literal dots are escaped
-before flattening, then decoded for naming. Collisions receive `_2`, `_3`, etc.
+before flattening, then decoded for naming. When a literal dotted key and a
+nested path get the same name (`{"a.b": 1, "a": {"b": 2}}`), the nested one
+keeps `a.b` and the literal dotted one keeps its dots escaped: `a~1b` (a `~` in
+it as `~0`). That is the name nano gives it when no parser reads the event
+(NAN-5894), so one field has one name either way. Only a name still taken
+after that (keys that differ only in case or snake-casing, such as `userName`
+and `user_name`) receives `_2`, `_3`, etc. Parsers built before NAN-5894 gave
+the literal dotted copy `a.b_2`; nano search finds that older name too.
 Scalar arrays retain their type/order; arrays containing objects or arrays use
 JSON strings. A scalar array is consumed only when every element is at one of
 its declared targets. Partially mapped arrays remain

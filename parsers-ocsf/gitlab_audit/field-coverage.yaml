@@ -1,0 +1,89 @@
+source: json
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+transforms:
+- source: created_at
+  kind: epoch_ms
+  target: time
+  format: '%+'
+  reason: ISO created_at converted to the event clock in milliseconds.
+- source: time
+  kind: epoch_ms
+  target: time
+  format: '%+'
+  reason: audit_json.log write clock, used only when created_at is absent.
+- source: with
+  kind: enum
+  target: auth_protocol
+  values:
+    ldap: LDAP
+    saml: SAML
+  reason: Known GitLab sign-in methods normalize to the OCSF auth_protocol caption.
+mappings:
+  author_id:
+  - actor.user.uid
+  - user.uid
+  author_name:
+  - actor.user.name
+  - user.display_name
+  - user.name
+  correlation_id:
+  - metadata.correlation_uid
+  entity_id:
+  - group.uid
+  - resources.uid
+  entity_type:
+  - group.type
+  - resources.type
+  meta~1caller_id:
+  - api.operation
+  meta~1remote_ip:
+  - src_endpoint.ip
+  meta~1user:
+  - user.name
+  severity:
+  - metadata.log_level
+  target_details:
+  - resources.name
+  - user.name
+  target_id:
+  - resources.uid
+  - user.uid
+  target_type:
+  - resources.type
+  with:
+  - auth_protocol
+  details.custom_message:
+  - message
+  failed_login:
+  - auth_protocol
+  ip_address:
+  - src_endpoint.ip
+  details.author_name:
+  - actor.user.name
+  details.entity_path:
+  - resources.name
+  details.ip_address:
+  - src_endpoint.ip
+  details.target_details:
+  - resources.name
+  - user.name
+  details.target_id:
+  - resources.uid
+  - user.uid
+  details.target_type:
+  - resources.type
+  entity_path:
+  - group.name
+  - resources.name
+  event_type:
+  - api.operation
+  - message
+  - metadata.event_code
+  id:
+  - metadata.uid
+  details.as:
+  - privileges
+  details.author_email:
+  - actor.user.email_addr
