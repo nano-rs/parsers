@@ -1,6 +1,6 @@
 name: gcp_audit_ocsf
 display_name: GCP Audit Log (OCSF)
-version: "1.3.0"
+version: "1.4.0"
 ocsf_version: "1.9.0"
 description: >
   Preserves unconsumed parsed fields, unaltered, in dotted snake_case unmapped keys.
@@ -93,7 +93,7 @@ parser_vrl: |
           "api": { "operation": "Unknown", "service": { "name": "unknown" } },
           "cloud": { "provider": "GCP" },
           "actor": { "user": { "name": "unknown" } },
-          "src_endpoint": { "ip": "0.0.0.0" }
+          "src_endpoint": { "hostname": "unknown" }
       }
       # NAN-5264: explicit fallback marker; nano parser health counts it.
       . = set!(., ["unmapped", "parse_fallback"], "unparsable input")
@@ -123,8 +123,10 @@ parser_vrl: |
       }
       activity_id = 99
       activity_name = "Other"
-      if starts_with(verb, "create") || starts_with(verb, "insert") { activity_id = 1; activity_name = "Create" }
-      if starts_with(verb, "get") || starts_with(verb, "list") || starts_with(verb, "read") || starts_with(verb, "describe") || starts_with(verb, "search") || starts_with(verb, "check") || starts_with(verb, "aggregated") { activity_id = 2; activity_name = "Read" }
+      # generate / sign / exchange mint a credential (IAM Credentials
+      # GenerateAccessToken, SignJwt, STS ExchangeToken): a Create.
+      if starts_with(verb, "create") || starts_with(verb, "insert") || starts_with(verb, "generate") || starts_with(verb, "sign") || starts_with(verb, "exchange") { activity_id = 1; activity_name = "Create" }
+      if starts_with(verb, "get") || starts_with(verb, "list") || starts_with(verb, "read") || starts_with(verb, "describe") || starts_with(verb, "search") || starts_with(verb, "check") || starts_with(verb, "aggregated") || starts_with(verb, "access") { activity_id = 2; activity_name = "Read" }
       if starts_with(verb, "update") || starts_with(verb, "patch") || starts_with(verb, "set") || starts_with(verb, "modify") || starts_with(verb, "enable") || starts_with(verb, "disable") || starts_with(verb, "start") || starts_with(verb, "stop") || starts_with(verb, "reset") || starts_with(verb, "resize") || starts_with(verb, "attach") || starts_with(verb, "detach") { activity_id = 3; activity_name = "Update" }
       if starts_with(verb, "delete") || starts_with(verb, "remove") || starts_with(verb, "destroy") || starts_with(verb, "purge") { activity_id = 4; activity_name = "Delete" }
 
@@ -157,10 +159,17 @@ parser_vrl: |
       }
       zone = to_string(labels.zone) ?? ""
       if zone != "" { cloud.zone = zone; cloud.region = zone }
+      # GKE (k8s_cluster) and audited_resource entries carry location instead
+      # of zone: a region ("us-central1"), a zone, or "global".
+      location = to_string(labels.location) ?? ""
+      if zone == "" && location != "" { cloud.region = location }
 
       # ---- principal ----
       auth_info = object(payload.authenticationInfo) ?? {}
       principal = to_string(auth_info.principalEmail) ?? ""
+      # Workload Identity Federation / STS callers have no e-mail, only a
+      # principalSubject (principal://iam.googleapis.com/...).
+      if principal == "" { principal = to_string(auth_info.principalSubject) ?? "" }
       user = { "name": "unknown" }
       if principal != "" {
           user = { "name": principal, "uid": principal }
@@ -177,18 +186,23 @@ parser_vrl: |
               user.type = "User"
           }
       }
+      # A call authenticated with a service-account KEY names that key.
+      sa_key = to_string(auth_info.serviceAccountKeyName) ?? ""
+      if sa_key != "" && principal != "" { user.credential_uid = sa_key }
       actor = { "user": user }
 
       # ---- caller network context ----
       req_meta = object(payload.requestMetadata) ?? {}
       caller_ip = to_string(req_meta.callerIp) ?? ""
-      src_endpoint = { "ip": "0.0.0.0" }
+      # API Activity requires src_endpoint. A missing caller is "unknown"; an
+      # invented address (0.0.0.0) would poison every IP-keyed hunt.
+      src_endpoint = { "hostname": "unknown" }
       if caller_ip != "" {
           if is_ipv4(caller_ip) || is_ipv6(caller_ip) {
               src_endpoint = { "ip": downcase(caller_ip) }
           } else {
               # GCP emits sentinels like "private" / "gce-internal-ip"
-              src_endpoint = { "ip": "0.0.0.0", "hostname": caller_ip }
+              src_endpoint = { "hostname": caller_ip }
           }
       }
 
@@ -417,7 +431,7 @@ parser_vrl: |
       }
   }
   # Declared source -> target mappings (field-coverage.yaml `mappings`).
-  __decl = "\n\"insertId\"\t[\"api.request.uid\",\"metadata.uid\"]\n\"logName\"\t[\"metadata.log_name\"]\n\"protoPayload.authenticationInfo.principalEmail\"\t[\"actor.user.email_addr\",\"actor.user.name\",\"actor.user.uid\"]\n\"protoPayload.methodName\"\t[\"api.operation\"]\n\"protoPayload.requestMetadata.callerIp\"\t[\"src_endpoint.hostname\",\"src_endpoint.ip\"]\n\"protoPayload.requestMetadata.callerSuppliedUserAgent\"\t[\"http_request.user_agent\"]\n\"protoPayload.resourceName\"\t[\"resources.name\",\"resources.uid\"]\n\"protoPayload.status.code\"\t[\"status_code\"]\n\"protoPayload.status.message\"\t[\"api.response.message\",\"status_detail\"]\n\"resource.labels.project_id\"\t[\"cloud.account.name\",\"cloud.account.uid\",\"cloud.project_uid\",\"resources.namespace\"]\n\"resource.labels.zone\"\t[\"cloud.region\",\"cloud.zone\",\"resources.zone\"]\n\"resource.type\"\t[\"resources.type\"]\n"
+  __decl = "\n\"logName\"\t[\"metadata.log_name\"]\n\"protoPayload.authenticationInfo.principalEmail\"\t[\"actor.user.email_addr\",\"actor.user.name\",\"actor.user.uid\"]\n\"protoPayload.authenticationInfo.principalSubject\"\t[\"actor.user.name\",\"actor.user.uid\"]\n\"protoPayload.methodName\"\t[\"api.operation\"]\n\"protoPayload.requestMetadata.callerIp\"\t[\"src_endpoint.hostname\",\"src_endpoint.ip\"]\n\"protoPayload.requestMetadata.callerSuppliedUserAgent\"\t[\"http_request.user_agent\"]\n\"protoPayload.resourceName\"\t[\"resources.name\",\"resources.uid\"]\n\"resource.labels.project_id\"\t[\"cloud.account.name\",\"cloud.account.uid\",\"cloud.project_uid\",\"resources.namespace\"]\n\"resource.labels.zone\"\t[\"cloud.region\",\"cloud.zone\",\"resources.zone\"]\n\"resource.type\"\t[\"resources.type\"]\n\"insertId\"\t[\"api.request.uid\",\"metadata.uid\"]\n\"protoPayload.status.code\"\t[\"status_code\"]\n\"protoPayload.status.message\"\t[\"api.response.message\",\"status_detail\"]\n\"resource.labels.location\"\t[\"cloud.region\"]\n\"protoPayload.authenticationInfo.serviceAccountKeyName\"\t[\"actor.user.credential_uid\"]\n"
   __preserve = []
   # END parser-specific transformations
   # Declared mappings: __decl holds "\n" + encode_json(key) + "\t" + JSON array of

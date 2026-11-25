@@ -1,0 +1,54 @@
+source: json
+transforms:
+- source: created
+  kind: scale
+  factor: 1000
+  target: time
+  reason: Stripe Event `created` is epoch seconds; it is the event time.
+- source: data.object.created
+  kind: scale
+  factor: 1000
+  target: resources.created_time
+  reason: The changed object's creation clock (epoch seconds).
+- source: data.object.created
+  kind: scale
+  factor: 1000
+  target: finding_info.created_time
+  reason: The fraud warning / dispute / review creation clock (epoch seconds).
+mappings_reason: Each source key maps to the OCSF target path(s) its value is copied to; a key is consumed
+  only when its value is at one of them (field_coverage_check.py verifies each by perturbation). Everything
+  else spills to unmapped.
+mappings:
+  api_version:
+  - api.version
+  data.object.charge:
+  - resources.uid
+  data.object.id:
+  - finding_info.uid
+  - resources.uid
+  data.object.object:
+  - resources.type
+  data.object.payment_intent:
+  - resources.uid
+  data.object.reason:
+  - finding_info.types
+  data.object.status:
+  - status_detail
+  id:
+  - metadata.uid
+  request.id:
+  - api.request.uid
+  type:
+  - api.operation
+  - message
+  - metadata.event_code
+  data.object.customer:
+  - resources.uid
+  data.object.failure_code:
+  - status_code
+  data.object.failure_message:
+  - status_detail
+  data.object.subscription:
+  - resources.uid
+  data.object.fraud_type:
+  - finding_info.types
