@@ -345,20 +345,64 @@ and after a large rewrite. CI runs the check on every PR (job "Parser load budge
   spec's home for an event with no class; forcing an application log line into a
   security class poisons every class-scoped hunt.
 
+### Declaring the input contract
+
+Every parser says what it reads with comment lines in its `parser_vrl` (nano
+NAN-5883). This repository serves every nano install, old and new, so the
+declaration is a backward-compatible pair:
+
+- `# nano:input=json` or `# nano:input=text` (v1): every nano version reads
+  it, exactly as today.
+- `# nano:input-v2=json`, `text` or `json_or_text` (v2): read from nano
+  v2.0.36, where it wins over the v1 line. Older versions ignore it.
+
+A v2 line always comes with a v1 line, and never write a bare
+`# nano:input=json_or_text`: nano before v2.0.36 reads it as undeclared and
+may infer JSON. `json_or_text` means the parser reads JSON records and text
+lines; declare it only once the parser tells a record of its source from a
+forwarder's wrapper (`{"message": "<line>", ...}`) itself.
+
+From nano v2.0.36, what `.message` holds for each contract:
+
+| Contract | HTTP `/ingest` | HEC string event or `/raw` | HEC object event | OTLP log |
+|---|---|---|---|---|
+| `json` | the record | the text (1) | the whole record | the body |
+| `json_or_text` | the record | the text (1) | the whole record | the body |
+| `text` | the record | the text | the record's line (its string `message`, else, with no `message`, its string `line`), or the whole record when it has none (2) | the body |
+
+(1) As before: when the text is not a JSON object and the event carried HEC
+indexed `fields`, the parser gets one JSON object of the fields and `message`.
+(2) The line needs a Vector build that marks object events
+(`%splunk_hec.event_kind`, nano-rs/vector NAN-5891); without it a `text`
+parser gets the whole record.
+
+A `text` parser's unread record keys, and HEC indexed `fields`, land under
+`unmapped` (never replacing a key the parser set).
+
+Undeclared, nano infers the contract from the parser's first structural
+decoder and logs a warning. `scripts/test_input_contract.py` checks every
+parser's contract against `scripts/json-input-parsers.txt` (the v1 contract
+every install reads), refuses unpaired v2 lines, and compares its port with
+nano's own classifier when `NANO_INPUT_CONTRACT` points at it (see
+`scripts/input-contract.lock`).
+
 ### Sending logs over Splunk HEC
 
-Send each log to nano as an HEC **string** event (`"event": "<the log, as text>"`),
-or post it to nano's `/ingest` endpoint. Both work for every parser.
+Send each log to nano as an HEC string event (`"event": "<the log, as text>"`),
+an HEC object event (`"event": { ... }`), or post it to nano's `/ingest`
+endpoint. From nano v2.0.36 an object event keeps every field of the record
+(nanosiem NAN-5891); string events and `/services/collector/raw` are handled
+exactly as before.
 
-HEC **object** events (`"event": { ... }`) are a problem for some parsers today.
-For an object event, nano removes some fields (such as `timestamp` and `host`)
-before the parser runs, and it may hand the parser only the event's `message`
-field. The event can then get the wrong time or lose fields. This hits JSON logs
-that have their own `timestamp`, `message` or `event` field, and sources that
-write both JSON and text lines: Traefik, AWS CloudWatch Logs, Google Cloud Logging (Pub/Sub
+On nano before v2.0.36, HEC **object** events are a problem for some parsers:
+nano removes some fields (such as `timestamp` and `host`) before the parser
+runs, and it may hand the parser only the event's `message` field. The event
+can then get the wrong time or lose fields. This hits JSON logs that have their
+own `timestamp`, `message` or `event` field, and sources that write both JSON
+and text lines: Traefik, AWS CloudWatch Logs, Google Cloud Logging (Pub/Sub
 push), Atlassian, Salesforce Event Monitoring, Zoom (webhooks), Keycloak,
-MySQL (Enterprise Audit), PostgreSQL and Kubernetes container logs. Each of those parsers says so in its
-`samples/README.md` or its description. A fix is planned in nano (.36).
+MySQL (Enterprise Audit), PostgreSQL and Kubernetes container logs. On those
+versions, send these sources as HEC string events or to `/ingest`.
 
 ## Structure
 
