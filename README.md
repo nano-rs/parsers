@@ -1,19 +1,19 @@
 # nano Community Parsers
 
 A collection of VRL parsers for nano log source ingestion. Every parser emits
-[OCSF 1.9](https://schema.ocsf.io) records for nano's OCSF lake.
+[OCSF 1.9](https://schema.ocsf.io) records, which nano stores in ClickHouse (`ocsf_logs`).
 
 ## Branches
 
 | Branch | Content | For |
 |--------|---------|-----|
-| `main` | OCSF 1.9 parsers (`parsers-ocsf/`) and `enrichments/` | nano (the OCSF lake) |
-| `legacy/clickhouse` | Archive: the UDM parsers (`parsers/`) plus the older OCSF parsers | The retired ClickHouse edition |
+| `main` | OCSF 1.9 parsers (`parsers-ocsf/`) and `enrichments/` | nano v2 (OCSF on ClickHouse) |
+| `legacy/clickhouse` | Frozen: the UDM parsers (`parsers/`) plus the older OCSF parsers | Older installs still on the legacy UDM schema |
 | `ocsf-1.9` | Frozen copy of the OCSF 1.9 parsers | Installs that still pin it; it receives no new parsers, use `main` |
 
-Legacy ClickHouse-edition users should point their parser repository at
-`legacy/clickhouse` or migrate to the OCSF lake. That branch is an archive for
-anyone who wants to go back and maintain their own parsers; it is not updated.
+nano is OCSF only. UDM is a legacy schema, kept only so older installs keep
+working until they migrate to OCSF. The `legacy/clickhouse` branch is frozen:
+it receives no changes, including bug fixes. Migrate to OCSF and use `main`.
 
 ## Available Parsers
 
@@ -183,7 +183,7 @@ anyone who wants to go back and maintain their own parsers; it is not updated.
 
 | Parser | Source type | Vendor | Format | Description |
 |--------|-------------|--------|--------|-------------|
-| [Generic JSON](parsers-ocsf/json_generic) | `json_generic` | — | JSON | Auto-detects common field names for timestamps, IPs, users, actions |
+| [Generic JSON](parsers-ocsf/json_generic) | `json_generic` | (any) | JSON | Auto-detects common field names for timestamps, IPs, users, actions |
 | [Generic Syslog](parsers-ocsf/syslog) | `syslog` | IETF | RFC 3164 / 5424 | Facility/severity decode, app-specific sub-parsing (sshd, sudo, iptables) |
 
 ## OCSF parsers
@@ -205,7 +205,7 @@ asserts `metadata.version` against this key rather than a hardcoded constant.
 
 ### Sample corpus
 
-Samples live **beside the parser** — this is the convention for the OCSF tree:
+Samples live **beside the parser**; this is the convention for the OCSF tree:
 
 ```
 parsers-ocsf/<source>/
@@ -217,17 +217,17 @@ parsers-ocsf/<source>/
 ```
 
 - One file per branch of the parser, named after the branch it exercises
-  (each EventID, each CloudTrail shape, each log type) — plus one malformed line,
+  (each EventID, each CloudTrail shape, each log type), plus one malformed line,
   because a parser that aborts on garbage drops the whole batch.
 - A file is either the raw log line, or a `{"message": "<raw line>"}` wrapper.
   Use the wrapper whenever the raw line is itself JSON containing a `message` key.
 - These are the inputs `scripts/validate-ocsf.sh` runs. A parser with no `samples/`
-  is reported as UNVALIDATED — it is unproven, not fine.
+  is reported as UNVALIDATED: it is unproven, not fine.
 
 An inline `samples:` block inside `parser.yaml` (exercised by
 `scripts/validate-vrl.sh`) is still honoured, but OCSF parsers use the sidecar
-directory because their raw lines — Windows XML, nested
-cloud JSON — are far too large to read inline.
+directory because their raw lines (Windows XML, nested
+cloud JSON) are far too large to read inline.
 
 ### Validating the OCSF tree
 
@@ -241,22 +241,22 @@ scripts/validate-ocsf.sh parsers-ocsf/windows_event_xml/parser.yaml
 
 Two gates per sample:
 
-1. **VRL** — `vector vrl` compiles *and runs* the program. `vector vrl` exits 0
+1. **VRL**: `vector vrl` compiles *and runs* the program. `vector vrl` exits 0
    even when a program aborts at runtime, so the signal is whether an object came
    out at all. An abort is a hard failure: that parser drops every event it touches.
-2. **OCSF** — the *emitted* event (never a row read back from the lake, which has
+2. **OCSF**: the *emitted* event (never a row read back from storage, which has
    been through column promotion and null-stripping) is checked against nano's OCSF
    contract, plus these tree-wide consistency rules:
    - `metadata.version` equals the parser's own `ocsf_version`
    - `type_uid == class_uid * 100 + activity_id`
    - the parser never writes `.udm.*` or `source_type` (`metadata.log_source`
      carries the source type in OCSF)
-   - `class_uid` is a real, **non-deprecated** class — OCSF 1.9 deprecated
+   - `class_uid` is a real, **non-deprecated** class. OCSF 1.9 deprecated
      Account Change (3001) and User Access Management (3005) in favour of
      User Management (3007) and Group Management (3006)
    - every path written is a canonical OCSF 1.9 attribute of the event's class,
-     or sits under `unmapped.*`. nano's lake stores every canonical path as its own
-     column and search serves it (indexed or not); a non-canonical path is refused
+     or sits under `unmapped.*`. nano stores every canonical path and search
+     serves it (indexed or not); a non-canonical path is refused
      by search ("Unknown canonical OCSF field"), so it is reported
 
 The contract check needs nano's `ocsf_event_validate` binary, which is a nano build
@@ -265,9 +265,9 @@ artifact and is not vendored here. Point `OCSF_VALIDATOR` at it, or put it on
 
 The reference data the script checks against lives next to it:
 
-- `scripts/ocsf-1.9.0-classes.json` — every class uid, caption and `@deprecated` flag,
+- `scripts/ocsf-1.9.0-classes.json`: every class uid, caption and `@deprecated` flag,
   regenerated from `https://schema.ocsf.io/api/1.9.0/`
-- `scripts/ocsf-1.9.0-contract.json.gz` — nano's embedded OCSF 1.9 contract
+- `scripts/ocsf-1.9.0-contract.json.gz`: nano's embedded OCSF 1.9 contract
   (classes, objects, attribute types), copied verbatim from nanosiem
   `nanosiem-core/src/parsers/ocsf-1.9.0-contract.json.gz`; rule 5 walks it
 
@@ -304,7 +304,7 @@ and after a large rewrite. CI runs the check on every PR (job "Parser load budge
   text). Masking is an opt-in Nano Pipe step, a pipeline concern, never a
   parser concern. Review rejects parser-level redaction.
 - Emit the **complete OCSF object on the root** (`. = ocsf`) so it lands in
-  the lake and every canonical path is stored as its own queryable column.
+  `ocsf_logs` and every canonical path is queryable.
 - **Declare every mapping explicitly.** `field-coverage.yaml` `mappings` lists
   each source key with the OCSF path(s) it is copied to, and each `transforms`
   rule names its target. A source field counts as mapped only when its value is
@@ -420,7 +420,7 @@ Each parser lives in its own directory under `parsers-ocsf/` with a `parser.yaml
 - **display_name**: Human-friendly name
 - **version**: Semantic version
 - **description**: What this parser does
-- **match_values**: The `source_type` that routes to this parser — **one value**
+- **match_values**: The `source_type` that routes to this parser: **one value**
 
 ### Naming a source type
 
@@ -428,7 +428,7 @@ One `source_type` per source, and it names *what the log is*, not how it is enco
 Parsers for different wire formats of the same source therefore share one value:
 `windows_sysmon` covers both the JSON and XML Sysmon parsers, and `windows_event`
 covers all three Windows Event Log parsers. Pick the parser matching your format and
-deploy **exactly one per source type** — deploying two that claim the same value routes
+deploy **exactly one per source type**; deploying two that claim the same value routes
 every event down both pipelines and writes it to storage twice.
 
 Genuinely different sources get different values even under one vendor: Sysmon for Linux
@@ -436,7 +436,7 @@ is `linux_sysmon`, not `windows_sysmon`.
 
 `match_values` is a list for backward compatibility and because a few collector-backed
 parsers still carry per-stream values, but new parsers should declare a single entry.
-The value is only a default — it is shown when importing and an operator can change it
+The value is only a default. It is shown when importing and an operator can change it
 to whatever their forwarders already tag with.
 - **category**: Log category (endpoint, network, cloud, security, application, generic)
 - **vendor**: Vendor/organization name
